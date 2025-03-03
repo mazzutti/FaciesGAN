@@ -7,7 +7,8 @@ import torch.nn.parallel
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-import os
+
+from datasets import helper
 from models.generator import Generator
 from models.discriminator import Discriminator
 from train import *
@@ -17,7 +18,7 @@ parser = argparse.ArgumentParser(description='PyTorch Simultaneous Training')
 parser.add_argument('--data_dir', default='../data/Gslibdata/250TI.gslib', help='path to dataset')
 parser.add_argument('--res_dir', default='./results')
 parser.add_argument('--log_dir', default='./logs')
-parser.add_argument('--condi', default=None)
+parser.add_argument('--cond', default=None)
 parser.add_argument('--gantype', default='zerogp', help='type of GAN loss', choices=['wgangp', 'zerogp', 'lsgan'])
 parser.add_argument('--batch_size', default=1, type=int,help='Total batch size - e.g) num_gpus = 2 , batch_size = 128 then, effectively, 64')
 parser.add_argument('--val_batch', default=1, type=int)
@@ -61,7 +62,7 @@ def main_worker(args):
     ###########
     # Dataset #
     ###########
-    train_loader=DataSets.get_dataloader(args.data_dir)
+    train_loader= DataSets.get_dataloader(args.data_dir)
 
     ######################
     # Validate and Train #
@@ -133,7 +134,7 @@ def run(condi_args,gslib_pre:str='',condi_file:str=None,use_fiter:bool=False):
     for gen_nums in range(1):
         x_fake_list = condi_args.generator(condi_args.z_list,ijs=ijs,vals=vals)
         for scale in range(condi_args.num_scale + 1):
-            helper.save_tensor_to_gslib(x_fake_list[scale],condi_args.save_folder,file_names=["{0}_{1}.gslib".format(gslib_pre,scale+1)])
+            helper.save_tensor_to_gslib(x_fake_list[scale], condi_args.save_folder, file_names=["{0}_{1}.gslib".format(gslib_pre, scale + 1)])
 
 if __name__ == '__main__':
     main()

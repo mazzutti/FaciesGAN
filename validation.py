@@ -1,4 +1,3 @@
-import datasets.helper as helper
 import utils
 from tqdm import trange
 from torch.nn import functional as F
@@ -8,7 +7,6 @@ import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
 import torchvision.utils as vutils
-import pickle
 
 from utils import *
 
@@ -58,7 +56,7 @@ def validateSinGAN(data_loader, networks, stage, args, additional=None):
         x_fake_list = G(z_list)
         for xi in range(len(x_fake_list)):
             scale=x_fake_list[xi].shape[-1]/args.size_list[-1]
-            utils.save_pic(args.condi,torch.clamp(x_fake_list[xi].detach().cpu(), -0.5, 0.5),args.res_dir,scale,stage,xi)
+            utils.save_pic(args.condi, torch.clamp(x_fake_list[xi].detach().cpu(), -0.5, 0.5), args.res_dir, scale, stage, xi)
 
 
 
