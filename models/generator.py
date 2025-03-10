@@ -1,96 +1,70 @@
-from torch import nn
-from torch.nn import functional as F
 import torch
-import os
-import torchvision.utils as vutils
+from torch import nn
+from torch.nn.functional import interpolate, pad
+
 
 class Generator(nn.Module):
-    def __init__(self, size_list ,img_ch=1,kernel:int=3):
+    def __init__(self, scales_list, in_channels=1, kernel_size=3, padding=5, out_channels=32):
         super(Generator, self).__init__()
-        self.nf = 32
-        self.kernel=kernel
+        self.kernel_size = kernel_size
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.scales_list = scales_list
         self.current_scale = 0
-        self.img_ch=img_ch
-        self.size_list = size_list
-        print(self.size_list)
+        self.out_padding = self.kernel_size // 2 - 1
+        self.in_padding = padding
+        self.stride = 1
+        self.resizers = [
+            lambda x, s=scale: interpolate(
+                x, (s, s), mode='bilinear', align_corners=True
+            )
+            for scale in self.scales_list[1:]
+        ]
+        self.subs = nn.ModuleList()
+        self.__add_generator()
 
-        self.sub_generators = nn.ModuleList()
+    def __add_generator(self):
+        self.subs.append(
+            nn.Sequential(
+                nn.Sequential(
+                    nn.Conv2d(self.in_channels, self.out_channels, self.kernel_size, self.stride, self.out_padding),
+                    nn.BatchNorm2d(self.out_channels),
+                    nn.LeakyReLU(2e-1)),
+                *[nn.Sequential(
+                    nn.Conv2d(self.out_channels, self.out_channels, self.kernel_size, self.stride, self.out_padding),
+                    nn.BatchNorm2d(self.out_channels),
+                    nn.LeakyReLU(2e-1)
+                ) for _ in range(3)],
+                nn.Sequential(
+                    nn.Conv2d(self.out_channels, self.in_channels, self.kernel_size, self.stride, self.out_padding),
+                    nn.Tanh())
+            )
+        )
 
-        first_generator = nn.ModuleList()
+    def forward(self, z, masks=None, images=None):
+        mask_columns = []
+        if masks is not None and images is not None:
+            for i in range(self.current_scale + 1):
+                columns = torch.argmax(torch.sum(masks[i], dim=2), dim=2)
+                z[i][:, :, self.in_padding:-self.in_padding,
+                columns+self.in_padding] = images[i][:, :, :, columns]
+                mask_columns.append(columns)
+        fake_inter_image = self.subs[0](z[0])
+        fake_image_list = [fake_inter_image]
 
-        first_generator.append(nn.Sequential(nn.Conv2d(self.img_ch, self.nf, self.kernel, 1,self.kernel//2-1),
-                                             nn.BatchNorm2d(self.nf),
-                                             nn.LeakyReLU(2e-1)))
-        for _ in range(3):
-            first_generator.append(nn.Sequential(nn.Conv2d(self.nf, self.nf, self.kernel, 1,self.kernel//2-1),
-                                                 nn.BatchNorm2d(self.nf),
-                                                 nn.LeakyReLU(2e-1)))
-
-        first_generator.append(nn.Sequential(nn.Conv2d(self.nf, self.img_ch, self.kernel, 1,self.kernel//2-1),
-                                             nn.Tanh()))
-
-        first_generator = nn.Sequential(*first_generator)
-
-        self.sub_generators.append(first_generator)
-
-    def forward(self, z, img=None,ijs=None,vals=None):
-        x_list = []
-        x_first = self.sub_generators[0](z[0])
-
-        if (ijs is not None) and (vals is not None):
-            ij=ijs[0]
-            x_first[...,ij[:,0],ij[:,1]]=vals
-
-        x_list.append(x_first)
-        if img is not None:
-            x_inter = img
-        else:
-            x_inter = x_first
-
-        for i in range(1, self.current_scale + 1): #for i in range(1, 1) is NULL
-            x_inter = F.interpolate(x_inter, (self.size_list[i], self.size_list[i]), mode='bilinear', align_corners=True)
-
-            x_prev = x_inter
-            x_inter = F.pad(x_inter, [5, 5, 5, 5], value=0)
-            x_inter = x_inter + z[i]
-            gen = self.sub_generators[i](x_inter)
-            x_inter =gen  + x_prev
-
-            if (ijs is not None) and (vals is not None):
-                ij=ijs[i]
-                x_inter[...,ij[:,0],ij[:,1]]=vals
-
-            x_list.append(x_inter)
-
-        return x_list
+        for i in range(1, self.current_scale + 1):
+            fake_inter_image = self.resizers[i-1](fake_inter_image)
+            prev_fake_image = fake_inter_image
+            fake_inter_image = pad(fake_inter_image, [self.in_padding] * 4, value=0)
+            fake_inter_image = fake_inter_image + z[i]
+            gen = self.subs[i](fake_inter_image)
+            fake_inter_image = gen + prev_fake_image
+            fake_image_list.append(fake_inter_image)
+        return fake_image_list, mask_columns
 
     def progress(self):
         self.current_scale += 1
-
-        if self.current_scale % 4 == 0:
-            self.nf *= 2
-
-        tmp_generator = nn.ModuleList()
-        tmp_generator.append(nn.Sequential(nn.Conv2d(self.img_ch, self.nf, self.kernel, 1,self.kernel//2-1),
-                                           nn.BatchNorm2d(self.nf),
-                                           nn.LeakyReLU(2e-1)))
-
-        for _ in range(3):
-            tmp_generator.append(nn.Sequential(nn.Conv2d(self.nf, self.nf, self.kernel, 1,self.kernel//2-1),
-                                               nn.BatchNorm2d(self.nf),
-                                               nn.LeakyReLU(2e-1)))
-
-        tmp_generator.append(nn.Sequential(nn.Conv2d(self.nf, self.img_ch, self.kernel, 1,self.kernel//2-1),
-                                           nn.Tanh()))
-
-        tmp_generator = nn.Sequential(*tmp_generator)
-
-        if self.current_scale % 4 != 0:
-            prev_generator = self.sub_generators[-1]
-
-            # Initialize layers via copy
-            if self.current_scale >= 1:
-                tmp_generator.load_state_dict(prev_generator.state_dict())
-
-        self.sub_generators.append(tmp_generator)
-        print("GENERATOR PROGRESSION DONE")
+        if self.current_scale % 4 == 0: self.out_channels *= 2
+        self.__add_generator()
+        if self.current_scale % 4 != 0 and self.current_scale >= 1:
+            self.subs[-1].load_state_dict(self.subs[-2].state_dict())

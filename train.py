@@ -1,148 +1,79 @@
+from torch.nn.functional import pad
 from tqdm import trange
-from torch.nn import functional as F
 import torch.nn
 import torch.nn.parallel
 import torch.optim
 import torch.utils.data
 import torch.utils.data.distributed
-from utils import *
-from ops import compute_grad_gp_wgan, compute_grad_gp
-import torchvision.utils as vutils
 
-def trainSinGAN(data_loader, networks, opts, stage, args, additional):
-    # avg meter
-    d_losses = AverageMeter()
-    g_losses = AverageMeter()
+from ops import compute_g_loss, get_discriminator_loss, compute_mse_g_loss
 
-    # set nets
-    D = networks[0]
-    G = networks[1]
-    # set opts
-    d_opt = opts['d_opt']
-    g_opt = opts['g_opt']
-    # switch to train mode
-    D.train()
-    G.train()
-    # summary writer
-    # writer = additional[0]
-    train_it = iter(data_loader)
-    # total_iter = 2000 * (args.num_scale - stage + 1)
-    # decay_lr = 1600 * (args.num_scale - stage + 1)
+
+def train(data_loader, generator, discriminator, generator_optimizer, discriminator_optimizer, stage, args):
+    discriminator.train()
+    generator.train()
+    data_loader.dataset.shuffle()
+
     total_iter = args.total_iter
     decay_lr = args.decay_lr
 
-    d_iter = 3
-    g_iter = 3
+    d_iter = 1
+    g_iter = 1
+    num_of_batchs = len(data_loader.dataset) // args.batch_size + 1
 
-    t_train = trange(0, total_iter, initial=0, total=total_iter)
+    train_iterator = trange(0, total_iter, initial=0, total=total_iter)
 
-    z_rec = additional['z_rec']
-    for z_idx in range(len(z_rec)):
-        z_rec[z_idx] = z_rec[z_idx].to(args.device)
+    z_list = []
+    d_loss, g_loss, g_rmse_loss = None, None, None
+    for i in train_iterator:
+        data_iterator = iter(data_loader)
+        for batch_id, (images, masks) in enumerate(data_iterator):
+            masks = [mask.to(args.device) for mask in masks[:stage + 1]]
+            images = [img.to(args.device) for img in images[:stage + 1]]
+            if i == decay_lr:
+                for param_group in discriminator_optimizer.param_groups: param_group['lr'] *= 0.9
+                for param_group in generator_optimizer.param_groups: param_group['lr'] *= 0.9
+            for _ in range(g_iter):
+                generator_optimizer.zero_grad()
+                z_rec = [
+                    pad((torch.randn if i == 0 else torch.zeros)
+                        (images[0].size(0), args.in_channels, s, s),
+                        [args.in_padding] * 4, value=0).to(args.device)
+                    for i, s in enumerate(args.scales_list)
+                ]
+                image_rec_list, mask_columns = generator(z_rec, masks=masks, images=images)
+                g_rec_loss = compute_mse_g_loss(image_rec_list[-1], images[stage], mask_columns[-1])
+                g_rmse_loss = torch.tensor([1.0] + [torch.sqrt(compute_mse_g_loss(
+                    image_rec_list[j], images[j], mask_columns[j])) for j in range(1, stage + 1)]).to(args.device)
 
-    x_in = next(train_it)
+                z_list = [
+                    pad(g_rmse_loss[z_idx] * torch.randn(
+                        images[0].size(0),
+                        args.in_channels,
+                        args.scales_list[z_idx],
+                        args.scales_list[z_idx]).to(args.device),
+                          [args.kernel_size] * 4, value=0) for z_idx in range(stage + 1)
+                ]
 
-    x_in = x_in.to(args.device)
-    x_org = x_in
-    x_in = F.interpolate(x_in, (args.size_list[stage], args.size_list[stage]), mode='bilinear', align_corners=True)
-    vutils.save_image(x_in.detach().cpu(), os.path.join(args.res_dir, 'ORGTRAIN_{}.png'.format(stage)),
-                      nrow=1, normalize=True)
+                image_fake_list, _ = generator(z_list)
+                g_fake_logit = discriminator(image_fake_list[-1])
+                ones = torch.ones_like(g_fake_logit).to(args.device)
+                g_loss = compute_g_loss(args, g_fake_logit, g_rec_loss, torch.sum(g_rmse_loss),  ones)
+                g_loss.backward(retain_graph=True)
+                generator_optimizer.step()
 
-    x_in_list = [x_in]
-    for xidx in range(1, stage + 1):
-        x_tmp = F.interpolate(x_org, (args.size_list[xidx], args.size_list[xidx]), mode='bilinear', align_corners=True)
-        x_in_list.append(x_tmp)
+            # Update discriminator
+            for _ in range(d_iter):
+                images[stage].requires_grad = True
+                discriminator_optimizer.zero_grad()
+                image_fake_list, _ = generator(z_list)
+                d_fake_logit = discriminator(image_fake_list[-1].detach())
+                d_real_logit = discriminator(images[stage])
+                d_loss = get_discriminator_loss(args,
+                    discriminator, d_real_logit, d_fake_logit, images[stage], image_fake_list)
+                d_loss.backward()
+                discriminator_optimizer.step()
 
-    for i in t_train:
-        if i == decay_lr:
-            #修改优化器中的学习率
-            for param_group in d_opt.param_groups:
-                    param_group['lr'] *= 0.1
-                    print("DISCRIMINATOR LEARNING RATE UPDATE TO :", param_group['lr'])
-            for param_group in g_opt.param_groups:
-                    param_group['lr'] *= 0.1
-                    print("GENERATOR LEARNING RATE UPDATE TO :", param_group['lr'])
-
-        for _ in range(g_iter):
-            g_opt.zero_grad()
-            
-            x_rec_list = G(z_rec) # G在不同维度生成的假图片集合
-            g_rec = F.mse_loss(x_rec_list[-1], x_in) # 输入真实图像与最后一级假图像之间的损失函数
-            # mse_loss有平方项 其值大小会影响梯度的大小 但rmse待验证？？？
-            # calculate rmse for each scale
-            rmse_list = [1.0]
-            for rmseidx in range(1, stage + 1):
-                rmse = torch.sqrt(F.mse_loss(x_rec_list[rmseidx], x_in_list[rmseidx]))
-                rmse_list.append(rmse)
-            z_list = [F.pad(rmse_list[z_idx] * torch.randn(args.batch_size, args.img_ch, args.size_list[z_idx],
-                                               args.size_list[z_idx]).to(args.device),
-                            [5, 5, 5, 5], value=0) for z_idx in range(stage + 1)]
-            # 这里为啥要将rmse乘以噪声??
-
-            x_fake_list = G(z_list)
-
-            g_fake_logit = D(x_fake_list[-1])
-
-            ones = torch.ones_like(g_fake_logit).to(args.device)
-
-            if args.gantype == 'wgangp':
-                # wgan gp 优化G 是使g_fake_logit增大 所以加负号 
-                g_fake = -torch.mean(g_fake_logit, (2, 3))# N*C*H*W -> N*C
-                g_loss = g_fake + 10.0 * g_rec 
-            elif args.gantype == 'zerogp':
-                # zero centered GP
-                g_fake = F.binary_cross_entropy_with_logits(g_fake_logit, ones, reduction='none').mean()
-                g_loss = g_fake + 100.0 * g_rec 
-
-            elif args.gantype == 'lsgan':
-                # lsgan
-                g_fake = F.mse_loss(torch.mean(g_fake_logit, (2, 3)), 0.9 * ones)
-                g_loss = g_fake + 50.0 * g_rec 
-
-            g_loss.backward()
-            g_opt.step()
-
-            g_losses.update(g_loss.item(), x_in.size(0))
-
-        # Update discriminator
-        for _ in range(d_iter):
-            x_in.requires_grad = True
-
-            d_opt.zero_grad()
-            x_fake_list = G(z_list)
-
-            d_fake_logit = D(x_fake_list[-1].detach())
-            d_real_logit = D(x_in)
-
-            ones = torch.ones_like(d_real_logit).to(args.device)
-            zeros = torch.zeros_like(d_fake_logit).to(args.device)
-
-            if args.gantype == 'wgangp':
-                # wgan gp
-                d_fake = torch.mean(d_fake_logit, (2, 3))
-                d_real = -torch.mean(d_real_logit, (2, 3))
-                d_gp = compute_grad_gp_wgan(D, x_in, x_fake_list[-1], args.device)
-                d_loss = d_real + d_fake + 10.0 * d_gp
-            elif args.gantype == 'zerogp':
-                # zero centered GP
-                # d_fake = F.binary_cross_entropy_with_logits(torch.mean(d_fake_logit, (2, 3)), zeros)
-                d_fake = F.binary_cross_entropy_with_logits(d_fake_logit, zeros, reduction='none').mean()
-                # d_real = F.binary_cross_entropy_with_logits(torch.mean(d_real_logit, (2, 3)), ones)
-                d_real = F.binary_cross_entropy_with_logits(d_real_logit, ones, reduction='none').mean()
-                d_gp = compute_grad_gp(torch.mean(d_real_logit, (2, 3)), x_in)
-                d_loss = d_real + d_fake + 10.0 * d_gp
-
-            elif args.gantype == 'lsgan':
-                # lsgan
-                d_fake = F.mse_loss(torch.mean(d_fake_logit, (2, 3)), zeros)
-                d_real = F.mse_loss(torch.mean(d_real_logit, (2, 3)), 0.9 * ones)
-                d_loss = d_real + d_fake
-
-            d_loss.backward()
-            d_opt.step()
-
-            d_losses.update(d_loss.item(), x_in.size(0))
-        t_train.set_description('Stage: [{}/{}] Avg Loss: D[{d_loss:.3f}] G[{g_loss:.3f}] RMSE[{rmse:.3f}]'
-                                .format(stage, args.num_scale, d_loss=d_loss.item(), g_loss=g_loss.item(), rmse=rmse_list[-1]))
-        # t_train.set_description('Stage: [{}/{}] Avg Loss: D[{d_losses.avg:.3f}] G[{g_losses.avg:.3f}] RMSE[{rmse:.3f}]'
-        #                         .format(stage, args.num_scale, d_losses=d_losses, g_losses=g_losses, rmse=rmse_list[-1]))
+            train_iterator.set_description(
+                f'Stage: [{stage}/{args.num_scales}] Batch: [{str(batch_id + 1).rjust(2)}/{num_of_batchs}] Avg Loss: discriminator '
+                f'[{d_loss.item():.3f}] generator [{g_loss.item():.3f}] RMSE [{g_rmse_loss[-1]:.3f}] |')
