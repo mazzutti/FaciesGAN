@@ -22,7 +22,6 @@ def main():
     parser.add_argument('--data_dir', default='data/facies_data', help='path to dataset')
     parser.add_argument('--results_dir', default='./results')
     parser.add_argument('--logs_dir', default='./logs')
-    parser.add_argument('--cond', default=None)
     parser.add_argument('--gantype', default='zerogp',
                         help='type of GAN loss', choices=['wgangp', 'zerogp', 'lsgan'])
     parser.add_argument('--batch_size', default=1, type=int,
