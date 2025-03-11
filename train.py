@@ -27,8 +27,8 @@ def train(data_loader, generator, discriminator, generator_optimizer, discrimina
     d_loss, g_loss, g_rmse_loss = None, None, None
     for i in train_iterator:
         data_iterator = iter(data_loader)
-        for batch_id, (images, masks) in enumerate(data_iterator):
-            masks = [mask.to(args.device) for mask in masks[:stage + 1]]
+        for batch_id, (images, mask_indexes) in enumerate(data_iterator):
+            mask_indexes = [mask.to(args.device) for mask in mask_indexes[:stage + 1]]
             images = [img.to(args.device) for img in images[:stage + 1]]
             if i == decay_lr:
                 for param_group in discriminator_optimizer.param_groups: param_group['lr'] *= 0.9
@@ -41,10 +41,10 @@ def train(data_loader, generator, discriminator, generator_optimizer, discrimina
                         [args.in_padding] * 4, value=0).to(args.device)
                     for i, s in enumerate(args.scales_list)
                 ]
-                image_rec_list, mask_columns = generator(z_rec, masks=masks, images=images)
-                g_rec_loss = compute_mse_g_loss(image_rec_list[-1], images[stage], mask_columns[-1])
+                image_rec_list = generator(z_rec, mask_indexes=mask_indexes, images=images)
+                g_rec_loss = compute_mse_g_loss(image_rec_list[-1], images[stage], mask_indexes[-1])
                 g_rmse_loss = torch.tensor([1.0] + [torch.sqrt(compute_mse_g_loss(
-                    image_rec_list[j], images[j], mask_columns[j])) for j in range(1, stage + 1)]).to(args.device)
+                    image_rec_list[j], images[j], mask_indexes[j])) for j in range(1, stage + 1)]).to(args.device)
 
                 z_list = [
                     pad(g_rmse_loss[z_idx] * torch.randn(
@@ -55,7 +55,7 @@ def train(data_loader, generator, discriminator, generator_optimizer, discrimina
                           [args.kernel_size] * 4, value=0) for z_idx in range(stage + 1)
                 ]
 
-                image_fake_list, _ = generator(z_list)
+                image_fake_list = generator(z_list)
                 g_fake_logit = discriminator(image_fake_list[-1])
                 ones = torch.ones_like(g_fake_logit).to(args.device)
                 g_loss = compute_g_loss(args, g_fake_logit, g_rec_loss, torch.sum(g_rmse_loss),  ones)
@@ -66,7 +66,7 @@ def train(data_loader, generator, discriminator, generator_optimizer, discrimina
             for _ in range(d_iter):
                 images[stage].requires_grad = True
                 discriminator_optimizer.zero_grad()
-                image_fake_list, _ = generator(z_list)
+                image_fake_list = generator(z_list)
                 d_fake_logit = discriminator(image_fake_list[-1].detach())
                 d_real_logit = discriminator(images[stage])
                 d_loss = get_discriminator_loss(args,

@@ -25,9 +25,9 @@ def validate(data_loader, generator, discriminator, stage, args):
         for sublist in data_loader.dataset.images_list[:stage + 1]
     ]
 
-    masks = [
+    mask_indexes = [
         torch.stack([mask.to(args.device) for mask in sublist[indexes]])
-        for sublist in data_loader.dataset.masks_list[:stage + 1]
+        for sublist in data_loader.dataset.mask_indexes_list[:stage + 1]
     ]
 
     z_rec = [
@@ -42,14 +42,14 @@ def validate(data_loader, generator, discriminator, stage, args):
     for i in range(args.num_real_samples):
         with torch.no_grad():
 
-            image_rec_list, mask_columns = generator(z_rec,
-                 masks=[mask[i].repeat(args.num_gen_per_sample, 1, 1, 1) for mask in masks],
+            image_rec_list = generator(z_rec,
+                 mask_indexes=[mask_index[i].repeat(args.num_gen_per_sample, 1, 1, 1) for mask_index in mask_indexes],
                  images=[image[i].repeat(args.num_gen_per_sample, 1, 1, 1) for image in images])
 
             # Calculate RMSE for each scale using list comprehension
             rmse_list =  torch.tensor([1.0] +  [
                 torch.sqrt(compute_mse_g_loss(
-                    image_rec_list[i], images[i], mask_columns[i])).item() / (100.0 if args.validation else 1.0)
+                    image_rec_list[i], images[i], mask_indexes[i])).item() / (100.0 if args.validation else 1.0)
                 for i in range(1, stage + 1)
             ]).to(args.device)
             if len(rmse_list) > 1: rmse_list[-1] = 0.0
@@ -60,8 +60,8 @@ def validate(data_loader, generator, discriminator, stage, args):
                 for r, rmse in enumerate(rmse_list)
             ]
 
-            images_fake, _ = generator(z_list)
+            images_fake = generator(z_list)
             image_fake_list.append(torch.clamp(images_fake[stage], -0.5, 0.5))
 
-    utils.plot_generated_images(image_fake_list, images[stage], masks[stage], stage, stage)
+    utils.plot_generated_images(image_fake_list, images[stage], mask_indexes[stage], stage, stage)
 

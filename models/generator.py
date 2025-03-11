@@ -41,14 +41,11 @@ class Generator(nn.Module):
             )
         )
 
-    def forward(self, z, masks=None, images=None):
-        mask_columns = []
-        if masks is not None and images is not None:
+    def forward(self, z, mask_indexes=None, images=None):
+        if mask_indexes is not None and images is not None:
             for i in range(self.current_scale + 1):
-                columns = torch.argmax(torch.sum(masks[i], dim=2), dim=2)
                 z[i][:, :, self.in_padding:-self.in_padding,
-                columns+self.in_padding] = images[i][:, :, :, columns]
-                mask_columns.append(columns)
+                    mask_indexes[i]+self.in_padding] = images[i][:, :, :, mask_indexes[i]]
         fake_inter_image = self.subs[0](z[0])
         fake_image_list = [fake_inter_image]
 
@@ -60,7 +57,7 @@ class Generator(nn.Module):
             gen = self.subs[i](fake_inter_image)
             fake_inter_image = gen + prev_fake_image
             fake_image_list.append(fake_inter_image)
-        return fake_image_list, mask_columns
+        return fake_image_list
 
     def progress(self):
         self.current_scale += 1

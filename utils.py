@@ -30,23 +30,24 @@ def scatter_ij(ax, ij, vals):
     ax.scatter(ij1[:, 1], ij1[:, 0], marker='.', s=1, c='C0')
 
 
-def plot_mask(mask, axis):
-    column = np.argmax(np.sum(mask, axis=0))
-    axis.scatter(np.full((mask.shape[0],), column),
-        np.arange(0, mask.shape[0]), c=mask[:, column], s=1, marker='s', cmap='plasma', label="Facies Mask")
+def plot_mask(mask_index, real_image,  axis):
+    axis.scatter(
+        np.full((real_image.shape[0],), mask_index),
+        np.arange(0, real_image.shape[0]),
+        c=np.astype(real_image[:, mask_index] > 0, np.int8), s=1, marker='s', cmap='plasma', label="Facies Mask")
 
-def plot_generated_images(fake_images, real_images, masks,  stage, index, out_dir='./results', save=False):
+def plot_generated_images(fake_images, real_images, mask_indexes,  stage, index, out_dir='./results', save=False):
     num_real_images = real_images.size(0)
     num_generated_per_real = fake_images[0].size(0)
     fig, axes = plt.subplots(num_real_images, num_generated_per_real + 1, figsize=(12, num_real_images * 2.5))
     fake_images = [np.permute_dims(fake_image.cpu().detach().numpy(), (0, 2, 3, 1)) for fake_image in fake_images]
     fake_images = [(fake_image > 0).astype(np.int32) for fake_image in fake_images]
     real_images = np.permute_dims(real_images.cpu().detach().numpy(), (0, 2, 3, 1))
-    masks = np.permute_dims(masks.cpu().detach().numpy(), (0, 2, 3, 1))
+    mask_indexes = mask_indexes.cpu().detach().numpy()
     for i in range(num_real_images):
         axes[i, 0].imshow(real_images[i], cmap='YlGn')  # Assuming one channel (e.g., well log)
         axes[i, 0].set_title(f'Well {i + 1}')
-        plot_mask(masks[i], axes[i, 0])
+        plot_mask(mask_indexes[i], real_images[i], axes[i, 0])
         axes[i, 0].set_xticks([])
         axes[i, 0].set_yticks([])
         axes[i, 0].axis('off')
@@ -55,7 +56,7 @@ def plot_generated_images(fake_images, real_images, masks,  stage, index, out_di
         for j in range(num_generated_per_real):
             axes[i, j + 1].imshow(fake_images[i][j], cmap='gray')
             axes[i, j + 1].set_title(f'Gen {j + 1}')
-            plot_mask(masks[i], axes[i, j + 1])
+            plot_mask(mask_indexes[i], real_images[i], axes[i, j + 1])
             axes[i, j + 1].axis('off')
 
     # Add a main title for the plot
