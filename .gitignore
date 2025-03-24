@@ -1,7 +1,8 @@
 .venv
 .idea
 .DS_Store
-__pycache__
-results/**
+**/__pycache__/**
 logs/**
+output/generated
+**/events.out.tfevents*
 

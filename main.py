@@ -1,140 +1,98 @@
+import os
+
+import torch
+import random
+import json
 import argparse
 
-import numpy as np
-import torch.nn
-import torch.nn.parallel
-import torch.optim
-import torch.utils.data
-import torch.utils.data.distributed
-from torch.optim import Adam
-from torch.utils.data import DataLoader
+from datetime import datetime
+from dateutil import tz
 
-from datasets.geological_facies_dataset import GeologicalFaciesDataset
-from models.generator import Generator
-from models.discriminator import Discriminator
-from train import *
-from utils import makedirs, formatted_print
-from validate import *
+from train import Trainer
+from log import init_output_logging
+from config import CHECKPOINT_PATH, OPT_FILE
 
-def main():
+def get_arguments():
+    parser = argparse.ArgumentParser()
 
-    parser = argparse.ArgumentParser(description='PyTorch Simultaneous Training')
-    parser.add_argument('--data_dir', default='data/facies_data', help='path to dataset')
-    parser.add_argument('--results_dir', default='./results')
-    parser.add_argument('--logs_dir', default='./logs')
-    parser.add_argument('--gantype', default='zerogp',
-                        help='type of GAN loss', choices=['wgangp', 'zerogp', 'lsgan'])
+    # workspace:
+    parser.add_argument("--use_cpu", action="store_true", help="use cpu")
+    parser.add_argument("--gpu_device", type=int, help="which GPU to use", default=0)
+    parser.add_argument("--input_path", help="input facie path", required=True)
+
+    # load, input, save configurations:
+    parser.add_argument("--manual_seed", type=int, help="manual seed")
+    parser.add_argument("--out_path", help="output folder path", default="facies_gan")
+    parser.add_argument("--stop_scale", type=int, help="stop scale", default=4)
+    parser.add_argument("--facie_num_channels", type=int, help="facie number of channels", default=1)
+    parser.add_argument(
+        "--img_color_range", type=int, nargs=2, help="range of values in the input facie", default=[0, 255]
+    )
+    parser.add_argument("--crop_size", type=int, help="crop size to train the facie", default=256)
     parser.add_argument('--batch_size', default=1, type=int,
-                        help='Total batch size - e.g) num_gpus = 2 , batch_size = 128 then, effectively, 64')
-    parser.add_argument('--val_batch', default=1, type=int)
-    parser.add_argument('--in_channels', default=1, type=int)
-    parser.add_argument('--kernel_size', default=5, type=int, choices=[3, 5, 7, 9])
-    parser.add_argument('--total_iter', default=250, type=int, help='total num of iteration')
-    parser.add_argument('--decay_lr', default=500, type=int, help='learning rate change iteration times')
-    parser.add_argument('--validation', default=False, type=bool)
-    parser.add_argument('--num_real_samples', default=5, type=int)
-    parser.add_argument('--num_gen_per_sample', default=5, type=int)
+                        help='Total batch size - e.g: num_gpus = 2, batch_size = 128 then, effectively, 64')
 
-    args = parser.parse_args()
-    args.scales_list = [8, 16, 32, 64, 128, 256]
-    args.num_scales = len(args.scales_list) - 1
-    args.in_padding = 5
-    args.device = torch.device('cuda' if torch.cuda.is_available() else 'mps' if torch.mps.is_available() else 'cpu')
-    makedirs(args.logs_dir)
-    makedirs(args.results_dir)
+    # networks hyperparameters:
+    parser.add_argument("--num_feature", type=int, help="initial number of features in each layer", default=32)
+    parser.add_argument("--min_num_feature", type=int, help="minimal number of features in each layer", default=32)
+    parser.add_argument("--kernel_size", type=int, help="kernel size", default=3)
+    parser.add_argument("--num_layer", type=int, help="number of layers in each scale", default=5)
+    parser.add_argument("--stride", help="stride", default=1)
+    parser.add_argument("--padding_size", type=int, help="net pad size", default=0)
 
-    formatted_print('Batch SIZE:', args.batch_size)
-    formatted_print('Logs DIR:', args.logs_dir)
-    formatted_print('Results DIR:', args.results_dir)
-    formatted_print('GAN TYPE:', args.gantype)
+    # pyramid parameters:
+    parser.add_argument("--noise_amp", type=float, help="adaptive noise cont weight", default=0.1)
+    parser.add_argument("--min_size", type=int, help="facie minimal size at the coarser scale", default=12)
+    parser.add_argument("--max_size", type=int, help="facie minimal size at the coarser scale", default=256)
 
-    main_worker(args)
+    # optimization hyperparameters:
+    parser.add_argument("--num_iter", type=int, default=2000, help="number of epochs to train per scale")
+    parser.add_argument("--gamma", type=float, help="scheduler gamma", default=0.9)
+    parser.add_argument("--lr_g", type=float, default=5e-5, help="learning rate, default=5e-8")
+    parser.add_argument("--lr_d", type=float, default=5e-5, help="learning rate, default=5e-8")
+    parser.add_argument("--lr_decay", type=int, default=1000, help="number of epochs before lr decay")
+    parser.add_argument("--beta1", type=float, default=0.5, help="beta1 for adam. default=0.5")
+    parser.add_argument("--generator_steps", type=int, help="Generator inner steps", default=10)
+    parser.add_argument("--discriminator_steps", type=int, help="Discriminator inner steps", default=10)
+    parser.add_argument("--lambda_grad", type=float, help="gradient penalty weight", default=0.1)
+    parser.add_argument("--alpha", type=float, help="reconstruction loss weight", default=10)
+    parser.add_argument("--save_interval", type=int, help="save log interval", default=100)
+    parser.add_argument("--num_real_facies", type=int,
+                        help="Number of real facies to use in the grid plot", default=5)
+    parser.add_argument("--num_generated_per_real", type=int,
+                        help="Number of generated facies per real facie to use in the grid plot", default=5)
+    parser.add_argument("--num_train_facies", type=int,
+                        help="Number of train facies to use in the FaciesGAN training", default=200)
 
-def main_worker(args):
-    ################
-    # Define model #
-    ################
-    discriminator = Discriminator(args.in_channels, args.kernel_size).to(args.device)
-    generator = Generator(args.scales_list, args.in_channels, args.kernel_size).to(args.device)
-
-    ######################
-    # Loss and Optimizer #
-    ######################
-    discriminator_optimizer = Adam(discriminator.subs[0].parameters(), 1e-4, (0.5, 0.95))
-    generator_optimizer = Adam(generator.subs[0].parameters(), 1e-4, (0.5, 0.95))
-
-    ###########
-    # Dataset #
-    ###########
-
-    dataset = GeologicalFaciesDataset(args.data_dir, args.scales_list)
-    data_loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False)
-
-    ######################
-    # Validate and Train #
-    ######################
-
-    args.stage = 0
-    for stage in range(args.stage, args.num_scales + 1):
-        train(data_loader, generator, discriminator, generator_optimizer, discriminator_optimizer, stage, args)
-        validate(data_loader, generator, discriminator, stage, args)
-        if stage < args.num_scales:
-            discriminator.progress()
-            generator.progress()
-            networks = [discriminator, generator]
-            networks = [x.to(args.device) for x in networks]
-            discriminator, generator, = networks
-            for net_idx in range(generator.current_scale):
-                for param in generator.subs[net_idx].parameters():
-                    param.requires_grad = False
-                for param in discriminator.subs[net_idx].parameters():
-                    param.requires_grad = False
-            discriminator_optimizer = Adam(
-                discriminator.subs[discriminator.current_scale].parameters(), 1e-4, (0.5, 0.95))
-            generator_optimizer = Adam(
-                generator.subs[generator.current_scale].parameters(),1e-4, (0.5, 0.95))
-
-    ##############
-    # Save model #
-    ##############
-    data_iterator = iter(data_loader)
-    images, masks = next(data_iterator)
-    images = [img.to(args.device) for img in images[:args.num_scales + 1]]
-
-    z_rec = [
-        pad((torch.randn if i == 0 else torch.zeros)
-            (images[0].size(0), args.in_channels, s, s),
-            [args.in_padding] * 4, value=0).to(args.device)
-        for i, s in enumerate(args.scales_list)
-    ]
-
-    with torch.no_grad():
-        image_rec_list = generator(z_rec)
-        rmse_list = [1.0] + [
-            torch.sqrt(compute_mse_g_loss(image_rec_list[i], images[i])).item() / (100.0 if args.validation else 1.0)
-            for i in range(1, args.num_scales + 1)
-        ]
-        if len(rmse_list) > 1: rmse_list[-1] = 0.0
-    np.savetxt(os.path.join(args.logs_dir, 'rmse_list.txt'), np.array(rmse_list))
-    torch.save(generator, os.path.join(args.logs_dir, 'gen.pkl'))
+    return parser
 
 
-def run(cond_args, gslib_pre: str = '', cond_file: str = None, use_fiter: bool = False):
-    ijs, vals = None, None
-    if cond_file is not None:
-        ij, vals = utils.load_condfile(cond_file)
-        ijs = [(ij * (cond_args.scales_list[zeros_idx] / cond_args.scales_list[-1])).astype(int) for zeros_idx in
-               range(cond_args.num_scales + 1)]
-        if use_fiter:
-            vals = vals * 2
-            # ijs, vals = helper.gen_filter(ijs, vals)
-        vals = torch.from_numpy(vals.astype(np.float32)).to(cond_args.device)
-    # for gen_nums in range(1):
-    #     x_fake_list = cond_args.generator(cond_args.z_list, ijs=ijs, vals=vals)
-    #     for scale in range(cond_args.num_scales + 1):
-    #         helper.save_tensor_to_gslib(x_fake_list[scale], cond_args.save_folder,
-    #                                     file_names=["{0}_{1}.gslib".format(gslib_pre, scale + 1)])
-    pass
+if __name__ == "__main__":
+    argument_parser = get_arguments()
+    options = argument_parser.parse_args()
 
-if __name__ == '__main__':
-    main()
+    if options.manual_seed is not None:
+        random.seed(options.manual_seed)
+        torch.manual_seed(options.manual_seed)
+
+    timestamp = datetime.now(tz.tzlocal()).strftime("%Y_%m_%d_%H_%M_%S")
+    options.out_path = os.path.join(CHECKPOINT_PATH, f"{timestamp}_{options.out_path}")
+    options.start_scale = 0
+
+    os.makedirs(options.out_path, exist_ok=True)
+
+    # Save the input parameters options
+    with open(os.path.join(options.out_path, OPT_FILE), "w") as file:
+        json.dump(vars(options), file, indent=4) # type: ignore
+
+    init_output_logging(os.path.join(options.out_path, "log.txt"))
+    print(vars(options))
+
+    device = torch.device(
+        f"cuda:{options.gpu_device}" if torch.cuda.is_available()
+        else f"mps:{options.gpu_device}" if torch.backends.mps.is_available()
+        else "cpu"
+    )
+
+    trainer = Trainer(device, options)
+    trainer.train()
