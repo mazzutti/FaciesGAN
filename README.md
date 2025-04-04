@@ -1,5 +1,5 @@
 # FaciesGAN: Conditional SinGAN for Transversal Geological Facies Prediction
-📌 Overview
+## 📌 Overview
 This repository implements FaciesGAN to generate transversal geological facies realizations, conditioned on well log data. The model learns geological patterns from an input training set and generates high-resolution facies images that honor well constraints.
 
 ## ✨ Features
