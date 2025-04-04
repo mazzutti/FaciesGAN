@@ -3,11 +3,11 @@
 This repository implements FaciesGAN to generate transversal geological facies realizations, conditioned on well log data. The model learns geological patterns from an input training set and generates high-resolution facies images that honor well constraints.
 
 ## ✨ Features
-FaciesGAN architecture adapted for geological facies modeling
-Conditioning on well log data to ensure realistic geological constraints
-Unsupervised multiscale learning from a single geological facies image
-Facies simulation with geological consistency
-Easy integration with geostatistical workflows
+* FaciesGAN architecture adapted for geological facies modeling
+* Conditioning on well log data to ensure realistic geological constraints
+* Unsupervised multiscale learning from a single geological facies image
+* Facies simulation with geological consistency
+* Easy integration with geostatistical workflows
 
 ## 📁 Repository Structure
 ```
