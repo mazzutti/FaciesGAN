@@ -45,9 +45,9 @@ python generate.py --how_many 500 --model_path results/2025_03_25_08_28_23_facie
 ```
 
 ## 📖 How It Works
-Multiscale training: FaciesGAN learns geological features progressively across multiple scales.
-Conditional generation: Well log data is incorporated as a constraint into the generator.
-Realistic facies synthesis: The trained model generates facies that resemble real-world geology.
+* Multiscale training: FaciesGAN learns geological features progressively across multiple scales.
+* Conditional generation: Well log data is incorporated as a constraint into the generator.
+* Realistic facies synthesis: The trained model generates facies that resemble real-world geology.
 
 ## 🤝 Contributing
 Pull requests and contributions are welcome! Feel free to submit issues or suggest improvements.
