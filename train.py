@@ -42,6 +42,7 @@ class Trainer:
 
         self.num_real_facies: int = options.num_real_facies
         self.num_generated_per_real: int = options.num_generated_per_real
+        self.wells = options.wells
 
         # Optimizer configuration
         self.lr_g: float = options.lr_g

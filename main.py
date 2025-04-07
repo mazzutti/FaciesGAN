@@ -52,8 +52,8 @@ def get_arguments():
     parser.add_argument("--lr_d", type=float, default=5e-5, help="learning rate, default=5e-8")
     parser.add_argument("--lr_decay", type=int, default=1000, help="number of epochs before lr decay")
     parser.add_argument("--beta1", type=float, default=0.5, help="beta1 for adam. default=0.5")
-    parser.add_argument("--generator_steps", type=int, help="Generator inner steps", default=10)
-    parser.add_argument("--discriminator_steps", type=int, help="Discriminator inner steps", default=10)
+    parser.add_argument("--generator_steps", type=int, help="Generator inner steps", default=3)
+    parser.add_argument("--discriminator_steps", type=int, help="Discriminator inner steps", default=3)
     parser.add_argument("--lambda_grad", type=float, help="gradient penalty weight", default=0.1)
     parser.add_argument("--alpha", type=float, help="reconstruction loss weight", default=10)
     parser.add_argument("--save_interval", type=int, help="save log interval", default=100)
@@ -63,6 +63,10 @@ def get_arguments():
                         help="Number of generated facies per real facie to use in the grid plot", default=5)
     parser.add_argument("--num_train_facies", type=int,
                         help="Number of train facies to use in the FaciesGAN training", default=200)
+    parser.add_argument("--wells", type=int,
+                        help="list of well indices to train the model from",
+                        nargs='+',
+                        default=tuple())
 
     return parser
 

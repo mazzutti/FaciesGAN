@@ -274,7 +274,8 @@ class FaciesGAN:
         with open(os.path.join(path, AMP_FILE), "w") as f:
             f.write(str(self.noise_amp[scale]))
 
-    def load(self, path: str, load_discriminator: bool = True, load_shapes: bool = True, until_scale: int = None) -> int:
+    def load(self, path: str, load_discriminator: bool = True,
+             load_shapes: bool = True, until_scale: int = None, load_masked_facies: bool = True) -> int:
         """
         Load the generator, discriminator, reconstruction noise, shapes, and noise amplitude from the specified path.
 
@@ -283,6 +284,7 @@ class FaciesGAN:
             load_discriminator (bool): Whether to load the discriminator. Default is True.
             load_shapes (bool): Whether to load the shapes. Default is True.
             until_scale (int): The scale index up to which to load. Default is None.
+            load_masked_facies (bool): Whether to load the masked facies. Default is True.
 
         Returns:
             int: The number of scales loaded.
@@ -292,7 +294,7 @@ class FaciesGAN:
         if until_scale is not None:
             scales_path = [scale for scale in scales_path if scale <= until_scale]
 
-        self.masked_facies = []
+        if load_masked_facies: self.masked_facies = []
         for scale in scales_path:
             try:
                 num_feature, min_num_feature = self.get_num_features(scale)
@@ -324,7 +326,8 @@ class FaciesGAN:
                 with open(os.path.join(path, str(scale), AMP_FILE)) as f:
                     self.noise_amp.append(float(f.readline().strip()))
 
-                self.masked_facies.append(ops.load(os.path.join(path, str(scale), M_FILE), self.device))
+                if load_masked_facies:
+                    self.masked_facies.append(ops.load(os.path.join(path, str(scale), M_FILE), self.device))
 
             except Exception as e:
                 print(f"Error loading models from {os.path.join(path, str(scale))}. There may be files missing.")

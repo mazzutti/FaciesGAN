@@ -1,3 +1,4 @@
+import copy
 import os
 import random
 from typing import List, Tuple
@@ -9,19 +10,16 @@ import time
 import tifffile as tif
 
 from argparse import ArgumentParser
-
 from matplotlib import pyplot as plt
-from scipy.stats import ks_2samp
 from sklearn.metrics import euclidean_distances
 
 from facies_dataset import FaciesDataset
+from log import format_time
 from models.facies_gan import FaciesGAN
 from config import OPT_FILE
 from types import SimpleNamespace
 
-from ops import norm, np2torch, range_transform, facie_resize
-from utils import torch2np, get_best_distribution
-from log import format_time
+from utils import torch2np
 from sklearn.manifold import MDS
 
 def generate_facies(model: FaciesGAN, how_many: int, model_path: str, options: SimpleNamespace) -> Tuple[List[np.ndarray], List[int]]:
@@ -37,41 +35,29 @@ def generate_facies(model: FaciesGAN, how_many: int, model_path: str, options: S
         Returns:
             Tuple[List[np.ndarray], List[int]]: A tuple containing a list of generated facies as numpy arrays and a list of mask indexes.
         """
-        model.load(model_path, load_discriminator=False)
+        model.load(model_path, load_discriminator=False, load_masked_facies=False)
         model.generator.eval()
 
-        mask_indexes = [
-            random.choice(options.wells)
-            if options.wells
-            else random.randint(0, options.num_train_facies - 1) for _ in range(how_many)
-        ]
-
-        # mask_indexes = list(range(how_many))  * 2
+        mask_indexes = [random.choice(options.wells) for _ in range(how_many)]
 
         noises = model.get_noise(mask_indexes, rec=options.rec)
 
         with torch.no_grad():
             generated_facies = [
                 torch2np(gen_facie.unsqueeze(0), denormalize=True)
-                for gen_facie in model.generator(noises, model.noise_amp)
+                for gen_facie in model.generator(noises, model.noise_amp, in_facie=None)
             ]
         return generated_facies, mask_indexes
 
 
 def plot_mds(fake_facies, mask_indexes, options):
-    options.num_train_facies = max(mask_indexes)
-    dataset: FaciesDataset = FaciesDataset(options, ceiling=False)
+
     fake_facies = np.stack(fake_facies, 0).squeeze(-1)
-    real_facies = dataset.facies_pyramid[-1][list(range(max(mask_indexes)))]
-
-    # ks_2samp(real_facies, fake_facies)
-
-    real_facies = np.reshape(torch2np(real_facies, denormalize=True), [max(mask_indexes), -1])
-    real_facies[np.where(real_facies >= 0.5)], real_facies[np.where(real_facies < 0.5)] = 1, 0
-    real_facies_similarities = euclidean_distances(real_facies)
+    real_facies = dataset.facies_pyramid[-1]
+    real_facies = np.reshape(torch2np(real_facies, denormalize=True), [dataset.facies_pyramid[-1].shape[0], -1])
     fake_facies = np.reshape(fake_facies, [len(mask_indexes), -1])
-    fake_facies[np.where(fake_facies >= 0.5)], fake_facies[np.where(fake_facies < 0.5)] = 1, 0
-    fake_facies[np.isnan(fake_facies)] = 0
+
+    real_facies_similarities = euclidean_distances(real_facies)
     fake_facies_similarities = euclidean_distances(fake_facies)
     mds = MDS(
         n_components=2,
@@ -83,6 +69,7 @@ def plot_mds(fake_facies, mask_indexes, options):
         normalized_stress="auto",
     )
     real_facies_reduced = mds.fit((real_facies_similarities + real_facies_similarities.T) / 2).embedding_
+    real_facies_reduced = real_facies_reduced[options.wells]
     fake_facies_reduced = mds.fit((fake_facies_similarities + fake_facies_similarities.T) / 2).embedding_
     plt.scatter(real_facies_reduced[:, 0], real_facies_reduced[:, 1])
     plt.scatter(fake_facies_reduced[:, 0], fake_facies_reduced[:, 1])
@@ -91,6 +78,43 @@ def plot_mds(fake_facies, mask_indexes, options):
     plt.ylabel("MDS Dimension 2")
     plt.legend(('Real Facies', 'Fake Facies'), loc='upper right')
     plt.show()
+
+    # fake_facies = np.stack(fake_facies, 0).squeeze(-1)
+    # real_facies = dataset.facies_pyramid[-1]
+    # real_facies = np.reshape(torch2np(real_facies, denormalize=True), [200, -1])
+    # fake_facies = np.reshape(fake_facies, [len(mask_indexes), -1])
+    #
+    # real_facies_similarities = euclidean_distances(real_facies)
+    # fake_facies_similarities = euclidean_distances(fake_facies)
+    # mds = MDS(
+    #     n_components=2,
+    #     max_iter=3000,
+    #     eps=1e-9,
+    #     random_state=np.random.RandomState(seed=3),
+    #     dissimilarity="precomputed",
+    #     n_jobs=1,
+    #     normalized_stress="auto",
+    # )
+    # real_facies_reduced = mds.fit((real_facies_similarities + real_facies_similarities.T) / 2).embedding_
+    # fake_facies_reduced = mds.fit((fake_facies_similarities + fake_facies_similarities.T) / 2).embedding_
+    # sc = plt.scatter(real_facies_reduced[:, 0], real_facies_reduced[:, 1])
+    # # plt.scatter(fake_facies_reduced[:, 0], fake_facies_reduced[:, 1])
+    # plt.title("MDS Visualization of FaciesGAN generated facies")
+    # plt.xlabel("MDS Dimension 1")
+    # # plt.ylabel("MDS Dimension 2")
+    # # plt.legend(('Real Facies', 'Fake Facies'), loc='upper right')
+    # import mplcursors
+    # cursor = mplcursors.cursor([sc], hover=True)
+    #
+    # def label_func(sel):
+    #     print(sel.index)
+    #     sel.annotation.set_text(str(sel.index))
+    #
+    # cursor.connect("add", label_func)
+    # plt.show()
+    # pass
+
+
 
 
 if __name__ == "__main__":
@@ -105,7 +129,7 @@ if __name__ == "__main__":
         help="list of well indices to generate facies from",
         type=int,
         nargs='+',
-        default=()
+        default=tuple(range(200)),
     )
     parser.add_argument(
         "--rec",
@@ -143,13 +167,23 @@ if __name__ == "__main__":
 
     print("Generating facies...")
 
-    faciesGAN = FaciesGAN(args.device, options=args)
+    options = copy.copy(args)
+    if arguments.plot_mds:
+        options.num_train_facies = len(options.wells)
+
+    dataset: FaciesDataset = FaciesDataset(options, ceiling=False)
+    masked_facies = []
+    for i in range(len(dataset.facies_pyramid)):
+        masked_facies.append(torch.stack([mask * facie
+              for mask, facie in zip(dataset.masks_pyramid[i], dataset.facies_pyramid[i])], dim=0))
+    faciesGAN = FaciesGAN(args.device, options=args, masked_facies=masked_facies)
     facies, mi = generate_facies(faciesGAN, arguments.how_many, arguments.model_path, args)
+
+
     if arguments.plot_mds: plot_mds(facies, mi, args)
     if arguments.plot_well_mask:
-        masked_facies = faciesGAN.masked_facies[-1].cpu().detach().numpy()
-        for i, (facie, masked_facie) in enumerate(zip(facies, masked_facies[mi]), 1):
-            masked_facie = np.squeeze(masked_facie)
+        for i, (facie, masked_facie) in enumerate(zip(facies, [masked_facies[-1][i] for i in mi]), 1):
+            masked_facie = np.squeeze(masked_facie.numpy())
             mask_index = np.argmax(np.sum(np.squeeze(masked_facie) != 0, axis=0))
             fig, axes = plt.subplots(1, 1)
             axes.imshow(facie.squeeze() , cmap='gray')

@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import torch
 import scipy.stats as st
 
+
 from config import RESULTS_DIR
 from ops import torch2np
 
@@ -93,9 +94,10 @@ def get_best_distribution(data: np.ndarray) -> Tuple[str, float, Tuple]:
     dist_results = []
     params = {}
 
+
     for dist_name in dist_names:
         dist = getattr(st, dist_name)
-        param = dist.fit(data)
+        param = dist.fit(data.flatten())
         params[dist_name] = param
 
         # Applying the Kolmogorov-Smirnov test
