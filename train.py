@@ -37,6 +37,8 @@ class Trainer:
         self.save_interval: int = options.save_interval
         self.batch_size: int = options.batch_size if (
                 options.batch_size < options.num_train_facies) else options.num_train_facies
+        self.batch_size: int = self.batch_size if (
+                options.batch_size < len(options.wells)) else len(options.wells)
         self.fine_tuning: bool = fine_tuning
         self.checkpoint_path: Optional[str] = checkpoint_path
 
@@ -60,9 +62,20 @@ class Trainer:
         self.masked_facies: List[torch.Tensor] = []
 
         dataset: FaciesDataset = FaciesDataset(options)
-
         self.scales_list: List[Tuple[int, int, int]] = dataset.scales_list
+
+        if len(options.wells) > 0:
+            for i in range(len(self.scales_list)):
+                dataset.facies_pyramid[i] = dataset.facies_pyramid[i][list(options.wells)]
+                dataset.masks_pyramid[i] = dataset.masks_pyramid[i][list(options.wells)]
+        elif options.num_train_facies < len(dataset):
+            idxs = torch.randperm(len(dataset))[:options.num_train_facies]
+            for i in range(len(self.scales_list)):
+                dataset.facies_pyramid[i] = dataset.facies_pyramid[i][idxs]
+                dataset.masks_pyramid[i] = dataset.masks_pyramid[i][idxs]
+
         self.data_loader: DataLoader = DataLoader(dataset, batch_size=options.batch_size, shuffle=False)
+
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
         self.model: FaciesGAN = FaciesGAN(device, options, self.masked_facies)

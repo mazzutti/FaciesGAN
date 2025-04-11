@@ -38,16 +38,6 @@ class FaciesDataset(Dataset):
             self.masks_pyramid[i] = torch.stack([
                 mask_resize(mask.unsqueeze(0), scale[2:]) for mask in masks], dim=0).squeeze(1)
 
-        if len(options.wells) > 0:
-            for i in range(len(self.scales_list)):
-                self.facies_pyramid[i] = self.facies_pyramid[i][list(options.wells)]
-                self.masks_pyramid[i] = self.masks_pyramid[i][list(options.wells)]
-        elif options.num_train_facies < len(self):
-            idxs = torch.randperm(len(self))[:options.num_train_facies]
-            for i in range(len(self.scales_list)):
-                self.facies_pyramid[i] = self.facies_pyramid[i][idxs]
-                self.masks_pyramid[i] = self.masks_pyramid[i][idxs]
-
         if shuffle:
             self.shuffle()
 

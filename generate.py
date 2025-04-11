@@ -168,8 +168,8 @@ if __name__ == "__main__":
     print("Generating facies...")
 
     options = copy.copy(args)
-    if arguments.plot_mds:
-        options.num_train_facies = len(options.wells)
+    # if arguments.plot_mds:
+    #     options.num_train_facies = len(options.wells)
 
     dataset: FaciesDataset = FaciesDataset(options, ceiling=False)
     masked_facies = []
