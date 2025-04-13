@@ -21,7 +21,7 @@ class FaciesDataset(Dataset):
         resizers (list): List of torchvision transforms for resizing facies and masks.
         ceiling (bool, optional): Whether to set all positive values to 1. Defaults to False.
     """
-    def __init__(self, options, shuffle=True, ceiling=True):
+    def __init__(self, options, shuffle=False, ceiling=True):
         self.data_dir = options.input_path
         self.scales_list = generate_scales(options)
         self.facies_pyramid = [torch.empty((0, 1, *scale)) for scale in self.scales_list]

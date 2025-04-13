@@ -36,9 +36,9 @@ class Trainer:
         self.num_iter: int = options.num_iter
         self.save_interval: int = options.save_interval
         self.batch_size: int = options.batch_size if (
-                options.batch_size < options.num_train_facies) else options.num_train_facies
-        self.batch_size: int = self.batch_size if (
-                options.batch_size < len(options.wells)) else len(options.wells)
+            options.batch_size < options.num_train_facies) else options.num_train_facies
+        self.batch_size: int = self.batch_size if not (
+            len(options.wells) > 0 and options.batch_size < len(options.wells)) else len(options.wells)
         self.fine_tuning: bool = fine_tuning
         self.checkpoint_path: Optional[str] = checkpoint_path
 
