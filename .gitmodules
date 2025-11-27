@@ -1,0 +1,4 @@
+[submodule "data/dataset"]
+	path = data/dataset
+	url = https://github.com/mazzutti/Stanford-VI-E.git
+	branch = master
