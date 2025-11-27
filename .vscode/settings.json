@@ -1,8 +1,7 @@
 {
     // Pylance type checking mode is configured in `pyrightconfig.json`.
     "python.analysis.autoSearchPaths": true,
-    "python.analysis.useLibraryCodeForTypes": true,
-    // Exclude: managed by pyrightconfig.json; watch-exclude still useful here
+    // "useLibraryCodeForTypes" is configured in pyrightconfig.json when present
     // Also exclude from file watching in the workspace
     "files.watcherExclude": {
         "**/.venv/**": true
