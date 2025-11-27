@@ -7,3 +7,16 @@ line-length = 120
 # Skip virtualenv and build artifacts when sorting imports
 skip = [".venv", "build", "dist", "__pycache__"]
 profile = "black"
+
+[tool.pyright]
+# Pyright settings (duplicated from pyrightconfig.json for centralization).
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportOptionalMemberAccess = true
+reportOptionalSubscript = true
+exclude = ["**/.venv/**"]
+useLibraryCodeForTypes = true
+
+[[tool.pyright.executionEnvironments]]
+root = "."
+extraPaths = []
