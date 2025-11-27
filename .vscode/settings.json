@@ -4,29 +4,16 @@
   "editor.formatOnSave": true,
   "python.linting.enabled": true,
   "python.linting.flake8Enabled": true,
+  "files.watcherExclude": {
+    "**/.venv/**": true
+  },
   "files.exclude": {
     "**/__pycache__": true,
     "**/.pytest_cache": true,
-    "results/": true
+    "results/": true,
+    "**/.venv/**": true
+  },
+  "search.exclude": {
+    "**/.venv/**": true
   }
 }
-{
-    // Exclude virtualenv from file watching, UI and search
-    "files.watcherExclude": {
-        "**/.venv/**": true
-    },
-    "files.exclude": {
-        "**/.venv/**": true
-    },
-    "search.exclude": {
-        "**/.venv/**": true
-    },
-
-    // Python settings
-    "python.linting.enabled": true,
-    "python.linting.flake8Enabled": true,
-    "python.formatting.provider": "black",
-    "editor.formatOnSave": true,
-}
-
-
