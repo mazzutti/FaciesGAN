@@ -1,14 +1,8 @@
 {
     // Pylance type checking mode is configured in `pyrightconfig.json`.
-    // Do not set `python.analysis.typeCheckingMode` or
-    // `python.analysis.diagnosticMode` here when using pyrightconfig.json.
-    // Help Pylance find imports in the workspace
     "python.analysis.autoSearchPaths": true,
     "python.analysis.useLibraryCodeForTypes": true,
-    // Exclude virtual environment folder from analysis
-    "python.analysis.exclude": [
-        "**/.venv/**"
-    ],
+    // Exclude: managed by pyrightconfig.json; watch-exclude still useful here
     // Also exclude from file watching in the workspace
     "files.watcherExclude": {
         "**/.venv/**": true
