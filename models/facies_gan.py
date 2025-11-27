@@ -2,6 +2,7 @@ import argparse
 import math
 import os
 from types import SimpleNamespace
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -12,15 +13,19 @@ from config import AMP_FILE, D_FILE, G_FILE, M_FILE, REC_FILE, SHAPE_FILE
 from models.discriminator import Discriminator
 from models.generator import Generator
 
+# Sentinel used to detect when `masked_facies` was not provided by the caller.
+# This allows distinguishing an explicit `None` from the argument being omitted.
+_MASKED_FACIES_SENTINEL = object()
+
 
 class FaciesGAN:
     def __init__(
         self,
         device: torch.device,
         options: argparse.Namespace | SimpleNamespace,
-        masked_facies: list[torch.Tensor] = None,
-        *args,
-        **kwargs,
+        masked_facies: list[torch.Tensor] | None | object = _MASKED_FACIES_SENTINEL,
+        *args: tuple[Any, ...],
+        **kwargs: dict[str, Any],
     ) -> None:
         """
         Initialize the FaciesGAN class.
@@ -50,10 +55,17 @@ class FaciesGAN:
         self.kernel_size = options.kernel_size
         self.padding_size = options.padding_size
 
-        self.shapes: list = []
-        self.rec_noise: list = []
-        self.noise_amp: list = []
-        self.masked_facies = masked_facies
+        self.shapes: list[tuple[int, ...]] = []
+        self.rec_noise: list[torch.Tensor] = []
+        self.noise_amp: list[float] = []
+
+        # If the caller omitted `masked_facies`, the sentinel will be present.
+        # Treat omission as `None`, while still allowing callers to pass an
+        # explicit `None` value if desired.
+        if masked_facies is _MASKED_FACIES_SENTINEL:
+            self.masked_facies = None
+        else:
+            self.masked_facies = masked_facies
 
         self.generator = Generator(
             self.num_layer, self.kernel_size, self.padding_size, self.facie_num_channels
