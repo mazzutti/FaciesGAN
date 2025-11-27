@@ -2,7 +2,8 @@ import argparse
 import math
 import os
 from types import SimpleNamespace
-from typing import Any, Optional, Sequence
+from typing import Any
+from collections.abc import Sequence
 
 import torch
 import torch.nn as nn
