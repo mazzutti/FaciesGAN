@@ -11,7 +11,9 @@ class Writable(Protocol):
 
 
 class OutputLogger(object):
-    def __init__(self, file: str | None = None, mode: str | None = None, buffer: str | None = "") -> None:
+    def __init__(
+        self, file: str | None = None, mode: str | None = None, buffer: str | None = ""
+    ) -> None:
         """
         Initialize the OutputLogger.
 
@@ -66,7 +68,9 @@ class OutputLogger(object):
 
 
 class TeeOutputStream(object):
-    def __init__(self, child_streams: Sequence[Writable], auto_flush: bool = False) -> None:
+    def __init__(
+        self, child_streams: Sequence[Writable], auto_flush: bool = False
+    ) -> None:
         """
         Initialize the TeeOutputStream.
 
@@ -99,7 +103,9 @@ class TeeOutputStream(object):
             stream.flush()
 
 
-def init_output_logging(filename: str, mode: str = "at", output_logger: OutputLogger | None = None) -> None:
+def init_output_logging(
+    filename: str, mode: str = "at", output_logger: OutputLogger | None = None
+) -> None:
     """
     Initialize output logging to a file.
 

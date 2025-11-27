@@ -148,8 +148,8 @@ def torch2np(
 
     Args:
         tensor (torch.Tensor): The input tensor to convert.
-        denormalize (bool, optional): Whether to denormalize the tensor from the range [-1, 1] to [0, 1]. Defaults to False.
-        ceiling (bool, optional): Whether to set all positive values to 1. Defaults to False.
+        denormalize (bool, optional): If True, denormalize from [-1, 1] to [0, 1].
+        ceiling (bool, optional): If True, set positive values to 1.
 
     Returns:
         np.ndarray: The converted NumPy array.

@@ -33,7 +33,7 @@ def generate_facies(
         options (SimpleNamespace): Options for the model.
 
     Returns:
-        Tuple[List[np.ndarray], List[int]]: A tuple containing a list of generated facies as numpy arrays and a list of mask indexes.
+        tuple[list[np.ndarray], list[int]]: A tuple with generated facies (numpy arrays) and mask indexes.
     """
     model.load(model_path, load_discriminator=False, load_masked_facies=False)
     model.generator.eval()
@@ -140,7 +140,10 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--rec",
-        help="generate a sample with the reconstruction noise. The reconstruction sample will have the same size as the TI",
+        help=(
+            "generate a sample with the reconstruction noise. "
+            "The reconstruction sample will have the same size as the TI"
+        ),
         action="store_true",
     )
     parser.add_argument("--gpu_device", help="GPU device", type=int, default=0)

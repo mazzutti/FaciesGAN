@@ -21,11 +21,13 @@ from utils import plot_generated_facies
 
 
 class Trainer:
-    def __init__(self,
-                 device: torch.device,
-                 options: argparse.Namespace,
-                 fine_tuning: bool = False,
-                 checkpoint_path: str | None = None):
+    def __init__(
+        self,
+        device: torch.device,
+        options: argparse.Namespace,
+        fine_tuning: bool = False,
+        checkpoint_path: str | None = None,
+    ):
         self.device: torch.device = device
 
         # Training parameters
@@ -34,10 +36,16 @@ class Trainer:
         self.out_path: str = options.out_path
         self.num_iter: int = options.num_iter
         self.save_interval: int = options.save_interval
-        self.batch_size: int = options.batch_size if (
-            options.batch_size < options.num_train_facies) else options.num_train_facies
-        self.batch_size: int = self.batch_size if not (
-            len(options.wells) > 0 and options.batch_size < len(options.wells)) else len(options.wells)
+        self.batch_size: int = (
+            options.batch_size
+            if (options.batch_size < options.num_train_facies)
+            else options.num_train_facies
+        )
+        self.batch_size: int = (
+            self.batch_size
+            if not (len(options.wells) > 0 and options.batch_size < len(options.wells))
+            else len(options.wells)
+        )
         self.fine_tuning: bool = fine_tuning
         self.checkpoint_path: str | None = checkpoint_path
 
@@ -65,15 +73,19 @@ class Trainer:
 
         if len(options.wells) > 0:
             for i in range(len(self.scales_list)):
-                dataset.facies_pyramid[i] = dataset.facies_pyramid[i][list(options.wells)]
+                dataset.facies_pyramid[i] = dataset.facies_pyramid[i][
+                    list(options.wells)
+                ]
                 dataset.masks_pyramid[i] = dataset.masks_pyramid[i][list(options.wells)]
         elif options.num_train_facies < len(dataset):
-            idxs = torch.randperm(len(dataset))[:options.num_train_facies]
+            idxs = torch.randperm(len(dataset))[: options.num_train_facies]
             for i in range(len(self.scales_list)):
                 dataset.facies_pyramid[i] = dataset.facies_pyramid[i][idxs]
                 dataset.masks_pyramid[i] = dataset.masks_pyramid[i][idxs]
 
-        self.data_loader: DataLoader = DataLoader(dataset, batch_size=options.batch_size, shuffle=False)
+        self.data_loader: DataLoader = DataLoader(
+            dataset, batch_size=options.batch_size, shuffle=False
+        )
 
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
@@ -82,10 +94,18 @@ class Trainer:
 
         print("Generated facie shapes:")
         print("╔══════════╦══════════╦══════════╦══════════╗")
-        print("║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format("Batch", "Channels", "Height", "Width"))
+        print(
+            "║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format(
+                "Batch", "Channels", "Height", "Width"
+            )
+        )
         print("╠══════════╬══════════╬══════════╬══════════╣")
         for shape in self.scales_list:
-            print("║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format(shape[0], shape[1], shape[2], shape[3]))
+            print(
+                "║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format(
+                    shape[0], shape[1], shape[2], shape[3]
+                )
+            )
         print("╚══════════╩══════════╩══════════╩══════════╝")
 
     def train(self) -> None:
@@ -121,83 +141,128 @@ class Trainer:
             writer = SummaryWriter(log_dir=scale_path)
             data_iterator = iter(self.data_loader)
             for batch_id, (self.facies, self.masks) in enumerate(data_iterator):
-                self.masked_facies = [mask * facie for mask, facie in zip(self.masks, self.facies)]
+                self.masked_facies = [
+                    mask * facie for mask, facie in zip(self.masks, self.facies)
+                ]
                 self.model.masked_facies = self.masked_facies
                 self.train_scale(scale, writer, scale_path, results_path, batch_id)
                 self.model.save_scale(scale, scale_path)
 
             scale_end_time = time.time()
-            print(f"Scale {scale + 1} training time: {format_time(int(scale_end_time - scale_start_time))}")
+            print(
+                f"Scale {scale + 1} training time: {format_time(int(scale_end_time - scale_start_time))}"
+            )
 
         end_train_time = time.time()
-        print("\nTotal training time:", format_time(int(end_train_time - start_train_time)))
+        print(
+            "\nTotal training time:",
+            format_time(int(end_train_time - start_train_time)),
+        )
 
-    def train_scale(self, scale: int, writer: SummaryWriter, scale_path: str, results_path: str, batch_id: int) -> None:
-           """
-           Train the model at a specific scale.
+    def train_scale(
+        self,
+        scale: int,
+        writer: SummaryWriter,
+        scale_path: str,
+        results_path: str,
+        batch_id: int,
+    ) -> None:
+        """
+        Train the model at a specific scale.
 
-           Args:
-               scale (int): The current scale index.
-               writer (SummaryWriter): TensorBoard writer for logging.
-               scale_path (str): Path to save the scale-specific models and optimizers.
-               results_path (str): Path to save the generated facies.
-               batch_id (int): The current batch index.
-           """
-           mask_indexes = list(range(self.batch_size))
+        Args:
+            scale (int): The current scale index.
+            writer (SummaryWriter): TensorBoard writer for logging.
+            scale_path (str): Path to save the scale-specific models and optimizers.
+            results_path (str): Path to save the generated facies.
+            batch_id (int): The current batch index.
+        """
+        mask_indexes = list(range(self.batch_size))
 
-           real = self.facies[scale][mask_indexes].to(self.device)
-           mask = self.masks[scale][mask_indexes].to(self.device)
-           masked_facie = self.masked_facies[scale][mask_indexes].to(self.device)
+        real = self.facies[scale][mask_indexes].to(self.device)
+        mask = self.masks[scale][mask_indexes].to(self.device)
+        masked_facie = self.masked_facies[scale][mask_indexes].to(self.device)
 
-           generator_optimizer = optim.Adam(
-               self.model.generator.gens[-1].parameters(), lr=self.lr_g, betas=(self.beta1, 0.999)
-           )
-           discriminator_optimizer = optim.Adam(
-               self.model.discriminator.parameters(), lr=self.lr_d, betas=(self.beta1, 0.999)
-           )
-           generator_scheduler = optim.lr_scheduler.MultiStepLR(
-               optimizer=generator_optimizer, milestones=[self.lr_decay], gamma=self.gamma
-           )
-           discriminator_scheduler = optim.lr_scheduler.MultiStepLR(
-               optimizer=discriminator_optimizer, milestones=[self.lr_decay], gamma=self.gamma
-           )
+        generator_optimizer = optim.Adam(
+            self.model.generator.gens[-1].parameters(),
+            lr=self.lr_g,
+            betas=(self.beta1, 0.999),
+        )
+        discriminator_optimizer = optim.Adam(
+            self.model.discriminator.parameters(),
+            lr=self.lr_d,
+            betas=(self.beta1, 0.999),
+        )
+        generator_scheduler = optim.lr_scheduler.MultiStepLR(
+            optimizer=generator_optimizer, milestones=[self.lr_decay], gamma=self.gamma
+        )
+        discriminator_scheduler = optim.lr_scheduler.MultiStepLR(
+            optimizer=discriminator_optimizer,
+            milestones=[self.lr_decay],
+            gamma=self.gamma,
+        )
 
-           if self.fine_tuning:
-               self.__load_optimizers(
-                   scale, scale_path, generator_optimizer, discriminator_optimizer,
-                   generator_scheduler, discriminator_scheduler
-               )
+        if self.fine_tuning:
+            self.__load_optimizers(
+                scale,
+                scale_path,
+                generator_optimizer,
+                discriminator_optimizer,
+                generator_scheduler,
+                discriminator_scheduler,
+            )
 
-           z_rec, prev_rec = self.__initialize_noise(scale, masked_facie, real, mask_indexes)
+        z_rec, prev_rec = self.__initialize_noise(
+            scale, masked_facie, real, mask_indexes
+        )
 
-           epochs = tqdm(range(1, self.num_iter + 1))
+        epochs = tqdm(range(1, self.num_iter + 1))
 
-           for epoch in epochs:
+        for epoch in epochs:
 
-               discriminator_loss, discriminator_loss_real, discriminator_loss_fake, discriminator_loss_gp = (
-                   self.model.optimize_discriminator(mask_indexes, real, discriminator_optimizer)
-               )
+            (
+                discriminator_loss,
+                discriminator_loss_real,
+                discriminator_loss_fake,
+                discriminator_loss_gp,
+            ) = self.model.optimize_discriminator(
+                mask_indexes, real, discriminator_optimizer
+            )
 
-               generator_loss, generator_loss_fake, generator_loss_rec, fake, rec = (
-                   self.model.optimize_generator(mask_indexes, real, mask, prev_rec, generator_optimizer)
-               )
+            generator_loss, generator_loss_fake, generator_loss_rec, fake, rec = (
+                self.model.optimize_generator(
+                    mask_indexes, real, mask, prev_rec, generator_optimizer
+                )
+            )
 
-               self.__log_epoch(
-                   epochs, writer, epoch, scale, batch_id, generator_loss, discriminator_loss,
-                   discriminator_loss_real, discriminator_loss_fake, discriminator_loss_gp,
-                   generator_loss_fake, generator_loss_rec
-               )
+            self.__log_epoch(
+                epochs,
+                writer,
+                epoch,
+                scale,
+                batch_id,
+                generator_loss,
+                discriminator_loss,
+                discriminator_loss_real,
+                discriminator_loss_fake,
+                discriminator_loss_gp,
+                generator_loss_fake,
+                generator_loss_rec,
+            )
 
-               if epoch % self.save_interval == 0 or epoch == self.num_iter:
-                   self.__save_generated_facies(scale, epoch, results_path, mask)
+            if epoch % self.save_interval == 0 or epoch == self.num_iter:
+                self.__save_generated_facies(scale, epoch, results_path, mask)
 
-               generator_scheduler.step()
-               discriminator_scheduler.step()
+            generator_scheduler.step()
+            discriminator_scheduler.step()
 
-           self.__save_optimizers(
-               scale_path, generator_optimizer, discriminator_optimizer,
-               generator_scheduler, discriminator_scheduler
-           )
+        self.__save_optimizers(
+            scale_path,
+            generator_optimizer,
+            discriminator_optimizer,
+            generator_scheduler,
+            discriminator_scheduler,
+        )
 
     def load(self, path: str, until_scale: int | None = None) -> None:
         """
@@ -207,7 +272,9 @@ class Trainer:
             path (str): The path to the model files.
             until_scale (int, optional): The scale until which to load the models. Defaults to None.
         """
-        self.start_scale = self.model.load(path, load_shapes=False, until_scale=until_scale)
+        self.start_scale = self.model.load(
+            path, load_shapes=False, until_scale=until_scale
+        )
 
     def __load_model(self, scale: int) -> None:
         """
@@ -220,19 +287,25 @@ class Trainer:
             generator_path = os.path.join(self.checkpoint_path, str(scale), G_FILE)
             discriminator_path = os.path.join(self.checkpoint_path, str(scale), D_FILE)
 
-            self.model.generator.gens[-1].load_state_dict(load(generator_path, self.device))
-            self.model.discriminator.load_state_dict(load(discriminator_path, self.device))
+            self.model.generator.gens[-1].load_state_dict(
+                load(generator_path, self.device)
+            )
+            self.model.discriminator.load_state_dict(
+                load(discriminator_path, self.device)
+            )
         except Exception as e:
             print(f"Error loading models from {self.checkpoint_path}/{scale}: {e}")
             raise
 
-    def __load_optimizers(self,
-                          scale: int,
-                          scale_path: str,
-                          generator_optimizer: optim.Optimizer,
-                          discriminator_optimizer: optim.Optimizer,
-                          generator_scheduler: optim.lr_scheduler.LRScheduler,
-                          discriminator_scheduler: optim.lr_scheduler.LRScheduler) -> None:
+    def __load_optimizers(
+        self,
+        scale: int,
+        scale_path: str,
+        generator_optimizer: optim.Optimizer,
+        discriminator_optimizer: optim.Optimizer,
+        generator_scheduler: optim.lr_scheduler.LRScheduler,
+        discriminator_scheduler: optim.lr_scheduler.LRScheduler,
+    ) -> None:
         """
         Load the state dictionaries for the optimizers and schedulers.
 
@@ -245,10 +318,18 @@ class Trainer:
             discriminator_scheduler (optim.lr_scheduler.LRScheduler): Scheduler for the discriminator optimizer.
         """
         try:
-            generator_optimizer.load_state_dict(load(os.path.join(scale_path, OPT_G_FILE), self.device))
-            discriminator_optimizer.load_state_dict(load(os.path.join(scale_path, OPT_D_FILE), self.device))
-            generator_scheduler.load_state_dict(load(os.path.join(scale_path, SCH_G_FILE), self.device))
-            discriminator_scheduler.load_state_dict(load(os.path.join(scale_path, SCH_D_FILE), self.device))
+            generator_optimizer.load_state_dict(
+                load(os.path.join(scale_path, OPT_G_FILE), self.device)
+            )
+            discriminator_optimizer.load_state_dict(
+                load(os.path.join(scale_path, OPT_D_FILE), self.device)
+            )
+            generator_scheduler.load_state_dict(
+                load(os.path.join(scale_path, SCH_G_FILE), self.device)
+            )
+            discriminator_scheduler.load_state_dict(
+                load(os.path.join(scale_path, SCH_D_FILE), self.device)
+            )
         except Exception as e:
             print(f"Error loading optimizers from {scale_path}/{scale}: {e}")
             raise e
@@ -273,6 +354,7 @@ class Trainer:
             Tuple[torch.Tensor, Optional[torch.Tensor]]: The initialized noise tensor and the previous
             reconstruction tensor.
         """
+
         def update_rec_noise(rec: torch.Tensor) -> None:
             if len(self.model.rec_noise) <= scale:
                 self.model.rec_noise.append(rec)
@@ -280,22 +362,31 @@ class Trainer:
                 self.model.rec_noise[scale] = (rec + self.model.rec_noise[scale]) / 2
 
         if scale == 0:
-            z_rec = generate_noise((1, *self.scales_list[scale][2:]), device=self.device, num_samp=self.batch_size)
+            z_rec = generate_noise(
+                (1, *self.scales_list[scale][2:]),
+                device=self.device,
+                num_samp=self.batch_size,
+            )
             z_rec = torch.cat([z_rec, masked_facie], dim=1)
             z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
             self.model.noise_amp.append(1.0) if len(self.model.rec_noise) == 0 else None
             update_rec_noise(z_rec)
             prev_rec = None
         else:
-            z_rec = torch.zeros((self.batch_size, 1, *self.scales_list[scale][2:]), device=self.device)
+            z_rec = torch.zeros(
+                (self.batch_size, 1, *self.scales_list[scale][2:]), device=self.device
+            )
             z_rec = torch.cat([z_rec, masked_facie], dim=1)
             z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
             update_rec_noise(z_rec)
 
             z_in = self.model.get_noise(mask_indexes, rec=True)
             with torch.no_grad():
-                prev_rec = self.model.generator(z_in,
-                    self.model.noise_amp, stop_scale=len(self.model.generator.gens) - 2)
+                prev_rec = self.model.generator(
+                    z_in,
+                    self.model.noise_amp,
+                    stop_scale=len(self.model.generator.gens) - 2,
+                )
                 prev_rec = facie_resize(prev_rec, (real.shape[-2], real.shape[-1]))
 
             rec_loss = nn.MSELoss()(real, prev_rec)
@@ -308,19 +399,21 @@ class Trainer:
 
         return z_rec, prev_rec
 
-    def __log_epoch(self,
-                    epochs: tqdm,
-                    writer: SummaryWriter,
-                    epoch: int,
-                    scale: int,
-                    batch_id: int,
-                    generator_loss: float,
-                    discriminator_loss: float,
-                    discriminator_loss_real: float,
-                    discriminator_loss_fake: float,
-                    discriminator_loss_gp: float,
-                    generator_loss_fake: float,
-                    generator_loss_rec: float) -> None:
+    def __log_epoch(
+        self,
+        epochs: tqdm,
+        writer: SummaryWriter,
+        epoch: int,
+        scale: int,
+        batch_id: int,
+        generator_loss: float,
+        discriminator_loss: float,
+        discriminator_loss_real: float,
+        discriminator_loss_fake: float,
+        discriminator_loss_gp: float,
+        generator_loss_fake: float,
+        generator_loss_rec: float,
+    ) -> None:
         """
         Log the losses for the current epoch.
 
@@ -338,39 +431,65 @@ class Trainer:
             generator_loss_fake (float): The generator loss for fake samples.
             generator_loss_rec (float): The reconstruction loss for the generator.
         """
-        epochs.set_description("Stage [{}/{}] | Batch [{}/{}] | Loss [G: {:2.3f}| D: {:2.3f}] Epoch".format(
-            scale + 1,
-            self.stop_scale + 1,
-            batch_id + 1,
-            self.num_of_batchs,
-            generator_loss,
-            discriminator_loss)
+        epochs.set_description(
+            "Stage [{}/{}] | Batch [{}/{}] | Loss [G: {:2.3f}| D: {:2.3f}] Epoch".format(
+                scale + 1,
+                self.stop_scale + 1,
+                batch_id + 1,
+                self.num_of_batchs,
+                generator_loss,
+                discriminator_loss,
+            )
         )
 
-        writer.add_scalar("Loss/train/discriminator/real", -discriminator_loss_real, epoch)
-        writer.add_scalar("Loss/train/discriminator/fake", discriminator_loss_fake, epoch)
-        writer.add_scalar("Loss/train/discriminator/gradient_penalty", discriminator_loss_gp, epoch)
+        writer.add_scalar(
+            "Loss/train/discriminator/real", -discriminator_loss_real, epoch
+        )
+        writer.add_scalar(
+            "Loss/train/discriminator/fake", discriminator_loss_fake, epoch
+        )
+        writer.add_scalar(
+            "Loss/train/discriminator/gradient_penalty", discriminator_loss_gp, epoch
+        )
         writer.add_scalar("Loss/train/discriminator", discriminator_loss, epoch)
         writer.add_scalar("Loss/train/generator/fake", generator_loss_fake, epoch)
-        writer.add_scalar("Loss/train/generator/reconstruction", generator_loss_rec, epoch)
+        writer.add_scalar(
+            "Loss/train/generator/reconstruction", generator_loss_rec, epoch
+        )
         writer.add_scalar("Loss/train/generator", generator_loss, epoch)
 
     def __save_generated_facies(self, scale, epoch, results_path, mask):
         indexes = torch.randint(self.batch_size, (self.num_real_facies,))
         real_facies = self.facies[scale][indexes]
-        noises = [self.model.get_noise(index.repeat(self.num_generated_per_real)) for index in indexes]
+        noises = [
+            self.model.get_noise(index.repeat(self.num_generated_per_real))
+            for index in indexes
+        ]
         with torch.no_grad():
-            generated_facies = [self.model.generator(noise, self.model.noise_amp) for noise in noises]
-            generated_facies = [generated_facie.clip(-1, 1) for generated_facie in generated_facies]
-        plot_generated_facies(generated_facies,
-            real_facies, mask[indexes], scale, epoch, out_dir=results_path, save=True)
+            generated_facies = [
+                self.model.generator(noise, self.model.noise_amp) for noise in noises
+            ]
+            generated_facies = [
+                generated_facie.clip(-1, 1) for generated_facie in generated_facies
+            ]
+        plot_generated_facies(
+            generated_facies,
+            real_facies,
+            mask[indexes],
+            scale,
+            epoch,
+            out_dir=results_path,
+            save=True,
+        )
 
     @staticmethod
-    def __save_optimizers(scale_path: str,
-                          generator_optimizer: optim.Optimizer,
-                          discriminator_optimizer: optim.Optimizer,
-                          generator_scheduler: optim.lr_scheduler.LRScheduler,
-                          discriminator_scheduler: optim.lr_scheduler.LRScheduler) -> None:
+    def __save_optimizers(
+        scale_path: str,
+        generator_optimizer: optim.Optimizer,
+        discriminator_optimizer: optim.Optimizer,
+        generator_scheduler: optim.lr_scheduler.LRScheduler,
+        discriminator_scheduler: optim.lr_scheduler.LRScheduler,
+    ) -> None:
         """
         Save the state dictionaries for the optimizers and schedulers.
 
@@ -381,7 +500,17 @@ class Trainer:
             generator_scheduler (optim.lr_scheduler._LRScheduler): Scheduler for the generator optimizer.
             discriminator_scheduler (optim.lr_scheduler._LRScheduler): Scheduler for the discriminator optimizer.
         """
-        torch.save(generator_optimizer.state_dict(), str(os.path.join(scale_path, OPT_G_FILE)))
-        torch.save(discriminator_optimizer.state_dict(), str(os.path.join(scale_path, OPT_D_FILE)))
-        torch.save(generator_scheduler.state_dict(), str(os.path.join(scale_path, SCH_G_FILE)))
-        torch.save(discriminator_scheduler.state_dict(), str(os.path.join(scale_path, SCH_D_FILE)))
+        torch.save(
+            generator_optimizer.state_dict(), str(os.path.join(scale_path, OPT_G_FILE))
+        )
+        torch.save(
+            discriminator_optimizer.state_dict(),
+            str(os.path.join(scale_path, OPT_D_FILE)),
+        )
+        torch.save(
+            generator_scheduler.state_dict(), str(os.path.join(scale_path, SCH_G_FILE))
+        )
+        torch.save(
+            discriminator_scheduler.state_dict(),
+            str(os.path.join(scale_path, SCH_D_FILE)),
+        )

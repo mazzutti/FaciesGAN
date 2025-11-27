@@ -92,8 +92,13 @@ class Generator(nn.Module):
         channels = min_num_feature
         for i in range(self.num_layer - 2):
             channels = int(num_feature / pow(2, (i + 1)))
-            block = ConvBlock(max(2 * channels, min_num_feature),
-                max(channels, min_num_feature), self.kernel_size, self.padding_size, 1)
+            block = ConvBlock(
+                max(2 * channels, min_num_feature),
+                max(channels, min_num_feature),
+                self.kernel_size,
+                self.padding_size,
+                1,
+            )
             body.add_module(f"block{i + 1}", block)
 
         tail = nn.Sequential(

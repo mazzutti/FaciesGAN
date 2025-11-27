@@ -21,22 +21,39 @@ class FaciesDataset(Dataset):
         resizers (list): List of torchvision transforms for resizing facies and masks.
         ceiling (bool, optional): Whether to set all positive values to 1. Defaults to False.
     """
+
     def __init__(self, options, shuffle=False, ceiling=True):
         self.data_dir = options.input_path
         self.scales_list = generate_scales(options)
-        self.facies_pyramid = [torch.empty((0, 1, *scale)) for scale in self.scales_list]
-        self.masks_pyramid = [torch.empty((0, 1, *scale), dtype=torch.int32) for scale in self.scales_list]
-        self.resizers = [transforms.Resize(scale[2:]) for scale in self.scales_list[:-1]]
+        self.facies_pyramid = [
+            torch.empty((0, 1, *scale)) for scale in self.scales_list
+        ]
+        self.masks_pyramid = [
+            torch.empty((0, 1, *scale), dtype=torch.int32) for scale in self.scales_list
+        ]
+        self.resizers = [
+            transforms.Resize(scale[2:]) for scale in self.scales_list[:-1]
+        ]
         self.ceiling = ceiling
 
-        facies = np2torch(np.load(gzip.open(os.path.join(self.data_dir, 'facies.npy.gz'), 'rb')))
-        masks = np2torch(np.load(gzip.open(os.path.join(self.data_dir, 'masks.npy.gz'), 'rb')))
+        facies = np2torch(
+            np.load(gzip.open(os.path.join(self.data_dir, "facies.npy.gz"), "rb"))
+        )
+        masks = np2torch(
+            np.load(gzip.open(os.path.join(self.data_dir, "masks.npy.gz"), "rb"))
+        )
 
         for i, scale in enumerate(self.scales_list):
-            self.facies_pyramid[i] = torch.stack([
-                facie_resize(facie.unsqueeze(0), scale[2:], self.ceiling) for facie in facies], dim=0).squeeze(1)
-            self.masks_pyramid[i] = torch.stack([
-                mask_resize(mask.unsqueeze(0), scale[2:]) for mask in masks], dim=0).squeeze(1)
+            self.facies_pyramid[i] = torch.stack(
+                [
+                    facie_resize(facie.unsqueeze(0), scale[2:], self.ceiling)
+                    for facie in facies
+                ],
+                dim=0,
+            ).squeeze(1)
+            self.masks_pyramid[i] = torch.stack(
+                [mask_resize(mask.unsqueeze(0), scale[2:]) for mask in masks], dim=0
+            ).squeeze(1)
 
         if shuffle:
             self.shuffle()
@@ -52,19 +69,21 @@ class FaciesDataset(Dataset):
 
     def __getitem__(self, idx):
         """
-         Returns the facies and masks at the specified index.
+        Returns the facies and masks at the specified index.
 
-         Args:
-             idx (int): Index of the sample to retrieve.
+        Args:
+            idx (int): Index of the sample to retrieve.
 
-         Returns:
-             tuple: Tuple of facies and masks at different scales.
-         """
-        return tuple(facies[idx] for facies in self.facies_pyramid), tuple(masks[idx] for masks in self.masks_pyramid)
+        Returns:
+            tuple: Tuple of facies and masks at different scales.
+        """
+        return tuple(facies[idx] for facies in self.facies_pyramid), tuple(
+            masks[idx] for masks in self.masks_pyramid
+        )
 
     def shuffle(self):
         """
-           Shuffles the dataset.
+        Shuffles the dataset.
         """
         idxs = torch.randperm(self.__len__())
         for i in range(len(self.scales_list)):
