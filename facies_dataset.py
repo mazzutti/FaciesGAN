@@ -1,12 +1,12 @@
-import os
 import gzip
+import os
 
 import numpy as np
 import torch
 from torch.utils.data import Dataset
-from torchvision.transforms import transforms
+from torchvision import transforms
 
-from ops import generate_scales, mask_resize, facie_resize, np2torch
+from ops import facie_resize, generate_scales, mask_resize, np2torch
 
 
 class FaciesDataset(Dataset):

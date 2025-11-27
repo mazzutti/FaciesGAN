@@ -1,23 +1,23 @@
 import argparse
-import os
 import math
+import os
 import time
-from typing import Optional, List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import torch.nn as nn
-from torch.utils.data import DataLoader
-
 from tensorboardX import SummaryWriter
-
-from facies_dataset import FaciesDataset
-from models.facies_gan import FaciesGAN
+from torch.utils.data import DataLoader
 from tqdm import tqdm
+
+from config import (D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, RESULT_FACIES_PATH,
+                    SCH_D_FILE, SCH_G_FILE)
+from facies_dataset import FaciesDataset
 from log import format_time
-from config import OPT_G_FILE, OPT_D_FILE, SCH_G_FILE, SCH_D_FILE, RESULT_FACIES_PATH, G_FILE, D_FILE
-from ops import create_dirs, load, generate_noise, facie_resize
+from models.facies_gan import FaciesGAN
+from ops import create_dirs, facie_resize, generate_noise, load
 from utils import plot_generated_facies
 
 

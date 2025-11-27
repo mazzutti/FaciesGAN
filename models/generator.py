@@ -1,7 +1,8 @@
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 from models.custom_layer import ConvBlock
 from ops import facie_resize

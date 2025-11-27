@@ -1,16 +1,16 @@
+import argparse
+import json
 import os
+import random
+from datetime import datetime
 
 import torch
-import random
-import json
-import argparse
-
-from datetime import datetime
 from dateutil import tz
 
-from train import Trainer
-from log import init_output_logging
 from config import CHECKPOINT_PATH, OPT_FILE
+from log import init_output_logging
+from train import Trainer
+
 
 def get_arguments():
     parser = argparse.ArgumentParser()

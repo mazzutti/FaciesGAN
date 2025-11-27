@@ -1,16 +1,16 @@
 import argparse
+import math
+import os
 from types import SimpleNamespace
 
-import ops as ops
 import torch
-import torch.nn.functional as F
 import torch.nn as nn
-import os
-import math
+import torch.nn.functional as F
 
-from models.generator import Generator
+import ops as ops
+from config import AMP_FILE, D_FILE, G_FILE, M_FILE, REC_FILE, SHAPE_FILE
 from models.discriminator import Discriminator
-from config import G_FILE, D_FILE, REC_FILE, AMP_FILE, SHAPE_FILE, M_FILE
+from models.generator import Generator
 
 
 class FaciesGAN:

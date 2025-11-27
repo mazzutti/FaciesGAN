@@ -1,10 +1,11 @@
 import math
 import os
-from typing import Tuple, List
+from typing import List, Tuple
 
 import numpy as np
 import torch
 from torch import nn
+
 
 def facie_resize(facie: torch.Tensor, size: tuple[int, ...], ceiling=False) -> torch.Tensor:
     """

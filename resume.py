@@ -1,14 +1,15 @@
-import os
-import torch
-import random
-import json
 import argparse
 import glob
-
+import json
+import os
+import random
 from types import SimpleNamespace
-from train import Trainer
+
+import torch
+
+from config import G_FILE, OPT_FILE, RESULT_FACIES_PATH
 from log import init_output_logging
-from config import G_FILE, RESULT_FACIES_PATH, OPT_FILE
+from train import Trainer
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

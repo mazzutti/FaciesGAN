@@ -1,10 +1,9 @@
 from typing import Tuple
 
-import numpy as np
 import matplotlib.pyplot as plt
-import torch
+import numpy as np
 import scipy.stats as st
-
+import torch
 
 from config import RESULTS_DIR
 from ops import torch2np

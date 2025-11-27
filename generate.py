@@ -1,26 +1,25 @@
 import copy
+import json
 import os
 import random
+import time
+from argparse import ArgumentParser
+from types import SimpleNamespace
 from typing import List, Tuple
 
 import numpy as np
-import torch
-import json
-import time
 import tifffile as tif
-
-from argparse import ArgumentParser
+import torch
 from matplotlib import pyplot as plt
+from sklearn.manifold import MDS
 from sklearn.metrics import euclidean_distances
 
+from config import OPT_FILE
 from facies_dataset import FaciesDataset
 from log import format_time
 from models.facies_gan import FaciesGAN
-from config import OPT_FILE
-from types import SimpleNamespace
-
 from utils import torch2np
-from sklearn.manifold import MDS
+
 
 def generate_facies(model: FaciesGAN, how_many: int, model_path: str, options: SimpleNamespace) -> Tuple[List[np.ndarray], List[int]]:
         """
