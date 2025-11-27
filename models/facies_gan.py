@@ -2,7 +2,7 @@ import argparse
 import math
 import os
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Optional
 
 import torch
 import torch.nn as nn
@@ -13,9 +13,6 @@ from config import AMP_FILE, D_FILE, G_FILE, M_FILE, REC_FILE, SHAPE_FILE
 from models.discriminator import Discriminator
 from models.generator import Generator
 
-# Sentinel used to detect when `masked_facies` was not provided by the caller.
-# This allows distinguishing an explicit `None` from the argument being omitted.
-_MASKED_FACIES_SENTINEL = object()
 
 
 class FaciesGAN:
@@ -23,7 +20,7 @@ class FaciesGAN:
         self,
         device: torch.device,
         options: argparse.Namespace | SimpleNamespace,
-        masked_facies: list[torch.Tensor] | None | object = _MASKED_FACIES_SENTINEL,
+        masked_facies: Optional[list[torch.Tensor]] = None,
         *args: tuple[Any, ...],
         **kwargs: dict[str, Any],
     ) -> None:
@@ -59,11 +56,11 @@ class FaciesGAN:
         self.rec_noise: list[torch.Tensor] = []
         self.noise_amp: list[float] = []
 
-        # If the caller omitted `masked_facies`, the sentinel will be present.
-        # Treat omission as `None`, while still allowing callers to pass an
-        # explicit `None` value if desired.
-        if masked_facies is _MASKED_FACIES_SENTINEL:
-            self.masked_facies = None
+        # Use a per-instance list when the caller didn't provide masked facies.
+        # Avoid using a mutable default argument to prevent shared state
+        # between instances.
+        if masked_facies is None:
+            self.masked_facies: list[torch.Tensor] = []
         else:
             self.masked_facies = masked_facies
 
@@ -155,7 +152,10 @@ class FaciesGAN:
                 device=self.device,
                 num_samp=len(mask_indexes),
             )
-            if self.masked_facies is not None:
+            # Use masked facies for this scale only if we have one stored
+            # for the current `index` (per-instance list default avoids
+            # shared-mutable defaults while allowing empty lists).
+            if index < len(self.masked_facies):
                 z = torch.cat(
                     [z, self.masked_facies[index][mask_indexes].to(self.device)], dim=1
                 )
