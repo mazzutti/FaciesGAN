@@ -2,7 +2,7 @@ import argparse
 import math
 import os
 from types import SimpleNamespace
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import torch
 import torch.nn as nn
@@ -14,13 +14,12 @@ from models.discriminator import Discriminator
 from models.generator import Generator
 
 
-
 class FaciesGAN:
     def __init__(
         self,
         device: torch.device,
         options: argparse.Namespace | SimpleNamespace,
-        masked_facies: Optional[list[torch.Tensor]] = None,
+        masked_facies: Sequence[torch.Tensor] = (),
         *args: tuple[Any, ...],
         **kwargs: dict[str, Any],
     ) -> None:
@@ -56,13 +55,13 @@ class FaciesGAN:
         self.rec_noise: list[torch.Tensor] = []
         self.noise_amp: list[float] = []
 
-        # Use a per-instance list when the caller didn't provide masked facies.
-        # Avoid using a mutable default argument to prevent shared state
-        # between instances.
-        if masked_facies is None:
-            self.masked_facies: list[torch.Tensor] = []
+        # Accept any sequence for `masked_facies` (tuple/list). Default to an
+        # empty tuple so the default is immutable and safe as a module-level
+        # default. Convert to a per-instance list for internal mutation.
+        if masked_facies:
+            self.masked_facies: list[torch.Tensor] = list(masked_facies)
         else:
-            self.masked_facies = masked_facies
+            self.masked_facies = []
 
         self.generator = Generator(
             self.num_layer, self.kernel_size, self.padding_size, self.facie_num_channels
