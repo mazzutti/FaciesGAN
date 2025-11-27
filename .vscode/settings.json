@@ -1,4 +1,16 @@
 {
+  "python.pythonPath": ".venv/bin/python",
+  "python.formatting.provider": "black",
+  "editor.formatOnSave": true,
+  "python.linting.enabled": true,
+  "python.linting.flake8Enabled": true,
+  "files.exclude": {
+    "**/__pycache__": true,
+    "**/.pytest_cache": true,
+    "results/": true
+  }
+}
+{
     // Exclude virtualenv from file watching, UI and search
     "files.watcherExclude": {
         "**/.venv/**": true
@@ -15,10 +27,6 @@
     "python.linting.flake8Enabled": true,
     "python.formatting.provider": "black",
     "editor.formatOnSave": true,
-
-    // Pyright / Pylance
-    "python.analysis.typeCheckingMode": "strict",
-    "python.analysis.useLibraryCodeForTypes": true
 }
 
 
