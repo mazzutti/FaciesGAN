@@ -23,6 +23,9 @@
     "reportUnknownArgumentType": "warning",
     "reportUnknownVariableType": "warning"
   },
+  "python.analysis.diagnosticMode": "workspace",
+  "python.analysis.useLibraryCodeForTypes": true,
+  "python.analysis.autoSearchPaths": true,
   "editor.codeActionsOnSave": {
     "source.organizeImports": true
   }
