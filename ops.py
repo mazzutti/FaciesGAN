@@ -90,7 +90,7 @@ def generate_scales(options) -> Sequence[tuple[int, ...]]:
     return shapes
 
 
-def weights_init(m):
+def weights_init(m: nn.Module) -> None:
     """
     Initialize the weights of the given module.
 
