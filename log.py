@@ -1,9 +1,17 @@
 import sys
-from typing import Optional
+from collections.abc import Sequence
+from typing import Protocol, runtime_checkable
+
+
+@runtime_checkable
+class Writable(Protocol):
+    def write(self, *args, **kwargs) -> object: ...
+
+    def flush(self) -> None: ...
 
 
 class OutputLogger(object):
-    def __init__(self, file: Optional[str] = None, mode: Optional[str] = None, buffer: Optional[str] = "") -> None:
+    def __init__(self, file: str | None = None, mode: str | None = None, buffer: str | None = "") -> None:
         """
         Initialize the OutputLogger.
 
@@ -58,7 +66,7 @@ class OutputLogger(object):
 
 
 class TeeOutputStream(object):
-    def __init__(self, child_streams: list, auto_flush: bool = False) -> None:
+    def __init__(self, child_streams: Sequence[Writable], auto_flush: bool = False) -> None:
         """
         Initialize the TeeOutputStream.
 
@@ -91,7 +99,7 @@ class TeeOutputStream(object):
             stream.flush()
 
 
-def init_output_logging(filename: str, mode: str = "at", output_logger: OutputLogger = None) -> None:
+def init_output_logging(filename: str, mode: str = "at", output_logger: OutputLogger | None = None) -> None:
     """
     Initialize output logging to a file.
 

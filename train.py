@@ -2,7 +2,6 @@ import argparse
 import math
 import os
 import time
-from typing import List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -26,7 +25,7 @@ class Trainer:
                  device: torch.device,
                  options: argparse.Namespace,
                  fine_tuning: bool = False,
-                 checkpoint_path: Optional[str] = None):
+                 checkpoint_path: str | None = None):
         self.device: torch.device = device
 
         # Training parameters
@@ -40,7 +39,7 @@ class Trainer:
         self.batch_size: int = self.batch_size if not (
             len(options.wells) > 0 and options.batch_size < len(options.wells)) else len(options.wells)
         self.fine_tuning: bool = fine_tuning
-        self.checkpoint_path: Optional[str] = checkpoint_path
+        self.checkpoint_path: str | None = checkpoint_path
 
         self.num_real_facies: int = options.num_real_facies
         self.num_generated_per_real: int = options.num_generated_per_real
@@ -56,13 +55,13 @@ class Trainer:
         # Model parameters
         self.zero_padding: int = options.num_layer * math.floor(options.kernel_size / 2)
         self.img_num_channel: int = options.facie_num_channels + 1
-        self.noise_amp: List[float] = options.noise_amp
-        self.facies: List[torch.Tensor] = []
-        self.masks: List[torch.Tensor] = []
-        self.masked_facies: List[torch.Tensor] = []
+        self.noise_amp: list[float] = options.noise_amp
+        self.facies: list[torch.Tensor] = []
+        self.masks: list[torch.Tensor] = []
+        self.masked_facies: list[torch.Tensor] = []
 
         dataset: FaciesDataset = FaciesDataset(options)
-        self.scales_list: List[Tuple[int, int, int]] = dataset.scales_list
+        self.scales_list: list[tuple[int, int, int]] = dataset.scales_list
 
         if len(options.wells) > 0:
             for i in range(len(self.scales_list)):
@@ -200,7 +199,7 @@ class Trainer:
                generator_scheduler, discriminator_scheduler
            )
 
-    def load(self, path: str, until_scale: int = None) -> None:
+    def load(self, path: str, until_scale: int | None = None) -> None:
         """
         Load the models and update the start scale for training.
 
@@ -254,11 +253,13 @@ class Trainer:
             print(f"Error loading optimizers from {scale_path}/{scale}: {e}")
             raise e
 
-    def __initialize_noise(self,
-                           scale: int,
-                           masked_facie: torch.Tensor,
-                           real: torch.Tensor,
-                           mask_indexes: List[int]) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    def __initialize_noise(
+        self,
+        scale: int,
+        masked_facie: torch.Tensor,
+        real: torch.Tensor,
+        mask_indexes: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Initialize the noise for the given scale.
 

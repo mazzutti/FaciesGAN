@@ -5,7 +5,6 @@ import random
 import time
 from argparse import ArgumentParser
 from types import SimpleNamespace
-from typing import List, Tuple
 
 import numpy as np
 import tifffile as tif
@@ -23,7 +22,7 @@ from utils import torch2np
 
 def generate_facies(
     model: FaciesGAN, how_many: int, model_path: str, options: SimpleNamespace
-) -> Tuple[List[np.ndarray], List[int]]:
+) -> tuple[list[np.ndarray], list[int]]:
     """
     Generate facies using the FaciesGAN model.
 
