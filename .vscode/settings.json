@@ -1,7 +1,7 @@
 {
     // Pylance type checking mode is configured in `pyrightconfig.json`.
-    "python.analysis.autoSearchPaths": true,
-    // "useLibraryCodeForTypes" is configured in pyrightconfig.json when present
+        // Pylance/Pyright settings are configured in `pyrightconfig.json`.
+        // Do not set non-overridable Pylance keys in workspace `settings.json`.
     // Also exclude from file watching in the workspace
     "files.watcherExclude": {
         "**/.venv/**": true
