@@ -132,7 +132,7 @@ class FaciesGAN:
 
     def get_noise(
         self, mask_indexes: list[int], rec: bool = False, last: bool = False
-    ) -> list[torch.Tensor] | torch.Tensor:
+    ) -> list[torch.Tensor]:
         """
         Generate noise for the GAN at different scales.
 
@@ -142,7 +142,8 @@ class FaciesGAN:
             last (bool): If True, return only the last scale noise.
 
         Returns:
-            list[torch.Tensor] | torch.Tensor: Generated noise.
+            list[torch.Tensor]: Generated noise for each scale (always a list). When `last` is True
+            a single-item list containing the last-scale tensor is returned.
         """
 
         def generate_noise(index: int) -> torch.Tensor:
@@ -172,7 +173,7 @@ class FaciesGAN:
         if rec:
             return self.rec_noise.copy()
         if last:
-            return generate_noise(len(self.rec_noise) - 1)
+            return [generate_noise(len(self.rec_noise) - 1)]
         return [generate_noise(i) for i in range(len(self.rec_noise))]
 
     def optimize_discriminator(
@@ -192,7 +193,10 @@ class FaciesGAN:
         Returns:
             tuple[float, float, float, float]: Total loss, real loss, fake loss, and gradient penalty loss.
         """
-        fixed_noise = self.get_noise(mask_indexes, last=True)
+        fixed_noise_list = self.get_noise(mask_indexes, last=True)
+        if not fixed_noise_list:
+            raise RuntimeError("No noise available for last scale")
+        fixed_noise = fixed_noise_list[0]
 
         total_loss, real_loss, fake_loss, gp_loss = 0, 0, 0, 0
         for _ in range(self.discriminator_steps):
@@ -204,6 +208,8 @@ class FaciesGAN:
 
             # Generate fake images
             noises = self.get_noise(mask_indexes)
+            # `fixed_noise` is a single tensor taken from the single-item list
+            # returned when `last=True`. Replace the last noise tensor with it.
             noises[-1] = fixed_noise
             with torch.no_grad():
                 fake = self.generator(noises, self.noise_amp)
