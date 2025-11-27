@@ -1,6 +1,5 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
-  "python.formatting.provider": "black",
   "editor.formatOnSave": true,
   "python.linting.enabled": true,
   "python.linting.flake8Enabled": true,
@@ -15,5 +14,7 @@
   },
   "search.exclude": {
     "**/.venv/**": true
-  }
+  },
+  "editor.defaultFormatter": "ms-python.black-formatter",
+  "python.analysis.enableTroubleshootMissingImports": true
 }
