@@ -1,5 +1,3 @@
-from typing import Tuple
-
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats as st
@@ -23,19 +21,23 @@ def plot_mask(mask: np.ndarray, real_facie: np.ndarray, axis: plt.Axes) -> None:
     axis.scatter(
         np.stack([np.full((mask.shape[0],), i) for i in mask_index]),
         np.stack([np.arange(0, mask.shape[0]) for _ in mask_index]),
-        c=np.stack([
-            np.astype(real_facie[:, i] >= 0.5, np.int8) for i in mask_index
-        ]), s=1, marker='s', cmap='plasma', label="Facies Mask")
+        c=np.stack([np.astype(real_facie[:, i] >= 0.5, np.int8) for i in mask_index]),
+        s=1,
+        marker="s",
+        cmap="plasma",
+        label="Facies Mask",
+    )
+
 
 def plot_generated_facies(
-        fake_facies: list[torch.Tensor],
-        real_facies: torch.Tensor,
-        masks: torch.Tensor,
-        stage: int,
-        index: int,
-        out_dir: str = RESULTS_DIR,
-        save: bool = False
-    ) -> None:
+    fake_facies: list[torch.Tensor],
+    real_facies: torch.Tensor,
+    masks: torch.Tensor,
+    stage: int,
+    index: int,
+    out_dir: str = RESULTS_DIR,
+    save: bool = False,
+) -> None:
     """
     Plot and optionally save generated facies alongside real facies and masks.
 
@@ -50,35 +52,40 @@ def plot_generated_facies(
     """
     num_real_facies = real_facies.size(0)
     num_generated_per_real = fake_facies[0].shape[0]
-    fig, axes = plt.subplots(num_real_facies, num_generated_per_real + 1, figsize=(12, num_real_facies * 2.5))
+    fig, axes = plt.subplots(
+        num_real_facies, num_generated_per_real + 1, figsize=(12, num_real_facies * 2.5)
+    )
     fake_facies = [torch2np(fake_facie, denormalize=True) for fake_facie in fake_facies]
     real_facies = torch2np(real_facies, denormalize=True, ceiling=True)
     masks = torch2np(masks)
     for i in range(num_real_facies):
-        axes[i, 0].imshow(real_facies[i], cmap='YlGn')
-        axes[i, 0].set_title(f'Well {i + 1}')
+        axes[i, 0].imshow(real_facies[i], cmap="YlGn")
+        axes[i, 0].set_title(f"Well {i + 1}")
         plot_mask(masks[i], np.squeeze(real_facies[i]), axes[i, 0])
         axes[i, 0].set_xticks([])
         axes[i, 0].set_yticks([])
-        axes[i, 0].axis('off')
+        axes[i, 0].axis("off")
 
         # Plot generated facies (remaining columns)
         for j in range(num_generated_per_real):
-            axes[i, j + 1].imshow(fake_facies[i][j], cmap='gray')
-            axes[i, j + 1].set_title(f'Gen {j + 1}')
+            axes[i, j + 1].imshow(fake_facies[i][j], cmap="gray")
+            axes[i, j + 1].set_title(f"Gen {j + 1}")
             plot_mask(masks[i], np.squeeze(real_facies[i]), axes[i, j + 1])
-            axes[i, j + 1].axis('off')
+            axes[i, j + 1].axis("off")
 
     # Add a main title for the plot
-    plt.suptitle(f"Stage {stage} - Well Log, Real vs Generated Facies", fontsize=16, y=0.99)
+    plt.suptitle(
+        f"Stage {stage} - Well Log, Real vs Generated Facies", fontsize=16, y=0.99
+    )
     plt.tight_layout()
     plt.subplots_adjust(top=0.95)
     plt.show()
-    if save: fig.savefig(f'{out_dir}/gen_{stage}_{index}.tif')
+    if save:
+        fig.savefig(f"{out_dir}/gen_{stage}_{index}.tif")
     plt.close()
 
 
-def get_best_distribution(data: np.ndarray) -> Tuple[str, float, Tuple]:
+def get_best_distribution(data: np.ndarray) -> tuple[str, float, tuple]:
     """
     Identify the best fitting distribution for the given data.
 
@@ -93,14 +100,13 @@ def get_best_distribution(data: np.ndarray) -> Tuple[str, float, Tuple]:
     dist_results = []
     params = {}
 
-
     for dist_name in dist_names:
         dist = getattr(st, dist_name)
         param = dist.fit(data.flatten())
         params[dist_name] = param
 
         # Applying the Kolmogorov-Smirnov test
-        result  = st.kstest(data, dist_name, args=param)
+        result = st.kstest(data, dist_name, args=param)
         dist_results.append((dist_name, np.sum(result.pvalue)))
 
     # Select the best fitted distribution

@@ -1,13 +1,15 @@
 import math
 import os
-from typing import List, Tuple
+from collections.abc import Sequence
 
 import numpy as np
 import torch
 from torch import nn
 
 
-def facie_resize(facie: torch.Tensor, size: tuple[int, ...], ceiling=False) -> torch.Tensor:
+def facie_resize(
+    facie: torch.Tensor, size: tuple[int, ...], ceiling=False
+) -> torch.Tensor:
     """
     Resize the input  tensor to the given size using bilinear interpolation.
 
@@ -19,8 +21,11 @@ def facie_resize(facie: torch.Tensor, size: tuple[int, ...], ceiling=False) -> t
     Returns:
         torch.Tensor: The resized  tensor.
     """
-    interpolated_facie = nn.functional.interpolate(facie, size=size, mode="bilinear", align_corners=True)
-    if ceiling: interpolated_facie[torch.where(interpolated_facie > 0)] = 1
+    interpolated_facie = nn.functional.interpolate(
+        facie, size=size, mode="bilinear", align_corners=True
+    )
+    if ceiling:
+        interpolated_facie[torch.where(interpolated_facie > 0)] = 1
     return interpolated_facie
 
 
@@ -36,13 +41,16 @@ def mask_resize(mask: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
         torch.Tensor: The resized masked_facie tensor with applied threshold.
     """
     mask = (mask > 0).float() * 1000
-    interpolated_mask = nn.functional.interpolate(mask, size=size, mode="bicubic", align_corners=False, antialias=True)
+    interpolated_mask = nn.functional.interpolate(
+        mask, size=size, mode="bicubic", align_corners=False, antialias=True
+    )
     mask_index = torch.argmax(torch.sum(interpolated_mask, dim=2), dim=-1)
     interpolated_mask.zero_()
     interpolated_mask[:, :, :, mask_index] = 1
     return interpolated_mask
 
-def generate_scales(options) -> List[Tuple[int, ...]]:
+
+def generate_scales(options) -> Sequence[tuple[int, ...]]:
     """
     Generate a list of shapes for different scales based on the given options.
 
@@ -59,16 +67,28 @@ def generate_scales(options) -> List[Tuple[int, ...]]:
         list: A list of tuples representing the shapes for each scale.
     """
     shapes = []
-    scale_factor = math.pow(options.min_size / (min(options.max_size, options.crop_size)), 1 / options.stop_scale)
+    scale_factor = math.pow(
+        options.min_size / (min(options.max_size, options.crop_size)),
+        1 / options.stop_scale,
+    )
     for i in range(options.stop_scale + 1):
         scale = math.pow(scale_factor, options.stop_scale - i)
-        out_shape = np.uint(np.round(np.array([
-            min(options.max_size, options.crop_size),
-            min(options.max_size, options.crop_size)]) * scale)).tolist()
+        out_shape = np.uint(
+            np.round(
+                np.array(
+                    [
+                        min(options.max_size, options.crop_size),
+                        min(options.max_size, options.crop_size),
+                    ]
+                )
+                * scale
+            )
+        ).tolist()
         if out_shape[0] % 2 != 0:
             out_shape = [int(shape + 1) for shape in out_shape]
         shapes.append((options.batch_size, options.facie_num_channels, *out_shape))
     return shapes
+
 
 def weights_init(m):
     """
@@ -88,6 +108,7 @@ def weights_init(m):
         m.weight.data.normal_(1.0, 0.02)
         m.bias.data.fill_(0)
 
+
 def norm(x):
     """
     Normalize the input tensor to the range [-1, 1].
@@ -100,6 +121,7 @@ def norm(x):
     """
     out = (x - 0.5) * 2
     return out.clamp(-1, 1)
+
 
 def denorm(tensor: torch.Tensor, ceiling: bool = False) -> torch.Tensor:
     """
@@ -118,7 +140,9 @@ def denorm(tensor: torch.Tensor, ceiling: bool = False) -> torch.Tensor:
     return tensor
 
 
-def torch2np(tensor: torch.Tensor, denormalize: bool = False, ceiling: bool = False) -> np.ndarray:
+def torch2np(
+    tensor: torch.Tensor, denormalize: bool = False, ceiling: bool = False
+) -> np.ndarray:
     """
     Convert a PyTorch tensor to a NumPy array.
 
@@ -130,10 +154,12 @@ def torch2np(tensor: torch.Tensor, denormalize: bool = False, ceiling: bool = Fa
     Returns:
         np.ndarray: The converted NumPy array.
     """
-    if denormalize: tensor = denorm(tensor, ceiling)
+    if denormalize:
+        tensor = denorm(tensor, ceiling)
     tensor = np.permute_dims(tensor.cpu().detach().numpy(), (0, 2, 3, 1))
     tensor = np.clip(tensor, 0, 1)
     return tensor.astype(np.float32)
+
 
 def np2torch(tensor: np.ndarray, normalize: bool = False) -> torch.Tensor:
     """
@@ -147,13 +173,16 @@ def np2torch(tensor: np.ndarray, normalize: bool = False) -> torch.Tensor:
         torch.Tensor: The converted and normalized PyTorch tensor.
     """
     tensor = torch.from_numpy(tensor).float()
-    if normalize: tensor = norm(tensor)
+    if normalize:
+        tensor = norm(tensor)
     return norm(tensor)
 
 
-def range_transform(facie: np.ndarray,
-                    in_range: Tuple[int, int] = (0, 255),
-                    out_range: Tuple[int, int] = (-1, 1)) -> np.ndarray:
+def range_transform(
+    facie: np.ndarray,
+    in_range: tuple[int, int] = (0, 255),
+    out_range: tuple[int, int] = (-1, 1),
+) -> np.ndarray:
     """
     Transforms the input  from one range to another.
 
@@ -166,10 +195,13 @@ def range_transform(facie: np.ndarray,
         np.ndarray: The transformed  array.
     """
     if in_range != out_range:
-        scale = np.float32(out_range[1] - out_range[0]) / np.float32(in_range[1] - in_range[0])
+        scale = np.float32(out_range[1] - out_range[0]) / np.float32(
+            in_range[1] - in_range[0]
+        )
         bias = np.float32(out_range[0]) - np.float32(in_range[0]) * scale
         facie = facie * scale + bias
     return facie
+
 
 def reset_grads(model: nn.Module, require_grad: bool = False) -> nn.Module:
     """
@@ -187,7 +219,10 @@ def reset_grads(model: nn.Module, require_grad: bool = False) -> nn.Module:
 
     return model
 
-def generate_noise(size: Tuple[int, ...], device: torch.device, num_samp: int = 1, scale: float = 1.0) -> torch.Tensor:
+
+def generate_noise(
+    size: tuple[int, ...], device: torch.device, num_samp: int = 1, scale: float = 1.0
+) -> torch.Tensor:
     """
     Generate random noise tensor.
 
@@ -200,8 +235,11 @@ def generate_noise(size: Tuple[int, ...], device: torch.device, num_samp: int = 
     Returns:
         torch.Tensor: The generated noise tensor.
     """
-    noise = torch.randn(num_samp, size[0], *[round(s / scale) for s in size[1:]], device=device)
-    if scale != 1: noise = facie_resize(noise, size[1:])
+    noise = torch.randn(
+        num_samp, size[0], *[round(s / scale) for s in size[1:]], device=device
+    )
+    if scale != 1:
+        noise = facie_resize(noise, size[1:])
     return noise
 
 
@@ -237,6 +275,7 @@ def calc_gradient_penalty(discriminator, real_data, fake_data, LAMBDA, device):
 
     return gradient_penalty
 
+
 def create_dirs(path: str) -> None:
     """
     Create directories if they do not exist.
@@ -250,7 +289,9 @@ def create_dirs(path: str) -> None:
         raise RuntimeError(f"Error creating directory {path}: {e}")
 
 
-def load(path: str, device: torch.device = torch.device("cpu")) -> dict | torch.nn.Module | torch.Tensor:
+def load(
+    path: str, device: torch.device = torch.device("cpu")
+) -> dict | torch.nn.Module | torch.Tensor:
     """
     Load a PyTorch models state dictionary from a file.
 

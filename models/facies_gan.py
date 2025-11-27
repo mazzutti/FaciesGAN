@@ -14,8 +14,14 @@ from models.generator import Generator
 
 
 class FaciesGAN:
-    def __init__(self, device: torch.device, options: argparse.Namespace | SimpleNamespace,
-                 masked_facies: list[torch.Tensor] = None, *args, **kwargs) -> None:
+    def __init__(
+        self,
+        device: torch.device,
+        options: argparse.Namespace | SimpleNamespace,
+        masked_facies: list[torch.Tensor] = None,
+        *args,
+        **kwargs,
+    ) -> None:
         """
         Initialize the FaciesGAN class.
 
@@ -50,10 +56,7 @@ class FaciesGAN:
         self.masked_facies = masked_facies
 
         self.generator = Generator(
-            self.num_layer,
-            self.kernel_size,
-            self.padding_size,
-            self.facie_num_channels
+            self.num_layer, self.kernel_size, self.padding_size, self.facie_num_channels
         ).to(self.device)
         self.discriminator: Discriminator | None = None
 
@@ -73,7 +76,9 @@ class FaciesGAN:
         if scale % 4 == 0:
             self.generator.gens[-1].apply(ops.weights_init)
         else:
-            self.generator.gens[-1].load_state_dict(self.generator.gens[-2].state_dict())
+            self.generator.gens[-1].load_state_dict(
+                self.generator.gens[-2].state_dict()
+            )
 
         if len(self.generator.gens) > 1:
             self.generator.gens[-2] = ops.reset_grads(self.generator.gens[-2])
@@ -92,8 +97,12 @@ class FaciesGAN:
         # If not, continue with the current Discriminator
         if scale % 4 == 0:
             self.discriminator = Discriminator(
-                num_feature, min_num_feature, self.num_layer, self.kernel_size, self.padding_size,
-                self.facie_num_channels - 1
+                num_feature,
+                min_num_feature,
+                self.num_layer,
+                self.kernel_size,
+                self.padding_size,
+                self.facie_num_channels - 1,
             ).to(self.device)
             self.discriminator.apply(ops.weights_init)
 
@@ -112,10 +121,9 @@ class FaciesGAN:
 
         return num_feature, min_num_feature
 
-    def get_noise(self,
-                  mask_indexes: list[int],
-                  rec: bool = False,
-                  last: bool = False) -> list[torch.Tensor] | torch.Tensor:
+    def get_noise(
+        self, mask_indexes: list[int], rec: bool = False, last: bool = False
+    ) -> list[torch.Tensor] | torch.Tensor:
         """
         Generate noise for the GAN at different scales.
 
@@ -131,77 +139,93 @@ class FaciesGAN:
         def generate_noise(index: int) -> torch.Tensor:
             shape = self.shapes[index][2:]
             z = ops.generate_noise(
-                (self.facie_num_channels - 1, *shape), device=self.device, num_samp=len(mask_indexes))
+                (self.facie_num_channels - 1, *shape),
+                device=self.device,
+                num_samp=len(mask_indexes),
+            )
             if self.masked_facies is not None:
-                z = torch.cat([z, self.masked_facies[index][mask_indexes].to(self.device)], dim=1)
+                z = torch.cat(
+                    [z, self.masked_facies[index][mask_indexes].to(self.device)], dim=1
+                )
             elif index == 0:
                 z = z.expand(z.shape[0], self.facie_num_channels, *shape)
             else:
                 z = ops.generate_noise(
-                    (self.facie_num_channels, *shape), device=self.device, num_samp=len(mask_indexes))
+                    (self.facie_num_channels, *shape),
+                    device=self.device,
+                    num_samp=len(mask_indexes),
+                )
             return F.pad(z, [self.zero_padding] * 4, value=0)
-        if rec: return self.rec_noise.copy()
-        if last: return generate_noise(len(self.rec_noise) - 1)
+
+        if rec:
+            return self.rec_noise.copy()
+        if last:
+            return generate_noise(len(self.rec_noise) - 1)
         return [generate_noise(i) for i in range(len(self.rec_noise))]
 
-    def optimize_discriminator(self,
-                               mask_indexes: list[int],
-                               real: torch.Tensor,
-                               discriminator_optimizer: torch.optim.Optimizer) -> tuple[float, float, float, float]:
-            """
-            Optimize the discriminator for a given set of real and generated images.
+    def optimize_discriminator(
+        self,
+        mask_indexes: list[int],
+        real: torch.Tensor,
+        discriminator_optimizer: torch.optim.Optimizer,
+    ) -> tuple[float, float, float, float]:
+        """
+        Optimize the discriminator for a given set of real and generated images.
 
-            Args:
-                mask_indexes (list[int]): Indexes of the masks.
-                real (torch.Tensor): Real images.
-                discriminator_optimizer (torch.optim.Optimizer): Optimizer for the discriminator.
+        Args:
+            mask_indexes (list[int]): Indexes of the masks.
+            real (torch.Tensor): Real images.
+            discriminator_optimizer (torch.optim.Optimizer): Optimizer for the discriminator.
 
-            Returns:
-                tuple[float, float, float, float]: Total loss, real loss, fake loss, and gradient penalty loss.
-            """
-            fixed_noise = self.get_noise(mask_indexes, last=True)
+        Returns:
+            tuple[float, float, float, float]: Total loss, real loss, fake loss, and gradient penalty loss.
+        """
+        fixed_noise = self.get_noise(mask_indexes, last=True)
 
-            total_loss, real_loss, fake_loss, gp_loss = 0, 0, 0, 0
-            for _ in range(self.discriminator_steps):
-                discriminator_optimizer.zero_grad()
+        total_loss, real_loss, fake_loss, gp_loss = 0, 0, 0, 0
+        for _ in range(self.discriminator_steps):
+            discriminator_optimizer.zero_grad()
 
-                # Calculate loss for real images
-                real_output = self.discriminator(real)
-                real_loss = -real_output.mean()
+            # Calculate loss for real images
+            real_output = self.discriminator(real)
+            real_loss = -real_output.mean()
 
-                # Generate fake images
-                noises = self.get_noise(mask_indexes)
-                noises[-1] = fixed_noise
-                with torch.no_grad():
-                    fake = self.generator(noises, self.noise_amp)
+            # Generate fake images
+            noises = self.get_noise(mask_indexes)
+            noises[-1] = fixed_noise
+            with torch.no_grad():
+                fake = self.generator(noises, self.noise_amp)
 
-                # Calculate loss for fake images
-                fake_output = self.discriminator(fake.detach())
-                fake_loss = fake_output.mean((0, 2, 3))
+            # Calculate loss for fake images
+            fake_output = self.discriminator(fake.detach())
+            fake_loss = fake_output.mean((0, 2, 3))
 
-                # Backpropagate the losses
-                real_loss.backward()
-                fake_loss.backward()
+            # Backpropagate the losses
+            real_loss.backward()
+            fake_loss.backward()
 
-                # Calculate and backpropagate gradient penalty
-                gp_loss = ops.calc_gradient_penalty(self.discriminator, real, fake, self.lambda_grad, self.device)
-                gp_loss.backward()
+            # Calculate and backpropagate gradient penalty
+            gp_loss = ops.calc_gradient_penalty(
+                self.discriminator, real, fake, self.lambda_grad, self.device
+            )
+            gp_loss.backward()
 
-                # Update the discriminator
-                discriminator_optimizer.step()
+            # Update the discriminator
+            discriminator_optimizer.step()
 
-                # Accumulate the losses
-                total_loss += real_loss.item() + fake_loss.item() + gp_loss.item()
+            # Accumulate the losses
+            total_loss += real_loss.item() + fake_loss.item() + gp_loss.item()
 
-            return total_loss, real_loss.item(), fake_loss.item(), gp_loss.item()
+        return total_loss, real_loss.item(), fake_loss.item(), gp_loss.item()
 
-    def optimize_generator(self,
-                           mask_indexes: list[int],
-                           real: torch.Tensor,
-                           mask: torch.Tensor,
-                           rec_in: torch.Tensor,
-                           generator_optimizer: torch.optim.Optimizer
-        ) -> tuple[float, float, float, torch.Tensor, torch.Tensor]:
+    def optimize_generator(
+        self,
+        mask_indexes: list[int],
+        real: torch.Tensor,
+        mask: torch.Tensor,
+        rec_in: torch.Tensor,
+        generator_optimizer: torch.optim.Optimizer,
+    ) -> tuple[float, float, float, torch.Tensor, torch.Tensor]:
         """
         Optimize the generator for a given set of real and generated images.
 
@@ -242,8 +266,16 @@ class FaciesGAN:
                 generator_loss_rec = self.alpha * nn.MSELoss()(rec, real)
                 generator_loss_rec.backward()
 
-            generator_masked_loss = 100 * self.alpha * nn.MSELoss(reduction="mean")(fake * mask, real * mask)
-            generator_loss = generator_masked_loss.item() + generator_loss_fake.item() + generator_loss_rec.item()
+            generator_masked_loss = (
+                100
+                * self.alpha
+                * nn.MSELoss(reduction="mean")(fake * mask, real * mask)
+            )
+            generator_loss = (
+                generator_masked_loss.item()
+                + generator_loss_fake.item()
+                + generator_loss_rec.item()
+            )
 
             generator_optimizer.step()
 
@@ -252,9 +284,8 @@ class FaciesGAN:
             generator_loss_fake.item(),
             generator_loss_rec.item(),
             fake.detach(),
-            rec.detach() if rec is not None else None
+            rec.detach() if rec is not None else None,
         )
-
 
     def save_scale(self, scale: int, path: str) -> None:
         """
@@ -274,8 +305,14 @@ class FaciesGAN:
         with open(os.path.join(path, AMP_FILE), "w") as f:
             f.write(str(self.noise_amp[scale]))
 
-    def load(self, path: str, load_discriminator: bool = True,
-             load_shapes: bool = True, until_scale: int = None, load_masked_facies: bool = True) -> int:
+    def load(
+        self,
+        path: str,
+        load_discriminator: bool = True,
+        load_shapes: bool = True,
+        until_scale: int = None,
+        load_masked_facies: bool = True,
+    ) -> int:
         """
         Load the generator, discriminator, reconstruction noise, shapes, and noise amplitude from the specified path.
 
@@ -294,7 +331,8 @@ class FaciesGAN:
         if until_scale is not None:
             scales_path = [scale for scale in scales_path if scale <= until_scale]
 
-        if load_masked_facies: self.masked_facies = []
+        if load_masked_facies:
+            self.masked_facies = []
         for scale in scales_path:
             try:
                 num_feature, min_num_feature = self.get_num_features(scale)
@@ -309,27 +347,37 @@ class FaciesGAN:
                         self.facie_num_channels,
                     ).to(self.device)
                     self.discriminator.load_state_dict(
-                        ops.load(os.path.join(path, str(scale), D_FILE), self.device))
+                        ops.load(os.path.join(path, str(scale), D_FILE), self.device)
+                    )
 
                 if load_shapes:
-                    self.shapes.append(ops.load(os.path.join(path, str(scale), SHAPE_FILE)))
+                    self.shapes.append(
+                        ops.load(os.path.join(path, str(scale), SHAPE_FILE))
+                    )
 
                 self.generator.create_scale(num_feature, min_num_feature)
                 self.generator.gens[scale].to(self.device)
                 self.generator.gens[scale].load_state_dict(
-                    ops.load(os.path.join(path, str(scale), G_FILE), self.device))
+                    ops.load(os.path.join(path, str(scale), G_FILE), self.device)
+                )
                 self.generator.gens[scale] = ops.reset_grads(self.generator.gens[scale])
                 self.generator.gens[scale].eval()
 
-                self.rec_noise.append(ops.load(os.path.join(path, str(scale), REC_FILE), self.device))
+                self.rec_noise.append(
+                    ops.load(os.path.join(path, str(scale), REC_FILE), self.device)
+                )
 
                 with open(os.path.join(path, str(scale), AMP_FILE)) as f:
                     self.noise_amp.append(float(f.readline().strip()))
 
                 if load_masked_facies:
-                    self.masked_facies.append(ops.load(os.path.join(path, str(scale), M_FILE), self.device))
+                    self.masked_facies.append(
+                        ops.load(os.path.join(path, str(scale), M_FILE), self.device)
+                    )
 
             except Exception as e:
-                print(f"Error loading models from {os.path.join(path, str(scale))}. There may be files missing.")
+                print(
+                    f"Error loading models from {os.path.join(path, str(scale))}. There may be files missing."
+                )
                 raise e
         return len(scales_path)
