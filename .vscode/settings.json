@@ -1,11 +1,10 @@
 {
-    // Enable strict type checking in Pylance for this workspace
-    "python.analysis.typeCheckingMode": "strict",
-    // Run diagnostics across the workspace (recommended for projects)
-    "python.analysis.diagnosticMode": "workspace",
+    // Pylance type checking mode is configured in `pyrightconfig.json`.
+    // Do not set `python.analysis.typeCheckingMode` or
+    // `python.analysis.diagnosticMode` here when using pyrightconfig.json.
     // Help Pylance find imports in the workspace
     "python.analysis.autoSearchPaths": true,
-    "python.analysis.useLibraryCodeForTypes": true
+    "python.analysis.useLibraryCodeForTypes": true,
     // Exclude virtual environment folder from analysis
     "python.analysis.exclude": [
         "**/.venv/**"
