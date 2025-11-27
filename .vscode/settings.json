@@ -1,0 +1,9 @@
+{
+    // Enable strict type checking in Pylance for this workspace
+    "python.analysis.typeCheckingMode": "strict",
+    // Run diagnostics across the workspace (recommended for projects)
+    "python.analysis.diagnosticMode": "workspace",
+    // Help Pylance find imports in the workspace
+    "python.analysis.autoSearchPaths": true,
+    "python.analysis.useLibraryCodeForTypes": true
+}
