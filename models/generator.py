@@ -18,11 +18,10 @@ class Generator(nn.Module):
         padding_size (int): Size of the padding.
         img_num_channel (int): Number of facie channels.
     """
-    def __init__(self,
-                 num_layer: int,
-                 kernel_size: int,
-                 padding_size: int,
-                 img_num_channel: int):
+
+    def __init__(
+        self, num_layer: int, kernel_size: int, padding_size: int, img_num_channel: int
+    ):
         super(Generator, self).__init__()
 
         self.num_layer = num_layer
@@ -34,12 +33,12 @@ class Generator(nn.Module):
         self.gens = nn.ModuleList()
 
     def forward(
-            self,
-            z: list[torch.Tensor],
-            amp: list[float],
-            in_facie: torch.Tensor = None,
-            start_scale: int = 0,
-            stop_scale: int = None,
+        self,
+        z: list[torch.Tensor],
+        amp: list[float],
+        in_facie: torch.Tensor = None,
+        start_scale: int = 0,
+        stop_scale: int = None,
     ) -> torch.Tensor:
         """
         Forward pass for the generator.
@@ -56,8 +55,13 @@ class Generator(nn.Module):
         """
         if in_facie is None:
             channels = z[start_scale].shape[1] - 1
-            height, width = (dim - self.full_zero_padding for dim in z[start_scale].shape[2:])
-            in_facie = torch.zeros((z[start_scale].shape[0], channels, height, width), device=z[start_scale].device)
+            height, width = (
+                dim - self.full_zero_padding for dim in z[start_scale].shape[2:]
+            )
+            in_facie = torch.zeros(
+                (z[start_scale].shape[0], channels, height, width),
+                device=z[start_scale].device,
+            )
 
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
 
@@ -86,7 +90,9 @@ class Generator(nn.Module):
             num_feature (int): The number of features for the convolutional layers.
             min_num_feature (int): The minimum number of features for the convolutional layers.
         """
-        head = ConvBlock(self.img_num_channel, num_feature, self.kernel_size, self.padding_size, 1)
+        head = ConvBlock(
+            self.img_num_channel, num_feature, self.kernel_size, self.padding_size, 1
+        )
         body = nn.Sequential()
 
         channels = min_num_feature

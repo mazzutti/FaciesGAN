@@ -9,7 +9,7 @@ skip = [".venv", "build", "dist", "__pycache__"]
 profile = "black"
 
 [tool.pyright]
-# Pyright settings (duplicated from pyrightconfig.json for centralization).
+# Pyright settings.
 typeCheckingMode = "strict"
 reportMissingTypeStubs = false
 reportOptionalMemberAccess = true

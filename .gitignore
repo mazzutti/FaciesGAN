@@ -1,6 +1,9 @@
 .venv
 .idea
 .DS_Store
+.ruff_cache
+.mypy_cache
+.pytest_cache
 **/__pycache__/**
 logs/**
 output/generated
