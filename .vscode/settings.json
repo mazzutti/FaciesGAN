@@ -1,8 +1,24 @@
 {
-    // Pylance type checking mode is configured in `pyrightconfig.json`.
-    // Also exclude from file watching in the workspace
+    // Exclude virtualenv from file watching, UI and search
     "files.watcherExclude": {
         "**/.venv/**": true
-    }
+    },
+    "files.exclude": {
+        "**/.venv/**": true
+    },
+    "search.exclude": {
+        "**/.venv/**": true
+    },
+
+    // Python settings
+    "python.linting.enabled": true,
+    "python.linting.flake8Enabled": true,
+    "python.formatting.provider": "black",
+    "editor.formatOnSave": true,
+
+    // Pyright / Pylance
+    "python.analysis.typeCheckingMode": "strict",
+    "python.analysis.useLibraryCodeForTypes": true
 }
+
 
