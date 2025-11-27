@@ -3,6 +3,9 @@
   "reportMissingTypeStubs": false,
   "reportOptionalMemberAccess": true,
   "reportOptionalSubscript": true,
+  "exclude": [
+    "**/.venv/**"
+  ],
   "executionEnvironments": [
     {
       "root": ".",

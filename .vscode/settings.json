@@ -6,4 +6,13 @@
     // Help Pylance find imports in the workspace
     "python.analysis.autoSearchPaths": true,
     "python.analysis.useLibraryCodeForTypes": true
+    // Exclude virtual environment folder from analysis
+    "python.analysis.exclude": [
+        "**/.venv/**"
+    ],
+    // Also exclude from file watching in the workspace
+    "files.watcherExclude": {
+        "**/.venv/**": true
+    }
 }
+
