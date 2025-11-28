@@ -164,17 +164,51 @@ import_all(){
 
 update_all(){
   echo "Updating imported subtrees from upstream ($REPO_URL -> data/*)"
-  # Add remote if missing
-  if ! git remote get-url stanford-upstream >/dev/null 2>&1; then
-    git remote add stanford-upstream "$REPO_URL" || true
+
+  # Require a clean working tree to avoid accidental overwrites.
+  if [ -n "$(git status --porcelain)" ]; then
+    echo "Error: working tree has uncommitted changes. Please commit or stash before running update."
+    exit 1
   fi
-  git fetch stanford-upstream || true
 
-  # Pull updates for each prefix. This uses subtree pull which expects the
-  # upstream branch to be available on the remote.
-  git subtree pull --prefix=data/dataset stanford-upstream "$REPO_BRANCH" --squash || echo "Failed to pull data/dataset (may be no changes)"
-  git subtree pull --prefix=data/xz_slices stanford-upstream "$REPO_BRANCH" --squash || echo "Failed to pull data/xz_slices (may be no changes)"
+  echo "Creating temporary clone to prepare bundle-based subtree pulls"
+  tmpdir=$(mktemp -d /tmp/stanford-XXXXXX)
+  echo "Cloning remote repository into temporary dir: $tmpdir"
+  git clone --no-checkout "$REPO_URL" "$tmpdir"
 
+  # If anything fails after this point, keep the temporary clone for inspection
+  trap 'echo "Update failed — temporary clone preserved at: $tmpdir"; exit 1' ERR
+
+  pushd "$tmpdir" >/dev/null
+  git sparse-checkout init --no-cone
+  git sparse-checkout set .cache/images/dataset .cache/images/xz_slices
+  git checkout "${REPO_BRANCH}" || true
+
+  split_branch_dataset="tmp-split-cache_images_dataset"
+  split_branch_xz="tmp-split-cache_images_xz_slices"
+  echo "Creating split branch $split_branch_dataset for .cache/images/dataset"
+  git subtree split -P .cache/images/dataset -b "$split_branch_dataset" || true
+  echo "Creating split branch $split_branch_xz for .cache/images/xz_slices"
+  git subtree split -P .cache/images/xz_slices -b "$split_branch_xz" || true
+  popd >/dev/null
+
+  # Create portable temporary bundle files
+  bundle_dataset=$(mktemp /tmp/dataset-XXXXXX.bundle 2>/dev/null || mktemp -t dataset)
+  bundle_xz=$(mktemp /tmp/xz-XXXXXX.bundle 2>/dev/null || mktemp -t xz)
+  git -C "$tmpdir" bundle create "$bundle_dataset" "$split_branch_dataset" || true
+  git -C "$tmpdir" bundle create "$bundle_xz" "$split_branch_xz" || true
+
+  # Pull updates for each prefix using the bundles (no direct remote add)
+  echo "Pulling updates for prefix data/dataset"
+  git subtree pull --prefix=data/dataset "$bundle_dataset" "$split_branch_dataset" --squash || echo "Failed to pull data/dataset (may be no changes)"
+
+  echo "Pulling updates for prefix data/xz_slices"
+  git subtree pull --prefix=data/xz_slices "$bundle_xz" "$split_branch_xz" --squash || echo "Failed to pull data/xz_slices (may be no changes)"
+
+  # Cleanup
+  rm -f "$bundle_dataset" "$bundle_xz"
+  rm -rf "$tmpdir"
+  trap - ERR
   echo "Update complete. Run 'git status' to inspect changes."
 }
 
