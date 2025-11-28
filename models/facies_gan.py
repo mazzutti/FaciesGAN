@@ -1,9 +1,9 @@
 import argparse
 import math
 import os
+from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
-from typing import Any
-from collections.abc import Sequence
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -55,6 +55,8 @@ class FaciesGAN:
         self.shapes: list[tuple[int, ...]] = []
         self.rec_noise: list[torch.Tensor] = []
         self.noise_amp: list[float] = []
+        # Current training scale (set by Trainer during training)
+        self.cur_scale: int = 0
 
         # Accept any sequence for `masked_facies` (tuple/list). Default to an
         # empty tuple so the default is immutable and safe as a module-level
@@ -64,10 +66,10 @@ class FaciesGAN:
         else:
             self.masked_facies = []
 
-        self.generator = Generator(
+        self.generator: Generator = Generator(
             self.num_layer, self.kernel_size, self.padding_size, self.facie_num_channels
         ).to(self.device)
-        self.discriminator: Discriminator | None = None
+        self.discriminator = None
 
     def init_scale_generator(self, scale: int) -> None:
         """
@@ -85,9 +87,7 @@ class FaciesGAN:
         if scale % 4 == 0:
             self.generator.gens[-1].apply(ops.weights_init)
         else:
-            self.generator.gens[-1].load_state_dict(
-                self.generator.gens[-2].state_dict()
-            )
+            self.generator.gens[-1].load_state_dict(self.generator.gens[-2].state_dict())
 
         if len(self.generator.gens) > 1:
             self.generator.gens[-2] = ops.reset_grads(self.generator.gens[-2])
@@ -142,8 +142,7 @@ class FaciesGAN:
             last (bool): If True, return only the last scale noise.
 
         Returns:
-            list[torch.Tensor]: Generated noise for each scale (always a list). When `last` is True
-            a single-item list containing the last-scale tensor is returned.
+            list[torch.Tensor]: Generated noise (one tensor per scale).
         """
 
         def generate_noise(index: int) -> torch.Tensor:
@@ -157,9 +156,7 @@ class FaciesGAN:
             # for the current `index` (per-instance list default avoids
             # shared-mutable defaults while allowing empty lists).
             if index < len(self.masked_facies):
-                z = torch.cat(
-                    [z, self.masked_facies[index][mask_indexes].to(self.device)], dim=1
-                )
+                z = torch.cat([z, self.masked_facies[index][mask_indexes].to(self.device)], dim=1)
             elif index == 0:
                 z = z.expand(z.shape[0], self.facie_num_channels, *shape)
             else:
@@ -193,29 +190,30 @@ class FaciesGAN:
         Returns:
             tuple[float, float, float, float]: Total loss, real loss, fake loss, and gradient penalty loss.
         """
-        fixed_noise_list = self.get_noise(mask_indexes, last=True)
-        if not fixed_noise_list:
-            raise RuntimeError("No noise available for last scale")
-        fixed_noise = fixed_noise_list[0]
+        fixed_noise = self.get_noise(mask_indexes, last=True)
 
-        total_loss, real_loss, fake_loss, gp_loss = 0, 0, 0, 0
+        total_loss = 0.0
+        # Initialize losses as torch tensors so their types remain consistent
+        # (avoids a union of int and Tensor which confuses static analyzers
+        # when calling .backward()). Place them on the correct device.
+        real_loss = torch.tensor(0.0, device=self.device)
+        fake_loss = torch.tensor(0.0, device=self.device)
+        gp_loss = torch.tensor(0.0, device=self.device)
         for _ in range(self.discriminator_steps):
             discriminator_optimizer.zero_grad()
 
             # Calculate loss for real images
-            real_output = self.discriminator(real)
+            real_output = cast(Discriminator, self.discriminator)(real)
             real_loss = -real_output.mean()
 
             # Generate fake images
             noises = self.get_noise(mask_indexes)
-            # `fixed_noise` is a single tensor taken from the single-item list
-            # returned when `last=True`. Replace the last noise tensor with it.
-            noises[-1] = fixed_noise
+            noises[-1] = fixed_noise[0]
             with torch.no_grad():
                 fake = self.generator(noises, self.noise_amp)
 
             # Calculate loss for fake images
-            fake_output = self.discriminator(fake.detach())
+            fake_output = cast(Discriminator, self.discriminator)(fake.detach())
             fake_loss = fake_output.mean((0, 2, 3))
 
             # Backpropagate the losses
@@ -224,9 +222,13 @@ class FaciesGAN:
 
             # Calculate and backpropagate gradient penalty
             gp_loss = ops.calc_gradient_penalty(
-                self.discriminator, real, fake, self.lambda_grad, self.device
+                cast(Discriminator, self.discriminator),
+                real,
+                fake,
+                self.lambda_grad,
+                self.device,
             )
-            gp_loss.backward()
+            gp_loss.backward()  # type: ignore
 
             # Update the discriminator
             discriminator_optimizer.step()
@@ -243,7 +245,7 @@ class FaciesGAN:
         mask: torch.Tensor,
         rec_in: torch.Tensor,
         generator_optimizer: torch.optim.Optimizer,
-    ) -> tuple[float, float, float, torch.Tensor, torch.Tensor]:
+    ) -> tuple[float, float, float, torch.Tensor, torch.Tensor | None]:
         """
         Optimize the generator for a given set of real and generated images.
 
@@ -258,7 +260,12 @@ class FaciesGAN:
             tuple[float, float, float, torch.Tensor, torch.Tensor]: Total loss, fake loss, reconstruction loss,
             generated fake images, and reconstructed images.
         """
-        generator_loss, generator_loss_fake, generator_loss_rec = 0.0, 0.0, 0.0
+        # Use scalar tensors for losses to keep types consistent (avoid
+        # mixing Python floats and torch tensors which confuses static
+        # analyzers when calling .item()).
+        generator_loss = 0.0
+        generator_loss_fake = torch.tensor(0.0, device=self.device)
+        generator_loss_rec = torch.tensor(0.0, device=self.device)
         fake, rec = None, None
 
         for _ in range(self.generator_steps):
@@ -267,7 +274,7 @@ class FaciesGAN:
             noises = self.get_noise(mask_indexes)
             fake = self.generator(noises, self.noise_amp)
 
-            generator_loss_fake = -self.discriminator(fake).mean()
+            generator_loss_fake = -cast(Discriminator, self.discriminator)(fake).mean()
             generator_loss_fake.backward()
 
             generator_loss_rec = torch.zeros(1, device=self.device)
@@ -285,23 +292,21 @@ class FaciesGAN:
                 generator_loss_rec.backward()
 
             generator_masked_loss = (
-                100
-                * self.alpha
-                * nn.MSELoss(reduction="mean")(fake * mask, real * mask)
+                100 * self.alpha * nn.MSELoss(reduction="mean")(fake * mask, real * mask)
             )
             generator_loss = (
-                generator_masked_loss.item()
-                + generator_loss_fake.item()
-                + generator_loss_rec.item()
+                float(generator_masked_loss.item())
+                + float(generator_loss_fake.item())
+                + float(generator_loss_rec.item())
             )
 
             generator_optimizer.step()
 
         return (
             generator_loss,
-            generator_loss_fake.item(),
-            generator_loss_rec.item(),
-            fake.detach(),
+            float(generator_loss_fake.item()),
+            float(generator_loss_rec.item()),
+            cast(torch.Tensor, fake).detach(),
             rec.detach() if rec is not None else None,
         )
 
@@ -315,7 +320,10 @@ class FaciesGAN:
             path (str): The directory path where the files will be saved.
         """
         torch.save(self.generator.gens[scale].state_dict(), os.path.join(path, G_FILE))
-        torch.save(self.discriminator.state_dict(), os.path.join(path, D_FILE))
+        torch.save(
+            cast(Discriminator, self.discriminator).state_dict(),
+            os.path.join(path, D_FILE),
+        )
         torch.save(self.rec_noise, os.path.join(path, REC_FILE))
         torch.save(self.shapes[scale], os.path.join(path, SHAPE_FILE))
         torch.save(self.masked_facies[scale], os.path.join(path, M_FILE))
@@ -328,7 +336,7 @@ class FaciesGAN:
         path: str,
         load_discriminator: bool = True,
         load_shapes: bool = True,
-        until_scale: int = None,
+        until_scale: int | None = None,
         load_masked_facies: bool = True,
     ) -> int:
         """
@@ -365,24 +373,39 @@ class FaciesGAN:
                         self.facie_num_channels,
                     ).to(self.device)
                     self.discriminator.load_state_dict(
-                        ops.load(os.path.join(path, str(scale), D_FILE), self.device)
+                        ops.load(
+                            os.path.join(path, str(scale), D_FILE),
+                            self.device,
+                            as_type=Mapping[str, Any],
+                        )
                     )
 
                 if load_shapes:
                     self.shapes.append(
-                        ops.load(os.path.join(path, str(scale), SHAPE_FILE))
+                        ops.load(
+                            os.path.join(path, str(scale), SHAPE_FILE),
+                            as_type=tuple[int, ...],
+                        )
                     )
 
                 self.generator.create_scale(num_feature, min_num_feature)
                 self.generator.gens[scale].to(self.device)
                 self.generator.gens[scale].load_state_dict(
-                    ops.load(os.path.join(path, str(scale), G_FILE), self.device)
+                    ops.load(
+                        os.path.join(path, str(scale), G_FILE),
+                        self.device,
+                        as_type=Mapping[str, Any],
+                    )
                 )
                 self.generator.gens[scale] = ops.reset_grads(self.generator.gens[scale])
                 self.generator.gens[scale].eval()
 
                 self.rec_noise.append(
-                    ops.load(os.path.join(path, str(scale), REC_FILE), self.device)
+                    ops.load(
+                        os.path.join(path, str(scale), REC_FILE),
+                        self.device,
+                        as_type=torch.Tensor,
+                    )
                 )
 
                 with open(os.path.join(path, str(scale), AMP_FILE)) as f:
@@ -390,12 +413,15 @@ class FaciesGAN:
 
                 if load_masked_facies:
                     self.masked_facies.append(
-                        ops.load(os.path.join(path, str(scale), M_FILE), self.device)
+                        ops.load(
+                            os.path.join(path, str(scale), M_FILE),
+                            self.device,
+                            as_type=torch.Tensor,
+                        )
                     )
 
             except Exception as e:
-                print(
-                    f"Error loading models from {os.path.join(path, str(scale))}. There may be files missing."
-                )
+                load_dir = os.path.join(path, str(scale))
+                print("Error loading models from", load_dir, ". There may be files missing.")
                 raise e
         return len(scales_path)

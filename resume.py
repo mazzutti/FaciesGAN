@@ -18,7 +18,7 @@ if __name__ == "__main__":
         "--checkpoint_path",
         type=str,
         help="checkpoint path to continue the training",
-        required=True
+        required=True,
     )
     parser.add_argument("--num_iter", type=int, help="number of epochs for fine-tuning")
     parser.add_argument("--start_scale", type=int, default=0, help="start scale for fine-tuning")
@@ -38,16 +38,16 @@ if __name__ == "__main__":
 
     if options.manual_seed is not None:
         random.seed(options.manual_seed)
-        torch.manual_seed(options.manual_seed)
+        torch.manual_seed(options.manual_seed)  # type: ignore
 
     if arguments.finetuning:
         print("Fine-Tuning: %d iter\n" % arguments.num_iter)
         options.num_iter = arguments.num_iter
 
     device = torch.device(
-        f"cuda:{options.gpu_device}" if torch.cuda.is_available()
-        else f"mps:{options.gpu_device}" if torch.backends.mps.is_available()
-        else "cpu"
+        f"cuda:{options.gpu_device}"
+        if torch.cuda.is_available()
+        else f"mps:{options.gpu_device}" if torch.backends.mps.is_available() else "cpu"
     )
     trainer = Trainer(device, options, arguments.finetuning, arguments.checkpoint_path)
 
@@ -55,7 +55,7 @@ if __name__ == "__main__":
         trainer.load(arguments.checkpoint_path, arguments.start_scale - 1)
     else:
         # Get last saved scale path
-        last_scale = max(map(int, next(os.walk(arguments.checkpoint_path))[1]))
+        last_scale = max(map(int, next(os.walk(arguments.checkpoint_path))[1]))  # type: ignore
         last_scale_path = os.path.join(arguments.checkpoint_path, str(last_scale))
 
         # If the last scale folder was created, but no models were saved, remove the folder

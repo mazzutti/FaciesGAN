@@ -1,4 +1,6 @@
 [flake8]
 exclude = .venv,build,dist,__pycache__
-max-line-length = 120
+max-line-length = 100
+# Ignore long-line checks (E501) project-wide.
+extend-ignore = E501
 

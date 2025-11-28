@@ -9,6 +9,7 @@ from dateutil import tz
 
 from config import CHECKPOINT_PATH, OPT_FILE
 from log import init_output_logging
+from protocols import TrainningOptions
 from train import Trainer
 
 
@@ -34,9 +35,7 @@ def get_arguments():
         help="range of values in the input facie",
         default=[0, 255],
     )
-    parser.add_argument(
-        "--crop_size", type=int, help="crop size to train the facie", default=256
-    )
+    parser.add_argument("--crop_size", type=int, help="crop size to train the facie", default=256)
     parser.add_argument(
         "--batch_size",
         default=1,
@@ -58,16 +57,12 @@ def get_arguments():
         default=32,
     )
     parser.add_argument("--kernel_size", type=int, help="kernel size", default=3)
-    parser.add_argument(
-        "--num_layer", type=int, help="number of layers in each scale", default=5
-    )
+    parser.add_argument("--num_layer", type=int, help="number of layers in each scale", default=5)
     parser.add_argument("--stride", help="stride", default=1)
     parser.add_argument("--padding_size", type=int, help="net pad size", default=0)
 
     # pyramid parameters:
-    parser.add_argument(
-        "--noise_amp", type=float, help="adaptive noise cont weight", default=0.1
-    )
+    parser.add_argument("--noise_amp", type=float, help="adaptive noise cont weight", default=0.1)
     parser.add_argument(
         "--min_size",
         type=int,
@@ -86,33 +81,19 @@ def get_arguments():
         "--num_iter", type=int, default=2000, help="number of epochs to train per scale"
     )
     parser.add_argument("--gamma", type=float, help="scheduler gamma", default=0.9)
-    parser.add_argument(
-        "--lr_g", type=float, default=5e-5, help="learning rate, default=5e-8"
-    )
-    parser.add_argument(
-        "--lr_d", type=float, default=5e-5, help="learning rate, default=5e-8"
-    )
+    parser.add_argument("--lr_g", type=float, default=5e-5, help="learning rate, default=5e-8")
+    parser.add_argument("--lr_d", type=float, default=5e-5, help="learning rate, default=5e-8")
     parser.add_argument(
         "--lr_decay", type=int, default=1000, help="number of epochs before lr decay"
     )
-    parser.add_argument(
-        "--beta1", type=float, default=0.5, help="beta1 for adam. default=0.5"
-    )
-    parser.add_argument(
-        "--generator_steps", type=int, help="Generator inner steps", default=3
-    )
+    parser.add_argument("--beta1", type=float, default=0.5, help="beta1 for adam. default=0.5")
+    parser.add_argument("--generator_steps", type=int, help="Generator inner steps", default=3)
     parser.add_argument(
         "--discriminator_steps", type=int, help="Discriminator inner steps", default=3
     )
-    parser.add_argument(
-        "--lambda_grad", type=float, help="gradient penalty weight", default=0.1
-    )
-    parser.add_argument(
-        "--alpha", type=float, help="reconstruction loss weight", default=10
-    )
-    parser.add_argument(
-        "--save_interval", type=int, help="save log interval", default=100
-    )
+    parser.add_argument("--lambda_grad", type=float, help="gradient penalty weight", default=0.1)
+    parser.add_argument("--alpha", type=float, help="reconstruction loss weight", default=10)
+    parser.add_argument("--save_interval", type=int, help="save log interval", default=100)
     parser.add_argument(
         "--num_real_facies",
         type=int,
@@ -144,11 +125,11 @@ def get_arguments():
 
 if __name__ == "__main__":
     argument_parser = get_arguments()
-    options = argument_parser.parse_args()
+    options = argument_parser.parse_args(namespace=TrainningOptions())
 
     if options.manual_seed is not None:
         random.seed(options.manual_seed)
-        torch.manual_seed(options.manual_seed)
+        torch.manual_seed(options.manual_seed)  # type: ignore
 
     timestamp = datetime.now(tz.tzlocal()).strftime("%Y_%m_%d_%H_%M_%S")
     options.out_path = os.path.join(CHECKPOINT_PATH, f"{timestamp}_{options.out_path}")

@@ -32,14 +32,21 @@
   "black-formatter.path": [
     "${workspaceFolder}/.venv/bin/python"
   ],
-  "black-formatter.args": ["--line-length", "120"],
+  "black-formatter.args": [
+    "--line-length",
+    "80"
+  ],
   "[python]": {
     "editor.defaultFormatter": "ms-python.black-formatter",
-  },  
+    "editor.formatOnSave": true
+  },
+
   "python.testing.unittestEnabled": false,
   "python.testing.pytestEnabled": true,
   "python.testing.pytestArgs": ["tests"],
-  "python.testing.autoTestDiscoverOnSaveEnabled": true
+  "python.testing.autoTestDiscoverOnSaveEnabled": true,
+  "editor.suggest.showTypeParameters": true,
+  "python.analysis.typeEvaluation.analyzeUnannotatedFunctions": true
 } 
 
 

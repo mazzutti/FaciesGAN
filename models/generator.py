@@ -19,10 +19,8 @@ class Generator(nn.Module):
         img_num_channel (int): Number of facie channels.
     """
 
-    def __init__(
-        self, num_layer: int, kernel_size: int, padding_size: int, img_num_channel: int
-    ):
-        super(Generator, self).__init__()
+    def __init__(self, num_layer: int, kernel_size: int, padding_size: int, img_num_channel: int):
+        super(Generator, self).__init__()  # type: ignore
 
         self.num_layer = num_layer
         self.kernel_size = kernel_size
@@ -36,9 +34,9 @@ class Generator(nn.Module):
         self,
         z: list[torch.Tensor],
         amp: list[float],
-        in_facie: torch.Tensor = None,
+        in_facie: torch.Tensor = torch.empty(),
         start_scale: int = 0,
-        stop_scale: int = None,
+        stop_scale: int | None = None,
     ) -> torch.Tensor:
         """
         Forward pass for the generator.
@@ -53,11 +51,9 @@ class Generator(nn.Module):
         Returns:
             torch.Tensor: Output facie tensor.
         """
-        if in_facie is None:
+        if in_facie.numel() == 0:
             channels = z[start_scale].shape[1] - 1
-            height, width = (
-                dim - self.full_zero_padding for dim in z[start_scale].shape[2:]
-            )
+            height, width = (dim - self.full_zero_padding for dim in z[start_scale].shape[2:])
             in_facie = torch.zeros(
                 (z[start_scale].shape[0], channels, height, width),
                 device=z[start_scale].device,
@@ -90,9 +86,7 @@ class Generator(nn.Module):
             num_feature (int): The number of features for the convolutional layers.
             min_num_feature (int): The minimum number of features for the convolutional layers.
         """
-        head = ConvBlock(
-            self.img_num_channel, num_feature, self.kernel_size, self.padding_size, 1
-        )
+        head = ConvBlock(self.img_num_channel, num_feature, self.kernel_size, self.padding_size, 1)
         body = nn.Sequential()
 
         channels = min_num_feature

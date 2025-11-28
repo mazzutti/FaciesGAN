@@ -1,7 +1,10 @@
+from typing import Any
+
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats as st
 import torch
+from matplotlib.markers import MarkerStyle
 
 from config import RESULTS_DIR
 from ops import torch2np
@@ -18,12 +21,24 @@ def plot_mask(mask: np.ndarray, real_facie: np.ndarray, axis: plt.Axes) -> None:
     """
     mask_sum = np.sum(np.squeeze(mask), axis=0)
     mask_index = np.where(mask_sum == np.max(mask_sum))[0]
-    axis.scatter(
-        np.stack([np.full((mask.shape[0],), i) for i in mask_index]),
-        np.stack([np.arange(0, mask.shape[0]) for _ in mask_index]),
-        c=np.stack([np.astype(real_facie[:, i] >= 0.5, np.int8) for i in mask_index]),
+
+    # If there are no mask indices, nothing to plot
+    if mask_index.size == 0:
+        return
+
+    # Build 1D arrays for scatter x, y and color values c. Use concatenate/ tile to
+    # ensure consistent shapes and concrete dtypes so static analysis can infer types.
+    height = int(mask.shape[0])
+    x = np.concatenate([np.full((height,), int(i), dtype=np.int32) for i in mask_index])
+    y = np.tile(np.arange(0, height, dtype=np.int32), len(mask_index))
+    c = np.concatenate([((real_facie[:, int(i)] >= 0.5).astype(np.int8)) for i in mask_index])
+
+    axis.scatter(  # type: ignore
+        x,
+        y,
+        c=c,
         s=1,
-        marker="s",
+        marker=MarkerStyle("s"),
         cmap="plasma",
         label="Facies Mask",
     )
@@ -55,37 +70,35 @@ def plot_generated_facies(
     fig, axes = plt.subplots(
         num_real_facies, num_generated_per_real + 1, figsize=(12, num_real_facies * 2.5)
     )
-    fake_facies = [torch2np(fake_facie, denormalize=True) for fake_facie in fake_facies]
-    real_facies = torch2np(real_facies, denormalize=True, ceiling=True)
-    masks = torch2np(masks)
+    fake_facies_arr = [torch2np(fake_facie, denormalize=True) for fake_facie in fake_facies]
+    np_real_facies = torch2np(real_facies, denormalize=True, ceiling=True)
+    np_masks = torch2np(masks)
     for i in range(num_real_facies):
-        axes[i, 0].imshow(real_facies[i], cmap="YlGn")
+        axes[i, 0].imshow(fake_facies_arr[i], cmap="YlGn")
         axes[i, 0].set_title(f"Well {i + 1}")
-        plot_mask(masks[i], np.squeeze(real_facies[i]), axes[i, 0])
+        plot_mask(np_masks[i], np.squeeze(fake_facies_arr[i]), axes[i, 0])
         axes[i, 0].set_xticks([])
         axes[i, 0].set_yticks([])
         axes[i, 0].axis("off")
 
         # Plot generated facies (remaining columns)
         for j in range(num_generated_per_real):
-            axes[i, j + 1].imshow(fake_facies[i][j], cmap="gray")
+            axes[i, j + 1].imshow(fake_facies_arr[i][j], cmap="gray")
             axes[i, j + 1].set_title(f"Gen {j + 1}")
-            plot_mask(masks[i], np.squeeze(real_facies[i]), axes[i, j + 1])
+            plot_mask(np_masks[i], np.squeeze(np_real_facies[i]), axes[i, j + 1])
             axes[i, j + 1].axis("off")
 
     # Add a main title for the plot
-    plt.suptitle(
-        f"Stage {stage} - Well Log, Real vs Generated Facies", fontsize=16, y=0.99
-    )
+    plt.suptitle(f"Stage {stage} - Well Log, Real vs Generated Facies", fontsize=16, y=0.99)  # type: ignore
     plt.tight_layout()
     plt.subplots_adjust(top=0.95)
     plt.show()
     if save:
-        fig.savefig(f"{out_dir}/gen_{stage}_{index}.tif")
+        fig.savefig(f"{out_dir}/gen_{stage}_{index}.tif")  # type: ignore
     plt.close()
 
 
-def get_best_distribution(data: np.ndarray) -> tuple[str, float, tuple]:
+def get_best_distribution(data: np.ndarray) -> tuple[str, float, tuple[Any, ...]]:
     """
     Identify the best fitting distribution for the given data.
 
@@ -93,12 +106,13 @@ def get_best_distribution(data: np.ndarray) -> tuple[str, float, tuple]:
         data (np.ndarray): The data to fit the distributions to.
 
     Returns:
-        Tuple[str, float, Tuple]: The name of the best fitting distribution, the p-value, and the parameters
+        tuple[str, float, tuple[Any, ...]]: The name of the best fitting distribution, the p-value, and the parameters
         of the best fit.
     """
     dist_names = ["norm", "exponweib", "pareto", "genextreme"]
-    dist_results = []
-    params = {}
+    # Explicitly type these containers so static analysis can infer types for methods like .append
+    dist_results: list[tuple[str, float]] = []
+    params: dict[str, tuple[Any, ...]] = {}
 
     for dist_name in dist_names:
         dist = getattr(st, dist_name)
@@ -106,8 +120,11 @@ def get_best_distribution(data: np.ndarray) -> tuple[str, float, tuple]:
         params[dist_name] = param
 
         # Applying the Kolmogorov-Smirnov test
-        result = st.kstest(data, dist_name, args=param)
-        dist_results.append((dist_name, np.sum(result.pvalue)))
+        # Use flattened data for the KS test to match the fit input
+        result = st.kstest(data.flatten(), dist_name, args=param)
+        # pvalue may be a scalar or array-like; coerce to float
+        pval = float(np.sum(result.pvalue))
+        dist_results.append((dist_name, pval))
 
     # Select the best fitted distribution
     best_dist, best_p = max(dist_results, key=lambda item: item[1])

@@ -1,15 +1,17 @@
 import math
 import os
 from collections.abc import Sequence
+from typing import TypeVar, cast
 
 import numpy as np
 import torch
+from numpy.typing import NDArray
 from torch import nn
 
+from protocols import TrainningOptions
 
-def facie_resize(
-    facie: torch.Tensor, size: tuple[int, ...], ceiling=False
-) -> torch.Tensor:
+
+def facie_resize(facie: torch.Tensor, size: tuple[int, ...], ceiling: bool = False) -> torch.Tensor:
     """
     Resize the input  tensor to the given size using bilinear interpolation.
 
@@ -50,7 +52,7 @@ def mask_resize(mask: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
     return interpolated_mask
 
 
-def generate_scales(options) -> Sequence[tuple[int, ...]]:
+def generate_scales(options: TrainningOptions) -> list[tuple[int, ...]]:
     """
     Generate a list of shapes for different scales based on the given options.
 
@@ -64,26 +66,30 @@ def generate_scales(options) -> Sequence[tuple[int, ...]]:
             - facie_num_channels (int): The number of  channels.
 
     Returns:
+
         list: A list of tuples representing the shapes for each scale.
     """
-    shapes = []
+    shapes: list[tuple[int, ...]] = []
     scale_factor = math.pow(
         options.min_size / (min(options.max_size, options.crop_size)),
         1 / options.stop_scale,
     )
     for i in range(options.stop_scale + 1):
         scale = math.pow(scale_factor, options.stop_scale - i)
-        out_shape = np.uint(
-            np.round(
-                np.array(
-                    [
-                        min(options.max_size, options.crop_size),
-                        min(options.max_size, options.crop_size),
-                    ]
+        out_shape = cast(
+            Sequence[int],
+            np.uint(
+                np.round(
+                    np.array(
+                        [
+                            min(options.max_size, options.crop_size),
+                            min(options.max_size, options.crop_size),
+                        ]
+                    )
+                    * scale
                 )
-                * scale
-            )
-        ).tolist()
+            ).tolist(),
+        )
         if out_shape[0] % 2 != 0:
             out_shape = [int(shape + 1) for shape in out_shape]
         shapes.append((options.batch_size, options.facie_num_channels, *out_shape))
@@ -97,6 +103,7 @@ def weights_init(m: nn.Module) -> None:
     Args:
         m (torch.nn.Module): The module to initialize.
 
+
     If the module is a Conv2d layer, its weights are initialized with a normal distribution
     with mean 0.0 and standard deviation 0.02. If the module is a BatchNorm2d or InstanceNorm2d
     layer, its weights are initialized with a normal distribution with mean 1.0 and standard deviation 0.02,
@@ -109,7 +116,7 @@ def weights_init(m: nn.Module) -> None:
         m.bias.data.fill_(0)
 
 
-def norm(x):
+def norm(x: torch.Tensor) -> torch.Tensor:
     """
     Normalize the input tensor to the range [-1, 1].
 
@@ -142,7 +149,7 @@ def denorm(tensor: torch.Tensor, ceiling: bool = False) -> torch.Tensor:
 
 def torch2np(
     tensor: torch.Tensor, denormalize: bool = False, ceiling: bool = False
-) -> np.ndarray:
+) -> NDArray[np.float32]:
     """
     Convert a PyTorch tensor to a NumPy array.
 
@@ -156,23 +163,24 @@ def torch2np(
     """
     if denormalize:
         tensor = denorm(tensor, ceiling)
-    tensor = np.permute_dims(tensor.cpu().detach().numpy(), (0, 2, 3, 1))
-    tensor = np.clip(tensor, 0, 1)
-    return tensor.astype(np.float32)
+    np_array = tensor.detach().cpu().numpy()
+    np_array = np.permute_dims(np_array, (0, 2, 3, 1))
+    np_array = np.clip(np_array, 0, 1)
+    return np_array.astype(np.float32)
 
 
-def np2torch(tensor: np.ndarray, normalize: bool = False) -> torch.Tensor:
+def np2torch(np_array: NDArray[np.float32], normalize: bool = False) -> torch.Tensor:
     """
     Convert a NumPy array to a PyTorch tensor and normalize it to the range [-1, 1].
 
     Args:
-        tensor (np.ndarray): The input NumPy array to convert.
+        np_array (np.ndarray): The input NumPy array to convert.
         normalize (bool): Whether to normalize the tensor to the range [-1, 1].
 
     Returns:
         torch.Tensor: The converted and normalized PyTorch tensor.
     """
-    tensor = torch.from_numpy(tensor).float()
+    tensor = torch.from_numpy(np_array).float()  # type: ignore
     if normalize:
         tensor = norm(tensor)
     return norm(tensor)
@@ -195,9 +203,7 @@ def range_transform(
         np.ndarray: The transformed  array.
     """
     if in_range != out_range:
-        scale = np.float32(out_range[1] - out_range[0]) / np.float32(
-            in_range[1] - in_range[0]
-        )
+        scale = np.float32(out_range[1] - out_range[0]) / np.float32(in_range[1] - in_range[0])
         bias = np.float32(out_range[0]) - np.float32(in_range[0]) * scale
         facie = facie * scale + bias
     return facie
@@ -232,18 +238,23 @@ def generate_noise(
         num_samp (int): The number of samples to generate. Default is 1.
         scale (float): The scale factor for resizing the noise tensor. Default is 1.0.
 
+
     Returns:
         torch.Tensor: The generated noise tensor.
     """
-    noise = torch.randn(
-        num_samp, size[0], *[round(s / scale) for s in size[1:]], device=device
-    )
+    noise = torch.randn(num_samp, size[0], *[round(s / scale) for s in size[1:]], device=device)
     if scale != 1:
         noise = facie_resize(noise, size[1:])
     return noise
 
 
-def calc_gradient_penalty(discriminator, real_data, fake_data, LAMBDA, device):
+def calc_gradient_penalty(
+    discriminator: nn.Module,
+    real_data: torch.Tensor,
+    fake_data: torch.Tensor,
+    LAMBDA: float,
+    device: torch.device,
+) -> torch.Tensor:
     """
     Calculate the gradient penalty for WGAN-GP.
 
@@ -262,7 +273,7 @@ def calc_gradient_penalty(discriminator, real_data, fake_data, LAMBDA, device):
     interpolates = (alpha * real_data + (1 - alpha) * fake_data).requires_grad_(True)
     disc_interpolates = discriminator(interpolates)
 
-    gradients = torch.autograd.grad(
+    gradients: torch.Tensor = torch.autograd.grad(
         outputs=disc_interpolates,
         inputs=interpolates,
         grad_outputs=torch.ones(disc_interpolates.size()).to(device),
@@ -271,7 +282,9 @@ def calc_gradient_penalty(discriminator, real_data, fake_data, LAMBDA, device):
         only_inputs=True,
     )[0]
 
-    gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean() * LAMBDA
+    # compute the L2 norm of gradients for each sample and apply the penalty
+    gradients = cast(torch.Tensor, gradients.norm(2, dim=1) - 1)  # type: ignore
+    gradient_penalty = (gradients**2).mean() * LAMBDA
 
     return gradient_penalty
 
@@ -286,20 +299,51 @@ def create_dirs(path: str) -> None:
     try:
         os.makedirs(path, exist_ok=True)
     except OSError as e:
-        raise RuntimeError(f"Error creating directory {path}: {e}")
+        msg = "Error creating directory:"
+        raise RuntimeError(msg, path, e)
+
+
+T = TypeVar("T")
 
 
 def load(
-    path: str, device: torch.device = torch.device("cpu")
-) -> dict | torch.nn.Module | torch.Tensor:
+    path: str,
+    device: torch.device = torch.device("cpu"),
+    as_type: type[T] | None = None,
+) -> T:
     """
-    Load a PyTorch models state dictionary from a file.
+    Load a PyTorch object from a file and return it as the requested type.
+
+    Callers can pass a runtime class in `as_type` (for example `dict` or
+    `list`) to indicate the expected shape of the loaded object. The
+    function will `cast` the loaded object to the generic return type `T` so
+    static type checkers can use the annotation. Note that `as_type` is only
+    used for a runtime `isinstance` check (when possible) and for clarity; it
+    does not change how `torch.load` behaves.
+
+    Examples:
+        state: Mapping[str, Any] = ops.load(path, as_type=dict)
+        noises: list[torch.Tensor] = ops.load(path, as_type=list)
 
     Args:
-        path (str): The file path to load the models state dictionary from.
-        device (torch.device): The device to map the loaded state dictionary to. Default is CPU.
+        path (str): The file path to load the object from.
+        device (torch.device): The device to map the loaded object to. Default is CPU.
+        as_type (Type[T] | None): Optional runtime class to assert the loaded object's type.
 
     Returns:
-        dict: The loaded state dictionary.
+        T: The loaded object, cast to the requested generic type.
     """
-    return torch.load(path, map_location=device, weights_only=True)
+    obj = torch.load(path, map_location=device, weights_only=True)
+    if as_type is not None:
+        # `as_type` should be a concrete runtime class (e.g., `dict` or `list`).
+        # For typing constructs like `Mapping[str, Any]` you should annotate the
+        # receiving variable at the callsite instead.
+        try:
+            if not isinstance(obj, as_type):
+                # non-fatal warning to help catch mismatches early
+                print(f"Warning: loaded object is not an instance of {as_type}")
+        except TypeError:
+            # `as_type` may not be a valid runtime-checkable type (e.g., typing
+            # constructs). Ignore the check in that case.
+            pass
+    return cast(T, obj)
