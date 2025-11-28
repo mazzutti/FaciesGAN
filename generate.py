@@ -18,7 +18,7 @@ from sklearn.manifold import MDS
 from sklearn.metrics import euclidean_distances
 
 from config import OPT_FILE
-from facies_dataset import FaciesDataset
+from dataset import PyramidsDataset
 from log import format_time
 from models.facies_gan import FaciesGAN
 from utils import torch2np
@@ -195,14 +195,14 @@ if __name__ == "__main__":
     # if arguments.plot_mds:
     #     options.num_train_facies = len(options.wells)
 
-    dataset: FaciesDataset = FaciesDataset(options, ceiling=False)
+    dataset: PyramidsDataset = PyramidsDataset(options, ceiling=False)
     masked_facies: list[torch.Tensor] = []
     for i in range(len(dataset.facies_pyramid)):
         masked_facies.append(
             torch.stack(
                 [
                     mask * facie
-                    for mask, facie in zip(dataset.masks_pyramid[i], dataset.facies_pyramid[i])
+                    for mask, facie in zip(dataset.wells_pyramid[i], dataset.facies_pyramid[i])
                 ],
                 dim=0,
             )

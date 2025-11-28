@@ -8,7 +8,7 @@ import torch
 from numpy.typing import NDArray
 from torch import nn
 
-from protocols import TrainningOptions
+from options import TrainningOptions
 
 
 def facie_resize(facie: torch.Tensor, size: tuple[int, ...], ceiling: bool = False) -> torch.Tensor:

@@ -1,5 +1,6 @@
 import math
 
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -34,7 +35,7 @@ class Generator(nn.Module):
         self,
         z: list[torch.Tensor],
         amp: list[float],
-        in_facie: torch.Tensor = torch.empty(),
+        in_facie: torch.Tensor | None = None,
         start_scale: int = 0,
         stop_scale: int | None = None,
     ) -> torch.Tensor:
@@ -51,19 +52,23 @@ class Generator(nn.Module):
         Returns:
             torch.Tensor: Output facie tensor.
         """
-        if in_facie.numel() == 0:
+        if in_facie is None:
             channels = z[start_scale].shape[1] - 1
-            height, width = (dim - self.full_zero_padding for dim in z[start_scale].shape[2:])
-            in_facie = torch.zeros(
+            height, width = tuple(dim - self.full_zero_padding for dim in z[start_scale].shape[2:])
+            facie = torch.zeros(
                 (z[start_scale].shape[0], channels, height, width),
                 device=z[start_scale].device,
             )
+        else:
+            facie: torch.Tensor  = in_facie
 
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
 
+
         for index in range(start_scale, stop_scale + 1):
-            in_facie = facie_resize(
-                in_facie,
+            
+            facie = facie_resize(
+                facie,
                 (
                     z[index].shape[2] - self.full_zero_padding,
                     z[index].shape[3] - self.full_zero_padding,
@@ -73,10 +78,10 @@ class Generator(nn.Module):
             z_in = torch.zeros_like(z[index])
             z_in[:, 1, :, :] = z[index][:, 1, :, :]
             z_in[:, 0, :, :] = amp[index] * z[index][:, 0, :, :]
-            z_in = z_in + F.pad(in_facie, [self.zero_padding] * 4, value=0)
+            z_in = z_in + F.pad(facie, [self.zero_padding] * 4, value=0)
 
-            in_facie = self.gens[index](z_in) + in_facie
-        return in_facie
+            facie = self.gens[index](z_in) + facie
+        return facie
 
     def create_scale(self, num_feature: int, min_num_feature: int) -> None:
         """

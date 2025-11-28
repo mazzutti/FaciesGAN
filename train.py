@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import math
 import os
 import time
@@ -21,12 +23,12 @@ from config import (
     SCH_D_FILE,
     SCH_G_FILE,
 )
-from facies_dataset import FaciesDataset
+from dataset import PyramidsDataset
 from log import format_time
 from models.discriminator import Discriminator
 from models.facies_gan import FaciesGAN
 from ops import create_dirs, facie_resize, generate_noise, load
-from protocols import TrainningOptions
+from options import TrainningOptions
 from utils import plot_generated_facies
 
 
@@ -36,14 +38,14 @@ class Trainer:
         device: torch.device,
         options: TrainningOptions,
         fine_tuning: bool = False,
-        checkpoint_path: str | None = None,
-    ):
+        checkpoint_path: str = ".checkpoints/",
+    ) -> None:
         self.device: torch.device = device
 
         # Training parameters
         self.start_scale: int = options.start_scale
         self.stop_scale: int = options.stop_scale
-        self.out_path: str = options.out_path
+        self.output_path: str = options.output_path
         self.num_iter: int = options.num_iter
         self.save_interval: int = options.save_interval
         self.batch_size: int = (
@@ -53,15 +55,16 @@ class Trainer:
         )
         self.batch_size: int = (
             self.batch_size
-            if not (len(options.wells) > 0 and options.batch_size < len(options.wells))
+            if not (len(options.wells) > 0 
+                    and options.batch_size < len(options.wells))
             else len(options.wells)
         )
         self.fine_tuning: bool = fine_tuning
-        self.checkpoint_path: str | None = checkpoint_path
+        self.checkpoint_path: str = checkpoint_path
 
         self.num_real_facies: int = options.num_real_facies
         self.num_generated_per_real: int = options.num_generated_per_real
-        self.wells = options.wells
+        self.wells: tuple[int, ...]= options.wells
 
         # Optimizer configuration
         self.lr_g: float = options.lr_g
@@ -78,20 +81,21 @@ class Trainer:
         self.masks: list[torch.Tensor] = []
         self.masked_facies: list[torch.Tensor] = []
 
-        dataset: FaciesDataset = FaciesDataset(options)
+        dataset: PyramidsDataset = PyramidsDataset(options)
         self.scales_list: list[tuple[int, ...]] = dataset.scales_list
 
         if len(options.wells) > 0:
             for i in range(len(self.scales_list)):
-                dataset.facies_pyramid[i] = dataset.facies_pyramid[i][list(options.wells)]
-                dataset.masks_pyramid[i] = dataset.masks_pyramid[i][list(options.wells)]
+                dataset.facies_pyramid[i] = dataset.facies_pyramid[i][options.wells]
+                dataset.wells_pyramid[i] = dataset.wells_pyramid[i][options.wells]
         elif options.num_train_facies < len(dataset):
             idxs = torch.randperm(len(dataset))[: options.num_train_facies]
             for i in range(len(self.scales_list)):
                 dataset.facies_pyramid[i] = dataset.facies_pyramid[i][idxs]
-                dataset.masks_pyramid[i] = dataset.masks_pyramid[i][idxs]
+                dataset.wells_pyramid[i] = dataset.wells_pyramid[i][idxs]
 
-        self.data_loader = DataLoader(dataset, batch_size=options.batch_size, shuffle=False)
+        self.data_loader = DataLoader(
+            dataset, batch_size=options.batch_size, shuffle=False)
 
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
@@ -126,7 +130,7 @@ class Trainer:
             self.model.cur_scale = scale
             scale_start_time = time.time()
 
-            scale_path = os.path.join(self.out_path, str(scale))
+            scale_path = os.path.join(self.output_path, str(scale))
             results_path = os.path.join(scale_path, RESULT_FACIES_PATH)
 
             create_dirs(scale_path)
@@ -211,7 +215,7 @@ class Trainer:
 
         _, prev_rec = self.__initialize_noise(scale, masked_facie, real, mask_indexes)
 
-        epochs = tqdm(range(1, self.num_iter + 1))
+        epochs: 'tqdm[int]' = tqdm(range(1, self.num_iter + 1))
 
         for epoch in epochs:
 
@@ -397,7 +401,7 @@ class Trainer:
 
     def __log_epoch(
         self,
-        epochs: tqdm[int],
+        epochs: 'tqdm[int]',
         writer: SummaryWriter,
         epoch: int,
         scale: int,

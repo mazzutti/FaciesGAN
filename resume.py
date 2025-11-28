@@ -4,26 +4,31 @@ import json
 import os
 import random
 from types import SimpleNamespace
+# from types import SimpleNamespace
 
 import torch
 
 from config import G_FILE, OPT_FILE, RESULT_FACIES_PATH
 from log import init_output_logging
 from train import Trainer
+from options import ResumeOptions
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fine_tuning", action="store_true", help="fine-tune the models")
     parser.add_argument(
-        "--checkpoint_path",
+        "--fine-tuning", action="store_true", help="fine-tune the models")
+    parser.add_argument(
+        "--checkpoint-path",
         type=str,
         help="checkpoint path to continue the training",
         required=True,
     )
-    parser.add_argument("--num_iter", type=int, help="number of epochs for fine-tuning")
-    parser.add_argument("--start_scale", type=int, default=0, help="start scale for fine-tuning")
+    parser.add_argument(
+        "--num-iter", type=int, help="number of epochs for fine-tuning")
+    parser.add_argument(
+        "--start-scale", type=int, default=0, help="start scale for fine-tuning")
 
-    arguments = parser.parse_args()
+    arguments = parser.parse_args(namespace=ResumeOptions())
 
     if arguments.fine_tuning and arguments.num_iter is None:
         raise ValueError("Number of iterations required for fine-tuning.")

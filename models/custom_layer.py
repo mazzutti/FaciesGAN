@@ -9,7 +9,7 @@ class ConvBlock(nn.Sequential):
         kernel_size: int,
         padding: int,
         stride: int,
-    ):
+    ) -> None:
         """
         A convolutional block that includes a Conv2D layer, BatchNorm2D, and LeakyReLU activation.
         """
