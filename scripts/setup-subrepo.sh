@@ -127,8 +127,11 @@ import_all(){
   popd >/dev/null
 
   # Create bundle files for each split branch so we can fetch without contacting network
-  bundle_dataset=$(mktemp /tmp/dataset-XXXX.bundle)
-  bundle_xz=$(mktemp /tmp/xz-XXXX.bundle)
+  # Create portable temporary bundle files. Use 6 Xs for mktemp template
+  # which is widely supported; if that fails (some macOS versions),
+  # fall back to `mktemp -t` which returns a safe temp path.
+  bundle_dataset=$(mktemp /tmp/dataset-XXXXXX.bundle 2>/dev/null || mktemp -t dataset)
+  bundle_xz=$(mktemp /tmp/xz-XXXXXX.bundle 2>/dev/null || mktemp -t xz)
   git -C "$tmpdir" bundle create "$bundle_dataset" "$split_branch_dataset" || true
   git -C "$tmpdir" bundle create "$bundle_xz" "$split_branch_xz" || true
 
