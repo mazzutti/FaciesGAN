@@ -9,9 +9,3 @@ logs/**
 output/generated
 **/events.out.tfevents*
 
-
-# Ignore data contents but keep the folder placeholder
-# Keep `data/.gitkeep` tracked if present
-/data/*
-!/data/.gitkeep
-
