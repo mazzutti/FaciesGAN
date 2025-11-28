@@ -78,11 +78,12 @@ import_subdir_via_subtree(){
   git subtree split -P "$remote_subdir" -b "$split_branch" || true
   popd >/dev/null
 
-  # Add a temporary remote pointing to the local clone, fetch and add subtree
-  # Remove any leftover remote from a previous run to avoid 'remote already exists' errors
-  git remote remove tmp-subrepo 2>/dev/null || true
-  git remote add tmp-subrepo "$tmpdir" || true
-  git fetch tmp-subrepo || true
+  # Create a bundle from the temporary clone for the split branch and
+  # import via the bundle to avoid using a local remote path. This is
+  # more robust on systems where git may attempt to chdir into the
+  # temporary path (which can race if the path is removed).
+  bundle=$(mktemp /tmp/subtree-XXXX.bundle)
+  git -C "$tmpdir" bundle create "$bundle" "$split_branch" || true
 
   echo "Adding subtree at prefix $prefix"
   # Back up any existing target
@@ -93,9 +94,9 @@ import_subdir_via_subtree(){
   fi
 
   # Use --squash to keep history compact. Remove --squash if you want full history.
-  git subtree add --prefix="$prefix" tmp-subrepo "$split_branch" --squash || true
+  git subtree add --prefix="$prefix" "$bundle" "$split_branch" --squash || true
 
-  git remote remove tmp-subrepo || true
+  rm -f "$bundle"
   rm -rf "$tmpdir"
   echo "Imported $remote_subdir -> $prefix"
 }
