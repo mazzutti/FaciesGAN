@@ -1,12 +1,13 @@
 import math
 
 
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from models.custom_layer import ConvBlock
-from ops import facie_resize
+from ops import interpolate
 
 
 class Generator(nn.Module):
@@ -35,7 +36,7 @@ class Generator(nn.Module):
         self,
         z: list[torch.Tensor],
         amp: list[float],
-        in_facie: torch.Tensor | None = None,
+        in_noise: torch.Tensor | None = None,
         start_scale: int = 0,
         stop_scale: int | None = None,
     ) -> torch.Tensor:
@@ -52,7 +53,7 @@ class Generator(nn.Module):
         Returns:
             torch.Tensor: Output facie tensor.
         """
-        if in_facie is None:
+        if in_noise is None:
             channels = z[start_scale].shape[1] - 1
             height, width = tuple(dim - self.full_zero_padding for dim in z[start_scale].shape[2:])
             facie = torch.zeros(
@@ -60,14 +61,14 @@ class Generator(nn.Module):
                 device=z[start_scale].device,
             )
         else:
-            facie: torch.Tensor  = in_facie
+            facie: torch.Tensor  = in_noise
 
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
 
 
         for index in range(start_scale, stop_scale + 1):
             
-            facie = facie_resize(
+            facie = interpolate(
                 facie,
                 (
                     z[index].shape[2] - self.full_zero_padding,

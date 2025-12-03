@@ -27,7 +27,7 @@ from dataset import PyramidsDataset
 from log import format_time
 from models.discriminator import Discriminator
 from models.facies_gan import FaciesGAN
-from ops import create_dirs, facie_resize, generate_noise, load
+from ops import create_dirs,  generate_noise, interpolate, load
 from options import TrainningOptions
 from utils import plot_generated_facies
 
@@ -82,16 +82,16 @@ class Trainer:
         self.masked_facies: list[torch.Tensor] = []
 
         dataset: PyramidsDataset = PyramidsDataset(options)
-        self.scales_list: list[tuple[int, ...]] = dataset.scales_list
+        self.scales_list: tuple[tuple[int, ...], ...] = dataset.scales_list # type: ignore
 
         if len(options.wells) > 0:
             for i in range(len(self.scales_list)):
-                dataset.facies_pyramid[i] = dataset.facies_pyramid[i][options.wells]
+                dataset.facies_pyramids[i] = dataset.facies_pyramids[i][options.wells]
                 dataset.wells_pyramid[i] = dataset.wells_pyramid[i][options.wells]
         elif options.num_train_facies < len(dataset):
             idxs = torch.randperm(len(dataset))[: options.num_train_facies]
             for i in range(len(self.scales_list)):
-                dataset.facies_pyramid[i] = dataset.facies_pyramid[i][idxs]
+                dataset.facies_pyramids[i] = dataset.facies_pyramids[i][idxs]
                 dataset.wells_pyramid[i] = dataset.wells_pyramid[i][idxs]
 
         self.data_loader = DataLoader(
@@ -100,7 +100,7 @@ class Trainer:
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
         self.model: FaciesGAN = FaciesGAN(device, options, self.masked_facies)
-        self.model.shapes = self.scales_list
+        self.model.shapes = list(self.scales_list)
 
         print("Generated facie shapes:")
         print("╔══════════╦══════════╦══════════╦══════════╗")
@@ -387,7 +387,7 @@ class Trainer:
                     self.model.noise_amp,
                     stop_scale=len(self.model.generator.gens) - 2,
                 )
-                prev_rec = facie_resize(prev_rec, (real.shape[-2], real.shape[-1]))
+                prev_rec = interpolate(prev_rec, (real.shape[-2], real.shape[-1]))
 
             rec_loss = nn.MSELoss()(real, prev_rec)
             RMSE = torch.sqrt(rec_loss).detach().item()
