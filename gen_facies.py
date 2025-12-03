@@ -27,17 +27,28 @@ from utils import torch2np
 def generate_facies(
     model: FaciesGAN, how_many: int, model_path: str, options: SimpleNamespace
 ) -> tuple[list[np.ndarray], list[int]]:
-    """
-    Generate facies using the FaciesGAN model.
+    """Generate facies realizations using trained FaciesGAN model.
 
-    Args:
-        model (FaciesGAN): The FaciesGAN model instance.
-        how_many (int): Number of facies to generate.
-        model_path (str): Path to the model.
-        options (SimpleNamespace): Options for the model.
+    Loads model weights, generates noise with well conditioning, and produces
+    synthetic facies images.
 
-    Returns:
-        tuple[list[np.ndarray], list[int]]: A tuple with generated facies (numpy arrays) and mask indexes.
+    Parameters
+    ----------
+    model : FaciesGAN
+        FaciesGAN model instance.
+    how_many : int
+        Number of facies realizations to generate.
+    model_path : str
+        Path to directory containing trained model checkpoints.
+    options : SimpleNamespace
+        Generation options including wells, rec flag, etc.
+
+    Returns
+    -------
+    tuple[list[np.ndarray], list[int]]
+        Tuple of (generated_facies, mask_indexes) where generated_facies is
+        a list of NumPy arrays and mask_indexes are the well conditioning
+        indices used.
     """
     model.load(model_path, load_discriminator=False, load_masked_facies=False)
     model.generator.eval()

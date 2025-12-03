@@ -2,6 +2,24 @@ import torch.nn as nn
 
 
 class ConvBlock(nn.Sequential):
+    """Convolutional block with Conv2D, BatchNorm, and LeakyReLU.
+
+    A standard building block for both generator and discriminator networks,
+    combining convolution, batch normalization, and activation.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    out_channels : int
+        Number of output channels.
+    kernel_size : int
+        Size of the convolutional kernel.
+    padding : int
+        Amount of padding to add.
+    stride : int
+        Stride of the convolution.
+    """
     def __init__(
         self,
         in_channels: int,
@@ -10,9 +28,6 @@ class ConvBlock(nn.Sequential):
         padding: int,
         stride: int,
     ) -> None:
-        """
-        A convolutional block that includes a Conv2D layer, BatchNorm2D, and LeakyReLU activation.
-        """
         super(ConvBlock, self).__init__()
 
         self.add_module(

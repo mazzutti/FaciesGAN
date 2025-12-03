@@ -16,6 +16,42 @@ from models.generator import Generator
 
 
 class FaciesGAN:
+    """Complete FaciesGAN model managing generator, discriminator, and training.
+
+    Coordinates multi-scale progressive GAN training for geological facies
+    generation with well conditioning. Manages noise generation, optimization
+    steps, and model persistence.
+
+    Parameters
+    ----------
+    device : torch.device
+        Device for model computation (CPU, CUDA, or MPS).
+    options : argparse.Namespace | SimpleNamespace
+        Configuration containing all hyperparameters.
+    masked_facies : Sequence[torch.Tensor], optional
+        Well-conditioned facies data for training. Defaults to empty tuple.
+    *args : tuple[Any, ...]
+        Additional positional arguments.
+    **kwargs : dict[str, Any]
+        Additional keyword arguments.
+
+    Attributes
+    ----------
+    generator : Generator
+        Multi-scale progressive generator network.
+    discriminator : Discriminator | None
+        Discriminator network (None until initialized for first scale).
+    rec_noise : list[torch.Tensor]
+        Reconstruction noise tensors for each scale.
+    noise_amp : list[float]
+        Noise amplitudes for each scale.
+    masked_facies : list[torch.Tensor]
+        Well-conditioned facies data.
+    shapes : list[tuple[int, ...]]
+        Pyramid resolutions for each scale.
+    cur_scale : int
+        Current training scale index.
+    """
     def __init__(
         self,
         device: torch.device,
@@ -24,14 +60,6 @@ class FaciesGAN:
         *args: tuple[Any, ...],
         **kwargs: dict[str, Any],
     ) -> None:
-        """
-        Initialize the FaciesGAN class.
-
-        Args:
-            device (torch.device): The device to run the model on (CPU or GPU).
-            options (argparse.Namespace): The options containing hyperparameters and configurations.
-            masked_facies (torch.Tensor, optional): The masked facies tensor. Defaults to None.
-        """
         super().__init__(*args, **kwargs)
         self.device = device
 
@@ -72,11 +100,15 @@ class FaciesGAN:
         self.discriminator = None
 
     def init_scale_generator(self, scale: int) -> None:
-        """
-        Initialize the generator for a given scale.
+        """Initialize generator for a new pyramid scale.
 
-        Args:
-            scale (int): The current scale index.
+        Creates a new scale block with appropriate feature counts, initializes
+        or copies weights, and freezes previous scale generators.
+
+        Parameters
+        ----------
+        scale : int
+            Pyramid scale index to initialize.
         """
         num_feature, min_num_feature = self.get_num_features(scale)
 
@@ -94,11 +126,16 @@ class FaciesGAN:
             self.generator.gens[-2].eval()
 
     def init_scale_discriminator(self, scale: int) -> None:
-        """
-        Initialize the discriminator for a given scale.
+        """Initialize discriminator for a new pyramid scale.
 
-        Args:
-            scale (int): The current scale index.
+        Creates a new discriminator with appropriate feature counts when
+        features are doubled (every 4 scales). Otherwise, reuses existing
+        discriminator.
+
+        Parameters
+        ----------
+        scale : int
+            Pyramid scale index to initialize.
         """
         num_feature, min_num_feature = self.get_num_features(scale)
 
@@ -116,14 +153,19 @@ class FaciesGAN:
             self.discriminator.apply(ops.weights_init)
 
     def get_num_features(self, scale: int) -> tuple[int, int]:
-        """
-        Calculate the number of features for the generator and discriminator at a given scale.
+        """Calculate feature counts for networks at a given scale.
 
-        Args:
-            scale (int): The current scale index.
+        Features double every 4 scales up to a maximum of 128.
 
-        Returns:
-            tuple[int, int]: A tuple containing the number of features and the minimum number of features.
+        Parameters
+        ----------
+        scale : int
+            Pyramid scale index.
+
+        Returns
+        -------
+        tuple[int, int]
+            (num_features, min_num_features) for the scale.
         """
         num_feature = min(self.num_feature * pow(2, math.floor(scale / 4)), 128)
         min_num_feature = min(self.min_num_feature * pow(2, math.floor(scale / 4)), 128)
@@ -133,16 +175,25 @@ class FaciesGAN:
     def get_noise(
         self, mask_indexes: list[int], rec: bool = False, last: bool = False
     ) -> list[torch.Tensor]:
-        """
-        Generate noise for the GAN at different scales.
+        """Generate noise tensors for all pyramid scales.
 
-        Args:
-            mask_indexes (list[int]): Indexes of the masks.
-            rec (bool): If True, return the reconstruction noise.
-            last (bool): If True, return only the last scale noise.
+        Creates random noise combined with well-conditioned facies data for
+        generator input. Can return reconstruction noise or only last scale.
 
-        Returns:
-            list[torch.Tensor]: Generated noise (one tensor per scale).
+        Parameters
+        ----------
+        mask_indexes : list[int]
+            Indices specifying which well conditioning to use.
+        rec : bool, optional
+            If True, return stored reconstruction noise. Defaults to False.
+        last : bool, optional
+            If True, return only the last (finest) scale noise. Defaults to False.
+
+        Returns
+        -------
+        list[torch.Tensor]
+            List of noise tensors, one per pyramid scale (or just last scale
+            if last=True).
         """
 
         def generate_noise(index: int) -> torch.Tensor:

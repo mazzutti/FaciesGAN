@@ -33,6 +33,48 @@ from utils import plot_generated_facies
 
 
 class Trainer:
+    """Trainer for multi-scale progressive FaciesGAN training.
+
+    Manages the complete training pipeline including dataset loading, model
+    initialization, progressive scale training, and checkpoint saving. Supports
+    both fresh training and fine-tuning from checkpoints.
+
+    Parameters
+    ----------
+    device : torch.device
+        Device for training (CPU, CUDA, or MPS).
+    options : TrainningOptions
+        Training configuration containing hyperparameters and paths.
+    fine_tuning : bool, optional
+        Whether to load and fine-tune from existing checkpoints. Defaults to False.
+    checkpoint_path : str, optional
+        Path to load checkpoints from when fine-tuning. Defaults to ".checkpoints/".
+
+    Attributes
+    ----------
+    device : torch.device
+        Training device.
+    start_scale : int
+        Starting pyramid scale index.
+    stop_scale : int
+        Final pyramid scale index.
+    batch_size : int
+        Effective batch size for training.
+    model : FaciesGAN
+        The FaciesGAN model instance.
+    scales_list : tuple[tuple[int, ...], ...]
+        Pyramid resolutions for each scale.
+    data_loader : DataLoader
+        PyTorch DataLoader for training data.
+    facies : list[torch.Tensor]
+        Current batch of facies data at all scales.
+    wells : list[torch.Tensor]
+        Current batch of well data at all scales.
+    seismic : list[torch.Tensor]
+        Current batch of seismic data at all scales.
+    stacked_data : list[torch.Tensor]
+        Element-wise product of wells and facies for conditioning.
+    """
     def __init__(
         self,
         device: torch.device,
@@ -116,16 +158,12 @@ class Trainer:
         print("╚══════════╩══════════╩══════════╩══════════╝")
 
     def train(self) -> None:
-        """
-        Train the model across multiple scales.
+        """Train the FaciesGAN model across all pyramid scales.
 
-        This method initializes the generator and discriminator for each scale,
-        loads the model if fine-tuning, and iterates over the data loader to train
-        the model at each scale. It also logs the training time for each scale and
-        the total training time.
-
-        Returns:
-            None
+        Performs progressive training from coarse to fine scales. For each scale,
+        initializes generator and discriminator, optionally loads checkpoint if
+        fine-tuning, then trains using the data loader. Logs training time for
+        each scale and total training time.
         """
         start_train_time = time.time()
 
@@ -175,15 +213,24 @@ class Trainer:
         results_path: str,
         batch_id: int,
     ) -> None:
-        """
-        Train the model at a specific scale.
+        """Train the model at a specific pyramid scale.
 
-        Args:
-            scale (int): The current scale index.
-            writer (SummaryWriter): TensorBoard writer for logging.
-            scale_path (str): Path to save the scale-specific models and optimizers.
-            results_path (str): Path to save the generated facies.
-            batch_id (int): The current batch index.
+        Initializes optimizers and schedulers, then iterates through training
+        epochs alternating between discriminator and generator updates. Saves
+        generated facies visualizations at regular intervals.
+
+        Parameters
+        ----------
+        scale : int
+            Current pyramid scale index.
+        writer : SummaryWriter
+            TensorBoard writer for logging metrics.
+        scale_path : str
+            Directory to save scale-specific checkpoints and optimizers.
+        results_path : str
+            Directory to save generated facies visualizations.
+        batch_id : int
+            Current batch index within the epoch.
         """
         mask_indexes = list(range(self.batch_size))
 
@@ -273,21 +320,30 @@ class Trainer:
         )
 
     def load(self, path: str, until_scale: int | None = None) -> None:
-        """
-        Load the models and update the start scale for training.
+        """Load saved models and set the starting scale for training.
 
-        Args:
-            path (str): The path to the model files.
-            until_scale (int, optional): The scale until which to load the models. Defaults to None.
+        Parameters
+        ----------
+        path : str
+            Path to the directory containing model checkpoint files.
+        until_scale : int | None, optional
+            Load models up to and including this scale. If None, loads all
+            available scales. Defaults to None.
         """
         self.start_scale = self.model.load(path, load_shapes=False, until_scale=until_scale)
 
     def __load_model(self, scale: int) -> None:
-        """
-        Load the generator and discriminator models for a given scale.
+        """Load generator and discriminator state dicts for a specific scale.
 
-        Args:
-            scale (int): The scale index to load the models for.
+        Parameters
+        ----------
+        scale : int
+            Scale index to load models for.
+
+        Raises
+        ------
+        Exception
+            If model files cannot be loaded from checkpoint path.
         """
         try:
             generator_path = os.path.join(str(self.checkpoint_path), str(scale), G_FILE)
@@ -313,16 +369,27 @@ class Trainer:
         generator_scheduler: optim.lr_scheduler.LRScheduler,
         discriminator_scheduler: optim.lr_scheduler.LRScheduler,
     ) -> None:
-        """
-        Load the state dictionaries for the optimizers and schedulers.
+        """Load optimizer and scheduler state dictionaries from checkpoint.
 
-        Args:
-            scale (int): The current scale index.
-            scale_path (str): Path to the scale-specific models and optimizers.
-            generator_optimizer (optim.Optimizer): Optimizer for the generator.
-            discriminator_optimizer (optim.Optimizer): Optimizer for the discriminator.
-            generator_scheduler (optim.lr_scheduler.LRScheduler): Scheduler for the generator optimizer.
-            discriminator_scheduler (optim.lr_scheduler.LRScheduler): Scheduler for the discriminator optimizer.
+        Parameters
+        ----------
+        scale : int
+            Current scale index (used for error reporting).
+        scale_path : str
+            Directory containing optimizer and scheduler checkpoints.
+        generator_optimizer : optim.Optimizer
+            Generator optimizer to load state into.
+        discriminator_optimizer : optim.Optimizer
+            Discriminator optimizer to load state into.
+        generator_scheduler : optim.lr_scheduler.LRScheduler
+            Generator learning rate scheduler to load state into.
+        discriminator_scheduler : optim.lr_scheduler.LRScheduler
+            Discriminator learning rate scheduler to load state into.
+
+        Raises
+        ------
+        Exception
+            If optimizer/scheduler files cannot be loaded.
         """
         try:
             generator_optimizer.load_state_dict(
@@ -348,18 +415,28 @@ class Trainer:
         real: torch.Tensor,
         mask_indexes: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """
-        Initialize the noise for the given scale.
+        """Initialize noise tensors and compute noise amplitude for the current scale.
 
-        Args:
-            scale (int): The current scale index.
-            masked_facie (torch.Tensor): The masked facie tensor.
-            real (torch.Tensor): The real facie tensor.
-            mask_indexes (List[int]): The list of masked_facie indexes.
+        For scale 0, initializes reconstruction noise with amplitude 1.0.
+        For subsequent scales, computes reconstruction from previous scales and
+        calculates amplitude based on RMSE between real and reconstructed images.
 
-        Returns:
-            Tuple[torch.Tensor, Optional[torch.Tensor]]: The initialized noise tensor and the previous
-            reconstruction tensor.
+        Parameters
+        ----------
+        scale : int
+            Current pyramid scale index.
+        masked_facie : torch.Tensor
+            Well-conditioned facies data for this scale.
+        real : torch.Tensor
+            Real facies images at this scale.
+        mask_indexes : list[int]
+            Indices of masked samples in the batch.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor | None]
+            Tuple of (z_rec, prev_rec) where z_rec is the initialized noise tensor
+            and prev_rec is the reconstruction from previous scales (None for scale 0).
         """
 
         def update_rec_noise(rec: torch.Tensor) -> None:
@@ -421,22 +498,37 @@ class Trainer:
         generator_loss_fake: float,
         generator_loss_rec: float,
     ) -> None:
-        """
-        Log the losses for the current epoch.
+        """Log training metrics for the current epoch to TensorBoard and console.
 
-        Args:
-            epochs (tqdm): The tqdm progress bar for epochs.
-            writer (SummaryWriter): TensorBoard writer for logging.
-            epoch (int): The current epoch number.
-            scale (int): The current scale index.
-            batch_id (int): The current batch index.
-            generator_loss (float): The total generator loss.
-            discriminator_loss (float): The total discriminator loss.
-            discriminator_loss_real (float): The discriminator loss for real samples.
-            discriminator_loss_fake (float): The discriminator loss for fake samples.
-            discriminator_loss_gp (float): The gradient penalty loss for the discriminator.
-            generator_loss_fake (float): The generator loss for fake samples.
-            generator_loss_rec (float): The reconstruction loss for the generator.
+        Updates the progress bar description and writes all loss components
+        to TensorBoard for visualization.
+
+        Parameters
+        ----------
+        epochs : tqdm[int]
+            Progress bar for epoch iteration.
+        writer : SummaryWriter
+            TensorBoard writer for logging metrics.
+        epoch : int
+            Current epoch number.
+        scale : int
+            Current pyramid scale index.
+        batch_id : int
+            Current batch index.
+        generator_loss : float
+            Total generator loss.
+        discriminator_loss : float
+            Total discriminator loss.
+        discriminator_loss_real : float
+            Discriminator loss on real samples.
+        discriminator_loss_fake : float
+            Discriminator loss on generated samples.
+        discriminator_loss_gp : float
+            Gradient penalty loss component.
+        generator_loss_fake : float
+            Generator adversarial loss component.
+        generator_loss_rec : float
+            Generator reconstruction loss component.
         """
         epochs.set_description(
             "Stage [{}/{}] | Batch [{}/{}] | Loss [G: {:2.3f}| D: {:2.3f}] Epoch".format(
@@ -505,15 +597,20 @@ class Trainer:
         generator_scheduler: optim.lr_scheduler.LRScheduler,
         discriminator_scheduler: optim.lr_scheduler.LRScheduler,
     ) -> None:
-        """
-        Save the state dictionaries for the optimizers and schedulers.
+        """Save optimizer and scheduler state dictionaries to disk.
 
-        Args:
-            scale_path (str): Path to save the scale-specific models and optimizers.
-            generator_optimizer (optim.Optimizer): Optimizer for the generator.
-            discriminator_optimizer (optim.Optimizer): Optimizer for the discriminator.
-            generator_scheduler (optim.lr_scheduler._LRScheduler): Scheduler for the generator optimizer.
-            discriminator_scheduler (optim.lr_scheduler._LRScheduler): Scheduler for the discriminator optimizer.
+        Parameters
+        ----------
+        scale_path : str
+            Directory to save checkpoint files.
+        generator_optimizer : optim.Optimizer
+            Generator optimizer to save.
+        discriminator_optimizer : optim.Optimizer
+            Discriminator optimizer to save.
+        generator_scheduler : optim.lr_scheduler.LRScheduler
+            Generator learning rate scheduler to save.
+        discriminator_scheduler : optim.lr_scheduler.LRScheduler
+            Discriminator learning rate scheduler to save.
         """
         torch.save(generator_optimizer.state_dict(), str(os.path.join(scale_path, OPT_G_FILE)))
         torch.save(

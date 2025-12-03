@@ -5,16 +5,25 @@ from models.custom_layer import ConvBlock
 
 
 class Discriminator(nn.Module):
-    """
-    A class representing the Discriminator models.
+    """Multi-layer discriminator for FaciesGAN using WGAN-GP.
 
-    Args:
-        num_features (int): The number of features for the convolutional layers.
-        min_num_features (int): The minimum number of features for the convolutional layers.
-        num_layer (int): The number of layers in the discriminator.
-        kernel_size (int): The size of the convolutional kernel.
-        padding_size (int): The size of the padding.
-        img_num_channel (int): The number of facie channels.
+    Distinguishes between real and generated facies images using a series
+    of convolutional blocks with progressively decreasing channel counts.
+
+    Parameters
+    ----------
+    num_features : int
+        Number of features in the first convolutional layer.
+    min_num_features : int
+        Minimum number of features (floor for channel reduction).
+    num_layer : int
+        Number of convolutional layers in the discriminator.
+    kernel_size : int
+        Size of convolutional kernels.
+    padding_size : int
+        Padding size for convolutions.
+    img_num_channel : int
+        Number of input facies channels.
     """
 
     def __init__(
@@ -50,14 +59,17 @@ class Discriminator(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass of the Discriminator.
+        """Discriminate input facies images.
 
-        Args:
-            x (torch.Tensor): Input tensor.
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor containing facies images.
 
-        Returns:
-            torch.Tensor: Output tensor after passing through the network.
+        Returns
+        -------
+        torch.Tensor
+            Discrimination scores (higher for more realistic images).
         """
         x = self.head(x)
         x = self.body(x)

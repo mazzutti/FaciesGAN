@@ -11,14 +11,31 @@ from ops import interpolate
 
 
 class Generator(nn.Module):
-    """
-    A class representing the Generator models.
+    """Multi-scale progressive generator for FaciesGAN.
 
-    Args:
-        num_layer (int): Number of layers in the generator.
-        kernel_size (int): Size of the convolutional kernel.
-        padding_size (int): Size of the padding.
-        img_num_channel (int): Number of facie channels.
+    Generates facies images through a progressive pyramid architecture,
+    where each scale has its own convolutional block. Images are generated
+    from coarse to fine resolution by upsampling and adding noise at each scale.
+
+    Parameters
+    ----------
+    num_layer : int
+        Number of convolutional layers in each scale block.
+    kernel_size : int
+        Size of convolutional kernels.
+    padding_size : int
+        Padding size for convolutions.
+    img_num_channel : int
+        Number of input channels (facies channels + noise channel).
+
+    Attributes
+    ----------
+    gens : nn.ModuleList
+        List of generator modules, one per pyramid scale.
+    zero_padding : int
+        Total padding added per layer.
+    full_zero_padding : int
+        Total padding for both sides (2 * zero_padding).
     """
 
     def __init__(self, num_layer: int, kernel_size: int, padding_size: int, img_num_channel: int):
@@ -40,18 +57,27 @@ class Generator(nn.Module):
         start_scale: int = 0,
         stop_scale: int | None = None,
     ) -> torch.Tensor:
-        """
-        Forward pass for the generator.
+        """Generate facies through progressive pyramid synthesis.
 
-        Args:
-            z (list[torch.Tensor]): List of noise tensors for each scale.
-            amp (list[float]): List of amplitude values for each scale.
-            in_facie (torch.Tensor, optional): Input facie tensor. Defaults to None.
-            start_scale (int, optional): Starting scale index. Defaults to 0.
-            stop_scale (int, optional): Stopping scale index. Defaults to None.
+        Parameters
+        ----------
+        z : list[torch.Tensor]
+            Noise tensors for each pyramid scale.
+        amp : list[float]
+            Noise amplitudes for each scale.
+        in_noise : torch.Tensor | None, optional
+            Initial facies tensor to start from. If None, starts with zeros.
+            Defaults to None.
+        start_scale : int, optional
+            Pyramid scale to start generation from. Defaults to 0.
+        stop_scale : int | None, optional
+            Final pyramid scale (inclusive). If None, uses all available scales.
+            Defaults to None.
 
-        Returns:
-            torch.Tensor: Output facie tensor.
+        Returns
+        -------
+        torch.Tensor
+            Generated facies tensor at the finest requested scale.
         """
         if in_noise is None:
             channels = z[start_scale].shape[1] - 1
@@ -85,12 +111,17 @@ class Generator(nn.Module):
         return facie
 
     def create_scale(self, num_feature: int, min_num_feature: int) -> None:
-        """
-        Create a new scale for the generator.
+        """Create and append a new scale block to the generator pyramid.
 
-        Args:
-            num_feature (int): The number of features for the convolutional layers.
-            min_num_feature (int): The minimum number of features for the convolutional layers.
+        Constructs a ConvBlock sequence with progressively decreasing channel
+        counts from num_feature down to min_num_feature.
+
+        Parameters
+        ----------
+        num_feature : int
+            Number of features in the first convolutional layer.
+        min_num_feature : int
+            Minimum number of features (floor for channel reduction).
         """
         head = ConvBlock(self.img_num_channel, num_feature, self.kernel_size, self.padding_size, 1)
         body = nn.Sequential()
