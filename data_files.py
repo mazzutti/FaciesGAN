@@ -1,60 +1,66 @@
-"""Data file management for facies, seismic, and wells datasets."""
-
+import os
 from enum import Enum
 
 
 class DataFiles(Enum):
-    """Enumeration for different types of data files with their paths and patterns."""
+    """Constants for dataset filenames stored in the data directory."""
+
+    __IMAGE_FILE_PATTERN__ = "*.png"
+    __MODEL_FILE_PATTERN__ = "*.pt"
+    __MAPPING_FILE_PATTERN__ = "*.npz"
 
     FACIES = "facies"
+    WELLS = "wells"
     SEISMIC = "seismic"
-    WELLS = "well"
 
-    def as_data_path(self) -> str:
-        """Return the directory path for this data file type.
+    def __init__(self,  value: str, data_dir: str = "./data") -> None:
+        self.filename = value
+        self.data_dir = data_dir
+
+    def as_data_path(self, data_dir: str | None = None) -> str:
+        """Return the full filesystem path for this data file inside `data_dir`.
+
+        Parameters
+        ----------
+        data_dir : str
+            Directory where the dataset files are stored.
 
         Returns
         -------
         str
-            Path to the data directory (e.g., 'data/dataset/facies').
+            Full path to the file represented by this enum member.
         """
-        return f"data/dataset/{self.value}"
-
+        return os.path.join(data_dir or self.data_dir, self.filename)
+    
     @property
     def image_file_pattern(self) -> str:
-        """Return the glob pattern for image files of this type.
+        """Get the image file pattern for this data type.
 
         Returns
         -------
         str
-            Glob pattern for matching image files (e.g., '*.png').
+            File pattern for image files of this data type.
         """
-        match self:
-            case DataFiles.FACIES:
-                return "xz_crossline_*_highres.png"
-            case DataFiles.SEISMIC:
-                return "xz_crossline_*.png"
-            case DataFiles.WELLS:
-                return "xz_crossline_*_highres.png"
+        return self.__IMAGE_FILE_PATTERN__
 
     @property
     def model_file_pattern(self) -> str:
-        """Return the glob pattern for model checkpoint files of this type.
+        """Get the model file pattern for this data type.
 
         Returns
         -------
         str
-            Glob pattern for matching model files (e.g., '*.pt').
+            File pattern for model files of this data type.
         """
-        return "xz_crossline_*.pt"
+        return self.__MODEL_FILE_PATTERN__
 
     @property
     def mapping_file_pattern(self) -> str:
-        """Return the glob pattern for mapping files (wells only).
+        """Get the mapping file pattern for this data type.
 
         Returns
         -------
         str
-            Glob pattern for matching mapping files (e.g., '*.npz').
+            File pattern for mapping files of this data type.
         """
-        return "*.npz"
+        return self.__MAPPING_FILE_PATTERN__
