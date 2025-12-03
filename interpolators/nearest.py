@@ -39,21 +39,25 @@ class NearestInterpolator(BaseInterpolator):
         image_path: Path,
         resolutions: tuple[tuple[int, ...], ...],
     ) -> list[torch.Tensor]:
-        """Render images at specified resolutions using trace-wise nearest neighbor interpolation.
+        """Create multi-scale pyramid using trace-wise nearest neighbor interpolation.
+
+        First upsamples the input image to the highest resolution using trace-wise
+        interpolation, then creates downsampled versions at each requested resolution.
+        Trace-wise interpolation processes vertical columns independently, which is
+        beneficial for seismic and well log data.
 
         Parameters
         ----------
-        loader : CustomLoader
-            Data loader containing the original image and encoder
-        resolutions : list[tuple[int, int]]
-            List of (height, width) tuples for output resolutions
+        image_path : Path
+            Filesystem path to the input image file.
+        resolutions : tuple[tuple[int, ...], ...]
+            Tuple of (batch, channels, height, width) tuples for output resolutions.
 
         Returns
         -------
-        tuple[list[NDArray[np.float32]], NDArray[np.float32]]
-            (smooth_imgs, high_res_img) where:
-            - smooth_imgs: list of images at requested resolutions (float32, 0-1)
-            - high_res_img: upsampled high-resolution image (float32, 0-1)
+        list[torch.Tensor]
+            List of interpolated images as float32 tensors with values in [0, 1],
+            one tensor per resolution in the pyramid.
         """
         smooth_imgs: list[torch.Tensor] = []
         

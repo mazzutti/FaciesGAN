@@ -11,26 +11,42 @@ class Writable(Protocol):
 
 
 class OutputLogger(object):
-    def __init__(self, file: str | None = None, mode: str = "at", buffer: str | None = "") -> None:
-        """
-        Initialize the OutputLogger.
+    """Logger that captures stdout/stderr and optionally writes to a file.
 
-        Attributes:
-            file (Optional[str]): The log file name.
-            mode (Optional[str]): The mode in which to open the log file.
-            buffer (Optional[str]): The buffer to store log data before writing to the file.
+    Parameters
+    ----------
+    file : str | None, optional
+        Log file name. Defaults to None (no file logging initially).
+    mode : str, optional
+        File open mode. Defaults to "at" (append text).
+    buffer : str | None, optional
+        Buffer to store log data before file is set. Defaults to empty string.
+    """
+    def __init__(self, file: str | None = None, mode: str = "at", buffer: str | None = "") -> None:
+        """Initialize the OutputLogger.
+
+        Attributes
+        ----------
+        file : str | None
+            The log file name.
+        mode : str
+            The mode in which to open the log file.
+        buffer : str | None
+            The buffer to store log data before writing to the file.
         """
         self.file = file
         self.mode = mode
         self.buffer = buffer
 
     def set_log_file(self, filename: str, mode: str = "at") -> None:
-        """
-        Set the log file and write any buffered data to it.
+        """Set the log file and write any buffered data to it.
 
-        Args:
-            filename (str): The name of the log file.
-            mode (str): The mode in which to open the log file. Default is "at".
+        Parameters
+        ----------
+        filename : str
+            The name of the log file.
+        mode : str, optional
+            The mode in which to open the log file. Defaults to "at" (append text).
         """
         assert self.file is None
         self.file = filename
@@ -41,11 +57,14 @@ class OutputLogger(object):
                 self.buffer = None
 
     def write(self, data: str) -> None:
-        """
-        Write data to the log file and buffer.
+        """Write data to the log file and buffer.
 
-        Args:
-            data (str): The data to write.
+        Skips lines starting with \\r (typically from tqdm progress bars).
+
+        Parameters
+        ----------
+        data : str
+            The data to write.
         """
         # Do not save tqdm print
         if data.startswith("\r"):
@@ -57,33 +76,48 @@ class OutputLogger(object):
             self.buffer += data
 
     def flush(self) -> None:
-        """
-        Flush the log file.
-        """
+        """Flush the log file buffer to disk."""
         if self.file is not None:
             with open(self.file, self.mode) as f:
                 f.flush()
 
 
 class TeeOutputStream(object):
-    def __init__(self, child_streams: Sequence[Writable], auto_flush: bool = False) -> None:
-        """
-        Initialize the TeeOutputStream.
+    """Stream that writes to multiple child streams simultaneously.
 
-        Args:
-            child_streams (list): List of child streams to write to.
-            auto_flush (bool): Whether to automatically flush after each write. Default is False.
+    Similar to the Unix 'tee' command, duplicates output to multiple
+    destinations.
+
+    Parameters
+    ----------
+    child_streams : Sequence[Writable]
+        List of output streams to write to.
+    auto_flush : bool, optional
+        Whether to automatically flush after each write. Defaults to False.
+    """
+    def __init__(self, child_streams: Sequence[Writable], auto_flush: bool = False) -> None:
+        """Initialize the TeeOutputStream.
+
+        Attributes
+        ----------
+        child_streams : Sequence[Writable]
+            List of child streams to write to.
+        auto_flush : bool
+            Whether to automatically flush after each write.
+        buffer : str
+            Internal buffer (currently unused).
         """
         self.child_streams = child_streams
         self.auto_flush = auto_flush
         self.buffer = ""
 
     def write(self, data: str) -> None:
-        """
-        Write data to all child streams.
+        """Write data to all child streams.
 
-        Args:
-            data (str): The data to write.
+        Parameters
+        ----------
+        data : str
+            The data to write to each stream.
         """
         for stream in self.child_streams:
             stream.write(data)
@@ -91,9 +125,7 @@ class TeeOutputStream(object):
             self.flush()
 
     def flush(self) -> None:
-        """
-        Flush all child streams.
-        """
+        """Flush all child streams."""
         for stream in self.child_streams:
             stream.flush()
 
@@ -101,13 +133,17 @@ class TeeOutputStream(object):
 def init_output_logging(
     filename: str, mode: str = "at", output_logger: OutputLogger | None = None
 ) -> None:
-    """
-    Initialize output logging to a file.
+    """Initialize output logging to redirect stdout/stderr to a file.
 
-    Args:
-        filename (str): The name of the file to log output to.
-        mode (str): The mode in which to open the log file. Default is "at".
-        output_logger (OutputLogger, optional): An instance of OutputLogger. Default is None.
+    Parameters
+    ----------
+    filename : str
+        The name of the file to log output to.
+    mode : str, optional
+        The mode in which to open the log file. Defaults to "at" (append text).
+    output_logger : OutputLogger | None, optional
+        An existing OutputLogger instance to use. If None, creates a new one
+        and redirects sys.stdout and sys.stderr. Defaults to None.
     """
     if output_logger is None:
         output_logger = OutputLogger()
@@ -117,14 +153,21 @@ def init_output_logging(
 
 
 def format_time(seconds: int) -> str:
-    """
-    Formats a time duration given in seconds into a human-readable string.
+    """Format time duration in seconds to human-readable string.
 
-    Args:
-        seconds (int): The time duration in seconds.
+    Parameters
+    ----------
+    seconds : int
+        The time duration in seconds.
 
-    Returns:
-        str: The formatted time string.
+    Returns
+    -------
+    str
+        Formatted time string in the format:
+        - "Xs" for seconds < 60
+        - "Xm YYs" for seconds < 3600
+        - "Xh YYm ZZs" for seconds < 86400
+        - "Xd YYh ZZm" for seconds >= 86400
     """
     s = int(round(seconds))
     if s < 60:

@@ -15,6 +15,30 @@ logger = logging.getLogger(__name__)
 
 
 class ColorEncoder:
+    """Manage color palette and conversions between RGB and categorical labels.
+
+    This class extracts unique colors from input images to build a palette,
+    then provides methods to convert between RGB pixel values and categorical
+    label indices. Supports MPS/CUDA devices with proper float32 handling.
+
+    Parameters
+    ----------
+    img_array : NDArray[Any]
+        Input RGB image array of shape (H, W, 3) with pixel values.
+    device : torch.device
+        Device (CPU/CUDA/MPS) for tensor operations.
+
+    Attributes
+    ----------
+    palette : NDArray[np.float32]
+        Array of unique RGB colors found in the image, shape (N, 3).
+    num_classes : int
+        Number of unique facies classes (colors) detected.
+    device : torch.device
+        Device used for tensor operations.
+    palette_tensor : torch.Tensor
+        Palette as a float32 tensor on the specified device.
+    """
     def __init__(
         self, img_array: NDArray[Any], device: torch.device) -> None:
         # Ensure we work with float32 NumPy arrays to avoid creating
@@ -60,9 +84,27 @@ class ColorEncoder:
         return self.palette_tensor[label_tensor.long()]
 
     def get_class_weights(self, labels: torch.Tensor) -> torch.Tensor:
-        """
-        Automatically calculates inverse frequency weights.
-        Rare classes (thin beds) get higher weights.
+        """Calculate inverse frequency class weights for imbalanced datasets.
+
+        Computes weights inversely proportional to class frequencies, giving
+        higher weights to rare classes (thin beds) and lower weights to
+        common classes. Useful for weighted loss functions.
+
+        Parameters
+        ----------
+        labels : torch.Tensor
+            Tensor of class label indices.
+
+        Returns
+        -------
+        torch.Tensor
+            Float tensor of normalized class weights, one per class, on the
+            encoder's device. Weights are normalized to have mean 1.0.
+
+        Notes
+        -----
+        Weight formula: weight[i] = N / (num_classes * count[i])
+        where N is total number of samples and count[i] is frequency of class i.
         """
         # Work with torch tensors directly to avoid numpy type inference issues
         # Move labels to CPU and ensure integer dtype

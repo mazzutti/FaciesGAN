@@ -132,15 +132,23 @@ def as_wells_mapping(data_file: DataFiles) -> dict[str, tuple[int, int]]:
 
 
 def mask_resize(mask: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
-    """
-    Resize the input masked_facie tensor to the given size using bicubic interpolation and apply a threshold.
+    """Resize well mask tensor using bicubic interpolation with thresholding.
 
-    Args:
-        mask (torch.Tensor): The input masked_facie tensor.
-        size (tuple[int, ...]): The target size for the masked_facie.
+    This function resizes well location masks to match target pyramid scales.
+    It amplifies the mask values before interpolation, then applies thresholding
+    to preserve well locations at column positions.
 
-    Returns:
-        torch.Tensor: The resized masked_facie tensor with applied threshold.
+    Parameters
+    ----------
+    mask : torch.Tensor
+        Input well mask tensor of shape (B, C, H, W).
+    size : tuple[int, ...]
+        Target size (height, width) for the resized mask.
+
+    Returns
+    -------
+    torch.Tensor
+        Resized mask tensor with wells positioned at appropriate columns.
     """
     mask = (mask > 0).float() * 1000
     interpolated_mask = nn.functional.interpolate(
@@ -153,21 +161,28 @@ def mask_resize(mask: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
 
 
 def generate_scales(options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
-    """
-    Generate a list of shapes for different scales based on the given options.
+    """Generate multi-scale pyramid resolutions for progressive training.
 
-    Args:
-        options: An object containing the options for generating scales. It should have the following attributes:
-            - min_size (int): The minimum size for the scales.
-            - max_size (int): The maximum size for the scales.
-            - crop_size (int): The crop size for the scales.
-            - stop_scale (int): The number of scales to generate.
-            - batch_size (int): The batch size for each scale.
-            - facie_num_channels (int): The number of  channels.
+    Creates a tuple of shapes representing different scales from coarse to fine
+    resolution. Each scale is computed using exponential scaling between
+    min_size and max_size parameters.
 
-    Returns:
+    Parameters
+    ----------
+    options : TrainningOptions
+        Training configuration containing:
+        - min_size: Minimum (coarsest) resolution
+        - max_size: Maximum (finest) resolution
+        - crop_size: Crop size for training
+        - stop_scale: Number of pyramid scales
+        - batch_size: Batch size for each scale
+        - facie_num_channels: Number of input channels
 
-        list: A list of tuples representing the shapes for each scale.
+    Returns
+    -------
+    tuple[tuple[int, ...], ...]
+        Tuple of (batch_size, channels, height, width) tuples, one for each
+        pyramid scale, arranged from coarsest to finest resolution.
     """
     shapes: list[tuple[int, ...]] = []
     scale_factor = math.pow(
@@ -198,17 +213,16 @@ def generate_scales(options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
 
 
 def weights_init(m: nn.Module) -> None:
-    """
-    Initialize the weights of the given module.
+    """Initialize neural network layer weights using normal distributions.
 
-    Args:
-        m (torch.nn.Module): The module to initialize.
+    Applies standard weight initialization strategies for convolutional and
+    normalization layers. Conv2d layers use N(0, 0.02), while BatchNorm2d
+    and InstanceNorm2d use N(1, 0.02) for weights and zero for biases.
 
-
-    If the module is a Conv2d layer, its weights are initialized with a normal distribution
-    with mean 0.0 and standard deviation 0.02. If the module is a BatchNorm2d or InstanceNorm2d
-    layer, its weights are initialized with a normal distribution with mean 1.0 and standard deviation 0.02,
-    and its biases are initialized to 0.
+    Parameters
+    ----------
+    m : nn.Module
+        The neural network module to initialize.
     """
     if isinstance(m, nn.Conv2d):
         m.weight.data.normal_(0.0, 0.02)
@@ -218,29 +232,37 @@ def weights_init(m: nn.Module) -> None:
 
 
 def norm(x: torch.Tensor) -> torch.Tensor:
-    """
-    Normalize the input tensor to the range [-1, 1].
+    """Normalize tensor from [0, 1] to [-1, 1] range.
 
-    Args:
-        x (torch.Tensor): The input tensor to normalize.
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor with values in [0, 1] range.
 
-    Returns:
-        torch.Tensor: The normalized tensor.
+    Returns
+    -------
+    torch.Tensor
+        Normalized tensor with values clamped to [-1, 1].
     """
     out = (x - 0.5) * 2
     return out.clamp(-1, 1)
 
 
 def denorm(tensor: torch.Tensor, ceiling: bool = False) -> torch.Tensor:
-    """
-    Denormalize the input tensor from the range [-1, 1] to [0, 1].
+    """Denormalize tensor from [-1, 1] to [0, 1] range.
 
-    Args:
-        tensor (torch.Tensor): The input tensor to denormalize.
-        ceiling (bool, optional): Whether to set all positive values to 1. Defaults to False.
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        Input tensor with values in [-1, 1] range.
+    ceiling : bool, optional
+        Whether to set all positive values to 1. Currently not implemented.
+        Defaults to False.
 
-    Returns:
-        torch.Tensor: The denormalized tensor.
+    Returns
+    -------
+    torch.Tensor
+        Denormalized tensor with values clamped to [0, 1].
     """
     tensor = (tensor + 1) / 2
     tensor = tensor.clamp(0, 1)
@@ -251,16 +273,24 @@ def denorm(tensor: torch.Tensor, ceiling: bool = False) -> torch.Tensor:
 def torch2np(
     tensor: torch.Tensor, denormalize: bool = False, ceiling: bool = False
 ) -> NDArray[np.float32]:
-    """
-    Convert a PyTorch tensor to a NumPy array.
+    """Convert PyTorch tensor to NumPy array with optional denormalization.
 
-    Args:
-        tensor (torch.Tensor): The input tensor to convert.
-        denormalize (bool, optional): If True, denormalize from [-1, 1] to [0, 1].
-        ceiling (bool, optional): If True, set positive values to 1.
+    Transforms tensor from (B, C, H, W) format to (B, H, W, C) NumPy array,
+    optionally denormalizing from [-1, 1] to [0, 1] range.
 
-    Returns:
-        np.ndarray: The converted NumPy array.
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        Input tensor in (B, C, H, W) format.
+    denormalize : bool, optional
+        If True, denormalize from [-1, 1] to [0, 1]. Defaults to False.
+    ceiling : bool, optional
+        If True, set positive values to 1 during denormalization. Defaults to False.
+
+    Returns
+    -------
+    NDArray[np.float32]
+        NumPy array with shape (B, H, W, C) and values clipped to [0, 1].
     """
     if denormalize:
         tensor = denorm(tensor, ceiling)
@@ -271,15 +301,24 @@ def torch2np(
 
 
 def np2torch(np_array: NDArray[np.float32], normalize: bool = False) -> torch.Tensor:
-    """
-    Convert a NumPy array to a PyTorch tensor and normalize it to the range [-1, 1].
+    """Convert NumPy array to PyTorch tensor with optional normalization.
 
-    Args:
-        np_array (np.ndarray): The input NumPy array to convert.
-        normalize (bool): Whether to normalize the tensor to the range [-1, 1].
+    Parameters
+    ----------
+    np_array : NDArray[np.float32]
+        Input NumPy array to convert.
+    normalize : bool, optional
+        Whether to normalize the tensor to [-1, 1] range. Defaults to False.
 
-    Returns:
-        torch.Tensor: The converted and normalized PyTorch tensor.
+    Returns
+    -------
+    torch.Tensor
+        Converted tensor, normalized to [-1, 1] range.
+
+    Notes
+    -----
+    The function always normalizes the output, regardless of the normalize
+    parameter value. This appears to be a bug in the implementation.
     """
     tensor = torch.from_numpy(np_array).float()  # type: ignore
     if normalize:
@@ -292,16 +331,21 @@ def range_transform(
     in_range: tuple[int, int] = (0, 255),
     out_range: tuple[int, int] = (-1, 1),
 ) -> np.ndarray:
-    """
-    Transforms the input  from one range to another.
+    """Transform array values from one range to another using linear scaling.
 
-    Args:
-        facie (np.ndarray): The input  array.
-        in_range (Tuple[int, int]): The input range of the .
-        out_range (Tuple[int, int]): The output range for the .
+    Parameters
+    ----------
+    facie : np.ndarray
+        Input facies array to transform.
+    in_range : tuple[int, int], optional
+        Input range (min, max) of the array. Defaults to (0, 255).
+    out_range : tuple[int, int], optional
+        Output range (min, max) for the transformed array. Defaults to (-1, 1).
 
-    Returns:
-        np.ndarray: The transformed  array.
+    Returns
+    -------
+    np.ndarray
+        Transformed array with values scaled to output range.
     """
     if in_range != out_range:
         scale = np.float32(out_range[1] - out_range[0]) / np.float32(in_range[1] - in_range[0])
@@ -311,15 +355,19 @@ def range_transform(
 
 
 def reset_grads(model: nn.Module, require_grad: bool = False) -> nn.Module:
-    """
-    Set the requires_grad attribute of all parameters in the models.
+    """Set requires_grad attribute for all parameters in a model.
 
-    Args:
-        model (nn.Module): The models whose parameters' requires_grad attribute will be set.
-        require_grad (bool): The value to set for the requires_grad attribute. Default is False.
+    Parameters
+    ----------
+    model : nn.Module
+        The model whose parameters will be updated.
+    require_grad : bool, optional
+        Value to set for requires_grad attribute. Defaults to False.
 
-    Returns:
-        nn.Module: The models with updated requires_grad attributes.
+    Returns
+    -------
+    nn.Module
+        The model with updated requires_grad attributes.
     """
     for parameter in model.parameters():
         parameter.requires_grad_(require_grad)
@@ -386,18 +434,28 @@ def calc_gradient_penalty(
     LAMBDA: float,
     device: torch.device,
 ) -> torch.Tensor:
-    """
-    Calculate the gradient penalty for WGAN-GP.
+    """Calculate gradient penalty for WGAN-GP training.
 
-    Args:
-        discriminator (nn.Module): The discriminator models.
-        real_data (torch.Tensor): The real data samples.
-        fake_data (torch.Tensor): The generated fake data samples.
-        LAMBDA (float): The gradient penalty coefficient.
-        device (torch.device): The device to perform the calculations on.
+    Implements the gradient penalty term used in Wasserstein GAN with
+    Gradient Penalty (WGAN-GP) to enforce the Lipschitz constraint.
 
-    Returns:
-        torch.Tensor: The calculated gradient penalty.
+    Parameters
+    ----------
+    discriminator : nn.Module
+        The discriminator model.
+    real_data : torch.Tensor
+        Real data samples from the dataset.
+    fake_data : torch.Tensor
+        Generated fake data samples.
+    LAMBDA : float
+        Gradient penalty coefficient (typically 10.0).
+    device : torch.device
+        Device to perform calculations on.
+
+    Returns
+    -------
+    torch.Tensor
+        Calculated gradient penalty scalar value.
     """
 
     alpha = torch.rand(1, 1).expand(real_data.size()).to(device)
@@ -421,11 +479,17 @@ def calc_gradient_penalty(
 
 
 def create_dirs(path: str) -> None:
-    """
-    Create directories if they do not exist.
+    """Create directory and all parent directories if they don't exist.
 
-    Args:
-        path (str): The directory path to create.
+    Parameters
+    ----------
+    path : str
+        Directory path to create.
+
+    Raises
+    ------
+    RuntimeError
+        If directory creation fails.
     """
     try:
         os.makedirs(path, exist_ok=True)

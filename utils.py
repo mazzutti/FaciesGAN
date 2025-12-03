@@ -11,13 +11,19 @@ from ops import torch2np
 
 
 def plot_mask(mask: np.ndarray, real_facie: np.ndarray, axis: plt.Axes) -> None:
-    """
-    Plot the facies masked_facie on the given axis.
+    """Plot well locations on a facies visualization.
 
-    Args:
-        mask (np.ndarray): The facies masked_facie array.
-        real_facie (np.ndarray): The real array.
-        axis (matplotlib.axes.Axes): The axis to plot on.
+    Displays well positions as vertical scatter plots overlaid on the facies
+    image, using colors to represent facies values at well locations.
+
+    Parameters
+    ----------
+    mask : np.ndarray
+        Well mask array indicating well column positions.
+    real_facie : np.ndarray
+        Real facies array for determining colors at well locations.
+    axis : plt.Axes
+        Matplotlib axis to plot on.
     """
     mask_sum = np.sum(np.squeeze(mask), axis=0)
     mask_index = np.where(mask_sum == np.max(mask_sum))[0]
@@ -53,17 +59,28 @@ def plot_generated_facies(
     out_dir: str = RESULTS_DIR,
     save: bool = False,
 ) -> None:
-    """
-    Plot and optionally save generated facies alongside real facies and masks.
+    """Plot and optionally save generated facies alongside real facies with well locations.
 
-    Args:
-        fake_facies (list of torch.Tensor): List of generated facies for each real facie.
-        real_facies (torch.Tensor): Tensor of real facies.
-        masks (torch.Tensor): Tensor of masks corresponding to the real facies.
-        stage (int): Current stage of the process.
-        index (int): Index for saving the plot.
-        out_dir (str, optional): Directory to save the plot. Defaults to './outputs'.
-        save (bool, optional): Whether to save the plot. Defaults to False.
+    Creates a grid visualization comparing generated facies realizations with
+    real facies and well constraint overlays.
+
+    Parameters
+    ----------
+    fake_facies : list[torch.Tensor]
+        List of generated facies tensors, one tensor per real facie containing
+        multiple generated samples.
+    real_facies : torch.Tensor
+        Tensor of real facies images.
+    masks : torch.Tensor
+        Tensor of well location masks corresponding to the real facies.
+    stage : int
+        Current training stage/scale for labeling.
+    index : int
+        Iteration index for filename when saving.
+    out_dir : str, optional
+        Directory to save the plot. Defaults to RESULTS_DIR.
+    save : bool, optional
+        Whether to save the plot to disk. Defaults to False.
     """
     num_real_facies = real_facies.size(0)
     num_generated_per_real = fake_facies[0].shape[0]
