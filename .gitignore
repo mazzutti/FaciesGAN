@@ -1,11 +1,13 @@
 .venv
 .idea
 .DS_Store
+.cache/
 .ruff_cache
 .mypy_cache
 .pytest_cache
 **/__pycache__/**
 logs/**
 output/generated
+results/**
 **/events.out.tfevents*
 

@@ -5,7 +5,8 @@
     "**/.venv/**": true,
     "**/__pycache__": true,
     "**/.pytest_cache": true,
-    "results/": true
+    "results/": true,
+    ".cache/": true 
   },
   "files.exclude": {
     "**/__pycache__": true,
@@ -17,14 +18,16 @@
     "**/.venv/**/site-packages/**": true,
     "**/__pycache__": true,
     "**/.pytest_cache": true,
-    "results/": true
+    "results/": true,
+    ".cache/": true 
   },
   "python.analysis.exclude": [
     "**/.venv/**", 
     "**/.venv/**/site-packages/**",
     "**/__pycache__",
     "**/.pytest_cache",
-    "results/"
+    "results/",
+    ".cache/"
   ],
   "editor.defaultFormatter": "ms-python.black-formatter",
   "python.analysis.enableTroubleshootMissingImports": true
