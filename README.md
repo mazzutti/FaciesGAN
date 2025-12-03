@@ -156,7 +156,7 @@ Supports configurable patterns for:
 data/
 ├── facies/
 │   ├── xz_crossline_000.png    # Facies images (RGB)
-│   ├── xz_crossline_000.pt     # Pre-computed tensors (optional)
+│   ├── xz_crossline_000.pt     # NeuralSmoother models (optional)
 │   └── ...
 ├── wells/
 │   ├── xz_crossline_000.png    # Well log visualizations
