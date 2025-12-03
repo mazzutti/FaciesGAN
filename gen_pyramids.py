@@ -51,6 +51,32 @@ def to_facies_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Te
 
 @memory.cache # type: ignore
 def to_seismic_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Tensor]:
+    """Generate multi-scale pyramid representations of seismic images using 
+    nearest neighbor interpolation.
+
+    This function processes seismic data using trace-wise nearest neighbor
+    interpolation to create pyramid representations at multiple scales. Results
+    are cached across executions using joblib Memory for improved performance.
+
+    Parameters
+    ----------
+    scale_list : tuple[tuple[int, ...], ...]
+        Tuple of target resolutions as (batch, channels, height, width) tuples.
+        Each resolution defines one level in the output pyramid.
+
+    Returns
+    -------
+    list[torch.Tensor]
+        List of stacked tensors, one per scale level. Each tensor has shape
+        (N, H, W, 3) where N is the number of seismic images, and (H, W)
+        matches the corresponding resolution in scale_list.
+
+    Notes
+    -----
+    - Uses NearestInterpolator for trace-wise interpolation
+    - Results are cached in ./.cache directory
+    - Cache persists across program executions
+    """
     seismic_paths = as_image_file_list(DataFiles.SEISMIC)
     seismic_interpolator = NearestInterpolator(InterpolatorConfig())
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
@@ -65,6 +91,34 @@ def to_seismic_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.T
     
 @memory.cache # type: ignore
 def to_wells_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Tensor]:
+    """Generate multi-scale pyramid representations of well data.
+
+    This function processes well location data to create pyramid representations
+    at multiple scales. Each well is represented as a vertical trace in the output
+    images, with spatial scaling applied proportionally to maintain well positions
+    across different resolutions. Results are cached across executions.
+
+    Parameters
+    ----------
+    scale_list : tuple[tuple[int, ...], ...]
+        Tuple of target resolutions as (batch, channels, height, width) tuples.
+        Each resolution defines one level in the output pyramid.
+
+    Returns
+    -------
+    list[torch.Tensor]
+        List of stacked tensors, one per scale level. Each tensor has shape
+        (N, H, W, 3) where N is the number of well images, and (H, W)
+        matches the corresponding resolution in scale_list. Well locations
+        are represented as vertical traces at scaled column positions.
+
+    Notes
+    -----
+    - Uses WellInterpolator for well-specific trace extraction
+    - Well column positions are scaled proportionally across resolutions
+    - Results are cached in ./.cache directory
+    - Cache persists across program executions
+    """
     wells_interpolator = WellInterpolator(InterpolatorConfig())
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
     facies_paths = as_image_file_list(DataFiles.WELLS) # Ensure facies pyramids are cached
