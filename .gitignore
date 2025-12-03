@@ -10,4 +10,3 @@ logs/**
 output/generated
 results/**
 **/events.out.tfevents*
-
