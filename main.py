@@ -124,14 +124,7 @@ def get_arguments() -> ArgumentParser:
         help="list of well indices to train the model from",
         nargs="+",
         default=tuple(),
-    )
-
-    parser.add_argument(
-        "--regen-npy-gz",
-        action="store_false",
-        type=bool,
-        help="regenerate the npy.gz files from the input facies"
-    )
+    ) 
 
     return parser
 

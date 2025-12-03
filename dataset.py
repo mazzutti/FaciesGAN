@@ -39,10 +39,10 @@ class PyramidsDataset(Dataset[Masks]):
         self.data_dir = options.input_path
         self.scales_list = generate_scales(options)
     
-        self.wells_pyramid = [
+        self.wells_pyramids = [
             torch.empty((0, 1, *scale), dtype=torch.int32) for scale in self.scales_list
         ]
-        self.seismic_pyramid = [
+        self.seismic_pyramids = [
             torch.empty((0, 1, *scale), dtype=torch.float32) for scale in self.scales_list
         ]
         if regenerate:
@@ -76,8 +76,8 @@ class PyramidsDataset(Dataset[Masks]):
         """
         return (
             tuple(facies[idx] for facies in self.facies_pyramids), 
-            tuple(masks[idx] for masks in self.wells_pyramid),
-            tuple(seismic[idx] for seismic in self.seismic_pyramid),
+            tuple(wells[idx] for wells in self.wells_pyramids),
+            tuple(seismic[idx] for seismic in self.seismic_pyramids),
         )
 
     def shuffle(self) -> None:
@@ -87,5 +87,5 @@ class PyramidsDataset(Dataset[Masks]):
         idxs = torch.randperm(self.__len__())
         for i in range(len(self.scales_list)):
             self.facies_pyramids[i] = self.facies_pyramids[i][idxs]
-            self.wells_pyramid[i] = self.wells_pyramid[i][idxs]
-            self.seismic_pyramid[i] = self.seismic_pyramid[i][idxs]
+            self.wells_pyramids[i] = self.wells_pyramids[i][idxs]
+            self.seismic_pyramids[i] = self.seismic_pyramids[i][idxs]

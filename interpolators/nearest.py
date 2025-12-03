@@ -66,7 +66,7 @@ class NearestInterpolator(BaseInterpolator):
         high_res_img = self._upsample_image(img_np, super_height, super_width)
         smooth_imgs.append(torch.from_numpy(high_res_img.astype(np.float32))) # type: ignore
 
-        for new_h, new_w in resolutions[:-1]:
+        for _, _, new_h, new_w in resolutions[:-1]:
             interpolated_img = self._downsample_image(high_res_img, new_h, new_w)
             interpolated_img = interpolated_img.astype(np.float32).clip(0.0, 1.0)
             smooth_imgs.append(torch.from_numpy(interpolated_img)) # type: ignore

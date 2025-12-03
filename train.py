@@ -64,7 +64,7 @@ class Trainer:
 
         self.num_real_facies: int = options.num_real_facies
         self.num_generated_per_real: int = options.num_generated_per_real
-        self.wells: tuple[int, ...]= options.wells
+        self.wells_colums: tuple[int, ...]= options.wells
 
         # Optimizer configuration
         self.lr_g: float = options.lr_g
@@ -78,8 +78,9 @@ class Trainer:
         self.img_num_channel: int = options.facie_num_channels + 1
         self.noise_amp: float = options.noise_amp
         self.facies: list[torch.Tensor] = []
-        self.masks: list[torch.Tensor] = []
-        self.masked_facies: list[torch.Tensor] = []
+        self.wells: list[torch.Tensor] = []
+        self.seismic: list[torch.Tensor] = []
+        self.stacked_data: list[torch.Tensor] = []
 
         dataset: PyramidsDataset = PyramidsDataset(options)
         self.scales_list: tuple[tuple[int, ...], ...] = dataset.scales_list # type: ignore
@@ -87,19 +88,21 @@ class Trainer:
         if len(options.wells) > 0:
             for i in range(len(self.scales_list)):
                 dataset.facies_pyramids[i] = dataset.facies_pyramids[i][options.wells]
-                dataset.wells_pyramid[i] = dataset.wells_pyramid[i][options.wells]
+                dataset.wells_pyramids[i] = dataset.wells_pyramids[i][options.wells]
+                dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][options.wells]
         elif options.num_train_facies < len(dataset):
             idxs = torch.randperm(len(dataset))[: options.num_train_facies]
             for i in range(len(self.scales_list)):
                 dataset.facies_pyramids[i] = dataset.facies_pyramids[i][idxs]
-                dataset.wells_pyramid[i] = dataset.wells_pyramid[i][idxs]
+                dataset.wells_pyramids[i] = dataset.wells_pyramids[i][idxs]
+                dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][idxs]
 
         self.data_loader = DataLoader(
             dataset, batch_size=options.batch_size, shuffle=False)
 
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
-        self.model: FaciesGAN = FaciesGAN(device, options, self.masked_facies)
+        self.model: FaciesGAN = FaciesGAN(device, options, self.stacked_data)
         self.model.shapes = list(self.scales_list)
 
         print("Generated facie shapes:")
@@ -144,9 +147,13 @@ class Trainer:
 
             writer = SummaryWriter(log_dir=scale_path)
             data_iterator = iter(self.data_loader)
-            for batch_id, (self.facies, self.masks) in enumerate(data_iterator):
-                self.masked_facies = [mask * facie for mask, facie in zip(self.masks, self.facies)]
-                self.model.masked_facies = self.masked_facies
+            for batch_id, (
+                self.facies, 
+                self.wells, 
+                self.seismic
+            ) in enumerate(data_iterator):
+                self.stacked_data = [mask * facie for mask, facie in zip(self.wells, self.facies)]
+                self.model.masked_facies = self.stacked_data
                 self.train_scale(scale, writer, scale_path, results_path, batch_id)
                 self.model.save_scale(scale, scale_path)
 
@@ -181,8 +188,8 @@ class Trainer:
         mask_indexes = list(range(self.batch_size))
 
         real = self.facies[scale][mask_indexes].to(self.device)
-        mask = self.masks[scale][mask_indexes].to(self.device)
-        masked_facie = self.masked_facies[scale][mask_indexes].to(self.device)
+        mask = self.wells[scale][mask_indexes].to(self.device)
+        masked_facie = self.stacked_data[scale][mask_indexes].to(self.device)
 
         generator_optimizer = optim.Adam(
             self.model.generator.gens[-1].parameters(),
