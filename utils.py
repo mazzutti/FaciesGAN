@@ -1,5 +1,7 @@
 from typing import Any
 
+import matplotlib
+matplotlib.use('Agg')  # Set non-interactive backend before importing pyplot
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats as st
@@ -91,9 +93,9 @@ def plot_generated_facies(
     np_real_facies = torch2np(real_facies, denormalize=True, ceiling=True)
     np_masks = torch2np(masks)
     for i in range(num_real_facies):
-        axes[i, 0].imshow(fake_facies_arr[i], cmap="YlGn")
+        axes[i, 0].imshow(np_real_facies[i], cmap="YlGn")
         axes[i, 0].set_title(f"Well {i + 1}")
-        plot_mask(np_masks[i], np.squeeze(fake_facies_arr[i]), axes[i, 0])
+        plot_mask(np_masks[i], np.squeeze(np_real_facies[i]), axes[i, 0])
         axes[i, 0].set_xticks([])
         axes[i, 0].set_yticks([])
         axes[i, 0].axis("off")
@@ -109,9 +111,9 @@ def plot_generated_facies(
     plt.suptitle(f"Stage {stage} - Well Log, Real vs Generated Facies", fontsize=16, y=0.99)  # type: ignore
     plt.tight_layout()
     plt.subplots_adjust(top=0.95)
-    plt.show()
+    # plt.show()
     if save:
-        fig.savefig(f"{out_dir}/gen_{stage}_{index}.tif")  # type: ignore
+        fig.savefig(f"{out_dir}/gen_{stage}_{index}.png")  # type: ignore
     plt.close()
 
 

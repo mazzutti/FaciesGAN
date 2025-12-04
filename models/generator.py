@@ -80,22 +80,22 @@ class Generator(nn.Module):
             Generated facies tensor at the finest requested scale.
         """
         if in_noise is None:
-            channels = z[start_scale].shape[1] - 1
+            channels = z[start_scale].shape[1] // 2
             height, width = tuple(dim - self.full_zero_padding for dim in z[start_scale].shape[2:])
-            facie = torch.zeros(
+            out_facie = torch.zeros(
                 (z[start_scale].shape[0], channels, height, width),
                 device=z[start_scale].device,
             )
         else:
-            facie: torch.Tensor  = in_noise
+            out_facie: torch.Tensor  = in_noise
 
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
 
 
         for index in range(start_scale, stop_scale + 1):
             
-            facie = interpolate(
-                facie,
+            out_facie = interpolate(
+                out_facie,
                 (
                     z[index].shape[2] - self.full_zero_padding,
                     z[index].shape[3] - self.full_zero_padding,
@@ -105,10 +105,13 @@ class Generator(nn.Module):
             z_in = torch.zeros_like(z[index])
             z_in[:, 1, :, :] = z[index][:, 1, :, :]
             z_in[:, 0, :, :] = amp[index] * z[index][:, 0, :, :]
-            z_in = z_in + F.pad(facie, [self.zero_padding] * 4, value=0)
+            z_in = z_in + F.pad(
+                out_facie, 
+                [self.zero_padding] * 4, 
+                value=0).repeat(1, 2, 1, 1)
 
-            facie = self.gens[index](z_in) + facie
-        return facie
+            out_facie = self.gens[index](z_in) + out_facie
+        return out_facie
 
     def create_scale(self, num_feature: int, min_num_feature: int) -> None:
         """Create and append a new scale block to the generator pyramid.
@@ -141,7 +144,7 @@ class Generator(nn.Module):
         tail = nn.Sequential(
             nn.Conv2d(
                 max(channels, min_num_feature),
-                self.img_num_channel - 1,
+                self.img_num_channel // 2,
                 kernel_size=self.kernel_size,
                 stride=1,
                 padding=self.padding_size,

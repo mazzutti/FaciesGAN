@@ -58,12 +58,12 @@ class Discriminator(nn.Module):
             out_channels, 1, kernel_size=kernel_size, stride=1, padding=padding_size
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, generated_facie: torch.Tensor) -> torch.Tensor:
         """Discriminate input facies images.
 
         Parameters
         ----------
-        x : torch.Tensor
+        generated_facie : torch.Tensor
             Input tensor containing facies images.
 
         Returns
@@ -71,8 +71,8 @@ class Discriminator(nn.Module):
         torch.Tensor
             Discrimination scores (higher for more realistic images).
         """
-        x = self.head(x)
-        x = self.body(x)
-        x = self.tail(x)
+        scores = self.head(generated_facie)
+        scores = self.body(scores)
+        scores = self.tail(scores)
 
-        return x
+        return scores

@@ -16,7 +16,11 @@
         "--input-path",
         "data/",
         "--output-path",
-        "results/"
+        "results/",
+        "--num-train-pyramids",
+        "3",
+        "--num-iter",
+        "4000",
       ]
     }
   ]

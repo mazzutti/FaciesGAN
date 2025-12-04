@@ -28,8 +28,8 @@ class FaciesGAN:
         Device for model computation (CPU, CUDA, or MPS).
     options : argparse.Namespace | SimpleNamespace
         Configuration containing all hyperparameters.
-    masked_facies : Sequence[torch.Tensor], optional
-        Well-conditioned facies data for training. Defaults to empty tuple.
+    wells : Sequence[torch.Tensor], optional
+        Well location data for conditioning. Defaults to empty tuple.
     *args : tuple[Any, ...]
         Additional positional arguments.
     **kwargs : dict[str, Any]
@@ -45,8 +45,8 @@ class FaciesGAN:
         Reconstruction noise tensors for each scale.
     noise_amp : list[float]
         Noise amplitudes for each scale.
-    masked_facies : list[torch.Tensor]
-        Well-conditioned facies data.
+    wells : list[torch.Tensor]
+        Well location data for conditioning.
     shapes : list[tuple[int, ...]]
         Pyramid resolutions for each scale.
     cur_scale : int
@@ -56,7 +56,7 @@ class FaciesGAN:
         self,
         device: torch.device,
         options: argparse.Namespace | SimpleNamespace,
-        masked_facies: Sequence[torch.Tensor] = (),
+        wells: Sequence[torch.Tensor] = (),
         *args: tuple[Any, ...],
         **kwargs: dict[str, Any],
     ) -> None:
@@ -64,7 +64,7 @@ class FaciesGAN:
         self.device = device
 
         # Image parameters
-        self.facie_num_channels = options.facie_num_channels + 1
+        self.num_channels = options.num_channels * 2
         self.zero_padding = options.num_layer * math.floor(options.kernel_size / 2)
 
         # Training parameters
@@ -86,16 +86,16 @@ class FaciesGAN:
         # Current training scale (set by Trainer during training)
         self.cur_scale: int = 0
 
-        # Accept any sequence for `masked_facies` (tuple/list). Default to an
+        # Accept any sequence for `wells` (tuple/list). Default to an
         # empty tuple so the default is immutable and safe as a module-level
         # default. Convert to a per-instance list for internal mutation.
-        if masked_facies:
-            self.masked_facies: list[torch.Tensor] = list(masked_facies)
+        if wells:
+            self.wells: list[torch.Tensor] = list(wells)
         else:
-            self.masked_facies = []
+            self.wells = []
 
         self.generator: Generator = Generator(
-            self.num_layer, self.kernel_size, self.padding_size, self.facie_num_channels
+            self.num_layer, self.kernel_size, self.padding_size, self.num_channels
         ).to(self.device)
         self.discriminator = None
 
@@ -148,7 +148,7 @@ class FaciesGAN:
                 self.num_layer,
                 self.kernel_size,
                 self.padding_size,
-                self.facie_num_channels - 1,
+                self.num_channels // 2,
             ).to(self.device)
             self.discriminator.apply(ops.weights_init)
 
@@ -173,7 +173,7 @@ class FaciesGAN:
         return num_feature, min_num_feature
 
     def get_noise(
-        self, mask_indexes: list[int], rec: bool = False, last: bool = False
+        self, indexes: list[int], rec: bool = False, last: bool = False
     ) -> list[torch.Tensor]:
         """Generate noise tensors for all pyramid scales.
 
@@ -182,7 +182,7 @@ class FaciesGAN:
 
         Parameters
         ----------
-        mask_indexes : list[int]
+        indexes : list[int]
             Indices specifying which well conditioning to use.
         rec : bool, optional
             If True, return stored reconstruction noise. Defaults to False.
@@ -199,22 +199,22 @@ class FaciesGAN:
         def generate_noise(index: int) -> torch.Tensor:
             shape = self.shapes[index][2:]
             z = ops.generate_noise(
-                (self.facie_num_channels - 1, *shape),
+                (self.num_channels // 2, *shape),
                 device=self.device,
-                num_samp=len(mask_indexes),
+                num_samp=len(indexes),
             )
-            # Use masked facies for this scale only if we have one stored
+            # Use well location data for this scale only if we have it stored
             # for the current `index` (per-instance list default avoids
             # shared-mutable defaults while allowing empty lists).
-            if index < len(self.masked_facies):
-                z = torch.cat([z, self.masked_facies[index][mask_indexes].to(self.device)], dim=1)
+            if index < len(self.wells):
+                z = torch.cat([z, self.wells[index][indexes].to(self.device)], dim=1)
             elif index == 0:
-                z = z.expand(z.shape[0], self.facie_num_channels, *shape)
+                z = z.expand(z.shape[0], self.num_channels, *shape)
             else:
                 z = ops.generate_noise(
-                    (self.facie_num_channels, *shape),
+                    (self.num_channels, *shape),
                     device=self.device,
-                    num_samp=len(mask_indexes),
+                    num_samp=len(indexes),
                 )
             return F.pad(z, [self.zero_padding] * 4, value=0)
 
@@ -226,22 +226,22 @@ class FaciesGAN:
 
     def optimize_discriminator(
         self,
-        mask_indexes: list[int],
-        real: torch.Tensor,
+        indexes: list[int],
+        real_facies: torch.Tensor,
         discriminator_optimizer: torch.optim.Optimizer,
     ) -> tuple[float, float, float, float]:
         """
         Optimize the discriminator for a given set of real and generated images.
 
         Args:
-            mask_indexes (list[int]): Indexes of the masks.
-            real (torch.Tensor): Real images.
+            indexes (list[int]): Indexes of the samples in the batch.
+            real_facies (torch.Tensor): Real facies images.
             discriminator_optimizer (torch.optim.Optimizer): Optimizer for the discriminator.
 
         Returns:
             tuple[float, float, float, float]: Total loss, real loss, fake loss, and gradient penalty loss.
         """
-        fixed_noise = self.get_noise(mask_indexes, last=True)
+        fixed_noise = self.get_noise(indexes, last=True)
 
         total_loss = 0.0
         # Initialize losses as torch tensors so their types remain consistent
@@ -254,11 +254,11 @@ class FaciesGAN:
             discriminator_optimizer.zero_grad()
 
             # Calculate loss for real images
-            real_output = cast(Discriminator, self.discriminator)(real)
+            real_output = cast(Discriminator, self.discriminator)(real_facies)
             real_loss = -real_output.mean()
 
             # Generate fake images
-            noises = self.get_noise(mask_indexes)
+            noises = self.get_noise(indexes)
             noises[-1] = fixed_noise[0]
             with torch.no_grad():
                 fake = self.generator(noises, self.noise_amp)
@@ -274,7 +274,7 @@ class FaciesGAN:
             # Calculate and backpropagate gradient penalty
             gp_loss = ops.calc_gradient_penalty(
                 cast(Discriminator, self.discriminator),
-                real,
+                real_facies,
                 fake,
                 self.lambda_grad,
                 self.device,
@@ -291,9 +291,9 @@ class FaciesGAN:
 
     def optimize_generator(
         self,
-        mask_indexes: list[int],
-        real: torch.Tensor,
-        mask: torch.Tensor,
+        indexes: list[int],
+        real_facies: torch.Tensor,
+        masks: torch.Tensor,
         rec_in: torch.Tensor,
         generator_optimizer: torch.optim.Optimizer,
     ) -> tuple[float, float, float, torch.Tensor, torch.Tensor | None]:
@@ -301,9 +301,9 @@ class FaciesGAN:
         Optimize the generator for a given set of real and generated images.
 
         Args:
-            mask_indexes (list[int]): Indexes of the masks.
-            real (torch.Tensor): Real images.
-            mask (torch.Tensor): Mask tensor.
+            indexes (list[int]): Indexes of the samples.
+            real_facies (torch.Tensor): Real facies images.
+            masks (torch.Tensor): Binary mask tensor for well locations.
             rec_in (torch.Tensor): Input tensor for reconstruction.
             generator_optimizer (torch.optim.Optimizer): Optimizer for the generator.
 
@@ -322,7 +322,7 @@ class FaciesGAN:
         for _ in range(self.generator_steps):
             generator_optimizer.zero_grad()
 
-            noises = self.get_noise(mask_indexes)
+            noises = self.get_noise(indexes)
             fake = self.generator(noises, self.noise_amp)
 
             generator_loss_fake = -cast(Discriminator, self.discriminator)(fake).mean()
@@ -332,18 +332,18 @@ class FaciesGAN:
             rec = None
 
             if self.alpha != 0:
-                rec_noise = self.get_noise(mask_indexes, rec=True)
+                rec_noise = self.get_noise(indexes, rec=True)
                 rec = self.generator(
                     rec_noise,
                     self.noise_amp,
-                    in_facie=rec_in,
+                    in_noise=rec_in,
                     start_scale=len(self.generator.gens) - 1,
                 )
-                generator_loss_rec = self.alpha * nn.MSELoss()(rec, real)
+                generator_loss_rec = self.alpha * nn.MSELoss()(rec, real_facies)
                 generator_loss_rec.backward()
 
             generator_masked_loss = (
-                100 * self.alpha * nn.MSELoss(reduction="mean")(fake * mask, real * mask)
+                100 * self.alpha * nn.MSELoss(reduction="mean")(fake * masks, real_facies * masks)
             )
             generator_loss = (
                 float(generator_masked_loss.item())
@@ -377,7 +377,7 @@ class FaciesGAN:
         )
         torch.save(self.rec_noise, os.path.join(path, REC_FILE))
         torch.save(self.shapes[scale], os.path.join(path, SHAPE_FILE))
-        torch.save(self.masked_facies[scale], os.path.join(path, M_FILE))
+        torch.save(self.wells[scale], os.path.join(path, M_FILE))
 
         with open(os.path.join(path, AMP_FILE), "w") as f:
             f.write(str(self.noise_amp[scale]))
@@ -388,7 +388,7 @@ class FaciesGAN:
         load_discriminator: bool = True,
         load_shapes: bool = True,
         until_scale: int | None = None,
-        load_masked_facies: bool = True,
+        load_wells: bool = True,
     ) -> int:
         """
         Load the generator, discriminator, reconstruction noise, shapes, and noise amplitude from the specified path.
@@ -398,7 +398,7 @@ class FaciesGAN:
             load_discriminator (bool): Whether to load the discriminator. Default is True.
             load_shapes (bool): Whether to load the shapes. Default is True.
             until_scale (int): The scale index up to which to load. Default is None.
-            load_masked_facies (bool): Whether to load the masked facies. Default is True.
+            load_wells (bool): Whether to load the well location data. Default is True.
 
         Returns:
             int: The number of scales loaded.
@@ -408,8 +408,8 @@ class FaciesGAN:
         if until_scale is not None:
             scales_path = [scale for scale in scales_path if scale <= until_scale]
 
-        if load_masked_facies:
-            self.masked_facies = []
+        if load_wells:
+            self.wells = []
         for scale in scales_path:
             try:
                 num_feature, min_num_feature = self.get_num_features(scale)
@@ -421,7 +421,7 @@ class FaciesGAN:
                         self.num_layer,
                         self.kernel_size,
                         self.padding_size,
-                        self.facie_num_channels,
+                        self.num_channels // 2,
                     ).to(self.device)
                     self.discriminator.load_state_dict(
                         ops.load(
@@ -462,8 +462,8 @@ class FaciesGAN:
                 with open(os.path.join(path, str(scale), AMP_FILE)) as f:
                     self.noise_amp.append(float(f.readline().strip()))
 
-                if load_masked_facies:
-                    self.masked_facies.append(
+                if load_wells:
+                    self.wells.append(
                         ops.load(
                             os.path.join(path, str(scale), M_FILE),
                             self.device,

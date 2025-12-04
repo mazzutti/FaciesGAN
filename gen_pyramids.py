@@ -5,7 +5,7 @@ from interpolators.config import InterpolatorConfig
 from interpolators.nearest import NearestInterpolator
 from interpolators.neural import NeuralSmoother
 from interpolators.well import WellInterpolator
-from ops import as_image_file_list, as_model_file_list
+from ops import as_image_file_list, as_model_file_list, norm
 
 from joblib import Memory # type: ignore
 
@@ -43,9 +43,9 @@ def to_facies_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Te
         neural_smoother = NeuralSmoother(model_path, InterpolatorConfig())
         pyramid = neural_smoother.interpolate(facie_path, scale_list)
         for i in range(len(scale_list)):
-            pyramids_list[i].append(pyramid[i])
+            pyramids_list[i].append(norm(pyramid[i]))
     pyramids = [
-        torch.stack(pyramid, dim=0).squeeze(1) for pyramid in pyramids_list
+        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2) for pyramid in pyramids_list
     ]
     return pyramids
 
@@ -83,9 +83,9 @@ def to_seismic_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.T
     for seismic_path in seismic_paths:
         pyramid = seismic_interpolator.interpolate(seismic_path, scale_list)
         for i in range(len(scale_list)):
-            pyramids_list[i].append(pyramid[i])
+            pyramids_list[i].append(norm(pyramid[i]))
     pyramids = [
-        torch.stack(pyramid, dim=0).squeeze(1) for pyramid in pyramids_list
+        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2) for pyramid in pyramids_list
     ]
     return pyramids
     
@@ -121,13 +121,13 @@ def to_wells_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Ten
     """
     wells_interpolator = WellInterpolator(InterpolatorConfig())
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
-    facies_paths = as_image_file_list(DataFiles.WELLS) # Ensure facies pyramids are cached
+    facies_paths = as_image_file_list(DataFiles.WELLS) # Load well image paths
     for facie_path in facies_paths:
         pyramid = wells_interpolator.interpolate(facie_path, scale_list) # type: ignore
         for i in range(len(scale_list)):
-            pyramids_list[i].append(pyramid[i])
+            pyramids_list[i].append(norm(pyramid[i]))
     pyramids = [
-        torch.stack(pyramid, dim=0).squeeze(1) for pyramid in pyramids_list
+        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2) for pyramid in pyramids_list
     ]
     return pyramids
 

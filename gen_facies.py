@@ -50,7 +50,7 @@ def generate_facies(
         a list of NumPy arrays and mask_indexes are the well conditioning
         indices used.
     """
-    model.load(model_path, load_discriminator=False, load_masked_facies=False)
+    model.load(model_path, load_discriminator=False, load_wells=False)
     model.generator.eval()
 
     mask_indexes = [random.choice(options.wells) for _ in range(how_many)]
@@ -60,7 +60,7 @@ def generate_facies(
     with torch.no_grad():
         generated_facies = [
             torch2np(gen_facie.unsqueeze(0), denormalize=True)
-            for gen_facie in model.generator(noises, model.noise_amp, in_facie=None)
+            for gen_facie in model.generator(noises, model.noise_amp, in_noise=None)
         ]
     return generated_facies, mask_indexes
 
@@ -213,12 +213,12 @@ if __name__ == "__main__":
             torch.stack(
                 [
                     mask * facie
-                    for mask, facie in zip(dataset.wells_pyramid[i], dataset.facies_pyramids[i])
+                    for mask, facie in zip(dataset.wells_pyramids[i], dataset.facies_pyramids[i])
                 ],
                 dim=0,
             )
         )
-    faciesGAN = FaciesGAN(args.device, options=args, masked_facies=masked_facies)
+    faciesGAN = FaciesGAN(args.device, options=args, wells=masked_facies)
     facies, mi = generate_facies(faciesGAN, arguments.how_many, arguments.model_path, args)
 
     if arguments.plot_mds:

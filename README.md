@@ -182,11 +182,11 @@ Create custom training configurations by modifying `options.py`:
 from options import TrainningOptions
 
 opts = TrainningOptions(
-    min_size=16,           # Starting resolution
-    max_size=256,          # Final resolution
-    stop_scale=10,         # Number of pyramid scales
-    num_iter=50,           # Iterations per scale
-    batch_size=100,        # Batch size
+    min_size=12,          # Starting resolution
+    max_size=256,         # Final resolution
+    stop_scale=10,        # Number of pyramid scales
+    num_iter=50,          # Iterations per scale
+    batch_size=100,       # Batch size
     lr_g=0.0005,          # Generator learning rate
     lr_d=0.0005,          # Discriminator learning rate
     alpha=100,            # Reconstruction loss weight

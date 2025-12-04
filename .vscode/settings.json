@@ -10,8 +10,7 @@
   },
   "files.exclude": {
     "**/__pycache__": true,
-    "**/.pytest_cache": true,
-    "results/": true
+    "**/.pytest_cache": true
   },
   "search.exclude": {
     "**/.venv/**": true,

@@ -176,7 +176,7 @@ def generate_scales(options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
         - crop_size: Crop size for training
         - stop_scale: Number of pyramid scales
         - batch_size: Batch size for each scale
-        - facie_num_channels: Number of input channels
+        - num_channels: Number of input channels
 
     Returns
     -------
@@ -207,7 +207,7 @@ def generate_scales(options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
         )
         if out_shape[0] % 2 != 0:
             out_shape = [int(shape + 1) for shape in out_shape]
-        shapes.append((options.batch_size, options.facie_num_channels, *out_shape))
+        shapes.append((options.batch_size, options.num_channels, *out_shape))
         
     return tuple(shapes)
 
@@ -313,16 +313,18 @@ def np2torch(np_array: NDArray[np.float32], normalize: bool = False) -> torch.Te
     Returns
     -------
     torch.Tensor
-        Converted tensor, normalized to [-1, 1] range.
+        Converted tensor, always normalized to [-1, 1] range.
 
     Notes
     -----
-    The function always normalizes the output, regardless of the normalize
-    parameter value. This appears to be a bug in the implementation.
+    BUG: The function always applies normalization at the end, regardless of
+    the normalize parameter value. The normalize parameter causes double
+    normalization when True.
     """
     tensor = torch.from_numpy(np_array).float()  # type: ignore
     if normalize:
         tensor = norm(tensor)
+    # BUG: Always normalizes regardless of the normalize parameter
     return norm(tensor)
 
 
@@ -376,22 +378,19 @@ def reset_grads(model: nn.Module, require_grad: bool = False) -> nn.Module:
 
 
 def interpolate(tensor: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
-    """Resize the input noise tensor to the given size using bilinear interpolation.
+    """Resize the input tensor to the given size using bilinear interpolation.
 
     Parameters
     ----------
-    facie : torch.Tensor
-        The input noise tensor to be resized.
+    tensor : torch.Tensor
+        The input tensor to be resized.
     size : tuple[int, ...]
         The target spatial dimensions for the resized tensor (height, width).
-    ceiling : bool, optional
-        If True, set all positive values in the interpolated tensor to 1.
-        Defaults to False.
 
     Returns
     -------
     torch.Tensor
-        The resized tensor tensor with the specified dimensions.
+        The resized tensor with the specified dimensions.
     """
     interpolated_tensor = nn.functional.interpolate(
         tensor, size=size, mode="bilinear", align_corners=True
@@ -422,8 +421,8 @@ def generate_noise(
         (num_samp, channels, height/scale, width/scale).
     """
     noise = torch.randn(num_samp, size[0], *[round(s / scale) for s in size[1:]], device=device)
-    # if scale != 1:
-    #     noise = to_facie_pyramid(noise, size[1:])
+    if scale != 1:
+        noise = interpolate(noise, size[1:])
     return noise
 
 

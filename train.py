@@ -27,7 +27,7 @@ from dataset import PyramidsDataset
 from log import format_time
 from models.discriminator import Discriminator
 from models.facies_gan import FaciesGAN
-from ops import create_dirs,  generate_noise, interpolate, load
+from ops import create_dirs, denorm,  generate_noise, interpolate, load
 from options import TrainningOptions
 from utils import plot_generated_facies
 
@@ -73,7 +73,15 @@ class Trainer:
     seismic : list[torch.Tensor]
         Current batch of seismic data at all scales.
     stacked_data : list[torch.Tensor]
-        Element-wise product of wells and facies for conditioning.
+        Stacked data tensors (currently unused, wells used directly).
+    num_channels : int
+        Number of input channels in the facies data.
+    num_real_facies : int
+        Number of real facies used when composing result grids.
+    num_generated_per_real : int
+        How many generated facies to produce per real example.
+    wells_colums : tuple[int, ...]
+        Tuple of well column indices for filtering.
     """
     def __init__(
         self,
@@ -92,8 +100,8 @@ class Trainer:
         self.save_interval: int = options.save_interval
         self.batch_size: int = (
             options.batch_size
-            if (options.batch_size < options.num_train_facies)
-            else options.num_train_facies
+            if (options.batch_size < options.num_train_pyramids)
+            else options.num_train_pyramids
         )
         self.batch_size: int = (
             self.batch_size
@@ -104,6 +112,7 @@ class Trainer:
         self.fine_tuning: bool = fine_tuning
         self.checkpoint_path: str = checkpoint_path
 
+        self.num_channels: int = options.num_channels
         self.num_real_facies: int = options.num_real_facies
         self.num_generated_per_real: int = options.num_generated_per_real
         self.wells_colums: tuple[int, ...]= options.wells
@@ -117,7 +126,6 @@ class Trainer:
 
         # Model parameters
         self.zero_padding: int = options.num_layer * math.floor(options.kernel_size / 2)
-        self.img_num_channel: int = options.facie_num_channels + 1
         self.noise_amp: float = options.noise_amp
         self.facies: list[torch.Tensor] = []
         self.wells: list[torch.Tensor] = []
@@ -132,8 +140,8 @@ class Trainer:
                 dataset.facies_pyramids[i] = dataset.facies_pyramids[i][options.wells]
                 dataset.wells_pyramids[i] = dataset.wells_pyramids[i][options.wells]
                 dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][options.wells]
-        elif options.num_train_facies < len(dataset):
-            idxs = torch.randperm(len(dataset))[: options.num_train_facies]
+        elif options.num_train_pyramids < len(dataset):
+            idxs = torch.randperm(len(dataset))[: options.num_train_pyramids]
             for i in range(len(self.scales_list)):
                 dataset.facies_pyramids[i] = dataset.facies_pyramids[i][idxs]
                 dataset.wells_pyramids[i] = dataset.wells_pyramids[i][idxs]
@@ -144,7 +152,7 @@ class Trainer:
 
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
-        self.model: FaciesGAN = FaciesGAN(device, options, self.stacked_data)
+        self.model: FaciesGAN = FaciesGAN(device, options, self.wells)
         self.model.shapes = list(self.scales_list)
 
         print("Generated facie shapes:")
@@ -190,8 +198,7 @@ class Trainer:
                 self.wells, 
                 self.seismic
             ) in enumerate(data_iterator):
-                self.stacked_data = [mask * facie for mask, facie in zip(self.wells, self.facies)]
-                self.model.masked_facies = self.stacked_data
+                self.model.wells = self.wells
                 self.train_scale(scale, writer, scale_path, results_path, batch_id)
                 self.model.save_scale(scale, scale_path)
 
@@ -217,7 +224,8 @@ class Trainer:
 
         Initializes optimizers and schedulers, then iterates through training
         epochs alternating between discriminator and generator updates. Saves
-        generated facies visualizations at regular intervals.
+        generated facies visualizations at regular intervals. Creates binary
+        masks from well data for conditional training.
 
         Parameters
         ----------
@@ -232,11 +240,12 @@ class Trainer:
         batch_id : int
             Current batch index within the epoch.
         """
-        mask_indexes = list(range(self.batch_size))
+        indexes = list(range(self.batch_size))
 
-        real = self.facies[scale][mask_indexes].to(self.device)
-        mask = self.wells[scale][mask_indexes].to(self.device)
-        masked_facie = self.stacked_data[scale][mask_indexes].to(self.device)
+        real_facies = self.facies[scale][indexes].to(self.device)  
+        masks = (denorm(self.wells[scale][indexes])
+                 .to(self.device).sum(dim=1, keepdim=True) > 0).int()
+        wells = self.wells[scale][indexes].to(self.device)
 
         generator_optimizer = optim.Adam(
             self.model.generator.gens[-1].parameters(),
@@ -267,7 +276,7 @@ class Trainer:
                 discriminator_scheduler,
             )
 
-        _, prev_rec = self.__initialize_noise(scale, masked_facie, real, mask_indexes)
+        _, prev_rec = self.__initialize_noise(scale, wells, real_facies, indexes)
 
         epochs: 'tqdm[int]' = tqdm(range(1, self.num_iter + 1))
 
@@ -278,13 +287,13 @@ class Trainer:
                 discriminator_loss_real,
                 discriminator_loss_fake,
                 discriminator_loss_gp,
-            ) = self.model.optimize_discriminator(mask_indexes, real, discriminator_optimizer)
+            ) = self.model.optimize_discriminator(indexes, real_facies, discriminator_optimizer)
 
             generator_loss, generator_loss_fake, generator_loss_rec, _, _ = (
                 self.model.optimize_generator(
-                    mask_indexes,
-                    real,
-                    mask,
+                    indexes,
+                    real_facies,
+                    masks,
                     cast(torch.Tensor, prev_rec),
                     generator_optimizer,
                 )
@@ -306,7 +315,7 @@ class Trainer:
             )
 
             if epoch % self.save_interval == 0 or epoch == self.num_iter:
-                self.__save_generated_facies(scale, epoch, results_path, mask)
+                self.__save_generated_facies(scale, epoch, results_path, masks)
 
             generator_scheduler.step()
             discriminator_scheduler.step()
@@ -411,9 +420,9 @@ class Trainer:
     def __initialize_noise(
         self,
         scale: int,
-        masked_facie: torch.Tensor,
-        real: torch.Tensor,
-        mask_indexes: list[int],
+        well: torch.Tensor,
+        real_facie: torch.Tensor,
+        indexes: list[int],
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """Initialize noise tensors and compute noise amplitude for the current scale.
 
@@ -425,12 +434,12 @@ class Trainer:
         ----------
         scale : int
             Current pyramid scale index.
-        masked_facie : torch.Tensor
-            Well-conditioned facies data for this scale.
-        real : torch.Tensor
+        well : torch.Tensor
+            Well location data for this scale.
+        real_facie : torch.Tensor
             Real facies images at this scale.
-        mask_indexes : list[int]
-            Indices of masked samples in the batch.
+        indexes : list[int]
+            Indices of samples in the batch.
 
         Returns
         -------
@@ -445,35 +454,36 @@ class Trainer:
             else:
                 self.model.rec_noise[scale] = (rec + self.model.rec_noise[scale]) / 2
 
+
         if scale == 0:
             z_rec = generate_noise(
-                (1, *self.scales_list[scale][2:]),
+                (self.num_channels, *self.scales_list[scale][2:]),
                 device=self.device,
                 num_samp=self.batch_size,
             )
-            z_rec = torch.cat([z_rec, masked_facie], dim=1)
+            z_rec = torch.cat([z_rec, well], dim=1)
             z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
             self.model.noise_amp.append(1.0) if len(self.model.rec_noise) == 0 else None
             update_rec_noise(z_rec)
             prev_rec = None
         else:
             z_rec = torch.zeros(
-                (self.batch_size, 1, *self.scales_list[scale][2:]), device=self.device
+                (self.batch_size, self.num_channels, *self.scales_list[scale][2:]), device=self.device
             )
-            z_rec = torch.cat([z_rec, masked_facie], dim=1)
+            z_rec = torch.cat([z_rec, well], dim=1)
             z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
             update_rec_noise(z_rec)
 
-            z_in = self.model.get_noise(mask_indexes, rec=True)
+            z_in = self.model.get_noise(indexes, rec=True)
             with torch.no_grad():
                 prev_rec = self.model.generator(
                     z_in,
                     self.model.noise_amp,
                     stop_scale=len(self.model.generator.gens) - 2,
                 )
-                prev_rec = interpolate(prev_rec, (real.shape[-2], real.shape[-1]))
+                prev_rec = interpolate(prev_rec, (real_facie.shape[-2], real_facie.shape[-1]))
 
-            rec_loss = nn.MSELoss()(real, prev_rec)
+            rec_loss = nn.MSELoss()(real_facie, prev_rec)
             RMSE = torch.sqrt(rec_loss).detach().item()
             amp = self.noise_amp * RMSE
             if len(self.model.noise_amp) <= scale:
@@ -530,16 +540,23 @@ class Trainer:
         generator_loss_rec : float
             Generator reconstruction loss component.
         """
-        epochs.set_description(
-            "Stage [{}/{}] | Batch [{}/{}] | Loss [G: {:2.3f}| D: {:2.3f}] Epoch".format(
-                scale + 1,
-                self.stop_scale + 1,
-                batch_id + 1,
-                self.num_of_batchs,
-                generator_loss,
-                discriminator_loss,
+        # Update progress bar every 50 epochs to reduce terminal flickering
+        if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == self.num_iter:
+            epochs.set_description(
+                "Scale [{}/{}] | Batch [{}/{}]".format(
+                    scale + 1,
+                    self.stop_scale + 1,
+                    batch_id + 1,
+                    self.num_of_batchs,
+                )
             )
-        )
+            epochs.set_postfix( # type: ignore
+                G_adv=f'{generator_loss_fake:.3f}',
+                G_rec=f'{generator_loss_rec:.3f}',
+                D_real=f'{-discriminator_loss_real:.3f}',
+                D_fake=f'{discriminator_loss_fake:.3f}',
+                D_gp=f'{discriminator_loss_gp:.3f}'
+            )
 
         # Ensure scalars are plain Python floats for tensorboardX typing
         writer.add_scalar(  # type: ignore
@@ -565,8 +582,21 @@ class Trainer:
         writer.add_scalar("Loss/train/generator", float(generator_loss), epoch)  # type: ignore
 
     def __save_generated_facies(
-        self, scale: int, epoch: int, results_path: str, mask: torch.Tensor
+        self, scale: int, epoch: int, results_path: str, masks: torch.Tensor
     ) -> None:
+        """Save generated facies visualizations.
+        
+        Parameters
+        ----------
+        scale : int
+            Current scale index.
+        epoch : int
+            Current epoch number.
+        results_path : str
+            Directory to save visualizations.
+        masks : torch.Tensor
+            Binary mask tensors for well locations.
+        """
         indexes = torch.randint(self.batch_size, (self.num_real_facies,))
         real_facies = self.facies[scale][indexes]
         # get_noise expects a list[int] of indexes; convert tensor indices to python lists
@@ -582,7 +612,7 @@ class Trainer:
         plot_generated_facies(
             generated_facies,
             real_facies,
-            mask[indexes],
+            masks[indexes],
             scale,
             epoch,
             out_dir=results_path,

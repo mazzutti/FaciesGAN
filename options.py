@@ -18,7 +18,7 @@ class TrainningOptions(argparse.Namespace):
         beta1: float = 0.5,
         crop_size: int = 256,
         discriminator_steps: int = 3,
-        facie_num_channels: int = 3,
+        num_channels: int = 3,
         gamma: float = 0.9,
         generator_steps: int = 3,
         gpu_device: int = 0,
@@ -32,14 +32,14 @@ class TrainningOptions(argparse.Namespace):
         manual_seed: int | None = None,
         max_size: int = 1024,
         min_num_feature: int = 32,
-        min_size: int = 8,
+        min_size: int = 12,
         noise_amp: float = 0.1,
         num_feature: int = 32,
         num_generated_per_real: int = 5,
         num_iter: int = 2000,
         num_layer: int = 5,
         num_real_facies: int = 5,
-        num_train_facies: int = 200,
+        num_train_pyramids: int = 200,
         output_path: str = "results/",
         padding_size: int = 0,
         regen_npy_gz: bool = False,
@@ -65,7 +65,7 @@ class TrainningOptions(argparse.Namespace):
             Size to crop input facies for training. Default is 256.
         discriminator_steps : int, optional
             Number of discriminator steps per training iteration. Default is 3.
-        facie_num_channels : int, optional
+        num_channels : int, optional
             Number of channels in the input facie. Default is 3.
         gamma : float, optional
             Learning-rate scheduler multiplicative factor. Default is 0.9.
@@ -96,7 +96,7 @@ class TrainningOptions(argparse.Namespace):
         min_num_feature : int, optional
             Minimum number of features in network layers. Default is 32.
         min_size : int, optional
-            Minimum size at the coarsest pyramid scale. Default is 8.
+            Minimum size at the coarsest pyramid scale. Default is 12.
         noise_amp : float, optional
             Base amplitude used to scale adaptive noise. Default is 0.1.
         num_feature : int, optional
@@ -146,7 +146,7 @@ class TrainningOptions(argparse.Namespace):
         self.beta1 = beta1
         self.crop_size = crop_size
         self.discriminator_steps = discriminator_steps
-        self.facie_num_channels = facie_num_channels
+        self.num_channels = num_channels
         self.gamma = gamma
         self.generator_steps = generator_steps
         self.gpu_device = gpu_device
@@ -167,7 +167,7 @@ class TrainningOptions(argparse.Namespace):
         self.num_iter = num_iter
         self.num_layer = num_layer
         self.num_real_facies = num_real_facies
-        self.num_train_facies = num_train_facies
+        self.num_train_pyramids = num_train_pyramids
         self.output_path = output_path
         self.padding_size = padding_size
         self.regen_npy_gz = regen_npy_gz
