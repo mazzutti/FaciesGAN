@@ -34,12 +34,16 @@ class TrainningOptions(argparse.Namespace):
         min_num_feature: int = 32,
         min_size: int = 12,
         noise_amp: float = 0.1,
+        min_noise_amp: float = 0.1,
+        scale0_noise_amp: float = 1.0,
+        lambda_diversity: float = 1.0,
         num_feature: int = 32,
         num_generated_per_real: int = 5,
         num_iter: int = 2000,
         num_layer: int = 5,
         num_real_facies: int = 5,
         num_train_pyramids: int = 200,
+        num_workers: int = 0,
         output_path: str = "results/",
         padding_size: int = 0,
         regen_npy_gz: bool = False,
@@ -99,6 +103,13 @@ class TrainningOptions(argparse.Namespace):
             Minimum size at the coarsest pyramid scale. Default is 12.
         noise_amp : float, optional
             Base amplitude used to scale adaptive noise. Default is 0.1.
+        min_noise_amp : float, optional
+            Minimum noise amplitude floor for diversity. Default is 0.1.
+        scale0_noise_amp : float, optional
+            Noise amplitude at scale 0 (controls structural diversity). Default is 1.0.
+        lambda_diversity : float, optional
+            Weight for diversity loss that penalizes similar outputs from different
+            noise inputs, encouraging the generator to produce diverse facies. Default is 1.0.
         num_feature : int, optional
             Base number of features in the first network layer. Default is 32.
         num_generated_per_real : int, optional
@@ -162,12 +173,16 @@ class TrainningOptions(argparse.Namespace):
         self.min_num_feature = min_num_feature
         self.min_size = min_size
         self.noise_amp = noise_amp
+        self.min_noise_amp = min_noise_amp
+        self.scale0_noise_amp = scale0_noise_amp
+        self.lambda_diversity = lambda_diversity
         self.num_feature = num_feature
         self.num_generated_per_real = num_generated_per_real
         self.num_iter = num_iter
         self.num_layer = num_layer
         self.num_real_facies = num_real_facies
         self.num_train_pyramids = num_train_pyramids
+        self.num_workers = num_workers
         self.output_path = output_path
         self.padding_size = padding_size
         self.regen_npy_gz = regen_npy_gz

@@ -15,6 +15,7 @@ from torch import nn
 from data_files import DataFiles
 from options import TrainningOptions
 
+
 def set_seed(seed: int = 42) -> None:
     """Set seeds for torch, numpy and python.random at module level.
 
@@ -82,6 +83,7 @@ def as_image_file_list(data_file: DataFiles) -> list[Path]:
     """
     data_dir = Path(data_file.as_data_path())
     return list(sorted(data_dir.glob(data_file.image_file_pattern)))
+
 
 def as_model_file_list(data_file: DataFiles) -> list[Path]:
     """Return a sorted list of model checkpoint file paths for the given data file type.
@@ -208,7 +210,7 @@ def generate_scales(options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
         if out_shape[0] % 2 != 0:
             out_shape = [int(shape + 1) for shape in out_shape]
         shapes.append((options.batch_size, options.num_channels, *out_shape))
-        
+
     return tuple(shapes)
 
 
@@ -219,6 +221,9 @@ def weights_init(m: nn.Module) -> None:
     normalization layers. Conv2d layers use N(0, 0.02), while BatchNorm2d
     and InstanceNorm2d use N(1, 0.02) for weights and zero for biases.
 
+    Skips normalization layers without affine parameters (e.g., InstanceNorm2d
+    with affine=False).
+
     Parameters
     ----------
     m : nn.Module
@@ -227,8 +232,11 @@ def weights_init(m: nn.Module) -> None:
     if isinstance(m, nn.Conv2d):
         m.weight.data.normal_(0.0, 0.02)
     elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.InstanceNorm2d):
-        m.weight.data.normal_(1.0, 0.02)
-        m.bias.data.fill_(0)
+        # Only initialize if affine parameters exist
+        if getattr(m, "weight", None) is not None:
+            m.weight.data.normal_(1.0, 0.02)
+        if getattr(m, "bias", None) is not None:
+            m.bias.data.fill_(0)
 
 
 def norm(x: torch.Tensor) -> torch.Tensor:
@@ -350,7 +358,9 @@ def range_transform(
         Transformed array with values scaled to output range.
     """
     if in_range != out_range:
-        scale = np.float32(out_range[1] - out_range[0]) / np.float32(in_range[1] - in_range[0])
+        scale = np.float32(out_range[1] - out_range[0]) / np.float32(
+            in_range[1] - in_range[0]
+        )
         bias = np.float32(out_range[0]) - np.float32(in_range[0]) * scale
         facie = facie * scale + bias
     return facie
@@ -397,6 +407,7 @@ def interpolate(tensor: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:
     )
     return interpolated_tensor
 
+
 def generate_noise(
     size: tuple[int, ...], device: torch.device, num_samp: int = 1, scale: float = 1.0
 ) -> torch.Tensor:
@@ -420,10 +431,71 @@ def generate_noise(
         Random tensor sampled from standard normal distribution with shape
         (num_samp, channels, height/scale, width/scale).
     """
-    noise = torch.randn(num_samp, size[0], *[round(s / scale) for s in size[1:]], device=device)
+    noise = torch.randn(
+        num_samp, size[0], *[round(s / scale) for s in size[1:]], device=device
+    )
     if scale != 1:
         noise = interpolate(noise, size[1:])
     return noise
+
+
+def calc_diversity_loss(
+    fake_samples: list[torch.Tensor],
+    noise_samples: list[list[torch.Tensor]],
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Calculate multi-scale diversity loss to encourage output variation.
+
+    Penalizes the generator when different noise inputs produce similar outputs.
+    Uses mode seeking loss: maximizes ratio of output distance to input distance.
+
+    Loss = -mean(||G(z1) - G(z2)|| / ||z1 - z2||)
+
+    This encourages the generator to produce diverse outputs for different
+    noise inputs while respecting well conditioning.
+
+    Parameters
+    ----------
+    fake_samples : list[torch.Tensor]
+        List of generated images from different noise inputs.
+        Each tensor has shape (1, C, H, W).
+    noise_samples : list[torch.Tensor]
+        List of noise tensors used to generate the fake samples.
+        Each is a list of tensors per scale; we use the coarsest scale.
+    eps : float, optional
+        Small constant for numerical stability. Defaults to 1e-8.
+
+    Returns
+    -------
+    torch.Tensor
+        Scalar diversity loss (negative, to be minimized).
+    """
+    if len(fake_samples) < 2:
+        return torch.tensor(0.0, device=fake_samples[0].device)
+
+    diversity_loss = torch.tensor(0.0, device=fake_samples[0].device)
+    num_pairs = 0
+
+    for i in range(len(fake_samples)):
+        for j in range(i + 1, len(fake_samples)):
+            # Calculate output distance (L1 for stability)
+            output_diff = torch.mean(torch.abs(fake_samples[i] - fake_samples[j]))
+
+            # Calculate input noise distance at coarsest scale (index 0)
+            # noise_samples[i] is a list of tensors per scale
+            noise_i = noise_samples[i][0]  # Coarsest scale
+            noise_j = noise_samples[j][0]
+            input_diff = torch.mean(torch.abs(noise_i - noise_j)) + eps
+
+            # Mode-seeking ratio: we want output_diff / input_diff to be large
+            # So we minimize -ratio (negative loss)
+            diversity_loss = diversity_loss - (output_diff / input_diff)
+            num_pairs += 1
+
+    if num_pairs > 0:
+        diversity_loss = diversity_loss / num_pairs
+
+    return diversity_loss
 
 
 def calc_gradient_penalty(

@@ -1,22 +1,24 @@
 from typing import Any
 
 import matplotlib
-matplotlib.use('Agg')  # Set non-interactive backend before importing pyplot
+# Only set Agg backend if matplotlib hasn't been configured yet
+# This allows training_visualizer.py to use interactive backends
+if matplotlib.get_backend() == 'agg':
+    matplotlib.use('Agg')  # Set non-interactive backend before importing pyplot
 import matplotlib.pyplot as plt
 import numpy as np
 import scipy.stats as st
 import torch
-from matplotlib.markers import MarkerStyle
 
 from config import RESULTS_DIR
 from ops import torch2np
 
 
 def plot_mask(mask: np.ndarray, real_facie: np.ndarray, axis: plt.Axes) -> None:
-    """Plot well locations on a facies visualization.
+    """Plot well locations on a facies visualization with visual markers.
 
-    Displays well positions as vertical scatter plots overlaid on the facies
-    image, using colors to represent facies values at well locations.
+    Displays well positions as vertical black lines, yellow side markers,
+    and arrows to mark the location without changing the actual facies colors.
 
     Parameters
     ----------
@@ -33,23 +35,25 @@ def plot_mask(mask: np.ndarray, real_facie: np.ndarray, axis: plt.Axes) -> None:
     # If there are no mask indices, nothing to plot
     if mask_index.size == 0:
         return
-
-    # Build 1D arrays for scatter x, y and color values c. Use concatenate/ tile to
-    # ensure consistent shapes and concrete dtypes so static analysis can infer types.
-    height = int(mask.shape[0])
-    x = np.concatenate([np.full((height,), int(i), dtype=np.int32) for i in mask_index])
-    y = np.tile(np.arange(0, height, dtype=np.int32), len(mask_index))
-    c = np.concatenate([((real_facie[:, int(i)] >= 0.5).astype(np.int8)) for i in mask_index])
-
-    axis.scatter(  # type: ignore
-        x,
-        y,
-        c=c,
-        s=1,
-        marker=MarkerStyle("s"),
-        cmap="plasma",
-        label="Facies Mask",
-    )
+    
+    for well_x in mask_index:
+        # Add thin yellow vertical lines on left and right sides (keeping well data in middle)
+        axis.axvline(x=int(well_x) - 0.5, color='yellow', linewidth=0.8, alpha=0.9, linestyle='-') # type: ignore
+        axis.axvline(x=int(well_x) + 0.5, color='yellow', linewidth=0.8, alpha=0.9, linestyle='-') # type: ignore
+        
+        # Add arrow at the top pointing down to the well location
+        arrow_y = -5  # Position above the image
+        axis.annotate( # type: ignore
+            '', 
+            xy=(int(well_x), 0),  # Arrow points to top of well
+            xytext=(int(well_x), arrow_y),  # Arrow starts above
+            arrowprops=dict(
+                arrowstyle='->',
+                color='red',
+                lw=2,
+                mutation_scale=20
+            )
+        )
 
 
 def plot_generated_facies(
@@ -89,6 +93,9 @@ def plot_generated_facies(
     fig, axes = plt.subplots(
         num_real_facies, num_generated_per_real + 1, figsize=(12, num_real_facies * 2.5)
     )
+    # Ensure axes is always 2D for consistent indexing
+    if num_real_facies == 1:
+        axes = axes.reshape(1, -1)
     fake_facies_arr = [torch2np(fake_facie, denormalize=True) for fake_facie in fake_facies]
     np_real_facies = torch2np(real_facies, denormalize=True, ceiling=True)
     np_masks = torch2np(masks)

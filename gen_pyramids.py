@@ -125,7 +125,12 @@ def to_wells_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Ten
     for facie_path in facies_paths:
         pyramid = wells_interpolator.interpolate(facie_path, scale_list) # type: ignore
         for i in range(len(scale_list)):
-            pyramids_list[i].append(norm(pyramid[i]))
+            # Normalize wells but preserve zeros (sparse structure)
+            # Only normalize non-zero pixels, keep zeros as zeros
+            well_data = pyramid[i]
+            mask = (well_data.abs() > 0.001).float()  # 1 where data exists, 0 where zeros
+            normalized = norm(well_data) * mask  # Apply norm only where data exists
+            pyramids_list[i].append(normalized)
     pyramids = [
         torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2) for pyramid in pyramids_list
     ]

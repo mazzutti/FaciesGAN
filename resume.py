@@ -4,6 +4,7 @@ import json
 import os
 import random
 from types import SimpleNamespace
+
 # from types import SimpleNamespace
 
 import torch
@@ -16,17 +17,18 @@ from options import ResumeOptions
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
-        "--fine-tuning", action="store_true", help="fine-tune the models")
+        "--fine-tuning", action="store_true", help="fine-tune the models"
+    )
     parser.add_argument(
         "--checkpoint-path",
         type=str,
         help="checkpoint path to continue the training",
         required=True,
     )
+    parser.add_argument("--num-iter", type=int, help="number of epochs for fine-tuning")
     parser.add_argument(
-        "--num-iter", type=int, help="number of epochs for fine-tuning")
-    parser.add_argument(
-        "--start-scale", type=int, default=0, help="start scale for fine-tuning")
+        "--start-scale", type=int, default=0, help="start scale for fine-tuning"
+    )
 
     arguments = parser.parse_args(namespace=ResumeOptions())
 
@@ -54,7 +56,13 @@ if __name__ == "__main__":
         if torch.cuda.is_available()
         else f"mps:{options.gpu_device}" if torch.backends.mps.is_available() else "cpu"
     )
-    trainer = Trainer(device, options, arguments.finetuning, arguments.checkpoint_path)
+    trainer = Trainer(
+        device,
+        options,
+        arguments.num_parallel_scales,
+        arguments.finetuning,
+        arguments.checkpoint_path,
+    )
 
     if arguments.fine_tuning:
         trainer.load(arguments.checkpoint_path, arguments.start_scale - 1)
@@ -65,7 +73,9 @@ if __name__ == "__main__":
 
         # If the last scale folder was created, but no models were saved, remove the folder
         if not os.path.isfile(os.path.join(last_scale_path, G_FILE)):
-            for file in glob.glob(os.path.join(last_scale_path, RESULT_FACIES_PATH, "*")):
+            for file in glob.glob(
+                os.path.join(last_scale_path, RESULT_FACIES_PATH, "*")
+            ):
                 os.remove(file)
             os.removedirs(os.path.join(last_scale_path, RESULT_FACIES_PATH))
             for file in glob.glob(os.path.join(last_scale_path, "*")):
