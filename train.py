@@ -1,13 +1,30 @@
+"""Parallel trainer for multi-scale FaciesGAN training.
+
+This module implements a training pipeline that trains multiple pyramid
+scales simultaneously in parallel groups. The parallel trainer processes
+multiple scales at once (controlled by ``num_parallel_scales``) instead of
+the sequential scale-by-scale training used in the original progressive
+implementation. Each scale keeps its own discriminator and optimizer, while
+the generator is managed by the central ``FaciesGAN`` model instance.
+
+Notes
+-----
+- For efficiency this trainer typically uses a single data batch per group
+    of scales (the DataLoader yields batches of pyramids and a group consumes
+    one batch to train all its scales in parallel).
+- The trainer stores per-scale reconstruction noise and noise amplitudes in
+    the model's ``rec_noise`` and ``noise_amp`` lists respectively.
+"""
+
 from __future__ import annotations
 
 import math
 import os
 import time
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from tensorboardX import SummaryWriter  # type: ignore
@@ -25,19 +42,20 @@ from config import (
 )
 from dataset import PyramidsDataset
 from log import format_time
-from models.discriminator import Discriminator
 from models.facies_gan import FaciesGAN
-from ops import create_dirs, denorm,  generate_noise, interpolate, load
+from ops import create_dirs, generate_noise, interpolate, load
 from options import TrainningOptions
+from tensorboard_visualizer import TensorBoardVisualizer
 from utils import plot_generated_facies
 
 
 class Trainer:
-    """Trainer for multi-scale progressive FaciesGAN training.
+    """Parallel trainer for multi-scale progressive FaciesGAN training.
 
-    Manages the complete training pipeline including dataset loading, model
-    initialization, progressive scale training, and checkpoint saving. Supports
-    both fresh training and fine-tuning from checkpoints.
+    This class manages simultaneous training of multiple pyramid scales by
+    grouping scales and training each group in parallel. Each scale retains
+    its own discriminator and optimizer while the shared generator is
+    exposed through the central :class:`models.facies_gan.FaciesGAN` model.
 
     Parameters
     ----------
@@ -45,6 +63,8 @@ class Trainer:
         Device for training (CPU, CUDA, or MPS).
     options : TrainningOptions
         Training configuration containing hyperparameters and paths.
+    num_parallel_scales : int, optional
+        Number of scales to train simultaneously. Defaults to 2.
     fine_tuning : bool, optional
         Whether to load and fine-tune from existing checkpoints. Defaults to False.
     checkpoint_path : str, optional
@@ -58,35 +78,31 @@ class Trainer:
         Starting pyramid scale index.
     stop_scale : int
         Final pyramid scale index.
+    num_parallel_scales : int
+        Number of scales to train in parallel.
     batch_size : int
-        Effective batch size for training.
+        Effective batch size for training. Note: the dataset yields per-pyramid
+        batches; groups of scales commonly consume a single batch when trained
+        in parallel.
     model : FaciesGAN
-        The FaciesGAN model instance.
+        The FaciesGAN model instance. Per-scale state such as ``rec_noise`` and
+        ``noise_amp`` is stored in the model and updated during initialization
+        and training.
     scales_list : tuple[tuple[int, ...], ...]
         Pyramid resolutions for each scale.
     data_loader : DataLoader
         PyTorch DataLoader for training data.
-    facies : list[torch.Tensor]
-        Current batch of facies data at all scales.
-    wells : list[torch.Tensor]
-        Current batch of well data at all scales.
-    seismic : list[torch.Tensor]
-        Current batch of seismic data at all scales.
-    stacked_data : list[torch.Tensor]
-        Stacked data tensors (currently unused, wells used directly).
-    num_channels : int
-        Number of input channels in the facies data.
-    num_real_facies : int
-        Number of real facies used when composing result grids.
-    num_generated_per_real : int
-        How many generated facies to produce per real example.
-    wells_colums : tuple[int, ...]
-        Tuple of well column indices for filtering.
+    visualizer : TensorBoardVisualizer
+        Handles per-epoch visualization and writes global logs under the
+        configured `log_dir` (``<output_path>/tensorboard_logs``). Each scale
+        also writes a per-scale SummaryWriter to its scale directory.
     """
+
     def __init__(
         self,
         device: torch.device,
         options: TrainningOptions,
+        num_parallel_scales: int = 2,
         fine_tuning: bool = False,
         checkpoint_path: str = ".checkpoints/",
     ) -> None:
@@ -98,6 +114,8 @@ class Trainer:
         self.output_path: str = options.output_path
         self.num_iter: int = options.num_iter
         self.save_interval: int = options.save_interval
+        self.num_parallel_scales: int = num_parallel_scales
+
         self.batch_size: int = (
             options.batch_size
             if (options.batch_size < options.num_train_pyramids)
@@ -105,17 +123,16 @@ class Trainer:
         )
         self.batch_size: int = (
             self.batch_size
-            if not (len(options.wells) > 0 
-                    and options.batch_size < len(options.wells))
+            if not (len(options.wells) > 0 and options.batch_size < len(options.wells))
             else len(options.wells)
         )
         self.fine_tuning: bool = fine_tuning
         self.checkpoint_path: str = checkpoint_path
 
-        self.num_channels: int = options.num_channels
+        self.num_channels: int = options.num_channels * 2
         self.num_real_facies: int = options.num_real_facies
         self.num_generated_per_real: int = options.num_generated_per_real
-        self.wells_colums: tuple[int, ...]= options.wells
+        self.wells_colums: tuple[int, ...] = options.wells
 
         # Optimizer configuration
         self.lr_g: float = options.lr_g
@@ -127,13 +144,14 @@ class Trainer:
         # Model parameters
         self.zero_padding: int = options.num_layer * math.floor(options.kernel_size / 2)
         self.noise_amp: float = options.noise_amp
+        self.min_noise_amp: float = options.min_noise_amp
+        self.scale0_noise_amp: float = options.scale0_noise_amp
         self.facies: list[torch.Tensor] = []
         self.wells: list[torch.Tensor] = []
         self.seismic: list[torch.Tensor] = []
-        self.stacked_data: list[torch.Tensor] = []
 
         dataset: PyramidsDataset = PyramidsDataset(options)
-        self.scales_list: tuple[tuple[int, ...], ...] = dataset.scales_list # type: ignore
+        self.scales_list: tuple[tuple[int, ...], ...] = dataset.scales_list  # type: ignore
 
         if len(options.wells) > 0:
             for i in range(len(self.scales_list)):
@@ -148,63 +166,128 @@ class Trainer:
                 dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][idxs]
 
         self.data_loader = DataLoader(
-            dataset, batch_size=options.batch_size, shuffle=False)
+            dataset,
+            batch_size=options.batch_size,
+            shuffle=False,
+            num_workers=options.num_workers,
+            pin_memory=True if device.type == "cuda" else False,
+        )
+        print(f"DataLoader num_workers: {self.data_loader.num_workers}")
 
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
-        self.model: FaciesGAN = FaciesGAN(device, options, self.wells)
+        self.model: FaciesGAN = FaciesGAN(
+            device, options, self.wells, num_parallel_scales=num_parallel_scales
+        )
         self.model.shapes = list(self.scales_list)
 
         print("Generated facie shapes:")
         print("╔══════════╦══════════╦══════════╦══════════╗")
-        print("║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format("Batch", "Channels", "Height", "Width"))
+        print(
+            "║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format(
+                "Batch", "Channels", "Height", "Width"
+            )
+        )
         print("╠══════════╬══════════╬══════════╬══════════╣")
         for shape in self.scales_list:
             print(
-                "║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format(shape[0], shape[1], shape[2], shape[3])
+                "║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format(
+                    shape[0], shape[1], shape[2], shape[3]
+                )
             )
         print("╚══════════╩══════════╩══════════╩══════════╝")
 
-    def train(self) -> None:
-        """Train the FaciesGAN model across all pyramid scales.
+        # Initialize TensorBoard visualizer
+        viz_path = os.path.join(self.output_path, "training_visualizations")
+        log_dir = os.path.join(self.output_path, "tensorboard_logs")
+        dataset_info = f"{len(dataset)} pyramids, {self.batch_size} batch size"
+        if len(options.wells) > 0:
+            dataset_info += f", wells: {options.wells}"
 
-        Performs progressive training from coarse to fine scales. For each scale,
-        initializes generator and discriminator, optionally loads checkpoint if
-        fine-tuning, then trains using the data loader. Logs training time for
-        each scale and total training time.
+        self.visualizer = TensorBoardVisualizer(
+            num_scales=self.stop_scale - self.start_scale + 1,
+            output_dir=viz_path,
+            log_dir=log_dir,
+            update_interval=1,  # Update every epoch
+            dataset_info=dataset_info,
+        )
+        print(f"📊 TensorBoard logging enabled!")
+        print(f"   View training progress: tensorboard --logdir={log_dir}")
+        print(f"   Then open: http://localhost:6006")
+
+    def train(self) -> None:
+        """Train the FaciesGAN model with parallel scale training.
+
+        Trains multiple pyramid scales simultaneously in groups. Processes
+        scales in batches of num_parallel_scales at a time.
         """
         start_train_time = time.time()
 
-        for scale in range(self.start_scale, self.stop_scale + 1):
-            self.model.cur_scale = scale
-            scale_start_time = time.time()
+        # Train scales in parallel groups
+        scale = self.start_scale
+        while scale <= self.stop_scale:
+            # Determine how many scales to train in this parallel group
+            num_scales_in_group = min(
+                self.num_parallel_scales, self.stop_scale - scale + 1
+            )
 
-            scale_path = os.path.join(self.output_path, str(scale))
-            results_path = os.path.join(scale_path, RESULT_FACIES_PATH)
+            scales_to_train = list(range(scale, scale + num_scales_in_group))
+            print(f"\n{'='*60}")
+            print(f"Training scales {scales_to_train} in parallel")
+            print(f"{'='*60}\n")
 
-            create_dirs(scale_path)
-            create_dirs(results_path)
+            group_start_time = time.time()
 
-            self.model.init_scale_generator(scale)
-            self.model.init_scale_discriminator(scale)
+            # Initialize all scales in the group
+            self.model.init_scales(scale, num_scales_in_group)
+
+            # Create directories for all scales
+            scale_paths: dict[int, str] = {}
+            results_paths: dict[int, str] = {}
+            writers: dict[int, SummaryWriter] = {}
+            for s in scales_to_train:
+                scale_path = os.path.join(self.output_path, str(s))
+                results_path = os.path.join(scale_path, RESULT_FACIES_PATH)
+                create_dirs(scale_path)
+                create_dirs(results_path)
+                scale_paths[s] = scale_path
+                results_paths[s] = results_path
+                writers[s] = SummaryWriter(log_dir=scale_path)
 
             if self.fine_tuning:
-                self.__load_model(scale)
+                for s in scales_to_train:
+                    self.__load_model(s)
 
-            writer = SummaryWriter(log_dir=scale_path)
+            # Consume a single DataLoader batch that contains pyramids for all
+            # training samples. The whole group of scales uses the same batch
+            # (pyramids across scales) during its parallel training step.
             data_iterator = iter(self.data_loader)
-            for batch_id, (
-                self.facies, 
-                self.wells, 
-                self.seismic
-            ) in enumerate(data_iterator):
-                self.model.wells = self.wells
-                self.train_scale(scale, writer, scale_path, results_path, batch_id)
-                self.model.save_scale(scale, scale_path)
+            # Grab one batch (pyramids across scales) for group training
+            self.facies, self.wells, self.seismic = next(data_iterator)
+            self.model.wells = self.wells
 
-            scale_end_time = time.time()
-            elapsed = format_time(int(scale_end_time - scale_start_time))
-            print(f"Scale {scale + 1} training time: {elapsed}")
+            # Train all scales in this group together
+            self.train_scales(
+                scales_to_train,
+                writers,
+                scale_paths,
+                results_paths,
+                0,  # batch_id = 0 since we only use one batch
+            )
+
+            # Save models for all scales in the group
+            for s in scales_to_train:
+                self.model.save_scale(s, scale_paths[s])
+
+            # Close writers
+            for writer in writers.values():
+                writer.close()
+
+            group_end_time = time.time()
+            elapsed = format_time(int(group_end_time - group_start_time))
+            print(f"\nScales {scales_to_train} training time: {elapsed}")
+
+            scale += num_scales_in_group
 
         end_train_time = time.time()
         print(
@@ -212,121 +295,304 @@ class Trainer:
             format_time(int(end_train_time - start_train_time)),
         )
 
-    def train_scale(
+        # Close TensorBoard writer
+        self.visualizer.close()
+        print("\n✅ Training complete!")
+        print("📊 View results in TensorBoard (if still running)")
+
+    def train_scales(
         self,
-        scale: int,
-        writer: SummaryWriter,
-        scale_path: str,
-        results_path: str,
+        scales: list[int],
+        writers: dict[int, SummaryWriter],
+        scale_paths: dict[int, str],
+        results_paths: dict[int, str],
         batch_id: int,
     ) -> None:
-        """Train the model at a specific pyramid scale.
-
-        Initializes optimizers and schedulers, then iterates through training
-        epochs alternating between discriminator and generator updates. Saves
-        generated facies visualizations at regular intervals. Creates binary
-        masks from well data for conditional training.
+        """Train multiple pyramid scales simultaneously.
 
         Parameters
         ----------
-        scale : int
-            Current pyramid scale index.
-        writer : SummaryWriter
-            TensorBoard writer for logging metrics.
-        scale_path : str
-            Directory to save scale-specific checkpoints and optimizers.
-        results_path : str
-            Directory to save generated facies visualizations.
+        scales : list[int]
+            List of scale indices to train in parallel.
+        writers : dict[int, SummaryWriter]
+            Dictionary mapping scale indices to TensorBoard writers.
+        scale_paths : dict[int, str]
+            Dictionary mapping scale indices to checkpoint directories.
+        results_paths : dict[int, str]
+            Dictionary mapping scale indices to results directories.
         batch_id : int
             Current batch index within the epoch.
         """
         indexes = list(range(self.batch_size))
 
-        real_facies = self.facies[scale][indexes].to(self.device)  
-        masks = (denorm(self.wells[scale][indexes])
-                 .to(self.device).sum(dim=1, keepdim=True) > 0).int()
-        wells = self.wells[scale][indexes].to(self.device)
+        # Prepare data for all scales
+        real_facies_dict: dict[int, torch.Tensor] = {}
+        masks_dict: dict[int, torch.Tensor] = {}
+        wells_dict: dict[int, torch.Tensor] = {}
 
-        generator_optimizer = optim.Adam(
-            self.model.generator.gens[-1].parameters(),
-            lr=self.lr_g,
-            betas=(self.beta1, 0.999),
-        )
-        discriminator_optimizer = optim.Adam(
-            cast(Discriminator, self.model.discriminator).parameters(),
-            lr=self.lr_d,
-            betas=(self.beta1, 0.999),
-        )
-        generator_scheduler = optim.lr_scheduler.MultiStepLR(
-            optimizer=generator_optimizer, milestones=[self.lr_decay], gamma=self.gamma
-        )
-        discriminator_scheduler = optim.lr_scheduler.MultiStepLR(
-            optimizer=discriminator_optimizer,
-            milestones=[self.lr_decay],
-            gamma=self.gamma,
-        )
+        for scale in scales:
+            real_facies_dict[scale] = self.facies[scale][indexes].to(self.device)
+            masks_dict[scale] = (
+                self.wells[scale][indexes]
+                .abs()
+                .to(self.device)
+                .sum(dim=1, keepdim=True)
+                > 0
+            ).int()
+            wells_dict[scale] = self.wells[scale][indexes].to(self.device)
+
+        # Create optimizers for all scales
+        generator_optimizers: dict[int, optim.Optimizer] = {}
+        discriminator_optimizers: dict[int, optim.Optimizer] = {}
+        generator_schedulers: dict[int, optim.lr_scheduler.LRScheduler] = {}
+        discriminator_schedulers: dict[int, optim.lr_scheduler.LRScheduler] = {}
+
+        for scale in scales:
+            generator_optimizers[scale] = optim.Adam(
+                self.model.generator.gens[scale].parameters(),
+                lr=self.lr_g,
+                betas=(self.beta1, 0.999),
+            )
+            discriminator_optimizers[scale] = optim.Adam(
+                self.model.discriminators[str(scale)].parameters(),
+                lr=self.lr_d,
+                betas=(self.beta1, 0.999),
+            )
+            generator_schedulers[scale] = optim.lr_scheduler.MultiStepLR(
+                generator_optimizers[scale],
+                milestones=[self.lr_decay],
+                gamma=self.gamma,
+            )
+            discriminator_schedulers[scale] = optim.lr_scheduler.MultiStepLR(
+                discriminator_optimizers[scale],
+                milestones=[self.lr_decay],
+                gamma=self.gamma,
+            )
 
         if self.fine_tuning:
-            self.__load_optimizers(
-                scale,
-                scale_path,
-                generator_optimizer,
-                discriminator_optimizer,
-                generator_scheduler,
-                discriminator_scheduler,
+            for scale in scales:
+                self.__load_optimizers(
+                    scale,
+                    scale_paths[scale],
+                    generator_optimizers[scale],
+                    discriminator_optimizers[scale],
+                    generator_schedulers[scale],
+                    discriminator_schedulers[scale],
+                )
+
+        # Initialize noise for all scales
+        rec_in_dict: dict[int, torch.Tensor] = {}
+        for scale in scales:
+            _, prev_rec = self.__initialize_noise(
+                scale, wells_dict[scale], real_facies_dict[scale], indexes
             )
+            rec_in_dict[scale] = prev_rec
 
-        _, prev_rec = self.__initialize_noise(scale, wells, real_facies, indexes)
-
-        epochs: 'tqdm[int]' = tqdm(range(1, self.num_iter + 1))
+        # Training loop
+        epochs: "tqdm[int]" = tqdm(range(1, self.num_iter + 1))
 
         for epoch in epochs:
+            # Optimize discriminators for all scales
+            discriminator_losses = self.model.optimize_discriminator(
+                indexes,
+                real_facies_dict,
+                discriminator_optimizers,
+            )
 
-            (
-                discriminator_loss,
-                discriminator_loss_real,
-                discriminator_loss_fake,
-                discriminator_loss_gp,
-            ) = self.model.optimize_discriminator(indexes, real_facies, discriminator_optimizer)
+            # Optimize generators for all scales
+            generator_results = self.model.optimize_generator(
+                indexes,
+                real_facies_dict,
+                masks_dict,
+                rec_in_dict,
+                generator_optimizers,
+            )
 
-            generator_loss, generator_loss_fake, generator_loss_rec, _, _ = (
-                self.model.optimize_generator(
-                    indexes,
-                    real_facies,
-                    masks,
-                    cast(torch.Tensor, prev_rec),
-                    generator_optimizer,
+            # Collect metrics for visualization
+            scale_metrics: dict[int, dict[str, Any]] = {}
+            generated_samples: dict[int, torch.Tensor] = {}
+
+            for scale in scales:
+                if scale in discriminator_losses and scale in generator_results:
+                    d_total, d_real, d_fake, d_gp = discriminator_losses[scale]
+                    g_total, g_fake, g_rec, g_well, g_div = generator_results[scale]
+
+                    scale_metrics[scale] = {
+                        "d_total": d_total,
+                        "d_real": d_real,
+                        "d_fake": d_fake,
+                        "g_total": g_total,
+                        "g_adv": g_fake,
+                        "g_rec": g_rec,
+                        "g_well": g_well,
+                        "g_div": g_div,
+                    }
+
+            # Update visualizer
+            if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == self.num_iter:
+                # Generate samples for visualization every 10 epochs
+                with torch.no_grad():
+                    for scale in scales:
+                        fake = self.model.generator(
+                            self.model.get_noise(indexes, scale),
+                            [1.0] * (scale + 1),
+                            stop_scale=scale,
+                        )
+                        generated_samples[scale] = fake[0]  # First sample in batch
+
+                # Update visualizer with samples
+                samples_processed = self.batch_size * epoch
+                self.visualizer.update(
+                    epoch, scale_metrics, generated_samples, samples_processed
                 )
-            )
 
-            self.__log_epoch(
-                epochs,
-                writer,
-                epoch,
-                scale,
-                batch_id,
-                generator_loss,
-                discriminator_loss,
-                discriminator_loss_real,
-                discriminator_loss_fake,
-                discriminator_loss_gp,
-                generator_loss_fake,
-                generator_loss_rec,
-            )
+                # Print one line per scale
+                for scale in scales:
+                    if scale in discriminator_losses and scale in generator_results:
+                        d_total, d_real, d_fake, d_gp = discriminator_losses[scale]
+                        g_total, g_fake, g_rec, _, _ = generator_results[scale]
 
+                        epochs.write(
+                            f"  Scale {scale}: G_adv={g_fake:7.3f} | G_rec={g_rec:7.3f} | "
+                            f"D_real={-d_real:7.3f} | D_fake={d_fake:7.3f} | D_gp={d_gp:7.3f}"
+                        )
+            else:
+                # Update visualizer without generating samples (just metrics)
+                samples_processed = self.batch_size * epoch
+                self.visualizer.update(epoch, scale_metrics, None, samples_processed)
+
+            # Save to TensorBoard for all scales
+            for scale in scales:
+                if scale in discriminator_losses and scale in generator_results:
+                    d_total, d_real, d_fake, d_gp = discriminator_losses[scale]
+                    g_total, g_fake, g_rec, _, _ = generator_results[scale]
+
+                    self.__log_epoch(
+                        epochs,
+                        writers[scale],
+                        epoch,
+                        scale,
+                        batch_id,
+                        g_total,
+                        d_total,
+                        d_real,
+                        d_fake,
+                        d_gp,
+                        g_fake,
+                        g_rec,
+                    )
+
+            # Save generated facies at intervals
             if epoch % self.save_interval == 0 or epoch == self.num_iter:
-                self.__save_generated_facies(scale, epoch, results_path, masks)
+                for scale in scales:
+                    self.__save_generated_facies(
+                        scale, epoch, results_paths[scale], masks_dict[scale]
+                    )
 
-            generator_scheduler.step()
-            discriminator_scheduler.step()
+            # Step schedulers
+            for scale in scales:
+                generator_schedulers[scale].step()
+                discriminator_schedulers[scale].step()
 
-        self.__save_optimizers(
-            scale_path,
-            generator_optimizer,
-            discriminator_optimizer,
-            generator_scheduler,
-            discriminator_scheduler,
-        )
+        # Save optimizers for all scales
+        for scale in scales:
+            self.__save_optimizers(
+                scale_paths[scale],
+                generator_optimizers[scale],
+                discriminator_optimizers[scale],
+                generator_schedulers[scale],
+                discriminator_schedulers[scale],
+            )
+
+    def __initialize_noise(
+        self,
+        scale: int,
+        wells: torch.Tensor,
+        real_facies: torch.Tensor,
+        indexes: list[int],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Initialize reconstruction noise for a specific scale.
+
+        Parameters
+        ----------
+        scale : int
+            Current pyramid scale index.
+        wells : torch.Tensor
+            Well conditioning data.
+        real_facies : torch.Tensor
+            Real facies data at the current scale.
+        indexes : list[int]
+            Batch sample indices.
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            A tuple ``(z_rec, prev_rec)`` where:
+
+            - ``z_rec`` is a batch-sized reconstruction noise tensor concatenated
+              with well-conditioning channels and padded according to
+              ``self.zero_padding``. Shape: ``(batch, num_channels, H, W)``
+            - ``prev_rec`` is the upsampled reconstruction from the previous
+              scale (zeros for scale 0). Shape matches ``real_facies``.
+        """
+        if scale == 0:
+            z_rec = generate_noise(
+                (self.num_channels // 2, *real_facies.shape[2:]),
+                device=self.device,
+                num_samp=self.batch_size,
+            )
+            z_rec = torch.cat([z_rec, wells], dim=1)
+            z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
+
+            self.model.rec_noise.append(z_rec)
+
+            prev_rec = torch.zeros_like(real_facies)
+
+            # Calculate noise amplitude for scale 0
+            with torch.no_grad():
+                fake = self.model.generator(
+                    self.model.get_noise(indexes, scale),
+                    [1.0] * (scale + 1),
+                    stop_scale=scale,
+                )
+
+            rmse = torch.sqrt(F.mse_loss(fake, real_facies))
+            amp = self.scale0_noise_amp * rmse.item()
+            self.model.noise_amp.append(amp)
+
+        else:
+            # For higher scales, calculate based on previous reconstruction
+            prev_rec = interpolate(
+                self.facies[scale - 1][indexes], real_facies.shape[2:]
+            ).to(self.device)
+
+            z_rec = generate_noise(
+                (self.num_channels // 2, *real_facies.shape[2:]),
+                device=self.device,
+                num_samp=self.batch_size,
+            )
+            z_rec = torch.cat([z_rec, wells], dim=1)
+            z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
+
+            self.model.rec_noise.append(z_rec)
+
+            # Calculate noise amplitude
+            with torch.no_grad():
+                fake = self.model.generator(
+                    self.model.get_noise(indexes, scale),
+                    self.model.noise_amp + [1.0],
+                    stop_scale=scale,
+                )
+
+            rmse = torch.sqrt(F.mse_loss(fake, real_facies))
+            amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
+
+            if scale < len(self.model.noise_amp):
+                self.model.noise_amp[scale] = (amp + self.model.noise_amp[scale]) / 2
+            else:
+                self.model.noise_amp.append(amp)
+
+        return z_rec, prev_rec
 
     def load(self, path: str, until_scale: int | None = None) -> None:
         """Load saved models and set the starting scale for training.
@@ -339,7 +605,9 @@ class Trainer:
             Load models up to and including this scale. If None, loads all
             available scales. Defaults to None.
         """
-        self.start_scale = self.model.load(path, load_shapes=False, until_scale=until_scale)
+        self.start_scale = self.model.load(
+            path, load_shapes=False, until_scale=until_scale
+        )
 
     def __load_model(self, scale: int) -> None:
         """Load generator and discriminator state dicts for a specific scale.
@@ -348,25 +616,21 @@ class Trainer:
         ----------
         scale : int
             Scale index to load models for.
-
-        Raises
-        ------
-        Exception
-            If model files cannot be loaded from checkpoint path.
         """
         try:
             generator_path = os.path.join(str(self.checkpoint_path), str(scale), G_FILE)
-            discriminator_path = os.path.join(str(self.checkpoint_path), str(scale), D_FILE)
+            discriminator_path = os.path.join(
+                str(self.checkpoint_path), str(scale), D_FILE
+            )
 
-            self.model.generator.gens[-1].load_state_dict(
+            self.model.generator.gens[scale].load_state_dict(
                 load(generator_path, self.device, as_type=Mapping[str, Any])
             )
-            cast(Discriminator, self.model.discriminator).load_state_dict(
+            self.model.discriminators[str(scale)].load_state_dict(
                 load(discriminator_path, self.device, as_type=Mapping[str, Any])
             )
         except Exception as e:
-            cp = self.checkpoint_path
-            print("Error loading models from", cp, "/", scale, ":", e)
+            print(f"Error loading models from {self.checkpoint_path}/{scale}: {e}")
             raise
 
     def __load_optimizers(
@@ -378,124 +642,42 @@ class Trainer:
         generator_scheduler: optim.lr_scheduler.LRScheduler,
         discriminator_scheduler: optim.lr_scheduler.LRScheduler,
     ) -> None:
-        """Load optimizer and scheduler state dictionaries from checkpoint.
-
-        Parameters
-        ----------
-        scale : int
-            Current scale index (used for error reporting).
-        scale_path : str
-            Directory containing optimizer and scheduler checkpoints.
-        generator_optimizer : optim.Optimizer
-            Generator optimizer to load state into.
-        discriminator_optimizer : optim.Optimizer
-            Discriminator optimizer to load state into.
-        generator_scheduler : optim.lr_scheduler.LRScheduler
-            Generator learning rate scheduler to load state into.
-        discriminator_scheduler : optim.lr_scheduler.LRScheduler
-            Discriminator learning rate scheduler to load state into.
-
-        Raises
-        ------
-        Exception
-            If optimizer/scheduler files cannot be loaded.
-        """
+        """Load optimizer and scheduler state dictionaries from checkpoint."""
         try:
             generator_optimizer.load_state_dict(
-                load(os.path.join(scale_path, OPT_G_FILE), self.device)
+                load(
+                    os.path.join(scale_path, OPT_G_FILE),
+                    self.device,
+                    as_type=dict[str, Any],
+                )
             )
             discriminator_optimizer.load_state_dict(
-                load(os.path.join(scale_path, OPT_D_FILE), self.device)
+                load(
+                    os.path.join(scale_path, OPT_D_FILE),
+                    self.device,
+                    as_type=dict[str, Any],
+                )
             )
             generator_scheduler.load_state_dict(
-                load(os.path.join(scale_path, SCH_G_FILE), self.device)
+                load(
+                    os.path.join(scale_path, SCH_G_FILE),
+                    self.device,
+                    as_type=dict[str, Any],
+                )
             )
             discriminator_scheduler.load_state_dict(
-                load(os.path.join(scale_path, SCH_D_FILE), self.device)
+                load(
+                    os.path.join(scale_path, SCH_D_FILE),
+                    self.device,
+                    as_type=dict[str, Any],
+                )
             )
         except Exception as e:
-            print("Error loading optimizers from", scale_path, "/", scale, ":", e)
-            raise e
-
-    def __initialize_noise(
-        self,
-        scale: int,
-        well: torch.Tensor,
-        real_facie: torch.Tensor,
-        indexes: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        """Initialize noise tensors and compute noise amplitude for the current scale.
-
-        For scale 0, initializes reconstruction noise with amplitude 1.0.
-        For subsequent scales, computes reconstruction from previous scales and
-        calculates amplitude based on RMSE between real and reconstructed images.
-
-        Parameters
-        ----------
-        scale : int
-            Current pyramid scale index.
-        well : torch.Tensor
-            Well location data for this scale.
-        real_facie : torch.Tensor
-            Real facies images at this scale.
-        indexes : list[int]
-            Indices of samples in the batch.
-
-        Returns
-        -------
-        tuple[torch.Tensor, torch.Tensor | None]
-            Tuple of (z_rec, prev_rec) where z_rec is the initialized noise tensor
-            and prev_rec is the reconstruction from previous scales (None for scale 0).
-        """
-
-        def update_rec_noise(rec: torch.Tensor) -> None:
-            if len(self.model.rec_noise) <= scale:
-                self.model.rec_noise.append(rec)
-            else:
-                self.model.rec_noise[scale] = (rec + self.model.rec_noise[scale]) / 2
-
-
-        if scale == 0:
-            z_rec = generate_noise(
-                (self.num_channels, *self.scales_list[scale][2:]),
-                device=self.device,
-                num_samp=self.batch_size,
-            )
-            z_rec = torch.cat([z_rec, well], dim=1)
-            z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
-            self.model.noise_amp.append(1.0) if len(self.model.rec_noise) == 0 else None
-            update_rec_noise(z_rec)
-            prev_rec = None
-        else:
-            z_rec = torch.zeros(
-                (self.batch_size, self.num_channels, *self.scales_list[scale][2:]), device=self.device
-            )
-            z_rec = torch.cat([z_rec, well], dim=1)
-            z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
-            update_rec_noise(z_rec)
-
-            z_in = self.model.get_noise(indexes, rec=True)
-            with torch.no_grad():
-                prev_rec = self.model.generator(
-                    z_in,
-                    self.model.noise_amp,
-                    stop_scale=len(self.model.generator.gens) - 2,
-                )
-                prev_rec = interpolate(prev_rec, (real_facie.shape[-2], real_facie.shape[-1]))
-
-            rec_loss = nn.MSELoss()(real_facie, prev_rec)
-            RMSE = torch.sqrt(rec_loss).detach().item()
-            amp = self.noise_amp * RMSE
-            if len(self.model.noise_amp) <= scale:
-                self.model.noise_amp.append(amp)
-            else:
-                self.model.noise_amp[scale] = (amp + self.model.noise_amp[scale]) / 2
-
-        return z_rec, prev_rec
+            print(f"Warning: Could not load optimizers for scale {scale}: {e}")
 
     def __log_epoch(
         self,
-        epochs: 'tqdm[int]',
+        epochs: "tqdm[int]",
         writer: SummaryWriter,
         epoch: int,
         scale: int,
@@ -508,57 +690,18 @@ class Trainer:
         generator_loss_fake: float,
         generator_loss_rec: float,
     ) -> None:
-        """Log training metrics for the current epoch to TensorBoard and console.
-
-        Updates the progress bar description and writes all loss components
-        to TensorBoard for visualization.
-
-        Parameters
-        ----------
-        epochs : tqdm[int]
-            Progress bar for epoch iteration.
-        writer : SummaryWriter
-            TensorBoard writer for logging metrics.
-        epoch : int
-            Current epoch number.
-        scale : int
-            Current pyramid scale index.
-        batch_id : int
-            Current batch index.
-        generator_loss : float
-            Total generator loss.
-        discriminator_loss : float
-            Total discriminator loss.
-        discriminator_loss_real : float
-            Discriminator loss on real samples.
-        discriminator_loss_fake : float
-            Discriminator loss on generated samples.
-        discriminator_loss_gp : float
-            Gradient penalty loss component.
-        generator_loss_fake : float
-            Generator adversarial loss component.
-        generator_loss_rec : float
-            Generator reconstruction loss component.
-        """
-        # Update progress bar every 50 epochs to reduce terminal flickering
+        """Log training metrics for the current epoch to TensorBoard and console."""
+        # Update progress bar description
         if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == self.num_iter:
             epochs.set_description(
-                "Scale [{}/{}] | Batch [{}/{}]".format(
-                    scale + 1,
-                    self.stop_scale + 1,
-                    batch_id + 1,
-                    self.num_of_batchs,
+                "Epoch [{:4d}/{}] Scales {}".format(
+                    epoch + 1,
+                    self.num_iter,
+                    list(self.model.active_scales),
                 )
             )
-            epochs.set_postfix( # type: ignore
-                G_adv=f'{generator_loss_fake:.3f}',
-                G_rec=f'{generator_loss_rec:.3f}',
-                D_real=f'{-discriminator_loss_real:.3f}',
-                D_fake=f'{discriminator_loss_fake:.3f}',
-                D_gp=f'{discriminator_loss_gp:.3f}'
-            )
 
-        # Ensure scalars are plain Python floats for tensorboardX typing
+        # Log to TensorBoard
         writer.add_scalar(  # type: ignore
             "Loss/train/discriminator/real", -float(discriminator_loss_real), epoch
         )
@@ -584,31 +727,26 @@ class Trainer:
     def __save_generated_facies(
         self, scale: int, epoch: int, results_path: str, masks: torch.Tensor
     ) -> None:
-        """Save generated facies visualizations.
-        
-        Parameters
-        ----------
-        scale : int
-            Current scale index.
-        epoch : int
-            Current epoch number.
-        results_path : str
-            Directory to save visualizations.
-        masks : torch.Tensor
-            Binary mask tensors for well locations.
-        """
+        """Save generated facies visualizations."""
         indexes = torch.randint(self.batch_size, (self.num_real_facies,))
         real_facies = self.facies[scale][indexes]
-        # get_noise expects a list[int] of indexes; convert tensor indices to python lists
+
         noises = [
-            self.model.get_noise([int(index.item())] * self.num_generated_per_real)
+            self.model.get_noise(
+                [int(index.item())] * self.num_generated_per_real, scale
+            )
             for index in indexes
         ]
+
         with torch.no_grad():
             generated_facies = [
-                self.model.generator(noise, self.model.noise_amp) for noise in noises
+                self.model.generator(
+                    noise, self.model.noise_amp[: scale + 1], stop_scale=scale
+                )
+                for noise in noises
             ]
-            generated_facies = [generated_facie.clip(-1, 1) for generated_facie in generated_facies]
+            generated_facies = [gen.clip(-1, 1) for gen in generated_facies]
+
         plot_generated_facies(
             generated_facies,
             real_facies,
@@ -627,28 +765,16 @@ class Trainer:
         generator_scheduler: optim.lr_scheduler.LRScheduler,
         discriminator_scheduler: optim.lr_scheduler.LRScheduler,
     ) -> None:
-        """Save optimizer and scheduler state dictionaries to disk.
-
-        Parameters
-        ----------
-        scale_path : str
-            Directory to save checkpoint files.
-        generator_optimizer : optim.Optimizer
-            Generator optimizer to save.
-        discriminator_optimizer : optim.Optimizer
-            Discriminator optimizer to save.
-        generator_scheduler : optim.lr_scheduler.LRScheduler
-            Generator learning rate scheduler to save.
-        discriminator_scheduler : optim.lr_scheduler.LRScheduler
-            Discriminator learning rate scheduler to save.
-        """
-        torch.save(generator_optimizer.state_dict(), str(os.path.join(scale_path, OPT_G_FILE)))
+        """Save optimizer and scheduler state dictionaries to disk."""
         torch.save(
-            discriminator_optimizer.state_dict(),
-            str(os.path.join(scale_path, OPT_D_FILE)),
+            generator_optimizer.state_dict(), os.path.join(scale_path, OPT_G_FILE)
         )
-        torch.save(generator_scheduler.state_dict(), str(os.path.join(scale_path, SCH_G_FILE)))
         torch.save(
-            discriminator_scheduler.state_dict(),
-            str(os.path.join(scale_path, SCH_D_FILE)),
+            discriminator_optimizer.state_dict(), os.path.join(scale_path, OPT_D_FILE)
+        )
+        torch.save(
+            generator_scheduler.state_dict(), os.path.join(scale_path, SCH_G_FILE)
+        )
+        torch.save(
+            discriminator_scheduler.state_dict(), os.path.join(scale_path, SCH_D_FILE)
         )
