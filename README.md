@@ -5,6 +5,7 @@ This repository implements FaciesGAN to generate transversal geological facies r
 
 ## ✨ Key Features
 * **Multi-scale Progressive Training**: FaciesGAN architecture with pyramid-based learning from coarse to fine scales
+* **Parallel Multi-Scale Training**: Train multiple pyramid scales simultaneously to reduce wall-clock time
 * **Well Conditioning**: Incorporates well log data as constraints to ensure geological realism
 * **Neural Interpolation**: Advanced interpolators (nearest, neural, well-based) for smooth multi-scale representations
 * **Color Palette Encoding**: Efficient RGB-to-label conversion for categorical facies data
@@ -84,10 +85,47 @@ Train the model on your facies dataset with multi-scale progressive learning:
 ```sh
 python main.py --input_path data --num_iter 40 --batch_size 200 \
     --save_interval 10 --num_train_facies 200 --gpu_device 0 \
-    --min_size 16 --max_size 128 --stop_scale 8
+    --min_size 16 --max_size 128 --stop_scale 8 --num_parallel_scales 2
 ```
 
-**Key Parameters:**
+### Performance Profiling
+
+Enable PyTorch profiler with the `--use-profiler` flag to analyze performance bottlenecks.
+The profiling behavior depends on your hardware backend:
+
+#### CUDA/CPU Profiling
+Exports a Chrome trace to `<output_path>/profiler_trace.json` that can be viewed at `chrome://tracing`:
+
+```sh
+# Profile CUDA training with parallel scales
+python main.py --input_path data --num_iter 100 --batch_size 200 \
+    --num_train_pyramids 50 --gpu_device 0 --stop_scale 6 \
+    --num_parallel_scales 2 --use-profiler
+
+# After training completes, open chrome://tracing and load profiler_trace.json
+```
+
+#### MPS (Apple Silicon) Profiling
+Uses `torch.mps.profiler` to generate OS Signpost traces for Xcode Instruments:
+
+```sh
+# Profile MPS training (automatically opens Instruments after completion)
+python main.py --input_path data --num_iter 100 --batch_size 200 \
+    --num_train_pyramids 50 --stop_scale 6 \
+    --num_parallel_scales 2 --use-profiler
+```
+
+**Workflow for MPS profiling:**
+1. Open Xcode Instruments before training
+2. Select the "Logging" instrument
+3. Click the record button
+4. Run your training command with `--use-profiler`
+5. View detailed signpost intervals showing MPS kernel execution in the Instruments timeline
+
+**Note**: The script will automatically attempt to open Instruments after profiling, but traces
+must be captured during execution. Launch Instruments and start recording before running training.
+
+**Key Training Parameters:**
 * `--min_size`: Starting resolution for coarse scale (default: 16)
 * `--max_size`: Final high-resolution output (default: 128)
 * `--stop_scale`: Number of scales in the pyramid (default: 8)
@@ -263,6 +301,16 @@ mypy .
 * ✅ **Dataset Restructure**: Organized data into facies/wells/seismic directories
 * ✅ **Documentation**: Comprehensive docstrings for all modules
 * ✅ **Code Quality**: Black formatting, Flake8 linting, MyPy type checking
+* ✅ **Parallel Trainer**: New `Trainer` supports training multiple scales in parallel
+    (use `--num_parallel_scales` to control group size). Each group consumes a
+    single batch of pyramids and trains its scales concurrently.
+* ✅ **TensorBoard Logging**: Training writes a global log directory under
+    ``<output_path>/tensorboard_logs`` and also creates a per-scale
+    SummaryWriter inside each scale folder (``<output_path>/<scale>/``) for
+    easier per-scale inspection.
+* ✅ **Performance Profiling**: Added `--use-profiler` flag with backend-specific
+    profiling support: Chrome traces for CUDA/CPU, OS Signpost traces for MPS
+    with automatic Xcode Instruments integration.
 
 ### Breaking Changes
 * `generate.py` renamed to `gen_facies.py`
