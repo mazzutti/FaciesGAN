@@ -1,3 +1,10 @@
+"""Main entry point for parallel multi-scale FaciesGAN training.
+
+This script provides the command-line interface and initialization for
+training a FaciesGAN model with parallel scale processing. Multiple pyramid
+scales can be trained simultaneously for faster overall training.
+"""
+
 import json
 import os
 import random
@@ -5,8 +12,8 @@ from datetime import datetime
 
 import torch
 from dateutil import tz
-
 from argparse import ArgumentParser
+
 from config import CHECKPOINT_PATH, OPT_FILE
 from log import init_output_logging
 from options import TrainningOptions
@@ -14,20 +21,25 @@ from train import Trainer
 
 
 def get_arguments() -> ArgumentParser:
+    """Parse command-line arguments for parallel FaciesGAN training.
+
+    Returns
+    -------
+    ArgumentParser
+        Configured argument parser with all training options.
+    """
     parser = ArgumentParser()
 
     # workspace:
-    parser.add_argument(
-        "--use-cpu", action="store_true", help="use cpu")
-    parser.add_argument(
-        "--gpu-device", type=int, help="which GPU to use", default=0)
-    parser.add_argument(
-        "--input-path", help="input facie path", required=True)
+    parser.add_argument("--use-cpu", action="store_true", help="use cpu")
+    parser.add_argument("--gpu-device", type=int, help="which GPU to use", default=0)
+    parser.add_argument("--input-path", help="input facie path", required=True)
 
     # load, input, save configurations:
     parser.add_argument("--manual-seed", type=int, help="manual seed")
     parser.add_argument(
-        "--output-path", help="output folder path", default="facies_gan")
+        "--output-path", help="output folder path", default="facies_gan_parallel"
+    )
     parser.add_argument("--stop-scale", type=int, help="stop scale", default=6)
     parser.add_argument(
         "--facie-num-channels", type=int, help="facie number of channels", default=3
@@ -40,7 +52,8 @@ def get_arguments() -> ArgumentParser:
         default=[0, 255],
     )
     parser.add_argument(
-        "--crop-size", type=int, help="crop size to train the facie", default=256)
+        "--crop-size", type=int, help="crop size to train the facie", default=256
+    )
     parser.add_argument(
         "--batch-size",
         default=1,
@@ -61,44 +74,83 @@ def get_arguments() -> ArgumentParser:
         help="minimal number of features in each layer",
         default=32,
     )
+    parser.add_argument("--kernel-size", type=int, help="kernel size", default=3)
     parser.add_argument(
-        "--kernel-size", type=int, help="kernel size", default=3)
-    parser.add_argument(
-        "--num-layers", type=int, help="number of layers in each scale", default=5)
-    parser.add_argument(
-        "--stride", help="stride", default=1)
-    parser.add_argument(
-        "--padding-size", type=int, help="net pad size", default=0)
+        "--num-layers", type=int, help="number of layers in each scale", default=5
+    )
+    parser.add_argument("--stride", help="stride", default=1)
+    parser.add_argument("--padding-size", type=int, help="net pad size", default=0)
 
     # pyramid parameters:
     parser.add_argument(
-        "--noise-amp", type=float, help="adaptive noise cont weight", default=0.1)
+        "--noise-amp", type=float, help="adaptive noise cont weight", default=0.1
+    )
+    parser.add_argument(
+        "--min-noise-amp",
+        type=float,
+        help="minimum noise amplitude floor for diversity",
+        default=0.5,
+    )
+    parser.add_argument(
+        "--scale0-noise-amp",
+        type=float,
+        help="noise amplitude at scale 0 (controls structural diversity)",
+        default=1.0,
+    )
+
+    # Parallel training specific parameters:
+    parser.add_argument(
+        "--num-parallel-scales",
+        type=int,
+        help="Number of scales to train in parallel (default: 2)",
+        default=2,
+    )
+
+    # profiling
+    parser.add_argument(
+        "--use-profiler",
+        action="store_true",
+        help="Enable PyTorch profiler and export a chrome trace to the output path",
+    )
 
     # optimization hyperparameters:
     parser.add_argument(
         "--num-iter", type=int, default=2000, help="number of epochs to train per scale"
     )
+    parser.add_argument("--gamma", type=float, help="scheduler gamma", default=0.9)
     parser.add_argument(
-        "--gamma", type=float, help="scheduler gamma", default=0.9)
+        "--lr-g", type=float, default=5e-5, help="learning rate, default=5e-5"
+    )
     parser.add_argument(
-        "--lr-g", type=float, default=5e-5, help="learning rate, default=5e-8")
-    parser.add_argument("--lr-d", type=float, default=5e-5, help="learning rate, default=5e-8")
+        "--lr-d", type=float, default=5e-5, help="learning rate, default=5e-5"
+    )
     parser.add_argument(
         "--lr-decay", type=int, default=1000, help="number of epochs before lr decay"
     )
     parser.add_argument(
-        "--beta1", type=float, default=0.5, help="beta1 for adam. default=0.5")
+        "--beta1", type=float, default=0.5, help="beta1 for adam. default=0.5"
+    )
     parser.add_argument(
-        "--generator-steps", type=int, help="Generator inner steps", default=3)
+        "--generator-steps", type=int, help="Generator inner steps", default=3
+    )
     parser.add_argument(
         "--discriminator-steps", type=int, help="Discriminator inner steps", default=3
     )
     parser.add_argument(
-        "--lambda-grad", type=float, help="gradient penalty weight", default=0.1)
+        "--lambda-grad", type=float, help="gradient penalty weight", default=0.1
+    )
     parser.add_argument(
-        "--alpha", type=float, help="reconstruction loss weight", default=10)
+        "--alpha", type=float, help="reconstruction loss weight", default=10
+    )
     parser.add_argument(
-        "--save-interval", type=int, help="save log interval", default=100)
+        "--lambda-diversity",
+        type=float,
+        help="diversity loss weight (encourages different outputs for different noise)",
+        default=1.0,
+    )
+    parser.add_argument(
+        "--save-interval", type=int, help="save log interval", default=100
+    )
     parser.add_argument(
         "--num-real-facies",
         type=int,
@@ -117,6 +169,12 @@ def get_arguments() -> ArgumentParser:
         help="Number of train pyramids to use in the FaciesGAN training",
         default=200,
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        help="Number of workers for data loading (0 = main process only)",
+        default=0,
+    )
 
     parser.add_argument(
         "--wells",
@@ -124,12 +182,13 @@ def get_arguments() -> ArgumentParser:
         help="list of well indices to train the model from",
         nargs="+",
         default=tuple(),
-    ) 
+    )
 
     return parser
 
 
-if __name__ == "__main__":
+def main() -> None:
+    """Main function to initialize and run parallel FaciesGAN training."""
     argument_parser = get_arguments()
     options = argument_parser.parse_args(namespace=TrainningOptions())
 
@@ -139,7 +198,8 @@ if __name__ == "__main__":
 
     timestamp = datetime.now(tz.tzlocal()).strftime("%Y_%m_%d_%H_%M_%S")
     options.output_path = os.path.join(
-        CHECKPOINT_PATH, f"{timestamp}_{options.output_path}")
+        CHECKPOINT_PATH, f"{timestamp}_{options.output_path}"
+    )
     options.start_scale = 0
 
     os.makedirs(options.output_path, exist_ok=True)
@@ -153,9 +213,80 @@ if __name__ == "__main__":
     device = torch.device(
         f"cuda:{options.gpu_device}"
         if torch.cuda.is_available()
-        else f"mps:{options.gpu_device}" 
-            if torch.backends.mps.is_available() else "cpu"
+        else f"mps:{options.gpu_device}" if torch.backends.mps.is_available() else "cpu"
     )
 
-    trainer = Trainer(device, options)
-    trainer.train()
+    print("\n" + "=" * 60)
+    print(f"PARALLEL LAPGAN TRAINING")
+    print("=" * 60)
+    print(f"Device: {device}")
+    print(f"Training scales: {options.start_scale} to {options.stop_scale}")
+    print(f"Parallel scales: {options.num_parallel_scales}")
+    print(f"Iterations per scale: {options.num_iter}")
+    print(f"Output path: {options.output_path}")
+    print("=" * 60 + "\n")
+
+    trainer = Trainer(device, options, num_parallel_scales=options.num_parallel_scales)
+
+    # Optionally run the trainer under the PyTorch profiler and export traces.
+    # MPS backend uses a different profiler API (torch.mps.profiler) that
+    # generates OS Signpost traces viewable in Xcode Instruments.
+    if getattr(options, "use_profiler", False):
+        if device.type == "mps":
+            # Use MPS-specific profiler for Apple Silicon GPUs
+            print("Starting MPS profiler (use Xcode Instruments to view traces)...")
+            print(
+                "Note: Launch Xcode Instruments with the Logging tool before starting training"
+            )
+            try:
+                torch.mps.profiler.start(mode="interval", wait_until_completed=False)  # type: ignore
+                trainer.train()
+                torch.mps.profiler.stop()  # type: ignore
+                print("MPS profiler stopped. Opening Xcode Instruments...")
+                # Attempt to open Xcode Instruments
+                import subprocess
+
+                try:
+                    subprocess.run(["open", "-a", "Instruments"], check=False)
+                except Exception as open_err:
+                    print(f"Could not automatically open Instruments: {open_err}")
+                    print(
+                        "Please open Xcode Instruments > Logging tool manually to view OS Signpost traces."
+                    )
+            except Exception as e:
+                print(f"Warning: MPS profiler error: {e}")
+                trainer.train()
+        else:
+            # Use standard torch.profiler for CPU/CUDA
+            try:
+                from torch.profiler import profile, ProfilerActivity  # type: ignore
+            except Exception:
+                print("Warning: PyTorch profiler not available in this environment.")
+                trainer.train()
+            else:
+                trace_file = os.path.join(options.output_path, "profiler_trace.json")
+                activities = [ProfilerActivity.CPU]
+                if torch.cuda.is_available():
+                    activities.append(ProfilerActivity.CUDA)
+
+                with profile(
+                    activities=activities, record_shapes=True, profile_memory=True
+                ) as prof:
+                    trainer.train()
+
+                try:
+                    prof.export_chrome_trace(trace_file)
+                    print(f"Profiler trace saved to: {trace_file}")
+                    print("View in Chrome at: chrome://tracing")
+                except Exception as e:
+                    print(f"Could not export profiler trace: {e}")
+    else:
+        trainer.train()
+
+    print("\n" + "=" * 60)
+    print("TRAINING COMPLETED SUCCESSFULLY")
+    print("=" * 60 + "\n")
+
+
+if __name__ == "__main__":
+    main()
