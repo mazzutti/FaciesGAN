@@ -4,5 +4,7 @@ flake8==7.3.0
 isort==7.0.0
 mypy==1.18.2
 black==25.11.0
+tensorboard==2.20.0
+tensorboardX==2.6.4
 # Optional/confirmed type stubs are centralized in `types-requirements.txt`.
 -r types-requirements.txt
