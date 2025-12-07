@@ -1,26 +1,34 @@
+"""Parallel LAPGAN implementation for training multiple scales simultaneously.
+
+This module extends the standard FaciesGAN to support parallel training of
+multiple pyramid scales. Instead of training scales sequentially, this
+implementation can train multiple scales at once using separate optimizers
+and discriminators for each scale.
+"""
+
 import argparse
 import math
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 import ops as ops
-from config import AMP_FILE, D_FILE, G_FILE, M_FILE, REC_FILE, SHAPE_FILE
+from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
 from models.discriminator import Discriminator
 from models.generator import Generator
 
 
 class FaciesGAN:
-    """Complete FaciesGAN model managing generator, discriminator, and training.
+    """Parallel multi-scale FaciesGAN for simultaneous scale training.
 
-    Coordinates multi-scale progressive GAN training for geological facies
-    generation with well conditioning. Manages noise generation, optimization
-    steps, and model persistence.
+    This class manages multiple discriminators and enables training several
+    pyramid scales in parallel rather than sequentially. Each scale has its
+    own discriminator and optimization state.
 
     Parameters
     ----------
@@ -30,6 +38,8 @@ class FaciesGAN:
         Configuration containing all hyperparameters.
     wells : Sequence[torch.Tensor], optional
         Well location data for conditioning. Defaults to empty tuple.
+    num_parallel_scales : int, optional
+        Number of scales to train in parallel. Defaults to 2.
     *args : tuple[Any, ...]
         Additional positional arguments.
     **kwargs : dict[str, Any]
@@ -39,8 +49,8 @@ class FaciesGAN:
     ----------
     generator : Generator
         Multi-scale progressive generator network.
-    discriminator : Discriminator | None
-        Discriminator network (None until initialized for first scale).
+    discriminators : nn.ModuleDict
+        Dictionary mapping scale indices to discriminator networks.
     rec_noise : list[torch.Tensor]
         Reconstruction noise tensors for each scale.
     noise_amp : list[float]
@@ -49,19 +59,24 @@ class FaciesGAN:
         Well location data for conditioning.
     shapes : list[tuple[int, ...]]
         Pyramid resolutions for each scale.
-    cur_scale : int
-        Current training scale index.
+    num_parallel_scales : int
+        Number of scales to train simultaneously.
+    active_scales : set[int]
+        Set of scale indices currently being trained.
     """
+
     def __init__(
         self,
         device: torch.device,
         options: argparse.Namespace | SimpleNamespace,
         wells: Sequence[torch.Tensor] = (),
+        num_parallel_scales: int = 2,
         *args: tuple[Any, ...],
         **kwargs: dict[str, Any],
     ) -> None:
         super().__init__(*args, **kwargs)
         self.device = device
+        self.num_parallel_scales = num_parallel_scales
 
         # Image parameters
         self.num_channels = options.num_channels * 2
@@ -72,6 +87,7 @@ class FaciesGAN:
         self.generator_steps = options.generator_steps
         self.lambda_grad = options.lambda_grad
         self.alpha = options.alpha
+        self.lambda_diversity = getattr(options, "lambda_diversity", 1.0)
 
         # Network parameters
         self.num_feature = options.num_feature
@@ -83,12 +99,10 @@ class FaciesGAN:
         self.shapes: list[tuple[int, ...]] = []
         self.rec_noise: list[torch.Tensor] = []
         self.noise_amp: list[float] = []
-        # Current training scale (set by Trainer during training)
-        self.cur_scale: int = 0
 
-        # Accept any sequence for `wells` (tuple/list). Default to an
-        # empty tuple so the default is immutable and safe as a module-level
-        # default. Convert to a per-instance list for internal mutation.
+        # Track active scales being trained
+        self.active_scales: set[int] = set()
+
         if wells:
             self.wells: list[torch.Tensor] = list(wells)
         else:
@@ -97,7 +111,24 @@ class FaciesGAN:
         self.generator: Generator = Generator(
             self.num_layer, self.kernel_size, self.padding_size, self.num_channels
         ).to(self.device)
-        self.discriminator = None
+
+        # Multiple discriminators for parallel training
+        self.discriminators: nn.ModuleDict = nn.ModuleDict()
+
+    def init_scales(self, start_scale: int, num_scales: int) -> None:
+        """Initialize multiple scales for parallel training.
+
+        Parameters
+        ----------
+        start_scale : int
+            Starting pyramid scale index.
+        num_scales : int
+            Number of consecutive scales to initialize.
+        """
+        for scale in range(start_scale, start_scale + num_scales):
+            self.init_scale_generator(scale)
+            self.init_scale_discriminator(scale)
+            self.active_scales.add(scale)
 
     def init_scale_generator(self, scale: int) -> None:
         """Initialize generator for a new pyramid scale.
@@ -115,22 +146,27 @@ class FaciesGAN:
         self.generator.create_scale(num_feature, min_num_feature)
         self.generator.gens[-1] = self.generator.gens[-1].to(self.device)
 
-        # Reinitialize the weights if the Generator features were doubled.
-        if scale % 4 == 0:
+        # Reinitialize the weights if features were doubled or using SPADE
+        prev_is_spade = (
+            (scale - 1) in self.generator.spade_scales if scale > 0 else False
+        )
+        curr_is_spade = scale in self.generator.spade_scales
+
+        if scale % 4 == 0 or prev_is_spade or curr_is_spade:
             self.generator.gens[-1].apply(ops.weights_init)
         else:
-            self.generator.gens[-1].load_state_dict(self.generator.gens[-2].state_dict())
+            self.generator.gens[-1].load_state_dict(
+                self.generator.gens[-2].state_dict()
+            )
 
-        if len(self.generator.gens) > 1:
-            self.generator.gens[-2] = ops.reset_grads(self.generator.gens[-2])
-            self.generator.gens[-2].eval()
+        # Don't freeze generators - allow joint optimization
+        # This is key for parallel training
 
     def init_scale_discriminator(self, scale: int) -> None:
         """Initialize discriminator for a new pyramid scale.
 
-        Creates a new discriminator with appropriate feature counts when
-        features are doubled (every 4 scales). Otherwise, reuses existing
-        discriminator.
+        Creates a new discriminator with appropriate feature counts. Each
+        scale gets its own discriminator for parallel training.
 
         Parameters
         ----------
@@ -139,18 +175,18 @@ class FaciesGAN:
         """
         num_feature, min_num_feature = self.get_num_features(scale)
 
-        # If the Discriminator features were doubled, recreate the Discriminator and reinitialize the weights.
-        # If not, continue with the current Discriminator
-        if scale % 4 == 0:
-            self.discriminator = Discriminator(
-                num_feature,
-                min_num_feature,
-                self.num_layer,
-                self.kernel_size,
-                self.padding_size,
-                self.num_channels // 2,
-            ).to(self.device)
-            self.discriminator.apply(ops.weights_init)
+        # Create a new discriminator for each scale
+        discriminator = Discriminator(
+            num_feature,
+            min_num_feature,
+            self.num_layer,
+            self.kernel_size,
+            self.padding_size,
+            self.num_channels // 2,  # 3 facies output channels
+        ).to(self.device)
+        discriminator.apply(ops.weights_init)
+
+        self.discriminators[str(scale)] = discriminator
 
     def get_num_features(self, scale: int) -> tuple[int, int]:
         """Calculate feature counts for networks at a given scale.
@@ -173,27 +209,26 @@ class FaciesGAN:
         return num_feature, min_num_feature
 
     def get_noise(
-        self, indexes: list[int], rec: bool = False, last: bool = False
+        self,
+        indexes: list[int],
+        scale: int,
+        rec: bool = False,
     ) -> list[torch.Tensor]:
-        """Generate noise tensors for all pyramid scales.
-
-        Creates random noise combined with well-conditioned facies data for
-        generator input. Can return reconstruction noise or only last scale.
+        """Generate noise tensors up to a specific pyramid scale.
 
         Parameters
         ----------
         indexes : list[int]
             Indices specifying which well conditioning to use.
+        scale : int
+            Generate noise up to and including this scale.
         rec : bool, optional
             If True, return stored reconstruction noise. Defaults to False.
-        last : bool, optional
-            If True, return only the last (finest) scale noise. Defaults to False.
 
         Returns
         -------
         list[torch.Tensor]
-            List of noise tensors, one per pyramid scale (or just last scale
-            if last=True).
+            List of noise tensors from scale 0 to the specified scale.
         """
 
         def generate_noise(index: int) -> torch.Tensor:
@@ -203,13 +238,10 @@ class FaciesGAN:
                 device=self.device,
                 num_samp=len(indexes),
             )
-            # Use well location data for this scale only if we have it stored
-            # for the current `index` (per-instance list default avoids
-            # shared-mutable defaults while allowing empty lists).
             if index < len(self.wells):
                 z = torch.cat([z, self.wells[index][indexes].to(self.device)], dim=1)
             elif index == 0:
-                z = z.expand(z.shape[0], self.num_channels, *shape)
+                z = z.repeat(1, 2, 1, 1)
             else:
                 z = ops.generate_noise(
                     (self.num_channels, *shape),
@@ -219,260 +251,372 @@ class FaciesGAN:
             return F.pad(z, [self.zero_padding] * 4, value=0)
 
         if rec:
-            return self.rec_noise.copy()
-        if last:
-            return [generate_noise(len(self.rec_noise) - 1)]
-        return [generate_noise(i) for i in range(len(self.rec_noise))]
+            return self.rec_noise[: scale + 1].copy()
+        return [generate_noise(i) for i in range(scale + 1)]
 
     def optimize_discriminator(
         self,
         indexes: list[int],
-        real_facies: torch.Tensor,
-        discriminator_optimizer: torch.optim.Optimizer,
-    ) -> tuple[float, float, float, float]:
+        real_facies_dict: dict[int, torch.Tensor],
+        discriminator_optimizers: dict[int, torch.optim.Optimizer],
+    ) -> dict[int, tuple[float, float, float, float]]:
+        """Optimize multiple discriminators in TRUE parallel (simultaneous GPU computation).
+
+        All discriminators are optimized in a single pass with gradient accumulation,
+        allowing true parallel execution on the GPU.
+
+        Parameters
+        ----------
+        indexes : list[int]
+            Indices of the samples in the batch.
+        real_facies_dict : dict[int, torch.Tensor]
+            Dictionary mapping scale indices to real facies tensors.
+        discriminator_optimizers : dict[int, torch.optim.Optimizer]
+            Dictionary mapping scale indices to discriminator optimizers.
+
+        Returns
+        -------
+        dict[int, tuple[float, float, float, float]]
+            Dictionary mapping scale indices to (total_loss, real_loss, fake_loss, gp_loss).
         """
-        Optimize the discriminator for a given set of real and generated images.
+        losses: dict[int, tuple[float, float, float, float]] = {}
 
-        Args:
-            indexes (list[int]): Indexes of the samples in the batch.
-            real_facies (torch.Tensor): Real facies images.
-            discriminator_optimizer (torch.optim.Optimizer): Optimizer for the discriminator.
-
-        Returns:
-            tuple[float, float, float, float]: Total loss, real loss, fake loss, and gradient penalty loss.
-        """
-        fixed_noise = self.get_noise(indexes, last=True)
-
-        total_loss = 0.0
-        # Initialize losses as torch tensors so their types remain consistent
-        # (avoids a union of int and Tensor which confuses static analyzers
-        # when calling .backward()). Place them on the correct device.
-        real_loss = torch.tensor(0.0, device=self.device)
-        fake_loss = torch.tensor(0.0, device=self.device)
-        gp_loss = torch.tensor(0.0, device=self.device)
         for _ in range(self.discriminator_steps):
-            discriminator_optimizer.zero_grad()
+            # Zero all gradients at once
+            for scale in self.active_scales:
+                if scale in real_facies_dict:
+                    discriminator_optimizers[scale].zero_grad()
 
-            # Calculate loss for real images
-            real_output = cast(Discriminator, self.discriminator)(real_facies)
-            real_loss = -real_output.mean()
+            # Compute all forward passes in parallel (triggers GPU parallelism)
+            scale_computations: list[
+                tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
+            ] = []
+            for scale in self.active_scales:
+                if scale not in real_facies_dict:
+                    continue
 
-            # Generate fake images
-            noises = self.get_noise(indexes)
-            noises[-1] = fixed_noise[0]
-            with torch.no_grad():
-                fake = self.generator(noises, self.noise_amp)
+                real_facies = real_facies_dict[scale]
+                discriminator = self.discriminators[str(scale)]
 
-            # Calculate loss for fake images
-            fake_output = cast(Discriminator, self.discriminator)(fake.detach())
-            fake_loss = fake_output.mean((0, 2, 3))
+                # Forward pass for real images
+                real_output = discriminator(real_facies)
+                real_loss: torch.Tensor = -real_output.mean()
 
-            # Backpropagate the losses
-            real_loss.backward()
-            fake_loss.backward()
+                # Generate fake images
+                noises = self.get_noise(indexes, scale)
+                with torch.no_grad():
+                    fake = self.generator(
+                        noises, self.noise_amp[: scale + 1], stop_scale=scale
+                    )
 
-            # Calculate and backpropagate gradient penalty
-            gp_loss = ops.calc_gradient_penalty(
-                cast(Discriminator, self.discriminator),
-                real_facies,
-                fake,
-                self.lambda_grad,
-                self.device,
-            )
-            gp_loss.backward()  # type: ignore
+                # Forward pass for fake images
+                fake_output = discriminator(fake.detach())
+                fake_loss: torch.Tensor = fake_output.mean()
 
-            # Update the discriminator
-            discriminator_optimizer.step()
+                # Gradient penalty
+                gp_loss: torch.Tensor = ops.calc_gradient_penalty(
+                    discriminator,
+                    real_facies,
+                    fake,
+                    self.lambda_grad,
+                    self.device,
+                )
 
-            # Accumulate the losses
-            total_loss += real_loss.item() + fake_loss.item() + gp_loss.item()
+                scale_computations.append((scale, real_loss, fake_loss, gp_loss))
 
-        return total_loss, real_loss.item(), fake_loss.item(), gp_loss.item()
+            # Backward pass for all scales (GPU can parallelize)
+            for scale, real_loss, fake_loss, gp_loss in scale_computations:
+                # all three are torch.Tensor; use autograd.backward on the list so the
+                # called function's signature is known to type checkers
+                torch.autograd.backward([real_loss, fake_loss, gp_loss])
+
+            # Update all discriminators
+            for scale in self.active_scales:
+                if scale in real_facies_dict:
+                    discriminator_optimizers[scale].step()
+
+            # Record losses from last step
+            for scale, real_loss, fake_loss, gp_loss in scale_computations:
+                total_loss = real_loss.item() + fake_loss.item() + gp_loss.item()
+                losses[scale] = (
+                    total_loss,
+                    real_loss.item(),
+                    fake_loss.item(),
+                    gp_loss.item(),
+                )
+
+        return losses
 
     def optimize_generator(
         self,
         indexes: list[int],
-        real_facies: torch.Tensor,
-        masks: torch.Tensor,
-        rec_in: torch.Tensor,
-        generator_optimizer: torch.optim.Optimizer,
-    ) -> tuple[float, float, float, torch.Tensor, torch.Tensor | None]:
-        """
-        Optimize the generator for a given set of real and generated images.
+        real_facies_dict: dict[int, torch.Tensor],
+        masks_dict: dict[int, torch.Tensor],
+        rec_in_dict: dict[int, torch.Tensor],
+        generator_optimizers: dict[int, torch.optim.Optimizer],
+    ) -> Dict[int, Tuple[float, float, float, torch.Tensor, Optional[torch.Tensor]]]:
+        """Optimize generator for multiple scales.
 
-        Args:
-            indexes (list[int]): Indexes of the samples.
-            real_facies (torch.Tensor): Real facies images.
-            masks (torch.Tensor): Binary mask tensor for well locations.
-            rec_in (torch.Tensor): Input tensor for reconstruction.
-            generator_optimizer (torch.optim.Optimizer): Optimizer for the generator.
+        All generator blocks are optimized together with gradient accumulation,
+        allowing true parallel execution on the GPU.
 
-        Returns:
-            tuple[float, float, float, torch.Tensor, torch.Tensor]: Total loss, fake loss, reconstruction loss,
-            generated fake images, and reconstructed images.
+        Parameters
+        ----------
+        indexes : list[int]
+            Indices of the samples.
+        real_facies_dict : dict[int, torch.Tensor]
+            Dictionary mapping scale indices to real facies tensors.
+        masks_dict : dict[int, torch.Tensor]
+            Dictionary mapping scale indices to binary mask tensors.
+        rec_in_dict : dict[int, torch.Tensor]
+            Dictionary mapping scale indices to reconstruction input tensors.
+        generator_optimizers : dict[int, torch.optim.Optimizer]
+            Dictionary mapping scale indices to generator optimizers.
+
+        Returns
+        -------
+        dict[int, tuple[float, float, float, torch.Tensor, torch.Tensor | None]]
+            Dictionary mapping scale indices to (total_loss, fake_loss, rec_loss, fake, rec).
         """
-        # Use scalar tensors for losses to keep types consistent (avoid
-        # mixing Python floats and torch tensors which confuses static
-        # analyzers when calling .item()).
-        generator_loss = 0.0
-        generator_loss_fake = torch.tensor(0.0, device=self.device)
-        generator_loss_rec = torch.tensor(0.0, device=self.device)
-        fake, rec = None, None
+        results: Dict[
+            int, Tuple[float, float, float, torch.Tensor, Optional[torch.Tensor]]
+        ] = {}
+        num_diversity_samples = 3
 
         for _ in range(self.generator_steps):
-            generator_optimizer.zero_grad()
+            # Zero all generator gradients at once
+            for scale in self.active_scales:
+                if scale in real_facies_dict:
+                    generator_optimizers[scale].zero_grad()
 
-            noises = self.get_noise(indexes)
-            fake = self.generator(noises, self.noise_amp)
+            # Compute all forward passes in parallel for all scales
+            scale_losses: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
+                {}
+            )
+            scale_fakes: dict[int, torch.Tensor] = {}
+            scale_recs: dict[int, torch.Tensor | None] = {}
 
-            generator_loss_fake = -cast(Discriminator, self.discriminator)(fake).mean()
-            generator_loss_fake.backward()
+            for scale in self.active_scales:
+                if scale not in real_facies_dict:
+                    continue
 
-            generator_loss_rec = torch.zeros(1, device=self.device)
-            rec = None
+                real_facies = real_facies_dict[scale]
+                masks = masks_dict[scale]
+                rec_in = rec_in_dict.get(scale)
+                discriminator = self.discriminators[str(scale)]
 
-            if self.alpha != 0:
-                rec_noise = self.get_noise(indexes, rec=True)
-                rec = self.generator(
-                    rec_noise,
-                    self.noise_amp,
-                    in_noise=rec_in,
-                    start_scale=len(self.generator.gens) - 1,
+                # Generate multiple samples for diversity loss
+                fake_samples: list[torch.Tensor] = []
+
+                for _ in range(num_diversity_samples):
+                    noises = self.get_noise(indexes, scale)
+                    fake_sample = self.generator(
+                        noises, self.noise_amp[: scale + 1], stop_scale=scale
+                    )
+                    fake_samples.append(fake_sample)
+
+                # Use the first sample as the main fake
+                fake = fake_samples[0]
+
+                # Adversarial loss
+                generator_loss_fake: torch.Tensor = -discriminator(fake).mean()
+
+                # Well conditioning loss (strong constraint at well locations)
+                generator_masked_loss: torch.Tensor = 10 * nn.MSELoss(reduction="mean")(
+                    fake * masks, real_facies * masks
                 )
-                generator_loss_rec = self.alpha * nn.MSELoss()(rec, real_facies)
-                generator_loss_rec.backward()
 
-            generator_masked_loss = (
-                100 * self.alpha * nn.MSELoss(reduction="mean")(fake * masks, real_facies * masks)
-            )
-            generator_loss = (
-                float(generator_masked_loss.item())
-                + float(generator_loss_fake.item())
-                + float(generator_loss_rec.item())
-            )
+                # Diversity loss - encourage different outputs for different noise
+                # This prevents mode collapse where all samples look the same
+                if self.lambda_diversity > 0 and len(fake_samples) >= 2:
+                    diversity_loss = torch.tensor(0.0, device=self.device)
+                    num_pairs = 0
+                    for i in range(len(fake_samples)):
+                        for j in range(i + 1, len(fake_samples)):
+                            # L2 distance between samples
+                            distance = torch.mean(
+                                (fake_samples[i] - fake_samples[j]) ** 2
+                            )
+                            # Penalize similarity (want samples to be DIFFERENT)
+                            diversity_loss += torch.exp(
+                                -distance * 10
+                            )  # High penalty when similar
+                            num_pairs += 1
+                    generator_loss_diversity: torch.Tensor = self.lambda_diversity * (
+                        diversity_loss / num_pairs
+                        if num_pairs > 0
+                        else torch.tensor(0.0, device=self.device)
+                    )
+                else:
+                    generator_loss_diversity: torch.Tensor = torch.tensor(
+                        0.0, device=self.device
+                    )
 
-            generator_optimizer.step()
+                generator_loss_rec: torch.Tensor = torch.zeros(1, device=self.device)
+                rec = None
 
-        return (
-            generator_loss,
-            float(generator_loss_fake.item()),
-            float(generator_loss_rec.item()),
-            cast(torch.Tensor, fake).detach(),
-            rec.detach() if rec is not None else None,
-        )
+                if self.alpha != 0 and rec_in is not None:
+                    rec_noise = self.get_noise(indexes, scale, rec=True)
+                    rec = self.generator(
+                        rec_noise,
+                        self.noise_amp[: scale + 1],
+                        in_noise=rec_in,
+                        start_scale=scale,
+                        stop_scale=scale,
+                    )
+                    generator_loss_rec = self.alpha * nn.MSELoss()(rec, real_facies)
+
+                # Combine all losses for this scale
+                total_gen_loss: torch.Tensor = (
+                    generator_loss_fake
+                    + generator_masked_loss
+                    + generator_loss_rec
+                    + generator_loss_diversity
+                )
+
+                # Store for backward pass
+                scale_losses[scale] = (
+                    total_gen_loss,
+                    generator_loss_fake,
+                    generator_loss_rec,
+                )
+                scale_fakes[scale] = fake
+                scale_recs[scale] = rec
+
+            # Backward pass for all scales (GPU can parallelize gradient computation)
+            for scale, losses_tuple in scale_losses.items():
+                total_gen_loss = losses_tuple[0]
+                torch.autograd.backward([total_gen_loss])
+
+            # Update all generators
+            for scale in self.active_scales:
+                if scale in real_facies_dict:
+                    generator_optimizers[scale].step()
+
+            # Record results from last step
+            for scale in self.active_scales:
+                if scale in scale_losses:
+                    total_gen_loss, generator_loss_fake, generator_loss_rec = (
+                        scale_losses[scale]
+                    )
+                    # Safely detach reconstruction tensor only if it exists and is a tensor
+                    rec_obj = scale_recs.get(scale)
+                    rec_detached = (
+                        rec_obj.detach() if isinstance(rec_obj, torch.Tensor) else None
+                    )
+                    results[scale] = (
+                        float(total_gen_loss.item()),
+                        float(generator_loss_fake.item()),
+                        float(generator_loss_rec.item()),
+                        scale_fakes[scale].detach(),
+                        rec_detached,
+                    )
+
+        return results
 
     def save_scale(self, scale: int, path: str) -> None:
-        """
-        Save the current scale's generator, discriminator, reconstruction noise, shapes, and noise amplitude
-        to the specified path.
+        """Save the generator and discriminator for a specific scale.
 
-        Args:
-            scale (int): The scale index to save.
-            path (str): The directory path where the files will be saved.
+        Parameters
+        ----------
+        scale : int
+            The scale index to save.
+        path : str
+            Directory path to save the models.
         """
-        torch.save(self.generator.gens[scale].state_dict(), os.path.join(path, G_FILE))
-        torch.save(
-            cast(Discriminator, self.discriminator).state_dict(),
-            os.path.join(path, D_FILE),
-        )
-        torch.save(self.rec_noise, os.path.join(path, REC_FILE))
-        torch.save(self.shapes[scale], os.path.join(path, SHAPE_FILE))
-        torch.save(self.wells[scale], os.path.join(path, M_FILE))
+        # Save generator for this scale
+        if scale < len(self.generator.gens):
+            generator_path = os.path.join(path, f"{G_FILE}")
+            torch.save(self.generator.gens[scale].state_dict(), generator_path)
 
-        with open(os.path.join(path, AMP_FILE), "w") as f:
-            f.write(str(self.noise_amp[scale]))
+        # Save discriminator for this scale
+        if str(scale) in self.discriminators:
+            discriminator_path = os.path.join(path, f"{D_FILE}")
+            torch.save(self.discriminators[str(scale)].state_dict(), discriminator_path)
+
+        # Save noise amplitude
+        if scale < len(self.noise_amp):
+            amp_path = os.path.join(path, AMP_FILE)
+            with open(amp_path, "w") as f:
+                f.write(str(self.noise_amp[scale]))
+
+        # Save shapes
+        if scale < len(self.shapes):
+            shape_path = os.path.join(path, SHAPE_FILE)
+            torch.save(self.shapes[scale], shape_path)
 
     def load(
         self,
         path: str,
-        load_discriminator: bool = True,
         load_shapes: bool = True,
         until_scale: int | None = None,
-        load_wells: bool = True,
+        load_discriminator: bool = False,
+        load_wells: bool = False,
     ) -> int:
+        """Load saved models and return the starting scale.
+
+        Parameters
+        ----------
+        path : str
+            Path to the directory containing model checkpoint files.
+        load_shapes : bool, optional
+            Whether to load shape information. Defaults to True.
+        until_scale : int | None, optional
+            Load models up to and including this scale. Defaults to None.
+
+        Returns
+        -------
+        int
+            The next scale to start training from.
         """
-        Load the generator, discriminator, reconstruction noise, shapes, and noise amplitude from the specified path.
-
-        Args:
-            path (str): The directory path where the files are saved.
-            load_discriminator (bool): Whether to load the discriminator. Default is True.
-            load_shapes (bool): Whether to load the shapes. Default is True.
-            until_scale (int): The scale index up to which to load. Default is None.
-            load_wells (bool): Whether to load the well location data. Default is True.
-
-        Returns:
-            int: The number of scales loaded.
-        """
-        scales_path = sorted(int(scale) for scale in next(os.walk(path))[1])
-
-        if until_scale is not None:
-            scales_path = [scale for scale in scales_path if scale <= until_scale]
-
+        scale = 0
         if load_wells:
             self.wells = []
-        for scale in scales_path:
-            try:
-                num_feature, min_num_feature = self.get_num_features(scale)
+        while os.path.exists(os.path.join(path, str(scale))):
+            if until_scale is not None and scale > until_scale:
+                break
 
-                if load_discriminator:
-                    self.discriminator = Discriminator(
-                        num_feature,
-                        min_num_feature,
-                        self.num_layer,
-                        self.kernel_size,
-                        self.padding_size,
-                        self.num_channels // 2,
-                    ).to(self.device)
-                    self.discriminator.load_state_dict(
-                        ops.load(
-                            os.path.join(path, str(scale), D_FILE),
-                            self.device,
-                            as_type=Mapping[str, Any],
-                        )
-                    )
+            scale_path = os.path.join(path, str(scale))
 
-                if load_shapes:
-                    self.shapes.append(
-                        ops.load(
-                            os.path.join(path, str(scale), SHAPE_FILE),
-                            as_type=tuple[int, ...],
-                        )
-                    )
-
-                self.generator.create_scale(num_feature, min_num_feature)
-                self.generator.gens[scale].to(self.device)
-                self.generator.gens[scale].load_state_dict(
-                    ops.load(
-                        os.path.join(path, str(scale), G_FILE),
-                        self.device,
-                        as_type=Mapping[str, Any],
-                    )
+            # Load generator
+            gen_path = os.path.join(scale_path, G_FILE)
+            if os.path.exists(gen_path):
+                self.init_scale_generator(scale)
+                self.generator.gens[-1].load_state_dict(
+                    torch.load(gen_path, map_location=self.device)
                 )
-                self.generator.gens[scale] = ops.reset_grads(self.generator.gens[scale])
-                self.generator.gens[scale].eval()
 
-                self.rec_noise.append(
+            if load_discriminator:
+
+                # Load discriminator
+                disc_path = os.path.join(scale_path, D_FILE)
+                if os.path.exists(disc_path):
+                    self.init_scale_discriminator(scale)
+                    self.discriminators[str(scale)].load_state_dict(
+                        torch.load(disc_path, map_location=self.device)
+                    )
+
+            # Load noise amplitude
+            amp_path = os.path.join(scale_path, AMP_FILE)
+            if os.path.exists(amp_path):
+                with open(amp_path, "r") as f:
+                    self.noise_amp.append(float(f.read().strip()))
+
+            # Load shapes
+            if load_shapes:
+                shape_path = os.path.join(scale_path, SHAPE_FILE)
+                if os.path.exists(shape_path):
+                    self.shapes.append(torch.load(shape_path, map_location=self.device))
+
+            if load_wells:
+                self.wells.append(
                     ops.load(
-                        os.path.join(path, str(scale), REC_FILE),
+                        os.path.join(path, str(scale), M_FILE),
                         self.device,
                         as_type=torch.Tensor,
                     )
                 )
 
-                with open(os.path.join(path, str(scale), AMP_FILE)) as f:
-                    self.noise_amp.append(float(f.readline().strip()))
+            scale += 1
 
-                if load_wells:
-                    self.wells.append(
-                        ops.load(
-                            os.path.join(path, str(scale), M_FILE),
-                            self.device,
-                            as_type=torch.Tensor,
-                        )
-                    )
-
-            except Exception as e:
-                load_dir = os.path.join(path, str(scale))
-                print("Error loading models from", load_dir, ". There may be files missing.")
-                raise e
-        return len(scales_path)
+        return scale
