@@ -6,7 +6,7 @@
     "**/__pycache__": true,
     "**/.pytest_cache": true,
     "results/": true,
-    ".cache/": true 
+    ".cache/": true
   },
   "files.exclude": {
     "**/__pycache__": true,
@@ -18,10 +18,10 @@
     "**/__pycache__": true,
     "**/.pytest_cache": true,
     "results/": true,
-    ".cache/": true 
+    ".cache/": true
   },
   "python.analysis.exclude": [
-    "**/.venv/**", 
+    "**/.venv/**",
     "**/.venv/**/site-packages/**",
     "**/__pycache__",
     "**/.pytest_cache",
@@ -29,8 +29,7 @@
     ".cache/"
   ],
   "editor.defaultFormatter": "ms-python.black-formatter",
-  "python.analysis.enableTroubleshootMissingImports": true
-  ,
+  "python.analysis.enableTroubleshootMissingImports": true,
   "python.analysis.typeCheckingMode": "strict",
   "python.analysis.diagnosticSeverityOverrides": {
     "reportMissingTypeStubs": "error",
@@ -40,28 +39,24 @@
   },
   "python.analysis.diagnosticMode": "workspace",
   "python.analysis.useLibraryCodeForTypes": true,
+  "python.analysis.indexing": false,
   "python.analysis.autoSearchPaths": true,
   "editor.codeActionsOnSave": {
     "source.organizeImports": "always"
   },
-  "black-formatter.path": [
-    "${workspaceFolder}/.venv/bin/python"
-  ],
-  "black-formatter.args": [
-    "--line-length",
-    "80"
-  ],
   "[python]": {
     "editor.defaultFormatter": "ms-python.black-formatter",
     "editor.formatOnSave": true
   },
-
   "python.testing.unittestEnabled": false,
   "python.testing.pytestEnabled": true,
-  "python.testing.pytestArgs": ["tests"],
+  "python.testing.pytestArgs": [
+    "tests"
+  ],
   "python.testing.autoTestDiscoverOnSaveEnabled": true,
   "editor.suggest.showTypeParameters": true,
-  "python.analysis.typeEvaluation.analyzeUnannotatedFunctions": true
-} 
+  "python.analysis.typeEvaluation.analyzeUnannotatedFunctions": true,
+  "python.analysis.languageServerMode": "full",
+  "python.analysis.supportRestructuredText": true,
 
-
+}
