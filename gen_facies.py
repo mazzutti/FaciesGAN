@@ -21,7 +21,8 @@ from config import OPT_FILE
 from dataset import PyramidsDataset
 from log import format_time
 from models.facies_gan import FaciesGAN
-from utils import torch2np, plot_generated_facies
+from background_workers import submit_plot_generated_facies
+from ops import torch2np
 
 
 def generate_facies(
@@ -65,7 +66,7 @@ def generate_facies(
         noises = model.get_noise(mask_indexes, scale=max_scale, rec=False)
 
     with torch.no_grad():
-        generated_facies = [
+        generated_facies: list[np.ndarray] = [
             torch2np(gen_facie.unsqueeze(0), denormalize=True)
             for gen_facie in model.generator(noises, model.noise_amp)
         ]
@@ -141,19 +142,10 @@ def generate_comparison_plots(
                 )
                 fake_list.append(fake.detach().cpu())
 
-        # Create comparison plot
-        plot_generated_facies(
-            fake_list,
-            real,
-            masks,
-            stage=scale,
-            index=start,
-            out_dir=out_path,
-            save=True,
-        )
+        submit_plot_generated_facies(fake_list, real, masks, scale, start, out_path)
 
         print(
-            f"Saved plot for indices {start}..{end-1} -> {out_path}/gen_{scale}_{start}.png"
+            f"Submitted async plot job for indices {start}..{end-1} -> {out_path}/gen_{scale}_{start}.png"
         )
 
 

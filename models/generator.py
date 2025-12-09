@@ -1,7 +1,6 @@
 import math
 
 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -10,13 +9,91 @@ from models.custom_layer import ConvBlock, SPADEGenerator
 from ops import interpolate
 
 
+class ColorQuantization(nn.Module):
+    """Quantize output to pure colors: red, green, blue, or black.
+
+    This layer uses differentiable soft quantization during training
+    and hard quantization during inference to produce clean discrete colors.
+    """
+
+    def __init__(self, temperature: float = 0.1) -> None:
+        super().__init__()
+        self.temperature = temperature
+
+        # Define pure colors in [-1, 1] range (tanh output range)
+        # Black, Red, Green, Blue
+        self.register_buffer(
+            "pure_colors",
+            torch.tensor(
+                [
+                    [-1.0, -1.0, -1.0],  # Black
+                    [1.0, -1.0, -1.0],  # Red
+                    [-1.0, 1.0, -1.0],  # Green
+                    [-1.0, -1.0, 1.0],  # Blue
+                ],
+                dtype=torch.float32,
+            ),
+        )
+        self.pure_colors: torch.Tensor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Quantize RGB output to pure colors.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (B, 3, H, W) with values in [-1, 1].
+
+        Returns
+        -------
+        torch.Tensor
+            Quantized tensor with same shape.
+        """
+        if not self.training:
+            # Hard quantization during inference
+            b, c, h, w = x.shape
+            # Use contiguous to avoid view issues
+            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)  # (B*H*W, 3)
+
+            # Calculate distances to pure colors using explicit operations
+            # Avoid cdist which can create complex views
+            # ||x - c||^2 = ||x||^2 + ||c||^2 - 2*x*c
+            x_norm = (x_flat**2).sum(dim=1, keepdim=True)  # (B*H*W, 1)
+            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)  # (4, 1)
+            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, self.pure_colors.t())
+
+            # Get nearest color
+            indices = torch.argmin(distances, dim=1)
+            quantized = self.pure_colors[indices]
+
+            return quantized.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+        else:
+            # Soft quantization during training (differentiable)
+            b, c, h, w = x.shape
+            # Use contiguous to avoid view issues
+            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)  # (B*H*W, 3)
+
+            # Calculate distances using explicit operations (avoid cdist)
+            x_norm = (x_flat**2).sum(dim=1, keepdim=True)  # (B*H*W, 1)
+            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)  # (4, 1)
+            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, self.pure_colors.t())
+
+            # Soft assignment using softmax
+            weights = F.softmax(-distances / self.temperature, dim=1)  # (B*H*W, 4)
+
+            # Weighted sum of pure colors
+            quantized = torch.mm(weights, self.pure_colors)  # (B*H*W, 3)
+
+            return quantized.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+
+
 class Generator(nn.Module):
     """Multi-scale progressive generator for FaciesGAN.
 
     Generates facies images through a progressive pyramid architecture,
     where each scale has its own convolutional block. Images are generated
     from coarse to fine resolution by upsampling and adding noise at each scale.
-    
+
     At the coarsest scale (scale 0), uses SPADE-based modulation to inject
     noise into the generation process, allowing the network to learn how
     noise should influence features at each spatial location.
@@ -42,7 +119,9 @@ class Generator(nn.Module):
         Total padding for both sides (2 * zero_padding).
     """
 
-    def __init__(self, num_layer: int, kernel_size: int, padding_size: int, img_num_channel: int):
+    def __init__(
+        self, num_layer: int, kernel_size: int, padding_size: int, img_num_channel: int
+    ):
         super(Generator, self).__init__()  # type: ignore
 
         self.num_layer = num_layer
@@ -54,6 +133,8 @@ class Generator(nn.Module):
         self.gens = nn.ModuleList()
         # Track which scales use SPADE (currently only scale 0)
         self.spade_scales: set[int] = set()
+        # Color quantization layer
+        self.color_quantizer = ColorQuantization(temperature=0.1)
 
     def forward(
         self,
@@ -88,7 +169,9 @@ class Generator(nn.Module):
         if in_noise is None:
             # Output 3 channels (input is 6: 3 noise + 3 wells)
             channels = z[start_scale].shape[1] // 2
-            height, width = tuple(dim - self.full_zero_padding for dim in z[start_scale].shape[2:])
+            height, width = tuple(
+                dim - self.full_zero_padding for dim in z[start_scale].shape[2:]
+            )
             out_facie = torch.zeros(
                 (z[start_scale].shape[0], channels, height, width),
                 device=z[start_scale].device,
@@ -99,7 +182,7 @@ class Generator(nn.Module):
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
 
         for index in range(start_scale, stop_scale + 1):
-            
+
             out_facie = interpolate(
                 out_facie,
                 (
@@ -111,17 +194,17 @@ class Generator(nn.Module):
             # z[index] has shape (batch, 6, H, W): 3 noise channels + 3 well channels
             # out_facie has shape (batch, 3, H, W): generated facies
             half_ch = z[index].shape[1] // 2  # = 3
-            
+
             if index in self.spade_scales:
                 # SPADE-based generation at coarse scale
                 # Apply amplitude scaling to noise channels
                 z_in = z[index].clone()
                 z_in[:, :half_ch, :, :] = amp[index] * z[index][:, :half_ch, :, :]
-                
+
                 # Add padded output facie to well conditioning channels
                 padded_facie = F.pad(out_facie, [self.zero_padding] * 4, value=0)
                 z_in[:, half_ch:, :, :] = z_in[:, half_ch:, :, :] + padded_facie
-                
+
                 # SPADE generator takes full conditioning and outputs directly
                 out_facie = self.gens[index](z_in) + out_facie
             else:
@@ -129,14 +212,17 @@ class Generator(nn.Module):
                 # Apply amplitude scaling to noise channels (first 3 channels)
                 z_in = z[index].clone()
                 z_in[:, :half_ch, :, :] = amp[index] * z[index][:, :half_ch, :, :]
-                
+
                 # Add padded output facie ONLY to conditioning channels (not noise)
                 # This ensures random noise always has direct impact on generation
                 padded_facie = F.pad(out_facie, [self.zero_padding] * 4, value=0)
                 z_in[:, half_ch:, :, :] = z_in[:, half_ch:, :, :] + padded_facie
 
                 out_facie = self.gens[index](z_in) + out_facie
-                
+
+        # Apply color quantization to enforce pure colors
+        out_facie = self.color_quantizer(out_facie)
+
         return out_facie
 
     def create_scale(self, num_feature: int, min_num_feature: int) -> None:
@@ -144,7 +230,7 @@ class Generator(nn.Module):
 
         Constructs a ConvBlock sequence with progressively decreasing channel
         counts from num_feature down to min_num_feature.
-        
+
         At scale 0, uses SPADEGenerator for noise-modulated generation.
         At higher scales, uses standard ConvBlock architecture.
 
@@ -156,7 +242,7 @@ class Generator(nn.Module):
             Minimum number of features (floor for channel reduction).
         """
         current_scale = len(self.gens)
-        
+
         if current_scale == 0:
             # Use SPADE-based generator at the coarsest scale
             # This allows noise to modulate features via learned gamma/beta
@@ -173,7 +259,13 @@ class Generator(nn.Module):
             self.spade_scales.add(current_scale)
         else:
             # Standard ConvBlock-based generator for finer scales
-            head = ConvBlock(self.img_num_channel, num_feature, self.kernel_size, self.padding_size, 1)
+            head = ConvBlock(
+                self.img_num_channel,
+                num_feature,
+                self.kernel_size,
+                self.padding_size,
+                1,
+            )
             body = nn.Sequential()
 
             channels = min_num_feature

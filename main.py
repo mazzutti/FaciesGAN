@@ -184,6 +184,17 @@ def get_arguments() -> ArgumentParser:
         default=tuple(),
     )
 
+    parser.add_argument(
+        "--no-tensorboard",
+        action="store_true",
+        help="disable TensorBoard logging during training",
+    )
+    parser.add_argument(
+        "--no-plot-facies",
+        action="store_true",
+        help="disable plot_generated_facies visualizations during training",
+    )
+
     return parser
 
 
@@ -191,6 +202,14 @@ def main() -> None:
     """Main function to initialize and run parallel FaciesGAN training."""
     argument_parser = get_arguments()
     options = argument_parser.parse_args(namespace=TrainningOptions())
+
+    # Handle --no-tensorboard flag
+    if hasattr(options, "no_tensorboard") and options.no_tensorboard:
+        options.enable_tensorboard = False
+
+    # Handle --no-plot-facies flag
+    if hasattr(options, "no_plot_facies") and options.no_plot_facies:
+        options.enable_plot_facies = False
 
     if options.manual_seed is not None:
         random.seed(options.manual_seed)
@@ -225,6 +244,30 @@ def main() -> None:
     print(f"Iterations per scale: {options.num_iter}")
     print(f"Output path: {options.output_path}")
     print("=" * 60 + "\n")
+
+    # Performance tuning: enable cuDNN autotuner and TF32 where available
+    try:
+        if device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
+            # Allow TF32 for faster matmuls on compatible NVIDIA GPUs
+            try:
+                torch.backends.cuda.matmul.allow_tf32 = True  # type: ignore
+            except Exception:
+                pass
+            try:
+                torch.backends.cudnn.allow_tf32 = True  # type: ignore
+            except Exception:
+                pass
+    except Exception:
+        # If backend tuning isn't supported on this build, continue without failing
+        pass
+
+    # Reasonable default for intra-op threads to avoid oversubscription
+    try:
+        cpu_threads = min(4, max(1, (os.cpu_count() or 1) // 2))
+        torch.set_num_threads(cpu_threads)
+    except Exception:
+        pass
 
     trainer = Trainer(device, options, num_parallel_scales=options.num_parallel_scales)
 

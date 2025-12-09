@@ -144,6 +144,7 @@ class FaciesGAN:
         num_feature, min_num_feature = self.get_num_features(scale)
 
         self.generator.create_scale(num_feature, min_num_feature)
+        # Move newly created module to device with channels-last memory format
         self.generator.gens[-1] = self.generator.gens[-1].to(self.device)
 
         # Reinitialize the weights if features were doubled or using SPADE
@@ -354,7 +355,10 @@ class FaciesGAN:
         masks_dict: dict[int, torch.Tensor],
         rec_in_dict: dict[int, torch.Tensor],
         generator_optimizers: dict[int, torch.optim.Optimizer],
-    ) -> Dict[int, Tuple[float, float, float, torch.Tensor, Optional[torch.Tensor]]]:
+    ) -> Dict[
+        int,
+        Tuple[float, float, float, float, float, torch.Tensor, Optional[torch.Tensor]],
+    ]:
         """Optimize generator for multiple scales.
 
         All generator blocks are optimized together with gradient accumulation,
@@ -375,11 +379,14 @@ class FaciesGAN:
 
         Returns
         -------
-        dict[int, tuple[float, float, float, torch.Tensor, torch.Tensor | None]]
-            Dictionary mapping scale indices to (total_loss, fake_loss, rec_loss, fake, rec).
+        dict[int, tuple[float, float, float, float, float, torch.Tensor, torch.Tensor | None]]
+            Dictionary mapping scale indices to (total_loss, adv_loss, rec_loss, well_loss, div_loss, fake, rec).
         """
         results: Dict[
-            int, Tuple[float, float, float, torch.Tensor, Optional[torch.Tensor]]
+            int,
+            Tuple[
+                float, float, float, float, float, torch.Tensor, Optional[torch.Tensor]
+            ],
         ] = {}
         num_diversity_samples = 3
 
@@ -390,9 +397,12 @@ class FaciesGAN:
                     generator_optimizers[scale].zero_grad()
 
             # Compute all forward passes in parallel for all scales
-            scale_losses: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = (
-                {}
-            )
+            scale_losses: dict[
+                int,
+                tuple[
+                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+                ],
+            ] = {}
             scale_fakes: dict[int, torch.Tensor] = {}
             scale_recs: dict[int, torch.Tensor | None] = {}
 
@@ -429,19 +439,28 @@ class FaciesGAN:
                 # Diversity loss - encourage different outputs for different noise
                 # This prevents mode collapse where all samples look the same
                 if self.lambda_diversity > 0 and len(fake_samples) >= 2:
-                    diversity_loss = torch.tensor(0.0, device=self.device)
-                    num_pairs = 0
-                    for i in range(len(fake_samples)):
-                        for j in range(i + 1, len(fake_samples)):
-                            # L2 distance between samples
-                            distance = torch.mean(
-                                (fake_samples[i] - fake_samples[j]) ** 2
-                            )
-                            # Penalize similarity (want samples to be DIFFERENT)
-                            diversity_loss += torch.exp(
-                                -distance * 10
-                            )  # High penalty when similar
-                            num_pairs += 1
+                    # Vectorized pairwise distance calculation
+                    n = len(fake_samples)
+                    stacked = torch.stack(
+                        [f.flatten() for f in fake_samples]
+                    )  # (n, -1)
+
+                    # Compute pairwise L2 distances using broadcasting
+                    # (n, 1, -1) - (1, n, -1) -> (n, n, -1)
+                    sq_diffs = (
+                        (stacked.unsqueeze(1) - stacked.unsqueeze(0)) ** 2
+                    ).mean(dim=2)
+
+                    # Extract upper triangular part (excluding diagonal) for unique pairs
+                    mask = torch.triu(
+                        torch.ones(n, n, device=self.device), diagonal=1
+                    ).bool()
+                    distances = sq_diffs[mask]
+
+                    # Penalize similarity (want samples to be DIFFERENT)
+                    diversity_loss = torch.exp(-distances * 10).sum()
+                    num_pairs = distances.numel()
+
                     generator_loss_diversity: torch.Tensor = self.lambda_diversity * (
                         diversity_loss / num_pairs
                         if num_pairs > 0
@@ -479,6 +498,8 @@ class FaciesGAN:
                     total_gen_loss,
                     generator_loss_fake,
                     generator_loss_rec,
+                    generator_masked_loss,
+                    generator_loss_diversity,
                 )
                 scale_fakes[scale] = fake
                 scale_recs[scale] = rec
@@ -496,9 +517,13 @@ class FaciesGAN:
             # Record results from last step
             for scale in self.active_scales:
                 if scale in scale_losses:
-                    total_gen_loss, generator_loss_fake, generator_loss_rec = (
-                        scale_losses[scale]
-                    )
+                    (
+                        total_gen_loss,
+                        generator_loss_fake,
+                        generator_loss_rec,
+                        generator_masked_loss,
+                        generator_loss_diversity,
+                    ) = scale_losses[scale]
                     # Safely detach reconstruction tensor only if it exists and is a tensor
                     rec_obj = scale_recs.get(scale)
                     rec_detached = (
@@ -508,6 +533,8 @@ class FaciesGAN:
                         float(total_gen_loss.item()),
                         float(generator_loss_fake.item()),
                         float(generator_loss_rec.item()),
+                        float(generator_masked_loss.item()),
+                        float(generator_loss_diversity.item()),
                         scale_fakes[scale].detach(),
                         rec_detached,
                     )

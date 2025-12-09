@@ -43,7 +43,7 @@ class TrainningOptions(argparse.Namespace):
         num_layer: int = 5,
         num_real_facies: int = 5,
         num_train_pyramids: int = 200,
-        num_workers: int = 0,
+        num_workers: int = 4,
         output_path: str = "results/",
         padding_size: int = 0,
         regen_npy_gz: bool = False,
@@ -53,6 +53,8 @@ class TrainningOptions(argparse.Namespace):
         stop_scale: int = 6,
         use_cpu: bool = False,
         wells: tuple[int, ...] = (),
+        enable_tensorboard: bool = True,
+        enable_plot_facies: bool = True,
     ) -> None:
         """Create a TrainningOptions namespace with defaults for training.
 
@@ -144,6 +146,10 @@ class TrainningOptions(argparse.Namespace):
         wells : tuple of int, optional
             Optional list/tuple of well indices to filter dataset. Default is
             an empty tuple.
+        enable_tensorboard : bool, optional
+            Enable TensorBoard logging during training. Default is True.
+        enable_plot_facies : bool, optional
+            Enable saving plot_generated_facies visualizations during training. Default is True.
 
         Notes
         -----
@@ -192,6 +198,8 @@ class TrainningOptions(argparse.Namespace):
         self.stop_scale = stop_scale
         self.use_cpu = use_cpu
         self.wells = wells
+        self.enable_tensorboard = enable_tensorboard
+        self.enable_plot_facies = enable_plot_facies
 
 
 class ResumeOptions(argparse.Namespace):

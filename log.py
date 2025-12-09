@@ -22,7 +22,10 @@ class OutputLogger(object):
     buffer : str | None, optional
         Buffer to store log data before file is set. Defaults to empty string.
     """
-    def __init__(self, file: str | None = None, mode: str = "at", buffer: str | None = "") -> None:
+
+    def __init__(
+        self, file: str | None = None, mode: str = "at", buffer: str | None = ""
+    ) -> None:
         """Initialize the OutputLogger.
 
         Attributes
@@ -95,7 +98,10 @@ class TeeOutputStream(object):
     auto_flush : bool, optional
         Whether to automatically flush after each write. Defaults to False.
     """
-    def __init__(self, child_streams: Sequence[Writable], auto_flush: bool = False) -> None:
+
+    def __init__(
+        self, child_streams: Sequence[Writable], auto_flush: bool = False
+    ) -> None:
         """Initialize the TeeOutputStream.
 
         Attributes

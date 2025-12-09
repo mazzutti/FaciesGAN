@@ -5,7 +5,7 @@
 
 PORT=${1:-6006}
 
-LATEST_DIR=$(ls -d results/*_parallel_results 2>/dev/null | sort -r | head -1)
+LATEST_DIR=$(ls -d results/*_results 2>/dev/null | sort -r | head -1)
 
 if [[ -z "$LATEST_DIR" ]]; then
     echo "❌ No results directory found in results/"

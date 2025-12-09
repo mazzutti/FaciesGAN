@@ -303,7 +303,16 @@ def torch2np(
     if denormalize:
         tensor = denorm(tensor, ceiling)
     np_array = tensor.detach().cpu().numpy()
-    np_array = np.permute_dims(np_array, (0, 2, 3, 1))
+    # Support both batch tensors (B, C, H, W) and single samples (C, H, W).
+    if np_array.ndim == 4:
+        # (B, C, H, W) -> (B, H, W, C)
+        np_array = np.transpose(np_array, (0, 2, 3, 1))
+    elif np_array.ndim == 3:
+        # (C, H, W) -> (H, W, C)
+        np_array = np.transpose(np_array, (1, 2, 0))
+    else:
+        raise ValueError(f"Unsupported tensor ndim for torch2np: {np_array.ndim}")
+
     np_array = np.clip(np_array, 0, 1)
     return np_array.astype(np.float32)
 
@@ -473,27 +482,36 @@ def calc_diversity_loss(
     if len(fake_samples) < 2:
         return torch.tensor(0.0, device=fake_samples[0].device)
 
-    diversity_loss = torch.tensor(0.0, device=fake_samples[0].device)
-    num_pairs = 0
+    # Vectorized pairwise distance calculation
+    n = len(fake_samples)
 
-    for i in range(len(fake_samples)):
-        for j in range(i + 1, len(fake_samples)):
-            # Calculate output distance (L1 for stability)
-            output_diff = torch.mean(torch.abs(fake_samples[i] - fake_samples[j]))
+    # Stack all samples: (n, C, H, W) -> flatten for easier computation
+    stacked_fakes = torch.stack([f.flatten() for f in fake_samples])  # (n, -1)
+    stacked_noises = torch.stack(
+        [noise_samples[i][0].flatten() for i in range(n)]
+    )  # (n, -1)
 
-            # Calculate input noise distance at coarsest scale (index 0)
-            # noise_samples[i] is a list of tensors per scale
-            noise_i = noise_samples[i][0]  # Coarsest scale
-            noise_j = noise_samples[j][0]
-            input_diff = torch.mean(torch.abs(noise_i - noise_j)) + eps
+    # Compute pairwise L1 distances using broadcasting
+    # (n, 1, -1) - (1, n, -1) -> (n, n, -1)
+    output_diffs = torch.abs(
+        stacked_fakes.unsqueeze(1) - stacked_fakes.unsqueeze(0)
+    ).mean(dim=2)
+    input_diffs = (
+        torch.abs(stacked_noises.unsqueeze(1) - stacked_noises.unsqueeze(0)).mean(dim=2)
+        + eps
+    )
 
-            # Mode-seeking ratio: we want output_diff / input_diff to be large
-            # So we minimize -ratio (negative loss)
-            diversity_loss = diversity_loss - (output_diff / input_diff)
-            num_pairs += 1
+    # Extract upper triangular part (excluding diagonal) for unique pairs
+    mask = torch.triu(
+        torch.ones(n, n, device=fake_samples[0].device), diagonal=1
+    ).bool()
+    ratios = -(output_diffs / input_diffs)[mask]
 
-    if num_pairs > 0:
-        diversity_loss = diversity_loss / num_pairs
+    diversity_loss = (
+        ratios.mean()
+        if ratios.numel() > 0
+        else torch.tensor(0.0, device=fake_samples[0].device)
+    )
 
     return diversity_loss
 
