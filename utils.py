@@ -489,7 +489,7 @@ def apply_well_mask(
 
 
 def draw_well_arrows(
-    mask: np.ndarray,
+    mask: np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray],
     draw: ImageDraw.ImageDraw,
     x_offset: int,
     y_offset: int,
@@ -511,28 +511,44 @@ def draw_well_arrows(
         Width of the subplot in pixels.
     """
     # Sum vertically to find columns that contain well pixels
-    mask_sum = np.sum(np.squeeze(mask), axis=0)
+    # If caller provided a preprocessed mask tuple (mask_2d, mask_bool, well_columns)
+    # use the `well_columns` directly since they are already resized to the
+    # `cell_size` resolution; this yields exact pixel alignment.
+    if isinstance(mask, tuple):
+        _, _, well_columns = mask
+        if well_columns.size == 0:
+            return
+        # well_columns are indices in [0, cell_size-1]; center the arrow on the
+        # middle of the column by adding 0.5 before integer conversion.
+        center_x = float(np.mean(well_columns)) + 0.5
+        arrow_x = x_offset + int(round(center_x))
 
-    # Get indices of columns where any well pixel exists
+        arrow_y = y_offset + 3
+        arrow_size = 10
+        draw.polygon(
+            [
+                (arrow_x, arrow_y + arrow_size),
+                (arrow_x - arrow_size // 2, arrow_y),
+                (arrow_x + arrow_size // 2, arrow_y),
+            ],
+            fill=(255, 0, 0),
+        )
+        return
+
+    # Fallback: accept a raw mask array and map its column indices into the
+    # cell pixel coordinates (for backward compatibility with callers that
+    # still pass the raw mask).
+    mask_sum = np.sum(np.squeeze(mask), axis=0)
     well_cols = np.where(mask_sum > 0)[0]
     if well_cols.size == 0:
         return
 
-    # Compute a center position for potentially multi-column wells
-    # Using the mean produces a sensible center for contiguous spans
     center_col = float(np.mean(well_cols))
-
-    # Map column index to pixel coordinate within the cell. Each column
-    # spans roughly cell_size / num_columns pixels; take the column center
-    # at (col + 0.5) * cell_size / num_columns for accurate centering.
     num_columns = len(mask_sum)
     center_x = (center_col + 0.5) * (cell_size / num_columns)
     arrow_x = x_offset + int(round(center_x))
 
-    # Vertical position on main canvas (tweakable offset)
     arrow_y = y_offset + 3
-
-    # Draw a single red arrow pointing down centered above the well column
     arrow_size = 10
     draw.polygon(
         [

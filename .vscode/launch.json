@@ -18,7 +18,7 @@
         "--output-path",
         "results/",
         "--num-train-pyramids",
-        "10",
+        "200",
         "--num-iter",
         "4000",
         "--num-parallel-scales",
