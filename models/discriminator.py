@@ -1,3 +1,9 @@
+"""Discriminator module used by FaciesGAN.
+
+Provides a multi-layer convolutional discriminator with a small API that
+returns per-pixel critic scores (suitable for WGAN-style losses).
+"""
+
 import torch
 import torch.nn as nn
 
@@ -5,10 +11,12 @@ from models.custom_layer import ConvBlock
 
 
 class Discriminator(nn.Module):
-    """Multi-layer discriminator for FaciesGAN using WGAN-GP.
+    """Convolutional critic for facies images (WGAN-GP compatible).
 
-    Distinguishes between real and generated facies images using a series
-    of convolutional blocks with progressively decreasing channel counts.
+    The discriminator produces a single-channel feature map of scores; for a
+    given input tensor of shape ``(B, C, H, W)`` the output shape is
+    ``(B, 1, H_out, W_out)`` where ``H_out``/``W_out`` depend on padding and
+    kernel sizes. Higher values indicate more-realistic patches.
 
     Parameters
     ----------
@@ -24,6 +32,15 @@ class Discriminator(nn.Module):
         Padding size for convolutions.
     input_channels : int
         Number of input facies channels.
+
+    Attributes
+    ----------
+    head : ConvBlock
+        Initial convolutional block.
+    body : nn.Sequential
+        Intermediate convolutional blocks.
+    tail : nn.Conv2d
+        Final 1-channel convolution producing scores.
     """
 
     def __init__(
@@ -35,7 +52,23 @@ class Discriminator(nn.Module):
         padding_size: int,
         input_channels: int,
     ) -> None:
+        """Initialize the convolutional discriminator.
 
+        Parameters
+        ----------
+        num_features : int
+            Number of features in the first convolutional layer.
+        min_num_features : int
+            Minimum number of features used when reducing channels.
+        num_layer : int
+            Number of convolutional layers.
+        kernel_size : int
+            Convolution kernel size.
+        padding_size : int
+            Padding applied to convolutions.
+        input_channels : int
+            Number of input image channels.
+        """
         super(Discriminator, self).__init__()  # type: ignore
 
         self.head = ConvBlock(
@@ -71,7 +104,9 @@ class Discriminator(nn.Module):
         Returns
         -------
         torch.Tensor
-            Discrimination scores (higher for more realistic images).
+            Discrimination scores with shape ``(B, 1, H_out, W_out)``. The
+            returned tensor is not reduced to a scalar so callers can compute
+            patch-wise or global losses as required.
         """
         scores = self.head(generated_facie)
         scores = self.body(scores)

@@ -1,3 +1,10 @@
+"""Generator network and supporting modules for FaciesGAN.
+
+This module provides the multi-scale ``Generator`` used to synthesize
+facies images from per-scale noise tensors, along with a simple
+``ColorQuantization`` module used to snap outputs to a small palette.
+"""
+
 import math
 
 import torch
@@ -9,13 +16,25 @@ from ops import interpolate
 
 
 class ColorQuantization(nn.Module):
-    """Quantize output to pure colors: red, green, blue, or black.
+    """Quantize output to a small set of pure colors.
 
-    This layer uses differentiable soft quantization during training
-    and hard quantization during inference to produce clean discrete colors.
+    During training this module performs a soft (differentiable) assignment
+    of each pixel to a small palette of pure colors using a temperature-
+    scaled softmax over negative squared distances. During evaluation it
+    performs a hard nearest-color lookup to produce discrete colors.
+
+    The palette is registered as a buffer and expects generator outputs in
+    the ``[-1, 1]`` range (tanh output).
     """
 
     def __init__(self, temperature: float = 0.1) -> None:
+        """Create a ColorQuantization module.
+
+        Parameters
+        ----------
+        temperature : float, optional
+            Softmax temperature used during training for soft assignments.
+        """
         super().__init__()
         self.temperature = temperature
 
@@ -25,10 +44,10 @@ class ColorQuantization(nn.Module):
             "pure_colors",
             torch.tensor(
                 [
-                    [-1.0, -1.0, -1.0],  # Black
-                    [1.0, -1.0, -1.0],  # Red
-                    [-1.0, 1.0, -1.0],  # Green
-                    [-1.0, -1.0, 1.0],  # Blue
+                    [-1.0, -1.0, -1.0],
+                    [1.0, -1.0, -1.0],
+                    [-1.0, 1.0, -1.0],
+                    [-1.0, -1.0, 1.0],
                 ],
                 dtype=torch.float32,
             ),
@@ -52,13 +71,13 @@ class ColorQuantization(nn.Module):
             # Hard quantization during inference
             b, c, h, w = x.shape
             # Use contiguous to avoid view issues
-            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)  # (B*H*W, 3)
+            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)
 
             # Calculate distances to pure colors using explicit operations
             # Avoid cdist which can create complex views
             # ||x - c||^2 = ||x||^2 + ||c||^2 - 2*x*c
-            x_norm = (x_flat**2).sum(dim=1, keepdim=True)  # (B*H*W, 1)
-            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)  # (4, 1)
+            x_norm = (x_flat**2).sum(dim=1, keepdim=True)
+            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)
             distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, self.pure_colors.t())
 
             # Get nearest color
@@ -70,18 +89,18 @@ class ColorQuantization(nn.Module):
             # Soft quantization during training (differentiable)
             b, c, h, w = x.shape
             # Use contiguous to avoid view issues
-            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)  # (B*H*W, 3)
+            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)
 
             # Calculate distances using explicit operations (avoid cdist)
-            x_norm = (x_flat**2).sum(dim=1, keepdim=True)  # (B*H*W, 1)
-            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)  # (4, 1)
+            x_norm = (x_flat**2).sum(dim=1, keepdim=True)
+            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)
             distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, self.pure_colors.t())
 
             # Soft assignment using softmax
-            weights = F.softmax(-distances / self.temperature, dim=1)  # (B*H*W, 4)
+            weights = F.softmax(-distances / self.temperature, dim=1)
 
             # Weighted sum of pure colors
-            quantized = torch.mm(weights, self.pure_colors)  # (B*H*W, 3)
+            quantized = torch.mm(weights, self.pure_colors)
 
             return quantized.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
 
@@ -89,13 +108,11 @@ class ColorQuantization(nn.Module):
 class Generator(nn.Module):
     """Multi-scale progressive generator for FaciesGAN.
 
-    Generates facies images through a progressive pyramid architecture,
-    where each scale has its own convolutional block. Images are generated
-    from coarse to fine resolution by upsampling and adding noise at each scale.
-
-    At the coarsest scale (scale 0), uses SPADE-based modulation to inject
-    noise into the generation process, allowing the network to learn how
-    noise should influence features at each spatial location.
+    The generator is composed of a sequence of per-scale modules appended
+    with ``create_scale``. It synthesizes images from a list of per-scale
+    noise tensors ``z`` and amplitude scalars ``amp``. The network supports
+    optional conditioning channels (wells/seismic) concatenated to the
+    noise tensor.
 
     Parameters
     ----------
@@ -106,16 +123,20 @@ class Generator(nn.Module):
     padding_size : int
         Padding size for convolutions.
     input_channels : int
-        Number of input channels (noise + cond channels).
+        Number of input channels (noise + conditioning channels).
 
     Attributes
     ----------
     gens : nn.ModuleList
-        List of generator modules, one per pyramid scale.
+        List of per-scale generator modules (SPADE or ConvBlock stacks).
     zero_padding : int
-        Total padding added per layer.
+        Padding applied per side to keep spatial alignment across scales.
     full_zero_padding : int
-        Total padding for both sides (2 * zero_padding).
+        Total padding applied (2 * zero_padding) used to compute output sizes.
+    spade_scales : set[int]
+        Set of scales that use SPADE-based generation (usually coarse scales).
+    color_quantizer : ColorQuantization
+        Module used to quantize outputs to a small palette of colors.
     """
 
     def __init__(
@@ -127,6 +148,23 @@ class Generator(nn.Module):
         output_channels: int = 3,
         num_img_channels: int = 3,
     ):
+        """Initialize the multi-scale Generator.
+
+        Parameters
+        ----------
+        num_layer : int
+            Number of convolutional layers per scale block.
+        kernel_size : int
+            Convolution kernel size.
+        padding_size : int
+            Padding size used for convolutions.
+        input_channels : int
+            Number of input channels (noise plus optional conditioning).
+        output_channels : int, optional
+            Number of output color channels (default 3).
+        num_img_channels : int, optional
+            Number of image channels used for conditioning (default 3).
+        """
         super(Generator, self).__init__()  # type: ignore
 
         self.num_layer = num_layer
@@ -309,7 +347,7 @@ class Generator(nn.Module):
             tail = nn.Sequential(
                 nn.Conv2d(
                     max(block_features, min_num_features),
-                    self.output_channels,  # Output 3 facies channels (input is 6)
+                    self.output_channels,
                     kernel_size=self.kernel_size,
                     stride=1,
                     padding=self.padding_size,

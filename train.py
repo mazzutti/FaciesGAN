@@ -30,12 +30,20 @@ import torch.optim as optim
 from tensorboardX import SummaryWriter  # type: ignore
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from metrics import ScaleMetrics, GeneratorMetrics, DiscriminatorMetrics
 
 import ops
 import utils
 from background_workers import submit_plot_generated_facies
-from config import (D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, RESULT_FACIES_PATH,
-                    SCH_D_FILE, SCH_G_FILE)
+from config import (
+    D_FILE,
+    G_FILE,
+    OPT_D_FILE,
+    OPT_G_FILE,
+    RESULT_FACIES_PATH,
+    SCH_D_FILE,
+    SCH_G_FILE,
+)
 from dataset import PyramidsDataset
 from log import format_time
 from models.facies_gan import FaciesGAN
@@ -95,6 +103,19 @@ class Trainer:
         fine_tuning: bool = False,
         checkpoint_path: str = ".checkpoints/",
     ) -> None:
+        """Create a Trainer instance and prepare datasets, model and logging.
+
+        Parameters
+        ----------
+        device : torch.device
+            Device used for training (cpu/cuda/mps).
+        options : TrainningOptions
+            Training options with hyperparameters and paths.
+        fine_tuning : bool, optional
+            Whether to attempt to load existing checkpoints, by default False.
+        checkpoint_path : str, optional
+            Base path for checkpoint files, by default ".checkpoints/".
+        """
         self.device: torch.device = device
 
         # Training parameters
@@ -224,15 +245,15 @@ class Trainer:
                 num_scales=self.stop_scale - self.start_scale + 1,
                 output_dir=viz_path,
                 log_dir=log_dir,
-                update_interval=1,  # Update every epoch
+                update_interval=1,
                 dataset_info=dataset_info,
             )
-            print(f"📊 TensorBoard logging enabled!")
+            print("📊 TensorBoard logging enabled!")
             print(f"   View training progress: tensorboard --logdir={log_dir}")
-            print(f"   Then open: http://localhost:6006")
+            print("   Then open: http://localhost:6006")
         else:
             self.visualizer = None  # type: ignore
-            print(f"📊 TensorBoard logging disabled")
+            print("📊 TensorBoard logging disabled")
 
     def train(self) -> None:
         """Train the FaciesGAN model with parallel scale training.
@@ -277,25 +298,34 @@ class Trainer:
                 for s in scales_to_train:
                     self.__load_model(s)
 
-            # Consume a single DataLoader batch that contains pyramids for all
-            # training samples. The whole group of scales uses the same batch
-            # (pyramids across scales) during its parallel training step.
-            data_iterator = iter(self.data_loader)
-            # Grab one batch (pyramids across scales) for group training
-            self.facies, self.wells, self.seismic = next(data_iterator)
-            self.model.wells = self.wells
-            self.model.seismic = self.seismic
+            # Iterate over DataLoader batches for this group and train on each
+            # Single progress bar for all batches and epochs in this group
+            total_batches = len(self.data_loader)
+            progress = tqdm(total=self.num_iter * total_batches, position=0)
+            for batch_id, batch in enumerate(self.data_loader):
+                # Each iteration yields a batch of pyramids (facies, wells, seismic)
+                self.facies, self.wells, self.seismic = batch
 
-            # Train all scales in this group together
-            self.train_scales(
-                scales_to_train,
-                writers,
-                scale_paths,
-                results_paths,
-                0,  # batch_id = 0 since we only use one batch
-            )
+                self.model.wells = self.wells
+                self.model.seismic = self.seismic
 
-            # Save models for all scales in the group
+                # Expose batch info to train_scales so it can show epoch progress
+                self._total_batches = total_batches
+                self._current_batch_id = batch_id
+
+                # Train all scales in this group using the current batch
+                self.train_scales(
+                    scales_to_train,
+                    writers,
+                    scale_paths,
+                    results_paths,
+                    batch_id,
+                    progress,
+                )
+
+            progress.close()
+
+            # After processing all batches for this group, save models
             for s in scales_to_train:
                 self.model.save_scale(s, scale_paths[s])
 
@@ -329,6 +359,7 @@ class Trainer:
         scale_paths: dict[int, str],
         results_paths: dict[int, str],
         batch_id: int,
+        progress: "tqdm[Any]",
     ) -> None:
         """Train multiple pyramid scales simultaneously.
 
@@ -345,6 +376,8 @@ class Trainer:
         batch_id : int
             Current batch index within the epoch.
         """
+        # Batch is provided by caller (`train()` sets `self.facies`, `self.wells`, `self.seismic`)
+
         indexes = list(range(self.batch_size))
 
         # Prepare data for all scales
@@ -429,52 +462,28 @@ class Trainer:
             )
             rec_in_dict[scale] = prev_rec
 
-        # Training loop - start display from 1
-        epochs: "tqdm[int]" = tqdm(
-            range(1, self.num_iter + 1), initial=1, total=self.num_iter
-        )
-
-        for epoch in epochs:
-            # Optimize discriminators for all scales
-            discriminator_losses = self.model.optimize_discriminator(
-                indexes,
-                real_facies_dict,
-                discriminator_optimizers,
+        # Training loop - iterate epochs (0-based) and update the single progress bar
+        for epoch in range(self.num_iter):
+            # Update progress description with current batch and epoch
+            progress.set_description(
+                f"Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch+1:4d}/{self.num_iter}]"
             )
 
-            # Optimize generators for all scales
-            generator_results = self.model.optimize_generator(
-                indexes,
-                real_facies_dict,
-                masks_dict,
-                rec_in_dict,
-                generator_optimizers,
-            )
-
-            # Collect metrics for visualization
-            scale_metrics: dict[int, dict[str, Any]] = {}
             generated_samples: dict[int, torch.Tensor] = {}
 
-            for scale in scales:
-                if scale in discriminator_losses and scale in generator_results:
-                    d_total, d_real, d_fake, d_gp = discriminator_losses[scale]
-                    g_total, g_fake, g_rec, g_well, g_div, _, _ = generator_results[
-                        scale
-                    ]
+            discriminator_metrics = self.model.optimize_discriminator(
+                indexes, real_facies_dict, discriminator_optimizers
+            )
+            generator_metrics = self.model.optimize_generator(
+                indexes, real_facies_dict, masks_dict, rec_in_dict, generator_optimizers
+            )
 
-                    scale_metrics[scale] = {
-                        "d_total": d_total,
-                        "d_real": d_real,
-                        "d_fake": d_fake,
-                        "g_total": g_total,
-                        "g_adv": g_fake,
-                        "g_rec": g_rec,
-                        "g_well": g_well,
-                        "g_div": g_div,
-                    }
+            scale_metrics = ScaleMetrics(
+                generator=generator_metrics, discriminator=discriminator_metrics
+            )
 
             # Update visualizer
-            if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == self.num_iter:
+            if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
                 # Generate samples for visualization every 50 epochs
                 with torch.no_grad():
                     for scale in scales:
@@ -483,67 +492,37 @@ class Trainer:
                             [1.0] * (scale + 1),
                             stop_scale=scale,
                         )
-                        generated_samples[scale] = fake[0]  # First sample in batch
+                        generated_samples[scale] = fake[0]
 
-                # Update visualizer with samples
                 samples_processed = self.batch_size * epoch
                 if self.enable_tensorboard and self.visualizer:
                     self.visualizer.update(
                         epoch, scale_metrics, generated_samples, samples_processed
                     )
 
-                # Print formatted metrics table for all scales
-                if len(scales) == 1:
-                    # Single scale - compact format
-                    scale = scales[0]
-                    if scale in discriminator_losses and scale in generator_results:
-                        d_total, d_real, d_fake, d_gp = discriminator_losses[scale]
-                        (
-                            g_total,
-                            g_fake,
-                            g_rec,
-                            g_well,
-                            g_div,
-                            _,
-                            _,
-                        ) = generator_results[scale]
+                # Always print formatted metrics table for all scales (multi-line table)
+                progress.write(
+                    f"\n  Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch + 1:4d}/{self.num_iter}]"
+                )
+                progress.write("  ┌" + "─" * 99 + "┐")
+                progress.write(
+                    f"  │ {'Scale':^5} │ {'G_total':>8} │ {'G_adv':>7} │ {'G_rec':>7} │ "
+                    f"{'G_well':>7} │ {'G_div':>7} │ {'D_total':>8} │ {'D_real':>7} │ "
+                    f"{'D_fake':>7} │ {'D_gp':>7} │"
+                )
+                progress.write("  ├" + "─" * 99 + "┤")
 
-                        epochs.write(
-                            f"  Epoch [{epoch + 1:4d}/{self.num_iter}] Scale {scale}: "
-                            f"G={g_total:7.3f} (adv={g_fake:6.3f} rec={g_rec:6.3f} well={g_well:6.3f} div={g_div:6.3f}) | "
-                            f"D={d_total:7.3f} (real={-d_real:6.3f} fake={d_fake:6.3f} gp={d_gp:5.3f})"
-                        )
-                else:
-                    # Multiple scales - table format
-                    epochs.write(f"\n  Epoch [{epoch + 1:4d}/{self.num_iter}]")
-                    epochs.write("  ┌" + "─" * 99 + "┐")
-                    epochs.write(
-                        f"  │ {'Scale':^5} │ {'G_total':>8} │ {'G_adv':>7} │ {'G_rec':>7} │ "
-                        f"{'G_well':>7} │ {'G_div':>7} │ {'D_total':>8} │ {'D_real':>7} │ "
-                        f"{'D_fake':>7} │ {'D_gp':>7} │"
+                for scale in scales:
+                    g = scale_metrics.generator[scale]
+                    d = scale_metrics.discriminator[scale]
+
+                    progress.write(
+                        f"  │ {scale:^5} │ {g.total.item():8.3f} │ {g.fake.item():7.3f} │ {g.rec.item():7.3f} │ "
+                        f"{g.well.item():7.3f} │ {g.div.item():7.3f} │ {d.total.item():8.3f} │ {d.real.item():7.3f} │ "
+                        f"{d.fake.item():7.3f} │ {d.gp.item():7.3f} │"
                     )
-                    epochs.write("  ├" + "─" * 99 + "┤")
 
-                    for scale in scales:
-                        if scale in discriminator_losses and scale in generator_results:
-                            d_total, d_real, d_fake, d_gp = discriminator_losses[scale]
-                            (
-                                g_total,
-                                g_fake,
-                                g_rec,
-                                g_well,
-                                g_div,
-                                _,
-                                _,
-                            ) = generator_results[scale]
-
-                            epochs.write(
-                                f"  │ {scale:^5} │ {g_total:8.3f} │ {g_fake:7.3f} │ {g_rec:7.3f} │ "
-                                f"{g_well:7.3f} │ {g_div:7.3f} │ {d_total:8.3f} │ {-d_real:7.3f} │ "
-                                f"{d_fake:7.3f} │ {d_gp:7.3f} │"
-                            )
-
-                    epochs.write("  └" + "─" * 99 + "┘")
+                progress.write("  └" + "─" * 99 + "┘")
             else:
                 # Update visualizer without generating samples (just metrics)
                 samples_processed = self.batch_size * epoch
@@ -552,31 +531,17 @@ class Trainer:
                         epoch, scale_metrics, None, samples_processed
                     )
 
-            # Save to TensorBoard for all scales
+            # Save to TensorBoard for all scales (pass `progress` as the bar)
             for scale in scales:
-                if scale in discriminator_losses and scale in generator_results:
-                    d_total, d_real, d_fake, d_gp = discriminator_losses[scale]
-                    g_total, g_fake, g_rec, g_well, g_div, _, _ = generator_results[
-                        scale
-                    ]
+                g = scale_metrics.generator[scale]
+                d = scale_metrics.discriminator[scale]
 
-                    self.__log_epoch(
-                        epochs,
-                        writers[scale],
-                        epoch,
-                        float(g_total),
-                        float(d_total),
-                        float(d_real),
-                        float(d_fake),
-                        float(d_gp),
-                        float(g_fake),
-                        float(g_rec),
-                        float(g_well),
-                        float(g_div),
-                    )
+                self.__log_epoch(progress, writers[scale], epoch, g, d)
 
             # Save generated facies at intervals
-            if epoch % self.save_interval == 0 or epoch == self.num_iter:
+            if (
+                epoch % self.save_interval == 0 or epoch == self.num_iter - 1
+            ) and epoch != 0:
                 for scale in scales:
                     self.__save_generated_facies(
                         scale,
@@ -589,6 +554,12 @@ class Trainer:
             for scale in scales:
                 generator_schedulers[scale].step()
                 discriminator_schedulers[scale].step()
+
+            # Advance the single progress bar (one step per epoch)
+            try:
+                progress.update(1)
+            except Exception:
+                pass
 
         # Save optimizers for all scales
         for scale in scales:
@@ -621,16 +592,12 @@ class Trainer:
         indexes : list[int]
             Batch sample indices.
 
-        Returns
-        -------
-        tuple[torch.Tensor, torch.Tensor]
-            A tuple ``(z_rec, prev_rec)`` where:
-
-            - ``z_rec`` is a batch-sized reconstruction noise tensor concatenated
-              with well-conditioning channels and padded according to
-              ``self.zero_padding``. Shape: ``(batch, num_channels, H, W)``
-            - ``prev_rec`` is the upsampled reconstruction from the previous
-              scale (zeros for scale 0). Shape matches ``real_facies``.
+                Returns
+                -------
+                torch.Tensor
+                        The upsampled previous reconstruction (``prev_rec``) matching
+                        ``real_facies`` spatial shape. Note: reconstruction noise ``z_rec``
+                        is stored in ``self.model.rec_noise`` and is not returned.
         """
         # Prepare previous reconstruction
         if scale == 0:
@@ -810,59 +777,59 @@ class Trainer:
         epochs: "tqdm[int]",
         writer: SummaryWriter,
         epoch: int,
-        generator_loss: float,
-        discriminator_loss: float,
-        discriminator_loss_real: float,
-        discriminator_loss_fake: float,
-        discriminator_loss_gp: float,
-        generator_loss_fake: float,
-        generator_loss_rec: float,
-        generator_loss_well: float,
-        generator_loss_div: float,
+        generator_metrics: GeneratorMetrics,
+        discriminator_metrics: DiscriminatorMetrics,
     ) -> None:
-        """Log training metrics for the current epoch to TensorBoard and console."""
+        """Log training metrics for the current epoch to TensorBoard and console.
+
+        Parameters
+        ----------
+        epochs : tqdm[int]
+            Progress bar instance to update description text.
+        writer : SummaryWriter
+            Per-scale TensorBoard writer to record scalars.
+        epoch : int
+            Current epoch index (0-based).
+        generator_metrics : GeneratorMetrics
+            Dataclass carrying tensor-valued generator losses for the scale.
+        discriminator_metrics : DiscriminatorMetrics
+            Dataclass carrying tensor-valued discriminator losses for the scale.
+
+        Notes
+        -----
+        Metric dataclass fields are tensor scalars; this function converts
+        them to Python floats via `.item()` before writing to TensorBoard or
+        formatting for display.
+        """
+        g = generator_metrics
+        d = discriminator_metrics
+
         # Update progress bar description with more detailed info
-        if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == self.num_iter:
+        if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
             epochs.set_description(
                 "Epoch [{:4d}/{}] Scales {} | G: {:.3f} | D: {:.3f}".format(
                     epoch + 1,
                     self.num_iter,
                     list(self.model.active_scales),
-                    generator_loss,
-                    discriminator_loss,
+                    g.total.item(),
+                    d.total.item(),
                 )
             )
 
         # Log to TensorBoard - discriminator losses
+        writer.add_scalar("Loss/train/discriminator/real", -d.real.item(), epoch)  # type: ignore
+        writer.add_scalar("Loss/train/discriminator/fake", d.fake.item(), epoch)  # type: ignore
         writer.add_scalar(  # type: ignore
-            "Loss/train/discriminator/real", -float(discriminator_loss_real), epoch
+            "Loss/train/discriminator/gradient_penalty", d.gp.item(), epoch
         )
-        writer.add_scalar(  # type: ignore
-            "Loss/train/discriminator/fake", float(discriminator_loss_fake), epoch
-        )
-        writer.add_scalar(  # type: ignore
-            "Loss/train/discriminator/gradient_penalty",
-            float(discriminator_loss_gp),
-            epoch,
-        )
-        writer.add_scalar(  # type: ignore
-            "Loss/train/discriminator", float(discriminator_loss), epoch
-        )
+        writer.add_scalar("Loss/train/discriminator", d.total.item(), epoch)  # type: ignore
 
         # Log to TensorBoard - generator losses
-        writer.add_scalar(  # type: ignore
-            "Loss/train/generator/adversarial", float(generator_loss_fake), epoch
-        )
-        writer.add_scalar(  # type: ignore
-            "Loss/train/generator/reconstruction", float(generator_loss_rec), epoch
-        )
-        writer.add_scalar(  # type: ignore
-            "Loss/train/generator/well_constraint", float(generator_loss_well), epoch
-        )
-        writer.add_scalar(  # type: ignore
-            "Loss/train/generator/diversity", float(generator_loss_div), epoch
-        )
-        writer.add_scalar("Loss/train/generator", float(generator_loss), epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator/adversarial", g.fake.item(), epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator/reconstruction", g.rec.item(), epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator/well_constraint", g.well.item(), epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator/diversity", g.div.item(), epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator", g.total.item(), epoch)  # type: ignore
 
     def __save_generated_facies(
         self,
@@ -871,7 +838,13 @@ class Trainer:
         results_path: str,
         masks: torch.Tensor | None = None,
     ) -> None:
-        """Save generated facies visualizations."""
+        """Save generated facies visualizations to disk asynchronously.
+
+        This method samples noises, generates multiple facies images per real
+        sample, clips them to [-1, 1], moves them to CPU and submits a
+        background worker job to save the visualization images. Masks are
+        passed through for overlay if provided.
+        """
         indexes = torch.randint(self.batch_size, (self.num_real_facies,))
         real_facies = self.facies[scale][indexes]
 

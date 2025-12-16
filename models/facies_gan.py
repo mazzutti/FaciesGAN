@@ -8,7 +8,7 @@ and discriminators for each scale.
 
 import math
 import os
-from typing import Any, Dict, Tuple, Optional
+from typing import Any, Dict
 
 import torch
 import torch.nn as nn
@@ -19,6 +19,7 @@ from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
 from models.discriminator import Discriminator
 from models.generator import Generator
 from options import TrainningOptions
+from metrics import DiscriminatorMetrics, GeneratorMetrics
 
 
 class FaciesGAN:
@@ -69,6 +70,21 @@ class FaciesGAN:
         *args: tuple[Any, ...],
         **kwargs: dict[str, Any],
     ) -> None:
+        """Initialize the parallel FaciesGAN model.
+
+        Parameters
+        ----------
+        device : torch.device
+            Device for computation.
+        options : TrainningOptions
+            Training configuration containing hyperparameters.
+        wells : list[torch.Tensor], optional
+            Optional per-scale well-conditioning tensors, by default [].
+        seismic : list[torch.Tensor], optional
+            Optional per-scale seismic-conditioning tensors, by default [].
+        noise_channels : int, optional
+            Number of input noise channels, by default 3.
+        """
         super().__init__(*args, **kwargs)
         self.device = device
         self.num_parallel_scales = options.num_parallel_scales
@@ -301,7 +317,7 @@ class FaciesGAN:
         indexes: list[int],
         real_facies_dict: dict[int, torch.Tensor],
         discriminator_optimizers: dict[int, torch.optim.Optimizer],
-    ) -> dict[int, tuple[float, float, float, float]]:
+    ) -> dict[int, DiscriminatorMetrics]:
         """Optimize multiple discriminators in TRUE parallel (simultaneous GPU computation).
 
         All discriminators are optimized in a single pass with gradient accumulation,
@@ -318,10 +334,15 @@ class FaciesGAN:
 
         Returns
         -------
-        dict[int, tuple[float, float, float, float]]
-            Dictionary mapping scale indices to (total_loss, real_loss, fake_loss, gp_loss).
+        dict[int, DiscriminatorMetrics]
+            Mapping from scale index to `DiscriminatorMetrics`. Each field is a
+            tensor scalar (autograd-enabled) representing losses computed for
+            that scale. Callers are expected to convert to Python floats when
+            logging (e.g., via `.item()`).
         """
-        losses: dict[int, tuple[float, float, float, float]] = {}
+        metrics: dict[int, DiscriminatorMetrics] = {}
+        # Temporarily hold tensor-valued metrics per-scale for backward()
+        scale_computations: dict[int, DiscriminatorMetrics] = {}
 
         for _ in range(self.discriminator_steps):
             # Zero all gradients at once
@@ -329,10 +350,10 @@ class FaciesGAN:
                 if scale in real_facies_dict:
                     discriminator_optimizers[scale].zero_grad()
 
-            # Compute all forward passes in parallel (triggers GPU parallelism)
-            scale_computations: list[
-                tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]
-            ] = []
+                # Compute all forward passes in parallel (triggers GPU parallelism)
+                # Map scale -> DiscriminatorStep (tensor losses) so we can call
+                # autograd.backward with named fields and then convert to floats.
+
             for scale in self.active_scales:
                 if scale not in real_facies_dict:
                     continue
@@ -364,13 +385,18 @@ class FaciesGAN:
                     self.device,
                 )
 
-                scale_computations.append((scale, real_loss, fake_loss, gp_loss))
+                # Store tensor-valued metrics directly so we can backward()
+                scale_computations[scale] = DiscriminatorMetrics(
+                    total=(real_loss + fake_loss + gp_loss),
+                    real=real_loss,
+                    fake=fake_loss,
+                    gp=gp_loss,
+                )
 
             # Backward pass for all scales (GPU can parallelize)
-            for scale, real_loss, fake_loss, gp_loss in scale_computations:
-                # all three are torch.Tensor; use autograd.backward on the list so the
-                # called function's signature is known to type checkers
-                torch.autograd.backward([real_loss, fake_loss, gp_loss])
+            for scale, step in scale_computations.items():
+                # step.real/step.fake/step.gp are autograd tensors
+                torch.autograd.backward([step.real, step.fake, step.gp])
 
             # Update all discriminators
             for scale in self.active_scales:
@@ -378,16 +404,17 @@ class FaciesGAN:
                     discriminator_optimizers[scale].step()
 
             # Record losses from last step
-            for scale, real_loss, fake_loss, gp_loss in scale_computations:
-                total_loss = real_loss.item() + fake_loss.item() + gp_loss.item()
-                losses[scale] = (
-                    total_loss,
-                    real_loss.item(),
-                    fake_loss.item(),
-                    gp_loss.item(),
+            for scale, step in scale_computations.items():
+                # Keep tensor metrics; conversion to python floats happens
+                # at logging time in the trainer/visualizer.
+                metrics[scale] = DiscriminatorMetrics(
+                    total=step.total,
+                    real=step.real,
+                    fake=step.fake,
+                    gp=step.gp,
                 )
 
-        return losses
+        return metrics
 
     def optimize_generator(
         self,
@@ -396,10 +423,7 @@ class FaciesGAN:
         masks_dict: dict[int, torch.Tensor],
         rec_in_dict: dict[int, torch.Tensor],
         generator_optimizers: dict[int, torch.optim.Optimizer],
-    ) -> Dict[
-        int,
-        Tuple[float, float, float, float, float, torch.Tensor, Optional[torch.Tensor]],
-    ]:
+    ) -> Dict[int, GeneratorMetrics]:
         """Optimize generator for multiple scales.
 
         All generator blocks are optimized together with gradient accumulation,
@@ -420,15 +444,13 @@ class FaciesGAN:
 
         Returns
         -------
-        dict[int, tuple[float, float, float, float, float, torch.Tensor, torch.Tensor | None]]
-            Dictionary mapping scale indices to (total_loss, adv_loss, rec_loss, well_loss, div_loss, fake, rec).
+        Dict[int, GeneratorMetrics]
+            Mapping from scale index to `GeneratorMetrics`. Each field is a
+            tensor scalar or tensor (for generated samples); metrics remain
+            as tensors to preserve autograd until the caller logs or detaches
+            them.
         """
-        results: Dict[
-            int,
-            Tuple[
-                float, float, float, float, float, torch.Tensor, Optional[torch.Tensor]
-            ],
-        ] = {}
+        scale_metrics: dict[int, GeneratorMetrics] = {}
         num_diversity_samples = 3
 
         for _ in range(self.generator_steps):
@@ -438,12 +460,9 @@ class FaciesGAN:
                     generator_optimizers[scale].zero_grad()
 
             # Compute all forward passes in parallel for all scales
-            scale_losses: dict[
-                int,
-                tuple[
-                    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-                ],
-            ] = {}
+            # Map scale -> GeneratorMetrics (tensor-valued) for clarity and
+            # easier backward() invocation.
+
             scale_fakes: dict[int, torch.Tensor] = {}
             scale_recs: dict[int, torch.Tensor | None] = {}
 
@@ -484,9 +503,7 @@ class FaciesGAN:
                 if self.lambda_diversity > 0 and len(fake_samples) >= 2:
                     # Vectorized pairwise distance calculation
                     n = len(fake_samples)
-                    stacked = torch.stack(
-                        [f.flatten() for f in fake_samples]
-                    )  # (n, -1)
+                    stacked = torch.stack([f.flatten() for f in fake_samples])
 
                     # Compute pairwise L2 distances using broadcasting
                     # (n, 1, -1) - (1, n, -1) -> (n, n, -1)
@@ -526,6 +543,7 @@ class FaciesGAN:
                         start_scale=scale,
                         stop_scale=scale,
                     )
+
                     generator_loss_rec = self.alpha * nn.MSELoss()(rec, real_facies)
 
                 # Combine all losses for this scale
@@ -536,53 +554,27 @@ class FaciesGAN:
                     + generator_loss_diversity
                 )
 
-                # Store for backward pass
-                scale_losses[scale] = (
-                    total_gen_loss,
-                    generator_loss_fake,
-                    generator_loss_rec,
-                    generator_masked_loss,
-                    generator_loss_diversity,
+                # Store tensor-valued GeneratorMetrics for backward pass
+                scale_metrics[scale] = GeneratorMetrics(
+                    total=total_gen_loss,
+                    fake=generator_loss_fake,
+                    rec=generator_loss_rec,
+                    well=generator_masked_loss,
+                    div=generator_loss_diversity,
                 )
                 scale_fakes[scale] = fake
                 scale_recs[scale] = rec
 
-            # Backward pass for all scales (GPU can parallelize gradient computation)
-            for scale, losses_tuple in scale_losses.items():
-                total_gen_loss = losses_tuple[0]
-                torch.autograd.backward([total_gen_loss])
+            if scale_metrics:
+                totals = [gm.total for gm in scale_metrics.values()]
+                torch.autograd.backward(totals)
 
             # Update all generators
             for scale in self.active_scales:
                 if scale in real_facies_dict:
                     generator_optimizers[scale].step()
 
-            # Record results from last step
-            for scale in self.active_scales:
-                if scale in scale_losses:
-                    (
-                        total_gen_loss,
-                        generator_loss_fake,
-                        generator_loss_rec,
-                        generator_masked_loss,
-                        generator_loss_diversity,
-                    ) = scale_losses[scale]
-                    # Safely detach reconstruction tensor only if it exists and is a tensor
-                    rec_obj = scale_recs.get(scale)
-                    rec_detached = (
-                        rec_obj.detach() if isinstance(rec_obj, torch.Tensor) else None
-                    )
-                    results[scale] = (
-                        float(total_gen_loss.item()),
-                        float(generator_loss_fake.item()),
-                        float(generator_loss_rec.item()),
-                        float(generator_masked_loss.item()),
-                        float(generator_loss_diversity.item()),
-                        scale_fakes[scale].detach(),
-                        rec_detached,
-                    )
-
-        return results
+        return scale_metrics
 
     def save_scale(self, scale: int, path: str) -> None:
         """Save the generator and discriminator for a specific scale.
