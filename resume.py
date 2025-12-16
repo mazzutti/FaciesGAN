@@ -1,3 +1,16 @@
+"""Resume training entrypoint.
+
+This script provides a small command-line wrapper to resume or fine-tune
+previously saved training checkpoints. It parses a few resume-related
+arguments, restores training options from the checkpoint `options.json`,
+initializes logging, and delegates to :class:`Trainer` to continue
+training from the requested scale or checkpoint path.
+
+Example
+-------
+Run with ``--checkpoint-path /path/to/checkpoint --num-iter 100`` to fine-tune.
+"""
+
 import argparse
 import glob
 import json
@@ -11,9 +24,6 @@ from config import G_FILE, OPT_FILE, RESULT_FACIES_PATH
 from log import init_output_logging
 from options import ResumeOptions
 from train import Trainer
-
-# from types import SimpleNamespace
-
 
 
 if __name__ == "__main__":

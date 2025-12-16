@@ -1,3 +1,14 @@
+"""Create cached multi-scale pyramids for facies, seismic and well data.
+
+This module exposes helpers that build multi-resolution tensors for the
+training pipeline. The functions are cached via ``joblib.Memory`` so repeated
+calls with the same scale list are fast. All pyramid functions accept a
+``scale_list`` that is a tuple of shape descriptors produced by
+``ops.generate_scales`` (each element is ``(batch, channels, height, width)``)
+and return a list of PyTorch tensors, one tensor per scale, with shape
+``(N, C, H, W)``.
+"""
+
 import torch
 from joblib import Memory  # type: ignore
 
@@ -14,26 +25,20 @@ memory = Memory("./.cache", verbose=0)
 
 @memory.cache  # type: ignore
 def to_facies_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Tensor]:
-    """Generate multi-scale pyramid representations of facies images using neural
-    interpolation.
-
-    For each facies image and its corresponding model checkpoint, this function
-    creates a NeuralSmoother instance and generates interpolated images at all
-    requested scales. The results are organized into pyramids where each scale
-    level contains tensors for all facies images.
+    """Generate multi-scale pyramid tensors for facies images using a neural interpolator.
 
     Parameters
     ----------
-    scale_list : list[tuple[int, ...]]
-        List of target resolutions as (height, width) tuples. Each resolution
-        defines one level in the output pyramid.
+    scale_list : tuple[tuple[int, ...], ...]
+        Tuple of scale descriptors as produced by ``ops.generate_scales``. Each
+        element must be a 4-tuple ``(batch, channels, height, width)`` describing
+        the target resolution.
 
     Returns
     -------
     list[torch.Tensor]
-        List of stacked tensors, one per scale level. Each tensor has shape
-        (N, H, W, 3) where N is the number of facies images, and (H, W)
-        matches the corresponding resolution in scale_list.
+        A list where each element is a PyTorch tensor containing all facies at
+        that scale with shape ``(N, C, H, W)`` (N images, C channels).
     """
     facies_paths = as_image_file_list(DataFiles.FACIES)
     models_paths = as_model_file_list(DataFiles.FACIES)
@@ -53,31 +58,21 @@ def to_facies_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Te
 
 @memory.cache  # type: ignore
 def to_seismic_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Tensor]:
-    """Generate multi-scale pyramid representations of seismic images using
-    nearest neighbor interpolation.
-
-    This function processes seismic data using trace-wise nearest neighbor
-    interpolation to create pyramid representations at multiple scales. Results
-    are cached across executions using joblib Memory for improved performance.
+    """Generate multi-scale pyramid tensors for seismic images using nearest interpolation.
 
     Parameters
     ----------
     scale_list : tuple[tuple[int, ...], ...]
-        Tuple of target resolutions as (batch, channels, height, width) tuples.
-        Each resolution defines one level in the output pyramid.
+        Tuple of scale descriptors ``(batch, channels, height, width)``.
 
     Returns
     -------
     list[torch.Tensor]
-        List of stacked tensors, one per scale level. Each tensor has shape
-        (N, H, W, 3) where N is the number of seismic images, and (H, W)
-        matches the corresponding resolution in scale_list.
+        A list of tensors (one per scale) with shape ``(N, C, H, W)``.
 
     Notes
     -----
-    - Uses NearestInterpolator for trace-wise interpolation
-    - Results are cached in ./.cache directory
-    - Cache persists across program executions
+    Uses NearestInterpolator and caches results in ``./.cache``.
     """
     seismic_paths = as_image_file_list(DataFiles.SEISMIC)
     seismic_interpolator = NearestInterpolator(InterpolatorConfig())
@@ -95,47 +90,35 @@ def to_seismic_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.T
 
 @memory.cache  # type: ignore
 def to_wells_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Tensor]:
-    """Generate multi-scale pyramid representations of well data.
-
-    This function processes well location data to create pyramid representations
-    at multiple scales. Each well is represented as a vertical trace in the output
-    images, with spatial scaling applied proportionally to maintain well positions
-    across different resolutions. Results are cached across executions.
+    """Generate multi-scale pyramid tensors for well location data.
 
     Parameters
     ----------
     scale_list : tuple[tuple[int, ...], ...]
-        Tuple of target resolutions as (batch, channels, height, width) tuples.
-        Each resolution defines one level in the output pyramid.
+        Tuple of scale descriptors ``(batch, channels, height, width)``.
 
     Returns
     -------
     list[torch.Tensor]
-        List of stacked tensors, one per scale level. Each tensor has shape
-        (N, H, W, 3) where N is the number of well images, and (H, W)
-        matches the corresponding resolution in scale_list. Well locations
-        are represented as vertical traces at scaled column positions.
+        A list of tensors (one per scale) with shape ``(N, C, H, W)``. Well
+        locations are represented as sparse vertical traces at the appropriate
+        column indices.
 
     Notes
     -----
-    - Uses WellInterpolator for well-specific trace extraction
-    - Well column positions are scaled proportionally across resolutions
-    - Results are cached in ./.cache directory
-    - Cache persists across program executions
+    Uses ``WellInterpolator`` and caches results in ``./.cache``.
     """
     wells_interpolator = WellInterpolator(InterpolatorConfig())
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
-    facies_paths = as_image_file_list(DataFiles.WELLS)  # Load well image paths
+    facies_paths = as_image_file_list(DataFiles.WELLS)
     for facie_path in facies_paths:
         pyramid = wells_interpolator.interpolate(facie_path, scale_list)  # type: ignore
         for i in range(len(scale_list)):
             # Normalize wells but preserve zeros (sparse structure)
             # Only normalize non-zero pixels, keep zeros as zeros
             well_data = pyramid[i]
-            mask = (
-                well_data.abs() > 0.001
-            ).float()  # 1 where data exists, 0 where zeros
-            normalized = norm(well_data) * mask  # Apply norm only where data exists
+            mask = (well_data.abs() > 0.001).float()
+            normalized = norm(well_data) * mask
             pyramids_list[i].append(normalized)
     pyramids = [
         torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2)

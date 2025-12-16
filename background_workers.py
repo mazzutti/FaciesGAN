@@ -66,6 +66,11 @@ class BackgroundWorker:
     _instance_lock = threading.Lock()
 
     def __new__(cls, max_workers: int = 2, max_pending: int = 32) -> "BackgroundWorker":
+        """Return the singleton BackgroundWorker instance.
+
+        Implements double-checked locking to ensure thread-safe lazy
+        initialization of the singleton instance.
+        """
         # Double-checked locking to safely initialize singleton
         if cls._instance is None:
             with cls._instance_lock:
@@ -74,6 +79,15 @@ class BackgroundWorker:
         return cls._instance
 
     def __init__(self, max_workers: int = 2, max_pending: int = 32) -> None:
+        """Initialize the process pool and pending-job tracking.
+
+        Parameters
+        ----------
+        max_workers : int
+            Maximum number of worker processes in the pool.
+        max_pending : int
+            Maximum number of pending futures before callers are blocked.
+        """
         # Initialize only once
         if getattr(self, "_initialized", False):
             return
@@ -122,9 +136,11 @@ class BackgroundWorker:
         ``wait_if_full=False`` a completed ``Future`` with a ``False`` result
         is returned immediately.
 
-        Important: this API accepts ``torch.Tensor`` inputs. Convert tensors
-        to CPU (``tensor.detach().cpu()``) before calling this method rather
-        than passing CUDA tensors directly into the executor to avoid
+        Important
+        ---------
+        This API accepts ``torch.Tensor`` inputs. Convert tensors to CPU
+        (``tensor.detach().cpu()``) before calling this method rather than
+        passing CUDA tensors directly into the executor to avoid
         pickling/serialization issues with GPU-backed storage.
         """
         # Wait for available slot if configured
@@ -166,6 +182,7 @@ class BackgroundWorker:
             return fut
 
     def pending_count(self) -> int:
+        """Return the current number of pending background jobs."""
         with self._pending_cond:
             return len(self._pending)
 
@@ -183,6 +200,14 @@ class BackgroundWorker:
                     self._pending_cond.wait(timeout=end - time.time())
 
     def shutdown(self, wait: bool = False) -> None:
+        """Shutdown the process pool and optionally wait for pending jobs.
+
+        Parameters
+        ----------
+        wait : bool
+            If True, block until all pending tasks complete before shutting
+            down the pool.
+        """
         try:
             # Optionally wait for pending jobs to complete
             if wait:
@@ -200,10 +225,10 @@ def submit_plot_generated_facies(
     out_dir: str,
     masks: torch.Tensor | None = None,
 ) -> Future[bool]:
-    """Convenience wrapper that uses the module-level BackgroundWorker.
+    """Submit a plot job using the module-level BackgroundWorker.
 
-    This keeps backward compatibility with existing import sites that call
-    `submit_plot_generated_facies(...)` directly.
+    This wrapper provides backward compatibility for callers that expect a
+    module-level function rather than instantiating the singleton class.
     """
     # BackgroundWorker is a singleton — calling the constructor returns the
     # shared instance. Use it to submit the job.

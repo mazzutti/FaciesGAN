@@ -1,3 +1,12 @@
+"""Nearest-neighbor interpolator module.
+
+Provides :class:`NearestInterpolator`, a lightweight trace-wise
+nearest-neighbor interpolation implementation compatible with the
+neural interpolator API. It is intended as a fast baseline for
+comparison and for rendering quick examples without a trained neural
+model.
+"""
+
 import logging
 from pathlib import Path
 

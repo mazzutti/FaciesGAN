@@ -1,3 +1,14 @@
+"""Custom neural network layers used by the generator and discriminator.
+
+This module implements building blocks such as :class:`ConvBlock`, SPADE
+normalization and SPADE-based generator blocks. These helpers are
+convenience modules that keep layer definitions and small forward
+utilities close to the model implementations.
+
+All public classes in this module are documented with NumPy-style
+docstrings describing parameters and returns.
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,6 +42,10 @@ class ConvBlock(nn.Sequential):
         padding: int,
         stride: int,
     ) -> None:
+        """Initialize a ConvBlock sequential module.
+
+        Parameters are documented on the class level.
+        """
         super(ConvBlock, self).__init__()
 
         self.add_module(
@@ -79,6 +94,10 @@ class SPADE(nn.Module):
         hidden_nc: int = 64,
         kernel_size: int = 3,
     ) -> None:
+        """Initialize the SPADE normalization module.
+
+        Parameters are documented on the class level.
+        """
         super().__init__()  # type: ignore
 
         self.norm = nn.InstanceNorm2d(norm_nc, affine=False)
@@ -167,6 +186,10 @@ class SPADEConvBlock(nn.Module):
         stride: int,
         spade_hidden: int = 64,
     ) -> None:
+        """Initialize the SPADEConvBlock used inside SPADEGenerator.
+
+        Parameters are documented on the class level.
+        """
         super().__init__()  # type: ignore
 
         self.spade = SPADE(in_channels, cond_channels, spade_hidden, kernel_size)
@@ -236,6 +259,10 @@ class SPADEGenerator(nn.Module):
         output_channels: int,
         input_channels: int,
     ) -> None:
+        """Initialize SPADEGenerator parameters and layers.
+
+        Parameters are documented on the class level.
+        """
         super().__init__()  # type: ignore
 
         self.init_conv = nn.Conv2d(

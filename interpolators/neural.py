@@ -46,7 +46,8 @@ class NeuralSmoother(BaseInterpolator):
 
     The original module-level functions `set_seed`, `get_mgrid` and
     `train` have been moved here. Thin module-level wrappers
-    below keep API compatibility."""
+    below keep API compatibility.
+    """
 
     def __init__(
         self,
@@ -82,7 +83,7 @@ class NeuralSmoother(BaseInterpolator):
         self.device: torch.device = resolve_device()
         self.num_classes: int = int(config.num_classes or 4)
         self.model = ResidualMLP(
-            num_classes=self.num_classes, 
+            num_classes=self.num_classes,
             scale=config.scale,
         ).to(self.device)
         self._load_model(model_path)
@@ -115,7 +116,6 @@ class NeuralSmoother(BaseInterpolator):
         except Exception:
             logger.info("Failed checking device for compilation; continuing")
 
-
     def _load_model(self, model_Path: Path) -> None:
         """Orchestrate model compilation, optional restore, and optimizer setup.
 
@@ -127,14 +127,15 @@ class NeuralSmoother(BaseInterpolator):
             state = torch.load(str(model_Path), map_location=self.device)
             ms: dict[str, Any] | None = self._state_from_checkpoint(state)
             if ms is None:
-                raise RuntimeError("Unable to interpret checkpoint state as model state")
+                raise RuntimeError(
+                    "Unable to interpret checkpoint state as model state"
+                )
             self.model.load_state_dict(ms)  # pyright: ignore
             logger.info(
                 f"Loaded model checkpoint from {model_Path}; skipping training."
             )
         else:
             raise FileNotFoundError("No checkpoint found; training model from scratch.")
-
 
     def interpolate(
         self,
@@ -179,7 +180,6 @@ class NeuralSmoother(BaseInterpolator):
         - A ColorEncoder is created from ``image_path`` during this call and
           stored in ``self.encoder`` for palette-based RGB conversion.
         """
-
         logger.info("Rendering facies pyramid...")
         # Get dimensions using base helper method
         _, _, super_height, super_width = self.get_target_dimensions()
@@ -194,7 +194,7 @@ class NeuralSmoother(BaseInterpolator):
                 chunk = coords[i : i + self.config.chunk_size]
                 logits_chunks.append(self.model(chunk))
 
-            logits = torch.cat(logits_chunks, dim=0)  # [H*W, C]
+            logits = torch.cat(logits_chunks, dim=0)
 
             probs = torch.softmax(logits, dim=1)
             probs = (
@@ -236,21 +236,46 @@ class NeuralSmoother(BaseInterpolator):
 
         return smooth_imgs
 
-    
+
 # ==========================================
 # 2. IMPROVED ARCHITECTURE: Residual MLP
 # ==========================================
 class FourierFeatureTransform(nn.Module):
+    """Fourier feature mapping used to embed 2D coordinates.
+
+    This module projects 2D coordinates into a higher-dimensional
+    sinusoidal feature space using a random Gaussian mapping matrix.
+
+    Parameters
+    ----------
+    mapping_size : int
+        Number of Fourier features per sine/cosine pair.
+    scale : float
+        Frequency scaling (sigma) applied to the random projection.
+    """
+
     def __init__(self, mapping_size: int = 256, scale: float = 10.0) -> None:
+        """Initialize Fourier feature projection and register buffers."""
         super().__init__()  # pyright: ignore[reportUnknownMemberType]
 
         # 'scale' is the "sigma". Higher = sharper/noisier. Lower = smoother/blurrier.
         # store as a buffer (not a trainable parameter) to avoid showing up in optimizer
         B = torch.randn(2, mapping_size) * scale
         self.register_buffer("B", B, persistent=True)
-        # self.B = Parameter(torch.randn(2, mapping_size) * scale, requires_grad=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply Fourier features to input coordinates.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input coordinates of shape (..., 2).
+
+        Returns
+        -------
+        torch.Tensor
+            Concatenated sin/cos feature tensor of shape (..., mapping_size*2).
+        """
         # Ensure numeric constant is a Python float so the result of the
         # multiplication with a torch.Tensor is a torch.Tensor. This helps
         # static type-checkers resolve the expression type (avoid 'Unknown').
@@ -260,14 +285,15 @@ class FourierFeatureTransform(nn.Module):
         B_tensor: torch.Tensor = cast(torch.Tensor, getattr(self, "B"))
         # Use torch.matmul to make the tensor operation explicit for static type checkers
         x_proj: torch.Tensor = torch.matmul(x * factor, B_tensor)
-        # x_proj = (2.0 * np.pi * x) @ self.B
         return torch.cat([torch.sin(x_proj), torch.cos(x_proj)], dim=-1)
 
 
 class ResidualMLP(nn.Module):
-    """
-    IMPROVEMENT 1: Residual Skip Connections + LayerNorm
-    This structure is similar to the NeRF architecture.
+    """Residual MLP with Fourier features and skip connections.
+
+    This architecture uses a Fourier feature embedding, residual/skip
+    connections and LayerNorm to produce stable per-coordinate class
+    predictions.
     """
 
     def __init__(
@@ -277,6 +303,19 @@ class ResidualMLP(nn.Module):
         scale: float = 1.0,
         hidden_dim: int = 256,
     ) -> None:
+        """Initialize the ResidualMLP network components.
+
+        Parameters
+        ----------
+        num_classes : int
+            Number of output classes.
+        mapping_size : int
+            Size of Fourier mapping features.
+        scale : float
+            Frequency scaling for Fourier features.
+        hidden_dim : int
+            Hidden layer dimension size.
+        """
         super().__init__()  # pyright: ignore[reportUnknownMemberType]
         self.fourier = FourierFeatureTransform(mapping_size, scale)
         input_dim = mapping_size * 2
@@ -309,6 +348,18 @@ class ResidualMLP(nn.Module):
         self.output = nn.Linear(hidden_dim, num_classes)
 
     def forward(self, coords: torch.Tensor) -> torch.Tensor:
+        """Compute per-coordinate class logits from input coordinates.
+
+        Parameters
+        ----------
+        coords : torch.Tensor
+            Input coordinate tensor of shape (..., 2).
+
+        Returns
+        -------
+        torch.Tensor
+            Unnormalized class logits for each input coordinate.
+        """
         # Embed coordinates
         x_emb = self.fourier(coords)
 

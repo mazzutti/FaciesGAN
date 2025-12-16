@@ -1,3 +1,11 @@
+"""Utilities and CLI for generating facies samples and comparison plots.
+
+This module contains helpers to generate samples from a trained
+FaciesGAN model, create comparison plots between real and generated
+facies, and provide simple MDS visualizations. It is primarily a
+convenience script used offline after training.
+"""
+
 import copy
 import json
 import os
@@ -157,7 +165,18 @@ def plot_mds(
     mask_indexes: list[int],
     options: SimpleNamespace,
 ) -> None:
+    """Plot MDS embedding comparing real and generated facies.
 
+    Parameters
+    ----------
+    fake_facies : list[np.ndarray]
+        List of generated facies arrays (flattenable) to include in the plot.
+    mask_indexes : list[int]
+        Indices used for well-based conditioning corresponding to the generated
+        facies.
+    options : SimpleNamespace
+        Options namespace containing dataset indices and other generation flags.
+    """
     # fake_facies parameter is a list of numpy arrays. Do not rebind the parameter
     # to an ndarray (which would violate the annotated type). Use a new local
     # variable for the stacked ndarray representation.
@@ -194,41 +213,6 @@ def plot_mds(
     plt.ylabel("MDS Dimension 2")
     plt.legend(("Real Facies", "Fake Facies"), loc="upper right")  # type: ignore
     plt.show()
-
-    # fake_facies = np.stack(fake_facies, 0).squeeze(-1)
-    # real_facies = dataset.facies_pyramid[-1]
-    # real_facies = np.reshape(torch2np(real_facies, denormalize=True), [200, -1])
-    # fake_facies = np.reshape(fake_facies, [len(mask_indexes), -1])
-    #
-    # real_facies_similarities = euclidean_distances(real_facies)
-    # fake_facies_similarities = euclidean_distances(fake_facies)
-    # mds = MDS(
-    #     n_components=2,
-    #     max_iter=3000,
-    #     eps=1e-9,
-    #     random_state=np.random.RandomState(seed=3),
-    #     dissimilarity="precomputed",
-    #     n_jobs=1,
-    #     normalized_stress="auto",
-    # )
-    # real_facies_reduced = mds.fit((real_facies_similarities + real_facies_similarities.T) / 2).embedding_
-    # fake_facies_reduced = mds.fit((fake_facies_similarities + fake_facies_similarities.T) / 2).embedding_
-    # sc = plt.scatter(real_facies_reduced[:, 0], real_facies_reduced[:, 1])
-    # # plt.scatter(fake_facies_reduced[:, 0], fake_facies_reduced[:, 1])
-    # plt.title("MDS Visualization of FaciesGAN generated facies")
-    # plt.xlabel("MDS Dimension 1")
-    # # plt.ylabel("MDS Dimension 2")
-    # # plt.legend(('Real Facies', 'Fake Facies'), loc='upper right')
-    # import mplcursors
-    # cursor = mplcursors.cursor([sc], hover=True)
-    #
-    # def label_func(sel):
-    #     print(sel.index)
-    #     sel.annotation.set_text(str(sel.index))
-    #
-    # cursor.connect("add", label_func)
-    # plt.show()
-    # pass
 
 
 if __name__ == "__main__":
@@ -313,8 +297,6 @@ if __name__ == "__main__":
     print("Generating facies...")
 
     options = copy.copy(args)
-    # if arguments.plot_mds:
-    #     options.num_train_facies = len(options.wells)
 
     dataset: PyramidsDataset = PyramidsDataset(options)
     masked_facies: list[torch.Tensor] = []

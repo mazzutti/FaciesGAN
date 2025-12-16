@@ -1,3 +1,10 @@
+"""Interpolator configuration dataclasses.
+
+This module contains small configuration dataclasses used by the
+interpolator implementations (nearest, well, neural). They provide a
+compact way to pass rendering options and geometry parameters.
+"""
+
 from dataclasses import dataclass
 
 
@@ -35,4 +42,3 @@ class InterpolatorConfig:
     upsample: int = 4
     chunk_size: int = 65536
     geometry: tuple[int, int] = (150, 120)
-

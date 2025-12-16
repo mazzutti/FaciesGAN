@@ -216,7 +216,13 @@ def get_arguments() -> ArgumentParser:
 
 
 def main() -> None:
-    """Main function to initialize and run parallel FaciesGAN training."""
+    """Run parallel FaciesGAN training.
+
+    Handles argument parsing, environment setup, logger initialization, and
+    constructs the :class:`Trainer` instance that performs the training
+    loop. This entry point is intended for CLI usage and is also used in
+    the ``if __name__ == '__main__'`` guard.
+    """
     argument_parser = get_arguments()
     options = argument_parser.parse_args(namespace=TrainningOptions())
 
@@ -253,7 +259,7 @@ def main() -> None:
     )
 
     print("\n" + "=" * 60)
-    print(f"PARALLEL LAPGAN TRAINING")
+    print("PARALLEL LAPGAN TRAINING")
     print("=" * 60)
     print(f"Device: {device}")
     print(f"Training scales: {options.start_scale} to {options.stop_scale}")
@@ -319,8 +325,7 @@ def main() -> None:
         else:
             # Use standard torch.profiler for CPU/CUDA
             try:
-                from torch.profiler import (ProfilerActivity,  # type: ignore
-                                            profile)
+                from torch.profiler import ProfilerActivity, profile  # type: ignore
             except Exception:
                 print("Warning: PyTorch profiler not available in this environment.")
                 trainer.train()

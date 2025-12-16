@@ -1,3 +1,11 @@
+"""Small array/tensor utilities and training helpers.
+
+This module provides lightweight utilities used across training and
+visualization code: device resolution, tensor<->numpy conversions, image
+loading, random seeds, and common neural-network helpers such as
+gradient-penalty and noise generation.
+"""
+
 import math
 import os
 import random
@@ -274,7 +282,6 @@ def denorm(tensor: torch.Tensor, ceiling: bool = False) -> torch.Tensor:
     """
     tensor = (tensor + 1) / 2
     tensor = tensor.clamp(0, 1)
-    # if ceiling: tensor[torch.where(tensor > 0)] = 1
     return tensor
 
 
@@ -485,11 +492,9 @@ def calc_diversity_loss(
     # Vectorized pairwise distance calculation
     n = len(fake_samples)
 
-    # Stack all samples: (n, C, H, W) -> flatten for easier computation
-    stacked_fakes = torch.stack([f.flatten() for f in fake_samples])  # (n, -1)
-    stacked_noises = torch.stack(
-        [noise_samples[i][0].flatten() for i in range(n)]
-    )  # (n, -1)
+    # Stack all samples and flatten for easier computation
+    stacked_fakes = torch.stack([f.flatten() for f in fake_samples])
+    stacked_noises = torch.stack([noise_samples[i][0].flatten() for i in range(n)])
 
     # Compute pairwise L1 distances using broadcasting
     # (n, 1, -1) - (1, n, -1) -> (n, n, -1)
@@ -546,7 +551,6 @@ def calc_gradient_penalty(
     torch.Tensor
         Calculated gradient penalty scalar value.
     """
-
     alpha = torch.rand(1, 1).expand(real_data.size()).to(device)
     interpolates = (alpha * real_data + (1 - alpha) * fake_data).requires_grad_(True)
     disc_interpolates = discriminator(interpolates)
@@ -595,27 +599,23 @@ def load(
     device: torch.device = torch.device("cpu"),
     as_type: type[T] | None = None,
 ) -> T:
-    """
-    Load a PyTorch object from a file and return it as the requested type.
+    """Load a PyTorch object from `path` and optionally validate its type.
 
-    Callers can pass a runtime class in `as_type` (for example `dict` or
-    `list`) to indicate the expected shape of the loaded object. The
-    function will `cast` the loaded object to the generic return type `T` so
-    static type checkers can use the annotation. Note that `as_type` is only
-    used for a runtime `isinstance` check (when possible) and for clarity; it
-    does not change how `torch.load` behaves.
+    Parameters
+    ----------
+    path : str
+        Filesystem path to the saved PyTorch object (state dict, tensors, list, etc.).
+    device : torch.device, optional
+        Device to map the loaded tensors to (defaults to CPU).
+    as_type : type[T] | None, optional
+        Optional runtime class used only for a non-fatal ``isinstance`` check
+        to help callers detect mismatches early (for example, ``dict`` or
+        ``list``). This parameter does not modify how ``torch.load`` behaves.
 
-    Examples:
-        state: Mapping[str, Any] = ops.load(path, as_type=dict)
-        noises: list[torch.Tensor] = ops.load(path, as_type=list)
-
-    Args:
-        path (str): The file path to load the object from.
-        device (torch.device): The device to map the loaded object to. Default is CPU.
-        as_type (Type[T] | None): Optional runtime class to assert the loaded object's type.
-
-    Returns:
-        T: The loaded object, cast to the requested generic type.
+    Returns
+    -------
+    T
+        The loaded object, cast to the requested generic return type.
     """
     obj = torch.load(path, map_location=device, weights_only=True)
     if as_type is not None:

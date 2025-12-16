@@ -1,3 +1,9 @@
+"""Helper enum describing dataset subdirectories and filename patterns.
+
+This module centralizes dataset directory names and common filename
+patterns used by data-loading and interpolation utilities.
+"""
+
 import os
 from enum import Enum
 
@@ -13,7 +19,16 @@ class DataFiles(Enum):
     WELLS = "wells"
     SEISMIC = "seismic"
 
-    def __init__(self,  value: str, data_dir: str = "./data") -> None:
+    def __init__(self, value: str, data_dir: str = "./data") -> None:
+        """Initialize a DataFiles enum member.
+
+        Parameters
+        ----------
+        value : str
+            Directory name for this data type (e.g., 'facies').
+        data_dir : str, optional
+            Base data directory, by default './data'.
+        """
         self.filename = value
         self.data_dir = data_dir
 
@@ -31,7 +46,7 @@ class DataFiles(Enum):
             Full path to the file represented by this enum member.
         """
         return os.path.join(data_dir or self.data_dir, self.filename)
-    
+
     @property
     def image_file_pattern(self) -> str:
         """Get the image file pattern for this data type.

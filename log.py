@@ -1,3 +1,9 @@
+"""Logging helpers that capture stdout/stderr and tee output streams.
+
+Provides simple stream wrappers used by the training scripts to duplicate
+console output to a file while keeping the progress bar output clean.
+"""
+
 import sys
 from collections.abc import Sequence
 from typing import Any, Protocol, runtime_checkable
@@ -5,9 +11,23 @@ from typing import Any, Protocol, runtime_checkable
 
 @runtime_checkable
 class Writable(Protocol):
-    def write(self, *args: Any, **kwargs: Any) -> object: ...
+    """Protocol representing a minimal writable stream.
 
-    def flush(self) -> None: ...
+    Implementations should provide ``write`` and ``flush`` methods so
+    they can be used as sinks for text output (stdout/stderr).
+    """
+
+    def write(self, *args: Any, **kwargs: Any) -> object:
+        """Write data to the stream.
+
+        This method mirrors the standard file-like ``write`` signature and
+        accepts positional and keyword arguments for compatibility.
+        """
+        ...
+
+    def flush(self) -> None:
+        """Flush any buffered output to the underlying storage."""
+        ...
 
 
 class OutputLogger(object):
@@ -60,9 +80,10 @@ class OutputLogger(object):
                 self.buffer = None
 
     def write(self, data: str) -> None:
-        """Write data to the log file and buffer.
+        r"""Write data to the log file and buffer.
 
-        Skips lines starting with \\r (typically from tqdm progress bars).
+        Skips lines starting with \r (typically emitted by progress bars)
+        to avoid polluting log files with carriage-return-only updates.
 
         Parameters
         ----------

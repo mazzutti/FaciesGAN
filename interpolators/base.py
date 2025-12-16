@@ -1,3 +1,10 @@
+"""Base classes and shared utilities for interpolators.
+
+This module defines :class:`BaseInterpolator`, a light-weight abstract
+base class that provides common helpers and a consistent API for
+interpolator implementations (nearest neighbor, neural, well-based,
+etc.). Subclasses should implement the :meth:`interpolate` method.
+"""
 
 from __future__ import annotations
 
@@ -9,6 +16,7 @@ import torch
 from interpolators.config import InterpolatorConfig
 
 logger = logging.getLogger(__name__)
+
 
 class BaseInterpolator:
     """Base class providing common functionality for all interpolators.
@@ -24,9 +32,9 @@ class BaseInterpolator:
     config: InterpolatorConfig
 
     def __init__(self, config: InterpolatorConfig) -> None:
+        """Store the provided configuration on the instance."""
         self.config = config
 
-    
     def get_target_dimensions(self) -> tuple[int, ...]:
         """Calculate native and target (super-resolution) dimensions.
 
@@ -45,9 +53,8 @@ class BaseInterpolator:
         super_width = native_width * self.config.upsample
         return native_height, native_width, super_height, super_width
 
-
     def interpolate(
-        self, 
+        self,
         image_path: Path,
         resolutions: tuple[tuple[int, ...], ...],
     ) -> list[torch.Tensor]:
@@ -81,5 +88,3 @@ class BaseInterpolator:
             If the subclass does not override this method.
         """
         raise NotImplementedError("Subclasses must implement render")
-
-

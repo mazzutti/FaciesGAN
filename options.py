@@ -1,3 +1,11 @@
+"""Typed option namespaces used by CLI entry points and scripts.
+
+This module provides :class:`TrainningOptions` and :class:`ResumeOptions`,
+lightweight dataclass-backed namespaces that mirror the command-line
+arguments used throughout the project. They may be passed as the
+``namespace`` argument to ``argparse.ArgumentParser.parse_args``.
+"""
+
 import argparse
 from dataclasses import dataclass
 
@@ -23,7 +31,7 @@ class TrainningOptions(argparse.Namespace):
         generator_steps: int = 3,
         gpu_device: int = 0,
         img_color_range: tuple[int, int] = (0, 255),
-        input_path: str = "data/",
+        input_path: str = "data",
         kernel_size: int = 3,
         lambda_grad: float = 0.1,
         lr_d: float = 5e-05,
@@ -244,7 +252,6 @@ class ResumeOptions(argparse.Namespace):
         start_scale : int
             Starting scale index for resuming/fine-tuning (default 0).
         """
-
         self.fine_tuning = fine_tuning
         self.checkpoint_path = checkpoint_path
         self.num_iter = num_iter

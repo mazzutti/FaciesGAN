@@ -1,16 +1,33 @@
-# ../main.py file
+"""Configuration constants used across the training and model modules.
+
+This module centralizes filesystem and checkpoint filename constants so
+other modules can import a single stable source of truth for file
+locations and conventional filenames used by the training and model
+serialization code.
+
+Notes
+-----
+These are plain string constants and are intended to be imported as
+required, for example::
+
+        from config import RESULTS_DIR, G_FILE
+
+Do not put runtime logic in this module; it only contains constants.
+"""
+
+# Directory and option filename used by the top-level scripts
 RESULTS_DIR = "results"
 CHECKPOINT_PATH = RESULTS_DIR
 OPT_FILE = "options.json"
 
-# ../models/train.py config
+# Optimizer / scheduler checkpoint filenames
 OPT_G_FILE = "opt_G.pth"
 OPT_D_FILE = "opt_D.pth"
 SCH_G_FILE = "sch_G.pth"
 SCH_D_FILE = "sch_D.pth"
 RESULT_FACIES_PATH = "real_x_generated_facies"
 
-# ../models/facies_gan.py config
+# Model and auxiliary filenames used by the facies GAN implementation
 G_FILE = "generator.pth"
 D_FILE = "discriminator.pth"
 M_FILE = "masks.pth"

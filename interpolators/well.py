@@ -1,3 +1,12 @@
+"""Well-based interpolation utilities.
+
+This module implements :class:`WellInterpolator`, which generates
+multi-scale images by extracting vertical well traces from facies
+images and positioning them at scaled column locations across
+resolutions. The output is suitable for tasks that require preserving
+vertical trace consistency (e.g. well logs and seismic traces).
+"""
+
 import logging
 from pathlib import Path
 
@@ -39,8 +48,8 @@ class WellInterpolator(BaseInterpolator):
         super().__init__(config)
 
     def interpolate(
-        self, 
-        image_path: Path, 
+        self,
+        image_path: Path,
         resolutions: tuple[tuple[int, ...], ...],
     ) -> list[torch.Tensor]:
         """Create multi-scale well representations by extracting and scaling vertical traces.
@@ -62,13 +71,12 @@ class WellInterpolator(BaseInterpolator):
             List of well trace tensors at different resolutions, with black
             backgrounds and the well trace positioned at the scaled column.
         """
-
         smooth_imgs: list[torch.Tensor] = []
-        
+
         logger.info("Rendering with trace-wise nearest neighbor interpolation...")
 
         well_mapping = as_wells_mapping(DataFiles.WELLS)
-        
+
         facie = load_image(image_path)
 
         height, width = facie.shape[:2]
@@ -90,8 +98,6 @@ class WellInterpolator(BaseInterpolator):
                 src_row = min(i * step, height - 1)
                 downsampled[i, scaled_column, :] = well_trace[src_row, :]
 
-            smooth_imgs.append(torch.from_numpy(downsampled)) # type: ignore
+            smooth_imgs.append(torch.from_numpy(downsampled))  # type: ignore
 
         return smooth_imgs
-
-    

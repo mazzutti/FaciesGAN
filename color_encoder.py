@@ -39,8 +39,17 @@ class ColorEncoder:
     palette_tensor : torch.Tensor
         Palette as a float32 tensor on the specified device.
     """
-    def __init__(
-        self, img_array: NDArray[Any], device: torch.device) -> None:
+
+    def __init__(self, img_array: NDArray[Any], device: torch.device) -> None:
+        """Create a ColorEncoder from an example RGB image.
+
+        Parameters
+        ----------
+        img_array : ndarray
+            RGB image array shaped (H, W, 3) used to build the palette.
+        device : torch.device
+            Device on which palette tensors will be stored.
+        """
         # Ensure we work with float32 NumPy arrays to avoid creating
         # torch.float64 tensors which are not supported on MPS devices.
         pixels = img_array.reshape(-1, 3).astype(np.float32, copy=False)
