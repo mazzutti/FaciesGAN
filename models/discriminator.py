@@ -22,7 +22,7 @@ class Discriminator(nn.Module):
         Size of convolutional kernels.
     padding_size : int
         Padding size for convolutions.
-    img_num_channel : int
+    input_channels : int
         Number of input facies channels.
     """
 
@@ -33,12 +33,14 @@ class Discriminator(nn.Module):
         num_layer: int,
         kernel_size: int,
         padding_size: int,
-        img_num_channel: int,
+        input_channels: int,
     ) -> None:
 
         super(Discriminator, self).__init__()  # type: ignore
 
-        self.head = ConvBlock(img_num_channel, num_features, kernel_size, padding_size, 1)
+        self.head = ConvBlock(
+            input_channels, num_features, kernel_size, padding_size, 1
+        )
 
         self.body = nn.Sequential(
             *[
@@ -53,9 +55,9 @@ class Discriminator(nn.Module):
             ]
         )
 
-        out_channels = max(num_features // (2 ** (num_layer - 2)), min_num_features)
+        output_channels = max(num_features // (2 ** (num_layer - 2)), min_num_features)
         self.tail = nn.Conv2d(
-            out_channels, 1, kernel_size=kernel_size, stride=1, padding=padding_size
+            output_channels, 1, kernel_size=kernel_size, stride=1, padding=padding_size
         )
 
     def forward(self, generated_facie: torch.Tensor) -> torch.Tensor:

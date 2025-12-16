@@ -1,6 +1,5 @@
 import math
 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -106,8 +105,8 @@ class Generator(nn.Module):
         Size of convolutional kernels.
     padding_size : int
         Padding size for convolutions.
-    img_num_channel : int
-        Number of input channels (facies channels + noise channel).
+    input_channels : int
+        Number of input channels (noise + cond channels).
 
     Attributes
     ----------
@@ -120,14 +119,23 @@ class Generator(nn.Module):
     """
 
     def __init__(
-        self, num_layer: int, kernel_size: int, padding_size: int, img_num_channel: int
+        self,
+        num_layer: int,
+        kernel_size: int,
+        padding_size: int,
+        input_channels: int,
+        output_channels: int = 3,
+        num_img_channels: int = 3,
     ):
         super(Generator, self).__init__()  # type: ignore
 
         self.num_layer = num_layer
         self.kernel_size = kernel_size
         self.padding_size = padding_size
-        self.img_num_channel = img_num_channel
+        self.input_channels = input_channels
+        self.output_channels = output_channels
+        self.cond_channels = input_channels - output_channels
+        self.has_cond_channels = self.cond_channels > 0
         self.zero_padding = self.num_layer * math.floor(self.kernel_size / 2)
         self.full_zero_padding = 2 * self.zero_padding
         self.gens = nn.ModuleList()
@@ -167,8 +175,7 @@ class Generator(nn.Module):
             Generated facies tensor at the finest requested scale.
         """
         if in_noise is None:
-            # Output 3 channels (input is 6: 3 noise + 3 wells)
-            channels = z[start_scale].shape[1] // 2
+            channels = self.output_channels
             height, width = tuple(
                 dim - self.full_zero_padding for dim in z[start_scale].shape[2:]
             )
@@ -177,10 +184,9 @@ class Generator(nn.Module):
                 device=z[start_scale].device,
             )
         else:
-            out_facie: torch.Tensor = in_noise
+            out_facie = in_noise
 
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
-
         for index in range(start_scale, stop_scale + 1):
 
             out_facie = interpolate(
@@ -191,32 +197,52 @@ class Generator(nn.Module):
                 ),
             )
 
-            # z[index] has shape (batch, 6, H, W): 3 noise channels + 3 well channels
-            # out_facie has shape (batch, 3, H, W): generated facies
-            half_ch = z[index].shape[1] // 2  # = 3
-
             if index in self.spade_scales:
                 # SPADE-based generation at coarse scale
                 # Apply amplitude scaling to noise channels
                 z_in = z[index].clone()
-                z_in[:, :half_ch, :, :] = amp[index] * z[index][:, :half_ch, :, :]
+                if self.has_cond_channels:
+                    z_in[:, : self.output_channels, :, :] = (
+                        amp[index] * z[index][:, : self.output_channels, :, :]
+                    )
+                else:
+                    z_in = amp[index] * z_in
 
-                # Add padded output facie to well conditioning channels
                 padded_facie = F.pad(out_facie, [self.zero_padding] * 4, value=0)
-                z_in[:, half_ch:, :, :] = z_in[:, half_ch:, :, :] + padded_facie
+                if self.has_cond_channels:
+                    num_repeats = self.cond_channels // self.output_channels
+                    padded_facie = padded_facie.repeat(1, num_repeats, 1, 1)
+                    # Add padded output facie to well conditioning channels
+                    z_in[:, self.output_channels :, :, :] = (
+                        z_in[:, self.output_channels :, :, :] + padded_facie
+                    )
+                else:
+                    z_in = z_in + padded_facie
 
                 # SPADE generator takes full conditioning and outputs directly
                 out_facie = self.gens[index](z_in) + out_facie
             else:
                 # Standard concatenation-based generation at finer scales
-                # Apply amplitude scaling to noise channels (first 3 channels)
+                # Apply amplitude scaling to noise channels (first N channels)
                 z_in = z[index].clone()
-                z_in[:, :half_ch, :, :] = amp[index] * z[index][:, :half_ch, :, :]
+                if self.has_cond_channels:
+                    z_in[:, : self.output_channels, :, :] = (
+                        amp[index] * z[index][:, : self.output_channels, :, :]
+                    )
+                else:
+                    z_in = amp[index] * z_in
 
                 # Add padded output facie ONLY to conditioning channels (not noise)
                 # This ensures random noise always has direct impact on generation
                 padded_facie = F.pad(out_facie, [self.zero_padding] * 4, value=0)
-                z_in[:, half_ch:, :, :] = z_in[:, half_ch:, :, :] + padded_facie
+                if self.has_cond_channels:
+                    num_repeats = self.cond_channels // self.output_channels
+                    padded_facie = padded_facie.repeat(1, num_repeats, 1, 1)
+                    z_in[:, self.output_channels :, :, :] = (
+                        z_in[:, self.output_channels :, :, :] + padded_facie
+                    )
+                else:
+                    z_in = z_in + padded_facie
 
                 out_facie = self.gens[index](z_in) + out_facie
 
@@ -225,20 +251,20 @@ class Generator(nn.Module):
 
         return out_facie
 
-    def create_scale(self, num_feature: int, min_num_feature: int) -> None:
+    def create_scale(self, num_features: int, min_num_features: int) -> None:
         """Create and append a new scale block to the generator pyramid.
 
         Constructs a ConvBlock sequence with progressively decreasing channel
-        counts from num_feature down to min_num_feature.
+        counts from num_features down to min_num_features.
 
         At scale 0, uses SPADEGenerator for noise-modulated generation.
         At higher scales, uses standard ConvBlock architecture.
 
         Parameters
         ----------
-        num_feature : int
+        num_features : int
             Number of features in the first convolutional layer.
-        min_num_feature : int
+        min_num_features : int
             Minimum number of features (floor for channel reduction).
         """
         current_scale = len(self.gens)
@@ -250,30 +276,30 @@ class Generator(nn.Module):
                 num_layer=self.num_layer,
                 kernel_size=self.kernel_size,
                 padding_size=self.padding_size,
-                num_feature=num_feature,
-                min_num_feature=min_num_feature,
-                img_channels=self.img_num_channel // 2,  # Output 3 facies channels
-                cond_channels=self.img_num_channel,  # Input 6 channels (noise + wells)
+                num_features=num_features,
+                min_num_features=min_num_features,
+                output_channels=self.output_channels,
+                input_channels=self.input_channels,
             )
             self.gens.append(spade_gen)
             self.spade_scales.add(current_scale)
         else:
             # Standard ConvBlock-based generator for finer scales
             head = ConvBlock(
-                self.img_num_channel,
-                num_feature,
+                self.input_channels,
+                num_features,
                 self.kernel_size,
                 self.padding_size,
                 1,
             )
             body = nn.Sequential()
 
-            channels = min_num_feature
+            block_features = min_num_features
             for i in range(self.num_layer - 2):
-                channels = int(num_feature / pow(2, (i + 1)))
+                block_features = int(num_features / pow(2, (i + 1)))
                 block = ConvBlock(
-                    max(2 * channels, min_num_feature),
-                    max(channels, min_num_feature),
+                    max(2 * block_features, min_num_features),
+                    max(block_features, min_num_features),
                     self.kernel_size,
                     self.padding_size,
                     1,
@@ -282,8 +308,8 @@ class Generator(nn.Module):
 
             tail = nn.Sequential(
                 nn.Conv2d(
-                    max(channels, min_num_feature),
-                    self.img_num_channel // 2,  # Output 3 facies channels (input is 6)
+                    max(block_features, min_num_features),
+                    self.output_channels,  # Output 3 facies channels (input is 6)
                     kernel_size=self.kernel_size,
                     stride=1,
                     padding=self.padding_size,

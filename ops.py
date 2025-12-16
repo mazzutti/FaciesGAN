@@ -1,15 +1,15 @@
 import math
 import os
+import random
 from collections.abc import Sequence
 from functools import lru_cache
 from pathlib import Path
-import random
 from typing import TypeVar, cast
 
-from PIL import Image
 import numpy as np
 import torch
 from numpy.typing import NDArray
+from PIL import Image
 from torch import nn
 
 from data_files import DataFiles
@@ -209,7 +209,7 @@ def generate_scales(options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
         )
         if out_shape[0] % 2 != 0:
             out_shape = [int(shape + 1) for shape in out_shape]
-        shapes.append((options.batch_size, options.num_channels, *out_shape))
+        shapes.append((options.batch_size, options.num_img_channels, *out_shape))
 
     return tuple(shapes)
 

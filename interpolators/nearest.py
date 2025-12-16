@@ -1,9 +1,11 @@
 import logging
 from pathlib import Path
+
 import numpy as np
+import torch
 from numpy.typing import NDArray
 from scipy.ndimage import zoom
-import torch
+
 from interpolators.base import BaseInterpolator
 from interpolators.config import InterpolatorConfig
 from ops import load_image
@@ -68,12 +70,11 @@ class NearestInterpolator(BaseInterpolator):
 
         img_np = load_image(image_path)
         high_res_img = self._upsample_image(img_np, super_height, super_width)
-        smooth_imgs.append(torch.from_numpy(high_res_img.astype(np.float32)))  # type: ignore
-
         for _, _, new_h, new_w in resolutions[:-1]:
             interpolated_img = self._downsample_image(high_res_img, new_h, new_w)
             interpolated_img = interpolated_img.astype(np.float32).clip(0.0, 1.0)
             smooth_imgs.append(torch.from_numpy(interpolated_img))  # type: ignore
+        smooth_imgs.append(torch.from_numpy(high_res_img.astype(np.float32)))  # type: ignore
         return smooth_imgs
 
     def _upsample_image(

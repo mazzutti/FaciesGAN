@@ -1,10 +1,12 @@
 import logging
 from pathlib import Path
+
 import numpy as np
 import torch
+
 from data_files import DataFiles
-from interpolators.config import InterpolatorConfig
 from interpolators.base import BaseInterpolator
+from interpolators.config import InterpolatorConfig
 from ops import as_wells_mapping, load_image
 
 # Module logger

@@ -5,14 +5,16 @@ import os
 import random
 from types import SimpleNamespace
 
-# from types import SimpleNamespace
-
 import torch
 
 from config import G_FILE, OPT_FILE, RESULT_FACIES_PATH
 from log import init_output_logging
-from train import Trainer
 from options import ResumeOptions
+from train import Trainer
+
+# from types import SimpleNamespace
+
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -28,6 +30,15 @@ if __name__ == "__main__":
     parser.add_argument("--num-iter", type=int, help="number of epochs for fine-tuning")
     parser.add_argument(
         "--start-scale", type=int, default=0, help="start scale for fine-tuning"
+    )
+
+    # Number of parallel scales to process at once when resuming
+    parser.add_argument(
+        "--num-parallel-scales",
+        "--num_parallel_scales",
+        type=int,
+        default=2,
+        help="number of scales to train in parallel when resuming",
     )
 
     arguments = parser.parse_args(namespace=ResumeOptions())
@@ -59,8 +70,7 @@ if __name__ == "__main__":
     trainer = Trainer(
         device,
         options,
-        arguments.num_parallel_scales,
-        arguments.finetuning,
+        arguments.fine_tuning,
         arguments.checkpoint_path,
     )
 

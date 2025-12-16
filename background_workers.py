@@ -19,9 +19,10 @@ import atexit
 import logging
 import multiprocessing as mp
 import threading
-import torch
-from concurrent.futures import ProcessPoolExecutor, Future
+from concurrent.futures import Future, ProcessPoolExecutor
 from typing import Optional
+
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -29,10 +30,10 @@ logger = logging.getLogger(__name__)
 def _save_plot_task(
     fake_list: list[torch.Tensor],
     real_arr: torch.Tensor,
-    masks_arr: torch.Tensor,
     stage: int,
     index: int,
     out_dir: str,
+    masks_arr: torch.Tensor | None = None,
 ) -> bool:
     # Import locally so the worker process has its own module imports
     from utils import plot_generated_facies
@@ -46,7 +47,7 @@ def _save_plot_task(
     # The plotting helper will accept the tensors and perform any
     # conversions internally as needed.
     plot_generated_facies(
-        fake_list, real_arr, masks_arr, stage, index, out_dir, save=True
+        fake_list, real_arr, stage, index, masks_arr, out_dir, save=True
     )
     return True
 
@@ -107,10 +108,10 @@ class BackgroundWorker:
         self,
         fake_list: list[torch.Tensor],
         real: torch.Tensor,
-        masks: torch.Tensor,
         stage: int,
         index: int,
         out_dir: str,
+        masks: torch.Tensor | None = None,
         wait_if_full: bool = True,
         timeout: Optional[float] = None,
     ) -> Future[bool]:
@@ -154,10 +155,10 @@ class BackgroundWorker:
                 _save_plot_task,
                 fake_list,
                 real,
-                masks,
                 int(stage),
                 int(index),
                 str(out_dir),
+                masks,
             )
             # Track and attach callback
             self._pending.add(fut)
@@ -194,10 +195,10 @@ class BackgroundWorker:
 def submit_plot_generated_facies(
     fake_list: list[torch.Tensor],
     real: torch.Tensor,
-    masks: torch.Tensor,
     stage: int,
     index: int,
     out_dir: str,
+    masks: torch.Tensor | None = None,
 ) -> Future[bool]:
     """Convenience wrapper that uses the module-level BackgroundWorker.
 
@@ -208,5 +209,5 @@ def submit_plot_generated_facies(
     # shared instance. Use it to submit the job.
     worker = BackgroundWorker()
     return worker.submit_plot_generated_facies(
-        fake_list, real, masks, stage, index, out_dir
+        fake_list, real, stage, index, out_dir, masks
     )

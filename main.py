@@ -8,11 +8,11 @@ scales can be trained simultaneously for faster overall training.
 import json
 import os
 import random
+from argparse import ArgumentParser
 from datetime import datetime
 
 import torch
 from dateutil import tz
-from argparse import ArgumentParser
 
 from config import CHECKPOINT_PATH, OPT_FILE
 from log import init_output_logging
@@ -42,7 +42,13 @@ def get_arguments() -> ArgumentParser:
     )
     parser.add_argument("--stop-scale", type=int, help="stop scale", default=6)
     parser.add_argument(
-        "--facie-num-channels", type=int, help="facie number of channels", default=3
+        "--num-img-channels", type=int, help="facie number of channels", default=3
+    )
+    parser.add_argument(
+        "--noise-channels",
+        type=int,
+        help="number of noise channels to generate per scale",
+        default=3,
     )
     parser.add_argument(
         "--img-color-range",
@@ -177,13 +183,24 @@ def get_arguments() -> ArgumentParser:
     )
 
     parser.add_argument(
-        "--wells",
+        "--use-wells",
+        action="store_true",
+        help="enable using wells during data loading (filter by --wells-mask-columns if set)",
+    )
+
+    parser.add_argument(
+        "--wells-mask-columns",
         type=int,
         help="list of well indices to train the model from",
         nargs="+",
         default=tuple(),
     )
 
+    parser.add_argument(
+        "--use-seismic",
+        action="store_true",
+        help="enable using seismic data during data loading",
+    )
     parser.add_argument(
         "--no-tensorboard",
         action="store_true",
@@ -269,7 +286,7 @@ def main() -> None:
     except Exception:
         pass
 
-    trainer = Trainer(device, options, num_parallel_scales=options.num_parallel_scales)
+    trainer = Trainer(device, options)
 
     # Optionally run the trainer under the PyTorch profiler and export traces.
     # MPS backend uses a different profiler API (torch.mps.profiler) that
@@ -302,7 +319,8 @@ def main() -> None:
         else:
             # Use standard torch.profiler for CPU/CUDA
             try:
-                from torch.profiler import profile, ProfilerActivity  # type: ignore
+                from torch.profiler import (ProfilerActivity,  # type: ignore
+                                            profile)
             except Exception:
                 print("Warning: PyTorch profiler not available in this environment.")
                 trainer.train()
@@ -332,4 +350,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    import lovely_tensors as lt  # type: ignore
+
+    lt.monkey_patch()
     main()

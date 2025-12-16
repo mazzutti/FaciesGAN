@@ -7,9 +7,10 @@ Much more responsive than matplotlib with better interactivity.
 # pyright: reportUnknownMemberType=false
 import os
 import time
-import torch
+
 import numpy as np
-from tensorboardX import SummaryWriter # pyright: ignore
+import torch
+from tensorboardX import SummaryWriter  # pyright: ignore
 
 
 class TensorBoardVisualizer:

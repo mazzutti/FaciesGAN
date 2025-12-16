@@ -17,17 +17,17 @@ from numpy.typing import NDArray
 from sklearn.manifold import MDS
 from sklearn.metrics import euclidean_distances
 
+from background_workers import submit_plot_generated_facies
 from config import OPT_FILE
 from dataset import PyramidsDataset
 from log import format_time
 from models.facies_gan import FaciesGAN
-from background_workers import submit_plot_generated_facies
 from ops import torch2np
 
 
 def generate_facies(
     model: FaciesGAN, how_many: int, model_path: str, options: SimpleNamespace
-) -> tuple[list[np.ndarray], list[int]]:
+) -> tuple[list[NDArray[np.float32]], list[int]]:
     """Generate facies realizations using trained FaciesGAN model.
 
     Loads model weights, generates noise with well conditioning, and produces
@@ -66,7 +66,7 @@ def generate_facies(
         noises = model.get_noise(mask_indexes, scale=max_scale, rec=False)
 
     with torch.no_grad():
-        generated_facies: list[np.ndarray] = [
+        generated_facies: list[NDArray[np.float32]] = [
             torch2np(gen_facie.unsqueeze(0), denormalize=True)
             for gen_facie in model.generator(noises, model.noise_amp)
         ]
@@ -127,8 +127,11 @@ def generate_comparison_plots(
         real = facies_scale[start:end]
 
         # Build masks from wells
-        wells = wells_scale[start:end]
-        masks = (wells.abs().sum(dim=1, keepdim=True) > 0).float()
+        if len(wells_scale) > 0:
+            wells = wells_scale[start:end]
+            masks = (wells.abs().sum(dim=1, keepdim=True) > 0).float()
+        else:
+            masks = None
 
         # Generate fake samples using the trained model
         fake_list: list[torch.Tensor] = []
@@ -142,7 +145,7 @@ def generate_comparison_plots(
                 )
                 fake_list.append(fake.detach().cpu())
 
-        submit_plot_generated_facies(fake_list, real, masks, scale, start, out_path)
+        submit_plot_generated_facies(fake_list, real, scale, start, out_path, masks)
 
         print(
             f"Submitted async plot job for indices {start}..{end-1} -> {out_path}/gen_{scale}_{start}.png"

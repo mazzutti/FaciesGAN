@@ -31,22 +31,16 @@ from tensorboardX import SummaryWriter  # type: ignore
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from config import (
-    D_FILE,
-    G_FILE,
-    OPT_D_FILE,
-    OPT_G_FILE,
-    RESULT_FACIES_PATH,
-    SCH_D_FILE,
-    SCH_G_FILE,
-)
+import ops
+import utils
+from background_workers import submit_plot_generated_facies
+from config import (D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, RESULT_FACIES_PATH,
+                    SCH_D_FILE, SCH_G_FILE)
 from dataset import PyramidsDataset
 from log import format_time
 from models.facies_gan import FaciesGAN
-from ops import create_dirs, generate_noise, interpolate, load
 from options import TrainningOptions
 from tensorboard_visualizer import TensorBoardVisualizer
-from background_workers import submit_plot_generated_facies
 
 
 class Trainer:
@@ -63,8 +57,6 @@ class Trainer:
         Device for training (CPU, CUDA, or MPS).
     options : TrainningOptions
         Training configuration containing hyperparameters and paths.
-    num_parallel_scales : int, optional
-        Number of scales to train simultaneously. Defaults to 2.
     fine_tuning : bool, optional
         Whether to load and fine-tune from existing checkpoints. Defaults to False.
     checkpoint_path : str, optional
@@ -78,8 +70,6 @@ class Trainer:
         Starting pyramid scale index.
     stop_scale : int
         Final pyramid scale index.
-    num_parallel_scales : int
-        Number of scales to train in parallel.
     batch_size : int
         Effective batch size for training. Note: the dataset yields per-pyramid
         batches; groups of scales commonly consume a single batch when trained
@@ -102,7 +92,6 @@ class Trainer:
         self,
         device: torch.device,
         options: TrainningOptions,
-        num_parallel_scales: int = 2,
         fine_tuning: bool = False,
         checkpoint_path: str = ".checkpoints/",
     ) -> None:
@@ -114,7 +103,7 @@ class Trainer:
         self.output_path: str = options.output_path
         self.num_iter: int = options.num_iter
         self.save_interval: int = options.save_interval
-        self.num_parallel_scales: int = num_parallel_scales
+        self.num_parallel_scales: int = options.num_parallel_scales
 
         self.batch_size: int = (
             options.batch_size
@@ -123,16 +112,25 @@ class Trainer:
         )
         self.batch_size: int = (
             self.batch_size
-            if not (len(options.wells) > 0 and options.batch_size < len(options.wells))
-            else len(options.wells)
+            if not (
+                len(options.wells_mask_columns) > 0
+                and options.batch_size < len(options.wells_mask_columns)
+            )
+            else len(options.wells_mask_columns)
         )
         self.fine_tuning: bool = fine_tuning
         self.checkpoint_path: str = checkpoint_path
 
-        self.num_channels: int = options.num_channels * 2
+        self.num_img_channels: int = options.num_img_channels
+        self.noise_channels: int = (
+            options.noise_channels
+            + (self.num_img_channels if options.use_wells else 0)
+            + (self.num_img_channels if options.use_seismic else 0)
+        )
+
         self.num_real_facies: int = options.num_real_facies
         self.num_generated_per_real: int = options.num_generated_per_real
-        self.wells_colums: tuple[int, ...] = options.wells
+        self.wells_mask_columns: tuple[int, ...] = options.wells_mask_columns
 
         # Optimizer configuration
         self.lr_g: float = options.lr_g
@@ -153,17 +151,27 @@ class Trainer:
         dataset: PyramidsDataset = PyramidsDataset(options)
         self.scales_list: tuple[tuple[int, ...], ...] = dataset.scales_list  # type: ignore
 
-        if len(options.wells) > 0:
+        if len(options.wells_mask_columns) > 0:
             for i in range(len(self.scales_list)):
-                dataset.facies_pyramids[i] = dataset.facies_pyramids[i][options.wells]
-                dataset.wells_pyramids[i] = dataset.wells_pyramids[i][options.wells]
-                dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][options.wells]
+                dataset.facies_pyramids[i] = dataset.facies_pyramids[i][
+                    options.wells_mask_columns
+                ]
+                if options.use_wells:
+                    dataset.wells_pyramids[i] = dataset.wells_pyramids[i][
+                        options.wells_mask_columns
+                    ]
+                if options.use_seismic:
+                    dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][
+                        options.wells_mask_columns
+                    ]
         elif options.num_train_pyramids < len(dataset):
             idxs = torch.randperm(len(dataset))[: options.num_train_pyramids]
             for i in range(len(self.scales_list)):
                 dataset.facies_pyramids[i] = dataset.facies_pyramids[i][idxs]
-                dataset.wells_pyramids[i] = dataset.wells_pyramids[i][idxs]
-                dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][idxs]
+                if options.use_wells:
+                    dataset.wells_pyramids[i] = dataset.wells_pyramids[i][idxs]
+                if options.use_seismic:
+                    dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][idxs]
 
         self.data_loader = DataLoader(
             dataset,
@@ -178,7 +186,11 @@ class Trainer:
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
         self.model: FaciesGAN = FaciesGAN(
-            device, options, self.wells, num_parallel_scales=num_parallel_scales
+            device,
+            options,
+            self.wells,
+            self.seismic,
+            noise_channels=self.noise_channels,
         )
         self.model.shapes = list(self.scales_list)
 
@@ -205,8 +217,8 @@ class Trainer:
             viz_path = os.path.join(self.output_path, "training_visualizations")
             log_dir = os.path.join(self.output_path, "tensorboard_logs")
             dataset_info = f"{len(dataset)} pyramids, {self.batch_size} batch size"
-            if len(options.wells) > 0:
-                dataset_info += f", wells: {options.wells}"
+            if len(options.wells_mask_columns) > 0:
+                dataset_info += f", wells: {options.wells_mask_columns}"
 
             self.visualizer = TensorBoardVisualizer(
                 num_scales=self.stop_scale - self.start_scale + 1,
@@ -255,8 +267,8 @@ class Trainer:
             for s in scales_to_train:
                 scale_path = os.path.join(self.output_path, str(s))
                 results_path = os.path.join(scale_path, RESULT_FACIES_PATH)
-                create_dirs(scale_path)
-                create_dirs(results_path)
+                ops.create_dirs(scale_path)
+                ops.create_dirs(results_path)
                 scale_paths[s] = scale_path
                 results_paths[s] = results_path
                 writers[s] = SummaryWriter(log_dir=scale_path)
@@ -272,6 +284,7 @@ class Trainer:
             # Grab one batch (pyramids across scales) for group training
             self.facies, self.wells, self.seismic = next(data_iterator)
             self.model.wells = self.wells
+            self.model.seismic = self.seismic
 
             # Train all scales in this group together
             self.train_scales(
@@ -338,27 +351,34 @@ class Trainer:
         real_facies_dict: dict[int, torch.Tensor] = {}
         masks_dict: dict[int, torch.Tensor] = {}
         wells_dict: dict[int, torch.Tensor] = {}
+        seismic_dict: dict[int, torch.Tensor] = {}
 
         for scale in scales:
-            # Transfer batch tensors to device using non-blocking copies when
-            # possible and convert to channels-last layout on CUDA for faster
-            # convolution kernels.
             facies_batch = self.facies[scale][indexes]
-            wells_batch = self.wells[scale][indexes]
 
-            if self.device.type == "cuda":
-                real_facies_dict[scale] = facies_batch.to(
-                    self.device, non_blocking=True
-                ).contiguous(memory_format=torch.channels_last)
-                wells_dev = wells_batch.to(self.device, non_blocking=True).contiguous(
-                    memory_format=torch.channels_last
+            # Wells (optional)
+            if len(self.wells) > 0:
+                wells_batch = self.wells[scale][indexes]
+                wells_dev = utils.to_device(
+                    wells_batch, self.device, channels_last=True
                 )
-            else:
-                real_facies_dict[scale] = facies_batch.to(self.device)
-                wells_dev = wells_batch.to(self.device)
+                masks_dev = (wells_dev.abs().sum(dim=1, keepdim=True) > 0).int()
+                masks_dev = utils.to_device(masks_dev, self.device, channels_last=True)
+                wells_dict[scale] = wells_dev
+                masks_dict[scale] = masks_dev
 
-            masks_dict[scale] = (wells_dev.abs().sum(dim=1, keepdim=True) > 0).int()
-            wells_dict[scale] = wells_dev
+            # Seismic (optional)
+            if len(self.seismic) > 0:
+                seismic_batch = self.seismic[scale][indexes]
+                seismic_dev = utils.to_device(
+                    seismic_batch, self.device, channels_last=True
+                )
+                seismic_dict[scale] = seismic_dev
+
+            # Real facies
+            real_facies_dict[scale] = utils.to_device(
+                facies_batch, self.device, channels_last=True
+            )
 
         # Create optimizers for all scales
         generator_optimizers: dict[int, optim.Optimizer] = {}
@@ -402,8 +422,10 @@ class Trainer:
         # Initialize noise for all scales
         rec_in_dict: dict[int, torch.Tensor] = {}
         for scale in scales:
-            _, prev_rec = self.__initialize_noise(
-                scale, wells_dict[scale], real_facies_dict[scale], indexes
+            wells = wells_dict[scale] if len(self.wells) > 0 else None
+            seismic = seismic_dict[scale] if len(self.seismic) > 0 else None
+            prev_rec = self.__initialize_noise(
+                scale, real_facies_dict[scale], indexes, wells, seismic
             )
             rec_in_dict[scale] = prev_rec
 
@@ -557,7 +579,10 @@ class Trainer:
             if epoch % self.save_interval == 0 or epoch == self.num_iter:
                 for scale in scales:
                     self.__save_generated_facies(
-                        scale, epoch, results_paths[scale], masks_dict[scale]
+                        scale,
+                        epoch,
+                        results_paths[scale],
+                        masks_dict[scale] if len(self.wells) > 0 else None,
                     )
 
             # Step schedulers
@@ -578,10 +603,11 @@ class Trainer:
     def __initialize_noise(
         self,
         scale: int,
-        wells: torch.Tensor,
         real_facies: torch.Tensor,
         indexes: list[int],
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        wells: torch.Tensor | None = None,
+        seismic: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Initialize reconstruction noise for a specific scale.
 
         Parameters
@@ -606,18 +632,16 @@ class Trainer:
             - ``prev_rec`` is the upsampled reconstruction from the previous
               scale (zeros for scale 0). Shape matches ``real_facies``.
         """
+        # Prepare previous reconstruction
         if scale == 0:
-            z_rec = generate_noise(
-                (self.num_channels // 2, *real_facies.shape[2:]),
+            prev_rec = torch.zeros_like(real_facies)
+            z_rec = ops.generate_noise(
+                (self.noise_channels, *real_facies.shape[2:]),
                 device=self.device,
                 num_samp=self.batch_size,
             )
-            z_rec = torch.cat([z_rec, wells], dim=1)
             z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
-
             self.model.rec_noise.append(z_rec)
-
-            prev_rec = torch.zeros_like(real_facies)
 
             # Calculate noise amplitude for scale 0
             with torch.no_grad():
@@ -632,22 +656,57 @@ class Trainer:
             self.model.noise_amp.append(amp)
 
         else:
-            # For higher scales, calculate based on previous reconstruction
-            prev_rec = interpolate(
+            # For higher scales, upsample previous facies to current resolution
+            prev_rec = ops.interpolate(
                 self.facies[scale - 1][indexes], real_facies.shape[2:]
             ).to(self.device)
 
-            z_rec = generate_noise(
-                (self.num_channels // 2, *real_facies.shape[2:]),
-                device=self.device,
-                num_samp=self.batch_size,
-            )
-            z_rec = torch.cat([z_rec, wells], dim=1)
+            # noise channel sizing for higher scales (empirical split)
+            if wells is None:
+                if seismic is None:
+                    z_rec = ops.generate_noise(
+                        (
+                            self.noise_channels,
+                            *real_facies.shape[2:],
+                        ),
+                        device=self.device,
+                        num_samp=self.batch_size,
+                    )
+                else:
+                    z_rec = ops.generate_noise(
+                        (
+                            self.noise_channels - self.num_img_channels,
+                            *real_facies.shape[2:],
+                        ),
+                        device=self.device,
+                        num_samp=self.batch_size,
+                    )
+                    z_rec = torch.cat([z_rec, seismic], dim=1)
+            else:
+                if seismic is None:
+                    z_rec = ops.generate_noise(
+                        (
+                            self.noise_channels - self.num_img_channels,
+                            *real_facies.shape[2:],
+                        ),
+                        device=self.device,
+                        num_samp=self.batch_size,
+                    )
+                    z_rec = torch.cat([z_rec, wells], dim=1)
+                else:
+                    z_rec = ops.generate_noise(
+                        (
+                            self.noise_channels - 2 * self.num_img_channels,
+                            *real_facies.shape[2:],
+                        ),
+                        device=self.device,
+                        num_samp=self.batch_size,
+                    )
+                    z_rec = torch.cat([z_rec, wells, seismic], dim=1)
             z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
-
             self.model.rec_noise.append(z_rec)
 
-            # Calculate noise amplitude
+            # Calculate noise amplitude based on reconstruction error
             with torch.no_grad():
                 fake = self.model.generator(
                     self.model.get_noise(indexes, scale),
@@ -663,7 +722,7 @@ class Trainer:
             else:
                 self.model.noise_amp.append(amp)
 
-        return z_rec, prev_rec
+        return prev_rec
 
     def load(self, path: str, until_scale: int | None = None) -> None:
         """Load saved models and set the starting scale for training.
@@ -695,10 +754,10 @@ class Trainer:
             )
 
             self.model.generator.gens[scale].load_state_dict(
-                load(generator_path, self.device, as_type=Mapping[str, Any])
+                ops.load(generator_path, self.device, as_type=Mapping[str, Any])
             )
             self.model.discriminators[str(scale)].load_state_dict(
-                load(discriminator_path, self.device, as_type=Mapping[str, Any])
+                ops.load(discriminator_path, self.device, as_type=Mapping[str, Any])
             )
         except Exception as e:
             print(f"Error loading models from {self.checkpoint_path}/{scale}: {e}")
@@ -716,28 +775,28 @@ class Trainer:
         """Load optimizer and scheduler state dictionaries from checkpoint."""
         try:
             generator_optimizer.load_state_dict(
-                load(
+                ops.load(
                     os.path.join(scale_path, OPT_G_FILE),
                     self.device,
                     as_type=dict[str, Any],
                 )
             )
             discriminator_optimizer.load_state_dict(
-                load(
+                ops.load(
                     os.path.join(scale_path, OPT_D_FILE),
                     self.device,
                     as_type=dict[str, Any],
                 )
             )
             generator_scheduler.load_state_dict(
-                load(
+                ops.load(
                     os.path.join(scale_path, SCH_G_FILE),
                     self.device,
                     as_type=dict[str, Any],
                 )
             )
             discriminator_scheduler.load_state_dict(
-                load(
+                ops.load(
                     os.path.join(scale_path, SCH_D_FILE),
                     self.device,
                     as_type=dict[str, Any],
@@ -806,7 +865,11 @@ class Trainer:
         writer.add_scalar("Loss/train/generator", float(generator_loss), epoch)  # type: ignore
 
     def __save_generated_facies(
-        self, scale: int, epoch: int, results_path: str, masks: torch.Tensor
+        self,
+        scale: int,
+        epoch: int,
+        results_path: str,
+        masks: torch.Tensor | None = None,
     ) -> None:
         """Save generated facies visualizations."""
         indexes = torch.randint(self.batch_size, (self.num_real_facies,))
@@ -830,21 +893,18 @@ class Trainer:
 
         if self.enable_plot_facies:
 
-            # Move tensors to CPU before submitting to background worker to
-            # avoid pickling CUDA tensors (which raises
-            # RuntimeError: _share_filename_: only available on CPU).
             generated_facies_cpu = [g.detach().cpu() for g in generated_facies]
             real_facies_cpu = real_facies.detach().cpu()
-            masks_cpu = masks[indexes].detach().cpu()
+            masks_cpu = masks[indexes].detach().cpu() if masks is not None else None
 
             # Submit background job to save the plot (non-blocking)
             submit_plot_generated_facies(
                 generated_facies_cpu,
                 real_facies_cpu,
-                masks_cpu,
                 scale,
                 epoch,
                 results_path,
+                masks_cpu,
             )
 
     @staticmethod

@@ -6,21 +6,19 @@ implementation can train multiple scales at once using separate optimizers
 and discriminators for each scale.
 """
 
-import argparse
 import math
 import os
-from collections.abc import Sequence
-from types import SimpleNamespace
 from typing import Any, Dict, Tuple, Optional
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import ops as ops
+import ops
 from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
 from models.discriminator import Discriminator
 from models.generator import Generator
+from options import TrainningOptions
 
 
 class FaciesGAN:
@@ -38,8 +36,6 @@ class FaciesGAN:
         Configuration containing all hyperparameters.
     wells : Sequence[torch.Tensor], optional
         Well location data for conditioning. Defaults to empty tuple.
-    num_parallel_scales : int, optional
-        Number of scales to train in parallel. Defaults to 2.
     *args : tuple[Any, ...]
         Additional positional arguments.
     **kwargs : dict[str, Any]
@@ -59,8 +55,6 @@ class FaciesGAN:
         Well location data for conditioning.
     shapes : list[tuple[int, ...]]
         Pyramid resolutions for each scale.
-    num_parallel_scales : int
-        Number of scales to train simultaneously.
     active_scales : set[int]
         Set of scale indices currently being trained.
     """
@@ -68,26 +62,36 @@ class FaciesGAN:
     def __init__(
         self,
         device: torch.device,
-        options: argparse.Namespace | SimpleNamespace,
-        wells: Sequence[torch.Tensor] = (),
-        num_parallel_scales: int = 2,
+        options: TrainningOptions,
+        wells: list[torch.Tensor] = [],
+        seismic: list[torch.Tensor] = [],
+        noise_channels: int = 3,
         *args: tuple[Any, ...],
         **kwargs: dict[str, Any],
     ) -> None:
         super().__init__(*args, **kwargs)
         self.device = device
-        self.num_parallel_scales = num_parallel_scales
+        self.num_parallel_scales = options.num_parallel_scales
 
         # Image parameters
-        self.num_channels = options.num_channels * 2
         self.zero_padding = options.num_layer * math.floor(options.kernel_size / 2)
+
+        self.num_img_channels = options.num_img_channels
+
+        # Input/output channels
+        self.disc_input_channels: int = self.num_img_channels
+        self.disc_output_channels: int = self.num_img_channels
+
+        # total channels fed to the generator (noise + conditioning)
+        self.gen_input_channels: int = noise_channels
+        self.gen_output_channels: int = self.num_img_channels
 
         # Training parameters
         self.discriminator_steps = options.discriminator_steps
         self.generator_steps = options.generator_steps
         self.lambda_grad = options.lambda_grad
         self.alpha = options.alpha
-        self.lambda_diversity = getattr(options, "lambda_diversity", 1.0)
+        self.lambda_diversity = options.lambda_diversity
 
         # Network parameters
         self.num_feature = options.num_feature
@@ -103,13 +107,15 @@ class FaciesGAN:
         # Track active scales being trained
         self.active_scales: set[int] = set()
 
-        if wells:
-            self.wells: list[torch.Tensor] = list(wells)
-        else:
-            self.wells = []
+        self.wells: list[torch.Tensor] = wells
+        self.seismic: list[torch.Tensor] = seismic
 
         self.generator: Generator = Generator(
-            self.num_layer, self.kernel_size, self.padding_size, self.num_channels
+            self.num_layer,
+            self.kernel_size,
+            self.padding_size,
+            self.gen_input_channels,
+            self.gen_output_channels,
         ).to(self.device)
 
         # Multiple discriminators for parallel training
@@ -183,7 +189,7 @@ class FaciesGAN:
             self.num_layer,
             self.kernel_size,
             self.padding_size,
-            self.num_channels // 2,  # 3 facies output channels
+            self.disc_input_channels,
         ).to(self.device)
         discriminator.apply(ops.weights_init)
 
@@ -233,22 +239,57 @@ class FaciesGAN:
         """
 
         def generate_noise(index: int) -> torch.Tensor:
+            """Generate per-scale noise, optionally concatenating well tensors.
+
+            Rules (preserve existing behavior):
+            - If `self.wells` is empty or `index >= len(self.wells)`: generate
+              `self.num_channels` noise channels.
+            - If `self.wells` exists and `index == 0`: generate `self.num_channels` noise.
+            - If `self.wells` exists and `index > 0`: generate `self.num_channels // 2`
+              noise channels and concatenate the corresponding well tensor.
+            """
             shape = self.shapes[index][2:]
-            z = ops.generate_noise(
-                (self.num_channels // 2, *shape),
-                device=self.device,
-                num_samp=len(indexes),
-            )
-            if index < len(self.wells):
-                z = torch.cat([z, self.wells[index][indexes].to(self.device)], dim=1)
-            elif index == 0:
-                z = z.repeat(1, 2, 1, 1)
+            batch = len(indexes)
+
+            # Determine whether we have a well  or seimic tensor or both for this index
+            has_well = len(self.wells) > 0 and index < len(self.wells)
+            has_seismic = len(self.seismic) > 0 and index < len(self.seismic)
+
+            if has_well and index > 0:
+                if has_seismic:
+                    base_ch = max(
+                        1, self.gen_input_channels - 2 * self.num_img_channels
+                    )
+                    z = ops.generate_noise(
+                        (base_ch, *shape), device=self.device, num_samp=batch
+                    )
+                    # Ensure well tensor is on the correct device and select batch indices
+                    well = self.wells[index][indexes].to(self.device)
+                    seismic = self.seismic[index][indexes].to(self.device)
+                    z = torch.cat([z, well, seismic], dim=1)
+                else:
+                    base_ch = max(1, self.gen_input_channels - self.num_img_channels)
+                    z = ops.generate_noise(
+                        (base_ch, *shape), device=self.device, num_samp=batch
+                    )
+                    # Ensure well tensor is on the correct device and select batch indices
+                    well = self.wells[index][indexes].to(self.device)
+                    z = torch.cat([z, well], dim=1)
+            elif has_seismic and index > 0:
+                base_ch = max(1, self.gen_input_channels - self.num_img_channels)
+                z = ops.generate_noise(
+                    (base_ch, *shape), device=self.device, num_samp=batch
+                )
+                # Ensure seismic tensor is on the correct device and select batch indices
+                seismic = self.seismic[index][indexes].to(self.device)
+                z = torch.cat([z, seismic], dim=1)
             else:
                 z = ops.generate_noise(
-                    (self.num_channels, *shape),
+                    (self.gen_input_channels, *shape),
                     device=self.device,
-                    num_samp=len(indexes),
+                    num_samp=batch,
                 )
+
             return F.pad(z, [self.zero_padding] * 4, value=0)
 
         if rec:
@@ -411,7 +452,7 @@ class FaciesGAN:
                     continue
 
                 real_facies = real_facies_dict[scale]
-                masks = masks_dict[scale]
+
                 rec_in = rec_in_dict.get(scale)
                 discriminator = self.discriminators[str(scale)]
 
@@ -432,10 +473,12 @@ class FaciesGAN:
                 generator_loss_fake: torch.Tensor = -discriminator(fake).mean()
 
                 # Well conditioning loss (strong constraint at well locations)
-                generator_masked_loss: torch.Tensor = 10 * nn.MSELoss(reduction="mean")(
-                    fake * masks, real_facies * masks
-                )
-
+                generator_masked_loss: torch.Tensor = torch.zeros(1, device=self.device)
+                if len(self.wells) > 0:
+                    masks = masks_dict[scale]
+                    generator_masked_loss: torch.Tensor = 10 * nn.MSELoss(
+                        reduction="mean"
+                    )(fake * masks, real_facies * masks)
                 # Diversity loss - encourage different outputs for different noise
                 # This prevents mode collapse where all samples look the same
                 if self.lambda_diversity > 0 and len(fake_samples) >= 2:

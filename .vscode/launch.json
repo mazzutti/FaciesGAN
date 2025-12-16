@@ -31,7 +31,9 @@
         "0.3",
         "--lambda-diversity",
         "1.0",
-        "--no-tensorboard"
+        "--no-tensorboard",
+        "--use-wells",
+        "--use-seismic"
         // "--use-profiler"
       ]
     }

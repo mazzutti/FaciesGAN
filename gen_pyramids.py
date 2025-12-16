@@ -1,4 +1,5 @@
 import torch
+from joblib import Memory  # type: ignore
 
 from data_files import DataFiles
 from interpolators.config import InterpolatorConfig
@@ -7,14 +8,13 @@ from interpolators.neural import NeuralSmoother
 from interpolators.well import WellInterpolator
 from ops import as_image_file_list, as_model_file_list, norm
 
-from joblib import Memory # type: ignore
-
 # Create a cache directory
 memory = Memory("./.cache", verbose=0)
 
-@memory.cache # type: ignore
+
+@memory.cache  # type: ignore
 def to_facies_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Tensor]:
-    """Generate multi-scale pyramid representations of facies images using neural 
+    """Generate multi-scale pyramid representations of facies images using neural
     interpolation.
 
     For each facies image and its corresponding model checkpoint, this function
@@ -45,13 +45,15 @@ def to_facies_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Te
         for i in range(len(scale_list)):
             pyramids_list[i].append(norm(pyramid[i]))
     pyramids = [
-        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2) for pyramid in pyramids_list
+        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2)
+        for pyramid in pyramids_list
     ]
     return pyramids
 
-@memory.cache # type: ignore
+
+@memory.cache  # type: ignore
 def to_seismic_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Tensor]:
-    """Generate multi-scale pyramid representations of seismic images using 
+    """Generate multi-scale pyramid representations of seismic images using
     nearest neighbor interpolation.
 
     This function processes seismic data using trace-wise nearest neighbor
@@ -85,11 +87,13 @@ def to_seismic_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.T
         for i in range(len(scale_list)):
             pyramids_list[i].append(norm(pyramid[i]))
     pyramids = [
-        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2) for pyramid in pyramids_list
+        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2)
+        for pyramid in pyramids_list
     ]
     return pyramids
-    
-@memory.cache # type: ignore
+
+
+@memory.cache  # type: ignore
 def to_wells_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Tensor]:
     """Generate multi-scale pyramid representations of well data.
 
@@ -121,18 +125,20 @@ def to_wells_pyramids(scale_list: tuple[tuple[int, ...], ...]) -> list[torch.Ten
     """
     wells_interpolator = WellInterpolator(InterpolatorConfig())
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
-    facies_paths = as_image_file_list(DataFiles.WELLS) # Load well image paths
+    facies_paths = as_image_file_list(DataFiles.WELLS)  # Load well image paths
     for facie_path in facies_paths:
-        pyramid = wells_interpolator.interpolate(facie_path, scale_list) # type: ignore
+        pyramid = wells_interpolator.interpolate(facie_path, scale_list)  # type: ignore
         for i in range(len(scale_list)):
             # Normalize wells but preserve zeros (sparse structure)
             # Only normalize non-zero pixels, keep zeros as zeros
             well_data = pyramid[i]
-            mask = (well_data.abs() > 0.001).float()  # 1 where data exists, 0 where zeros
+            mask = (
+                well_data.abs() > 0.001
+            ).float()  # 1 where data exists, 0 where zeros
             normalized = norm(well_data) * mask  # Apply norm only where data exists
             pyramids_list[i].append(normalized)
     pyramids = [
-        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2) for pyramid in pyramids_list
+        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2)
+        for pyramid in pyramids_list
     ]
     return pyramids
-

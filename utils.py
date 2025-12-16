@@ -1,12 +1,12 @@
-from typing import Any, cast
-
 import hashlib
 from collections import OrderedDict
-from typing_extensions import Self
+from typing import Any, cast
+
 import numpy as np
 import scipy.stats as st
 import torch
 from PIL import Image, ImageDraw, ImageFont
+from typing_extensions import Self
 
 from config import RESULTS_DIR
 from ops import torch2np
@@ -488,6 +488,34 @@ def apply_well_mask(
     return result
 
 
+def to_device(
+    tensor: torch.Tensor,
+    device: torch.device,
+    *,
+    channels_last: bool = True,
+    non_blocking: bool = True,
+) -> torch.Tensor:
+    """Move ``tensor`` to ``device`` with appropriate layout and contiguity.
+
+    - On CUDA: optionally convert to `channels_last` memory format and use
+      `non_blocking` transfer where supported.
+    - On MPS: use `.to(device).contiguous()`.
+    - On CPU: returns the original tensor.
+
+    This helper centralizes device-layout handling so callers can avoid
+    duplicating `.to(...).contiguous(...)` branches.
+    """
+    if device.type == "cuda":
+        if channels_last:
+            return tensor.to(device, non_blocking=non_blocking).contiguous(
+                memory_format=torch.channels_last
+            )
+        return tensor.to(device, non_blocking=non_blocking).contiguous()
+    if device.type == "mps":
+        return tensor.to(device).contiguous()
+    return tensor
+
+
 def draw_well_arrows(
     mask: np.ndarray | tuple[np.ndarray, np.ndarray, np.ndarray],
     draw: ImageDraw.ImageDraw,
@@ -563,9 +591,9 @@ def draw_well_arrows(
 def plot_generated_facies(
     fake_facies: list[torch.Tensor],
     real_facies: torch.Tensor,
-    masks: torch.Tensor,
     stage: int,
     index: int,
+    masks: torch.Tensor | None = None,
     out_dir: str = RESULTS_DIR,
     save: bool = False,
     cell_size: int = 256,
@@ -611,7 +639,9 @@ def plot_generated_facies(
         torch2np(fake_facie, denormalize=True) for fake_facie in fake_facies
     ]
     np_real_facies = torch2np(real_facies, denormalize=True, ceiling=True)
-    np_masks = torch2np(masks)
+    np_masks = None
+    if masks is not None:
+        np_masks = torch2np(masks)
 
     # Calculate grid dimensions with spacing and margins
     spacing = 20  # pixels between subplots
@@ -664,7 +694,9 @@ def plot_generated_facies(
     for i in range(num_real_facies):
         # Preprocess well mask once for this row (reusable for real and all generated facies)
         # Always use cell_size since all images will be resized to this dimension
-        preprocessed_mask = preprocessor(np_masks[i], (cell_size, cell_size))
+        preprocessed_mask = None
+        if np_masks is not None:
+            preprocessed_mask = preprocessor(np_masks[i], (cell_size, cell_size))
 
         # Real facies (first column) - use RGB directly without colormap
         real_arr = np.squeeze(np_real_facies[i])
@@ -682,22 +714,27 @@ def plot_generated_facies(
                 real_arr = np.array(resized).astype(np.float32) / 255.0
 
         # Apply well mask to show well pixels with original colors and replace black with white
-        real_arr_with_wells = apply_well_mask(
-            real_arr, np_masks[i], real_arr, preprocessed_mask
-        )
+        real_arr_with_wells = None
+        real_rgb = real_arr
+        if np_masks is not None and preprocessed_mask is not None:
+            real_arr_with_wells = apply_well_mask(
+                real_arr, np_masks[i], real_arr, preprocessed_mask
+            )
 
         # Handle both grayscale (H, W) and RGB (H, W, C) arrays
-        if real_arr_with_wells.ndim == 2:
-            # Grayscale - convert to RGB by stacking
-            real_rgb = np.stack(
-                [real_arr_with_wells, real_arr_with_wells, real_arr_with_wells], axis=-1
-            )
-        else:
-            # Already RGB
-            real_rgb = real_arr_with_wells
+        if real_arr_with_wells is not None:
+            if real_arr_with_wells.ndim == 2:
+                # Grayscale - convert to RGB by stacking
+                real_rgb = np.stack(
+                    [real_arr_with_wells, real_arr_with_wells, real_arr_with_wells],
+                    axis=-1,
+                )
+            else:
+                # Already RGB
+                real_rgb = real_arr_with_wells
 
         # Convert to uint8
-        real_rgb = (real_rgb * 255).astype(np.uint8)
+        real_rgb = (cast(np.ndarray, real_rgb) * 255).astype(np.uint8)
 
         h, w = real_rgb.shape[:2]
         real_img = Image.fromarray(real_rgb, mode="RGB")
@@ -725,7 +762,8 @@ def plot_generated_facies(
 
         # Draw arrow above the plot
         arrow_y = y_offset + title_height - arrow_height
-        draw_well_arrows(np_masks[i], main_draw, x_offset, arrow_y, cell_size)
+        if np_masks is not None:
+            draw_well_arrows(np_masks[i], main_draw, x_offset, arrow_y, cell_size)
 
         output_img.paste(real_img, (x_offset, y_offset + title_height))
 
@@ -772,9 +810,14 @@ def plot_generated_facies(
 
             # Now apply well mask using preprocessed mask and the already-processed real facies
             # Use real_arr_with_wells which already has white background in well columns
-            gen_rgb = apply_well_mask(
-                gen_rgb, np_masks[i], real_arr_with_wells, preprocessed_mask
-            )
+            if (
+                np_masks is not None
+                and preprocessed_mask is not None
+                and real_arr_with_wells is not None
+            ):
+                gen_rgb = apply_well_mask(
+                    gen_rgb, np_masks[i], real_arr_with_wells, preprocessed_mask
+                )
 
             # Convert to uint8
             gen_rgb = (gen_rgb * 255).astype(np.uint8)
@@ -798,7 +841,8 @@ def plot_generated_facies(
 
             # Draw arrow above the plot
             arrow_y = y_offset + title_height - arrow_height
-            draw_well_arrows(np_masks[i], main_draw, x_offset, arrow_y, cell_size)
+            if np_masks is not None:
+                draw_well_arrows(np_masks[i], main_draw, x_offset, arrow_y, cell_size)
 
             output_img.paste(gen_img, (x_offset, y_offset + title_height))
 

@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 
+
 @dataclass
 class InterpolatorConfig:
     """Configuration for neural interpolator inference.

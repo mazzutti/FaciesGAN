@@ -18,7 +18,7 @@ class TrainningOptions(argparse.Namespace):
         beta1: float = 0.5,
         crop_size: int = 256,
         discriminator_steps: int = 3,
-        num_channels: int = 3,
+        num_img_channels: int = 3,
         gamma: float = 0.9,
         generator_steps: int = 3,
         gpu_device: int = 0,
@@ -41,10 +41,12 @@ class TrainningOptions(argparse.Namespace):
         num_generated_per_real: int = 5,
         num_iter: int = 2000,
         num_layer: int = 5,
+        noise_channels: int = 3,
         num_real_facies: int = 5,
         num_train_pyramids: int = 200,
+        num_parallel_scales: int = 2,
         num_workers: int = 4,
-        output_path: str = "results/",
+        output_path: str = "results",
         padding_size: int = 0,
         regen_npy_gz: bool = False,
         save_interval: int = 100,
@@ -52,7 +54,9 @@ class TrainningOptions(argparse.Namespace):
         stride: int = 1,
         stop_scale: int = 6,
         use_cpu: bool = False,
-        wells: tuple[int, ...] = (),
+        use_wells: bool = False,
+        use_seismic: bool = False,
+        wells_mask_columns: tuple[int, ...] = (),
         enable_tensorboard: bool = True,
         enable_plot_facies: bool = True,
     ) -> None:
@@ -143,6 +147,10 @@ class TrainningOptions(argparse.Namespace):
             Final scale index (number of pyramid levels - 1). Default is 6.
         use_cpu : bool, optional
             Force CPU even if CUDA/MPS is available. Default is False.
+        use_wells : bool, optional
+            If True, enable loading/using well data (filter dataset by `wells`). Default is False.
+        use_seismic : bool, optional
+            If True, enable loading/using seismic data during training. Default is False.
         wells : tuple of int, optional
             Optional list/tuple of well indices to filter dataset. Default is
             an empty tuple.
@@ -163,7 +171,7 @@ class TrainningOptions(argparse.Namespace):
         self.beta1 = beta1
         self.crop_size = crop_size
         self.discriminator_steps = discriminator_steps
-        self.num_channels = num_channels
+        self.num_img_channels = num_img_channels
         self.gamma = gamma
         self.generator_steps = generator_steps
         self.gpu_device = gpu_device
@@ -188,6 +196,8 @@ class TrainningOptions(argparse.Namespace):
         self.num_layer = num_layer
         self.num_real_facies = num_real_facies
         self.num_train_pyramids = num_train_pyramids
+        self.num_parallel_scales = num_parallel_scales
+        self.noise_channels = noise_channels
         self.num_workers = num_workers
         self.output_path = output_path
         self.padding_size = padding_size
@@ -197,7 +207,9 @@ class TrainningOptions(argparse.Namespace):
         self.stride = stride
         self.stop_scale = stop_scale
         self.use_cpu = use_cpu
-        self.wells = wells
+        self.use_wells = use_wells
+        self.use_seismic = use_seismic
+        self.wells_mask_columns = wells_mask_columns
         self.enable_tensorboard = enable_tensorboard
         self.enable_plot_facies = enable_plot_facies
 

@@ -1,18 +1,12 @@
-
 from typing import TypeAlias
 
 import torch
 from torch.utils.data import Dataset
 
-from gen_pyramids import (
-    to_facies_pyramids, 
-    to_seismic_pyramids, 
-    to_wells_pyramids, 
-    memory,
-)
+from gen_pyramids import (memory, to_facies_pyramids, to_seismic_pyramids,
+                          to_wells_pyramids)
 from ops import generate_scales
 from options import TrainningOptions
-
 
 Pyramid: TypeAlias = tuple[torch.Tensor, ...]
 Masks: TypeAlias = tuple[Pyramid, Pyramid, Pyramid]
@@ -38,19 +32,22 @@ class PyramidsDataset(Dataset[Masks]):
     ) -> None:
         self.data_dir = options.input_path
         self.scales_list = generate_scales(options)
-    
+
         self.wells_pyramids = [
             torch.empty((0, 1, *scale), dtype=torch.int32) for scale in self.scales_list
         ]
         self.seismic_pyramids = [
-            torch.empty((0, 1, *scale), dtype=torch.float32) for scale in self.scales_list
+            torch.empty((0, 1, *scale), dtype=torch.float32)
+            for scale in self.scales_list
         ]
         if regenerate:
             memory.clear(warn=False)
 
         self.facies_pyramids = to_facies_pyramids(self.scales_list)
-        self.wells_pyramids = to_wells_pyramids(self.scales_list)   
-        self.seismic_pyramids = to_seismic_pyramids(self.scales_list)
+        if options.use_wells:
+            self.wells_pyramids = to_wells_pyramids(self.scales_list)
+        if options.use_seismic:
+            self.seismic_pyramids = to_seismic_pyramids(self.scales_list)
 
         if shuffle:
             self.shuffle()
@@ -75,9 +72,17 @@ class PyramidsDataset(Dataset[Masks]):
             tuple: Tuple of facies and masks at different scales.
         """
         return (
-            tuple(facies[idx] for facies in self.facies_pyramids), 
-            tuple(wells[idx] for wells in self.wells_pyramids),
-            tuple(seismic[idx] for seismic in self.seismic_pyramids),
+            tuple(facies[idx] for facies in self.facies_pyramids),
+            (
+                tuple(wells[idx] for wells in self.wells_pyramids)
+                if self.wells_pyramids[0].shape[0]
+                else ()
+            ),
+            (
+                tuple(seismic[idx] for seismic in self.seismic_pyramids)
+                if self.seismic_pyramids[0].shape[0]
+                else ()
+            ),
         )
 
     def shuffle(self) -> None:
@@ -87,5 +92,7 @@ class PyramidsDataset(Dataset[Masks]):
         idxs = torch.randperm(self.__len__())
         for i in range(len(self.scales_list)):
             self.facies_pyramids[i] = self.facies_pyramids[i][idxs]
-            self.wells_pyramids[i] = self.wells_pyramids[i][idxs]
-            self.seismic_pyramids[i] = self.seismic_pyramids[i][idxs]
+            if self.wells_pyramids[0].shape[0]:
+                self.wells_pyramids[i] = self.wells_pyramids[i][idxs]
+            if self.seismic_pyramids[0].shape:
+                self.seismic_pyramids[i] = self.seismic_pyramids[i][idxs]
