@@ -13,8 +13,12 @@ import torch.nn.functional as F
 
 from models.generator import Generator
 from models.torch import utils
-from models.torch.custom_layer import (TorchColorQuantization, TorchConvBlock,
-                                       TorchSPADEGenerator)
+from models.torch.custom_layer import (
+    TorchColorQuantization, 
+    TorchConvBlock,
+    TorchSPADEGenerator
+)
+
 
 
 class TorchGenerator(Generator[torch.Tensor, nn.ModuleList], nn.Module):
@@ -87,7 +91,7 @@ class TorchGenerator(Generator[torch.Tensor, nn.ModuleList], nn.Module):
         self.color_quantizer = TorchColorQuantization(temperature=0.1)
 
     def __call__(self, *args: Any, **kwds: Any) -> torch.Tensor:
-        return super().__call__(*args, **kwds)
+        return super().__call__(*args, **kwds) # type: ignore
 
     def forward(
         self,

@@ -3,7 +3,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 
-from models.types import T
+from ..types import T
 
 
 def calc_gradient_penalty(

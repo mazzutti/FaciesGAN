@@ -7,7 +7,7 @@ from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
 from metrics import DiscriminatorMetrics, GeneratorMetrics
 from models.discriminator import Discriminator
 from models.generator import Generator
-from models.types import TModule, TTensor
+from types import TModule, TTensor
 from options import TrainningOptions
 
 

@@ -10,7 +10,7 @@ import math
 from abc import ABC, abstractmethod
 from typing import Any, Generic, Self
 
-from models.types import TModule, TTensor
+from types import TModule, TTensor
 
 
 class Generator(ABC, Generic[TTensor, TModule]):
