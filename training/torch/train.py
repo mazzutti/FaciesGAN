@@ -18,7 +18,6 @@ Notes
 
 from __future__ import annotations
 
-import math
 import os
 import time
 from collections.abc import Mapping
@@ -28,6 +27,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from tensorboardX import SummaryWriter  # type: ignore
+from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -36,16 +36,21 @@ import utils
 from background_workers import submit_plot_generated_facies
 from config import (D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, RESULT_FACIES_PATH,
                     SCH_D_FILE, SCH_G_FILE)
-from dataset import PyramidsDataset
+from datasets.torch.dataset import TorchPyramidsDataset
 from log import format_time
 from metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
 from models.torch import utils as torch_utils
 from models.torch.facies_gan import TorchFaciesGAN
 from options import TrainningOptions
 from tensorboard_visualizer import TensorBoardVisualizer
+from training.base import Trainer
 
 
-class Trainer:
+class TorchTrainer(
+    Trainer[
+        torch.Tensor, torch.nn.Module, optim.Optimizer, optim.lr_scheduler.LRScheduler
+    ]
+):
     """Parallel trainer for multi-scale progressive FaciesGAN training.
 
     This class manages simultaneous training of multiple pyramid scales by
@@ -92,10 +97,10 @@ class Trainer:
 
     def __init__(
         self,
-        device: torch.device,
         options: TrainningOptions,
         fine_tuning: bool = False,
-        checkpoint_path: str = ".checkpoints/",
+        checkpoint_path: str = ".checkpoints",
+        device: torch.device = torch.device("cpu"),
     ) -> None:
         """Create a Trainer instance and prepare datasets, model and logging.
 
@@ -110,87 +115,25 @@ class Trainer:
         checkpoint_path : str, optional
             Base path for checkpoint files, by default ".checkpoints/".
         """
+        super().__init__(options, fine_tuning, checkpoint_path)
+        # allow subclasses to still reference device directly
         self.device: torch.device = device
 
-        # Training parameters
-        self.start_scale: int = options.start_scale
-        self.stop_scale: int = options.stop_scale
-        self.output_path: str = options.output_path
-        self.num_iter: int = options.num_iter
-        self.save_interval: int = options.save_interval
-        self.num_parallel_scales: int = options.num_parallel_scales
-
-        self.batch_size: int = (
-            options.batch_size
-            if (options.batch_size < options.num_train_pyramids)
-            else options.num_train_pyramids
-        )
-        self.batch_size: int = (
-            self.batch_size
-            if not (
-                len(options.wells_mask_columns) > 0
-                and options.batch_size < len(options.wells_mask_columns)
-            )
-            else len(options.wells_mask_columns)
-        )
-        self.fine_tuning: bool = fine_tuning
-        self.checkpoint_path: str = checkpoint_path
-
-        self.num_img_channels: int = options.num_img_channels
-        self.noise_channels: int = (
-            options.noise_channels
-            + (self.num_img_channels if options.use_wells else 0)
-            + (self.num_img_channels if options.use_seismic else 0)
-        )
-
-        self.num_real_facies: int = options.num_real_facies
-        self.num_generated_per_real: int = options.num_generated_per_real
-        self.wells_mask_columns: tuple[int, ...] = options.wells_mask_columns
-
-        # Optimizer configuration
-        self.lr_g: float = options.lr_g
-        self.lr_d: float = options.lr_d
-        self.beta1: float = options.beta1
-        self.lr_decay: int = options.lr_decay
-        self.gamma: float = options.gamma
-
-        # Model parameters
-        self.zero_padding: int = options.num_layer * math.floor(options.kernel_size / 2)
-        self.noise_amp: float = options.noise_amp
-        self.min_noise_amp: float = options.min_noise_amp
-        self.scale0_noise_amp: float = options.scale0_noise_amp
-        self.facies: list[torch.Tensor] = []
-        self.wells: list[torch.Tensor] = []
-        self.seismic: list[torch.Tensor] = []
-
-        dataset: PyramidsDataset = PyramidsDataset(options)
+        dataset: TorchPyramidsDataset = TorchPyramidsDataset(options)
         self.scales_list: tuple[tuple[int, ...], ...] = dataset.scales_list  # type: ignore
 
+        # Replace the existing wells_mask_columns / subsample block with:
+
         if len(options.wells_mask_columns) > 0:
-            for i in range(len(self.scales_list)):
-                dataset.facies_pyramids[i] = dataset.facies_pyramids[i][
-                    options.wells_mask_columns
-                ]
-                if options.use_wells:
-                    dataset.wells_pyramids[i] = dataset.wells_pyramids[i][
-                        options.wells_mask_columns
-                    ]
-                if options.use_seismic:
-                    dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][
-                        options.wells_mask_columns
-                    ]
+            sel = [int(i) for i in options.wells_mask_columns]
+            dataset.batches = [dataset.batches[i] for i in sel]
         elif options.num_train_pyramids < len(dataset):
             idxs = torch.randperm(len(dataset))[: options.num_train_pyramids]
-            for i in range(len(self.scales_list)):
-                dataset.facies_pyramids[i] = dataset.facies_pyramids[i][idxs]
-                if options.use_wells:
-                    dataset.wells_pyramids[i] = dataset.wells_pyramids[i][idxs]
-                if options.use_seismic:
-                    dataset.seismic_pyramids[i] = dataset.seismic_pyramids[i][idxs]
+            dataset.batches = [dataset.batches[i] for i in idxs]
 
         self.data_loader = DataLoader(
             dataset,
-            batch_size=options.batch_size,
+            batch_size=self.batch_size,
             shuffle=False,
             num_workers=options.num_workers,
             pin_memory=True if device.type == "cuda" else False,
@@ -200,11 +143,11 @@ class Trainer:
 
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
-        self.model: TorchFaciesGAN = TorchFaciesGAN(
+        self.model: TorchFaciesGAN = TorchFaciesGAN(  # type: ignore
             options,
             self.wells,
             self.seismic,
-            device,
+            device=self.device,
             noise_channels=self.noise_channels,
         )
         self.model.shapes = list(self.scales_list)
@@ -557,7 +500,7 @@ class Trainer:
 
         # Save optimizers for all scales
         for scale in scales:
-            self.__save_optimizers(
+            self.save_optimizers(
                 scale_paths[scale],
                 generator_optimizers[scale],
                 discriminator_optimizers[scale],
@@ -876,15 +819,18 @@ class Trainer:
                 masks_cpu,
             )
 
-    @staticmethod
-    def __save_optimizers(
+    def save_optimizers(
+        self,
         scale_path: str,
         generator_optimizer: optim.Optimizer,
         discriminator_optimizer: optim.Optimizer,
-        generator_scheduler: optim.lr_scheduler.LRScheduler,
-        discriminator_scheduler: optim.lr_scheduler.LRScheduler,
+        generator_scheduler: LRScheduler,
+        discriminator_scheduler: LRScheduler,
     ) -> None:
-        """Save optimizer and scheduler state dictionaries to disk."""
+        """Save optimizer and scheduler state dicts to disk using project
+        filename constants from :mod:`config`.
+        """
+        os.makedirs(scale_path, exist_ok=True)
         torch.save(
             generator_optimizer.state_dict(), os.path.join(scale_path, OPT_G_FILE)
         )

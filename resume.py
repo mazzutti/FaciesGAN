@@ -23,7 +23,7 @@ import torch
 from config import G_FILE, OPT_FILE, RESULT_FACIES_PATH
 from log import init_output_logging
 from options import ResumeOptions
-from train import Trainer
+from training.torch.train import TorchTrainer
 
 # from types import SimpleNamespace
 
@@ -79,11 +79,11 @@ if __name__ == "__main__":
         if torch.cuda.is_available()
         else f"mps:{options.gpu_device}" if torch.backends.mps.is_available() else "cpu"
     )
-    trainer = Trainer(
-        device,
+    trainer = TorchTrainer(
         options,
         arguments.fine_tuning,
         arguments.checkpoint_path,
+        device,
     )
 
     if arguments.fine_tuning:

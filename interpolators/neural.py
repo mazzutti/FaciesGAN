@@ -15,10 +15,11 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+import datasets.utils as utils
+import ops
 from color_encoder import ColorEncoder
 from interpolators.base import BaseInterpolator
 from interpolators.config import InterpolatorConfig
-from ops import load_image, resolve_device
 
 FileLike: TypeAlias = str | os.PathLike[str] | IO[bytes]
 
@@ -80,7 +81,7 @@ class NeuralSmoother(BaseInterpolator):
         """
         super().__init__(config)
         # resolved device for the instance (MPS/CUDA/CPU)
-        self.device: torch.device = resolve_device()
+        self.device: torch.device = ops.resolve_device()
         self.num_classes: int = int(config.num_classes or 4)
         self.model = ResidualMLP(
             num_classes=self.num_classes,
@@ -205,7 +206,7 @@ class NeuralSmoother(BaseInterpolator):
 
             labels = torch.argmax(probs.squeeze(0), dim=0)
             labels = labels.to(self.device)
-            img_np = load_image(image_path)
+            img_np = utils.load_image(image_path)
             self.encoder = ColorEncoder(img_np, device=self.device)
             pred_rgb = self.encoder.labels_to_rgb(labels)
             pred_rgb = pred_rgb.detach().cpu().reshape(super_height, super_width, 3)

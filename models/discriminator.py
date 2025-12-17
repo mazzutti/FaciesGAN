@@ -9,7 +9,7 @@ store numeric configuration and then implement the abstract methods.
 from abc import ABC, abstractmethod
 from typing import Any, Generic, Self
 
-from types import TModule, TTensor
+from typedefs import TModule, TTensor
 
 
 class Discriminator(ABC, Generic[TTensor, TModule]):

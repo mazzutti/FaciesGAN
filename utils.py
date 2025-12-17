@@ -9,13 +9,12 @@ input/output shapes where helpful.
 
 import hashlib
 from collections import OrderedDict
-from typing import Any, cast
+from typing import Any, Self, cast
 
 import numpy as np
 import scipy.stats as st
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from typing_extensions import Self
 
 from config import RESULTS_DIR
 from ops import torch2np

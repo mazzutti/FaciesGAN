@@ -17,7 +17,7 @@ from dateutil import tz
 from config import CHECKPOINT_PATH, OPT_FILE
 from log import init_output_logging
 from options import TrainningOptions
-from train import Trainer
+from training.torch.train import TorchTrainer
 
 
 def get_arguments() -> ArgumentParser:
@@ -299,7 +299,7 @@ def main() -> None:
     except Exception:
         pass
 
-    trainer = Trainer(device, options)
+    trainer = TorchTrainer(options, device=device)
 
     # Optionally run the trainer under the PyTorch profiler and export traces.
     # MPS backend uses a different profiler API (torch.mps.profiler) that

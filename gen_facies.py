@@ -27,7 +27,7 @@ from sklearn.metrics import euclidean_distances
 
 from background_workers import submit_plot_generated_facies
 from config import OPT_FILE
-from dataset import PyramidsDataset
+from datasets.torch.dataset import TorchPyramidsDataset
 from log import format_time
 from models.torch.facies_gan import TorchFaciesGAN
 from ops import torch2np
@@ -83,7 +83,7 @@ def generate_facies(
 
 def generate_comparison_plots(
     model: TorchFaciesGAN,
-    dataset: PyramidsDataset,
+    dataset: TorchPyramidsDataset,
     model_path: str,
     out_path: str,
     num_generated: int = 3,
@@ -298,7 +298,7 @@ if __name__ == "__main__":
 
     options = copy.copy(args)
 
-    dataset: PyramidsDataset = PyramidsDataset(options)
+    dataset: TorchPyramidsDataset = TorchPyramidsDataset(options)
     masked_facies: list[torch.Tensor] = []
     for i in range(len(dataset.facies_pyramids)):
         masked_facies.append(

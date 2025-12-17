@@ -10,17 +10,13 @@ import math
 import os
 import random
 from collections.abc import Sequence
-from functools import lru_cache
-from pathlib import Path
 from typing import cast
 
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from PIL import Image
 from torch import nn
 
-from data_files import DataFiles
 from options import TrainningOptions
 
 
@@ -38,25 +34,6 @@ def set_seed(seed: int = 42) -> None:
     random.seed(seed_int)
 
 
-def load_image(image_path: Path) -> NDArray[np.float32]:
-    """Load an image from disk and convert it to a normalized float32 numpy array.
-
-    Parameters
-    ----------
-    image_path : Path
-        Filesystem path to the image file to load.
-
-    Returns
-    -------
-    NDArray[np.float32]
-        RGB image as a float32 array with shape (H, W, 3) and values
-        normalized to the range [0, 1].
-    """
-    img_pil: Image.Image = Image.open(image_path).convert("RGB")
-    img_np = np.array(img_pil).astype(np.float32, copy=False) / 255.0
-    return img_np
-
-
 def resolve_device() -> torch.device:
     """Return the preferred device: MPS (Apple), CUDA, or CPU.
 
@@ -72,73 +49,6 @@ def resolve_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
-
-
-def as_image_file_list(data_file: DataFiles) -> list[Path]:
-    """Return a sorted list of image file paths for the given data file type.
-
-    Parameters
-    ----------
-    data_file : DataFiles
-        The data file type (FACIES, WELLS, or SEISMIC) specifying which
-        directory and file pattern to use.
-
-    Returns
-    -------
-    list[Path]
-        Sorted list of Path objects pointing to image files matching the
-        pattern for the specified data file type.
-    """
-    data_dir = Path(data_file.as_data_path())
-    return list(sorted(data_dir.glob(data_file.image_file_pattern)))
-
-
-def as_model_file_list(data_file: DataFiles) -> list[Path]:
-    """Return a sorted list of model checkpoint file paths for the given data file type.
-
-    Parameters
-    ----------
-    data_file : DataFiles
-        The data file type (FACIES, WELLS, or SEISMIC) specifying which
-        directory and model file pattern to use.
-
-    Returns
-    -------
-    list[Path]
-        Sorted list of Path objects pointing to model checkpoint files
-        matching the pattern for the specified data file type.
-    """
-    data_dir = Path(data_file.as_data_path())
-    return list(sorted(data_dir.glob(data_file.model_file_pattern)))
-
-
-@lru_cache(maxsize=1)
-def as_wells_mapping(data_file: DataFiles) -> dict[str, tuple[int, int]]:
-    """Load wells mapping from cache file.
-
-    Returns
-    -------
-    dict[str, tuple[int, int]]
-        Dictionary mapping image name to (column, non_black_pixels)
-    """
-    data_dir = Path(data_file.as_data_path())
-    mapping_file = data_dir / data_file.mapping_file_pattern
-    mapping_file = next(data_dir.glob(data_file.mapping_file_pattern))
-    if not mapping_file.exists():
-        raise FileNotFoundError(f"Wells mapping file not found: {mapping_file}")
-    try:
-        data = np.load(mapping_file, allow_pickle=True)
-        columns = data["columns"]
-        counts = data["counts"]
-        image_names = data["image_names"]
-
-        mapping = {
-            name: (int(col), int(count))
-            for name, col, count in zip(image_names, columns, counts)
-        }
-        return mapping
-    except Exception as e:
-        raise RuntimeError(f"Failed to load wells mapping: {e}")
 
 
 def mask_resize(mask: torch.Tensor, size: tuple[int, ...]) -> torch.Tensor:

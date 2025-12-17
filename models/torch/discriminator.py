@@ -79,7 +79,7 @@ class TorchDiscriminator(Discriminator[torch.Tensor, nn.ModuleList], nn.Module):
         self.discs = cast(list[nn.Module], nn.ModuleList())
 
     def __call__(self, *args: Any, **kwds: Any) -> torch.Tensor:
-        return super().__call__(*args, **kwds)
+        return super().__call__(*args, **kwds)  # type: ignore
 
     def forward(self, scale: int, input_tensor: torch.Tensor) -> torch.Tensor:
         """Discriminate input tensor and return score map tensor."""

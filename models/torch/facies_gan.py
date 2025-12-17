@@ -22,7 +22,7 @@ from models.torch.generator import TorchGenerator
 from options import TrainningOptions
 
 
-class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.ModuleList]):
+class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
     """PyTorch adapter for the framework-agnostic FaciesGAN base.
 
     Responsibilities
