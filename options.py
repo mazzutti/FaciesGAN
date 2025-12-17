@@ -44,7 +44,9 @@ class TrainningOptions(argparse.Namespace):
         noise_amp: float = 0.1,
         min_noise_amp: float = 0.1,
         scale0_noise_amp: float = 1.0,
+        well_loss_penalty: float = 10.0,
         lambda_diversity: float = 1.0,
+        num_diversity_samples: int = 3,
         num_feature: int = 32,
         num_generated_per_real: int = 5,
         num_iter: int = 2000,
@@ -124,6 +126,9 @@ class TrainningOptions(argparse.Namespace):
         lambda_diversity : float, optional
             Weight for diversity loss that penalizes similar outputs from different
             noise inputs, encouraging the generator to produce diverse facies. Default is 1.0.
+        num_diversity_samples : int, optional
+            Number of noise samples to generate per real example when computing
+            the diversity loss. Default is 3.
         num_feature : int, optional
             Base number of features in the first network layer. Default is 32.
         num_generated_per_real : int, optional
@@ -197,7 +202,9 @@ class TrainningOptions(argparse.Namespace):
         self.noise_amp = noise_amp
         self.min_noise_amp = min_noise_amp
         self.scale0_noise_amp = scale0_noise_amp
+        self.well_loss_penalty = well_loss_penalty
         self.lambda_diversity = lambda_diversity
+        self.num_diversity_samples = num_diversity_samples
         self.num_feature = num_feature
         self.num_generated_per_real = num_generated_per_real
         self.num_iter = num_iter

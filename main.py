@@ -197,6 +197,13 @@ def get_arguments() -> ArgumentParser:
     )
 
     parser.add_argument(
+        "--well-loss-penalty",
+        type=float,
+        help="weight multiplier for well/mask reconstruction loss",
+        default=10.0,
+    )
+
+    parser.add_argument(
         "--use-seismic",
         action="store_true",
         help="enable using seismic data during data loading",
@@ -325,7 +332,8 @@ def main() -> None:
         else:
             # Use standard torch.profiler for CPU/CUDA
             try:
-                from torch.profiler import ProfilerActivity, profile  # type: ignore
+                from torch.profiler import ProfilerActivity  # type: ignore
+                from torch.profiler import profile
             except Exception:
                 print("Warning: PyTorch profiler not available in this environment.")
                 trainer.train()
