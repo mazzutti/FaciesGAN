@@ -10,12 +10,11 @@ from itertools import repeat
 
 from torch.utils.data import Dataset
 
-from datasets.batch import Batch
 from options import TrainningOptions
-from typedefs import TTensor
+from typedefs import TTensor, Batch
 
 
-class BasePyramidsDataset(Dataset[Batch[TTensor]]):
+class PyramidsDataset(Dataset[Batch[TTensor]]):
     """Common functionality for multi-scale pyramid datasets.
 
     This class centralises the shared logic for loading precomputed
@@ -39,7 +38,7 @@ class BasePyramidsDataset(Dataset[Batch[TTensor]]):
     ) -> None:
         self.data_dir = options.input_path
         self.batches: list[Batch[TTensor]] = []
-        self.scales_list = self.generate_scales(options)
+        self.scales = self.generate_scales(options)
 
         if regenerate:
             self.clean_cache()

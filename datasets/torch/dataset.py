@@ -10,11 +10,11 @@ import torch
 
 import datasets.torch.utils as torch_utils
 import datasets.utils as utils
-from datasets.base import BasePyramidsDataset
+from datasets.base import PyramidsDataset
 from options import TrainningOptions
 
 
-class TorchPyramidsDataset(BasePyramidsDataset[torch.Tensor]):
+class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
     """Dataset of multi-scale facies and optional conditioning data.
 
     This dataset loads precomputed pyramids of facies (categorical images) and
@@ -86,13 +86,13 @@ class TorchPyramidsDataset(BasePyramidsDataset[torch.Tensor]):
             If the subclass does not implement this method.
         """
         facies_pyramids: tuple[torch.Tensor, ...] = torch_utils.to_facies_pyramids(
-            self.scales_list
+            self.scales
         )
         wells_pyramids: tuple[torch.Tensor, ...] = torch_utils.to_wells_pyramids(
-            self.scales_list
+            self.scales
         )
         seismic_pyramids: tuple[torch.Tensor, ...] = torch_utils.to_seismic_pyramids(
-            self.scales_list
+            self.scales
         )
 
         return facies_pyramids, wells_pyramids, seismic_pyramids

@@ -5,12 +5,10 @@ so other modules can import `Batch`, the framework-specific dataset and any
 helper factories without reaching into submodules.
 """
 
-from .base import BasePyramidsDataset
-from .batch import Batch
+from .base import PyramidsDataset
 from .torch.dataset import TorchPyramidsDataset
 
 __all__ = [
-    "Batch",
-    "BasePyramidsDataset",
+    "PyramidsDataset",
     "TorchPyramidsDataset",
 ]
