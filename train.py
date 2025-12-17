@@ -30,23 +30,17 @@ import torch.optim as optim
 from tensorboardX import SummaryWriter  # type: ignore
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from metrics import ScaleMetrics, GeneratorMetrics, DiscriminatorMetrics
 
 import ops
 import utils
 from background_workers import submit_plot_generated_facies
-from config import (
-    D_FILE,
-    G_FILE,
-    OPT_D_FILE,
-    OPT_G_FILE,
-    RESULT_FACIES_PATH,
-    SCH_D_FILE,
-    SCH_G_FILE,
-)
+from config import (D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, RESULT_FACIES_PATH,
+                    SCH_D_FILE, SCH_G_FILE)
 from dataset import PyramidsDataset
 from log import format_time
-from models.facies_gan import FaciesGAN
+from metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from models.torch import utils as torch_utils
+from models.torch.facies_gan import TorchFaciesGAN
 from options import TrainningOptions
 from tensorboard_visualizer import TensorBoardVisualizer
 
@@ -206,11 +200,11 @@ class Trainer:
 
         self.num_of_batchs: int = len(dataset) // self.batch_size
 
-        self.model: FaciesGAN = FaciesGAN(
-            device,
+        self.model: TorchFaciesGAN = TorchFaciesGAN(
             options,
             self.wells,
             self.seismic,
+            device,
             noise_channels=self.noise_channels,
         )
         self.model.shapes = list(self.scales_list)
@@ -426,7 +420,7 @@ class Trainer:
                 betas=(self.beta1, 0.999),
             )
             discriminator_optimizers[scale] = optim.Adam(
-                self.model.discriminators[str(scale)].parameters(),
+                self.model.discriminator.discs[scale].parameters(),
                 lr=self.lr_d,
                 betas=(self.beta1, 0.999),
             )
@@ -602,7 +596,7 @@ class Trainer:
         # Prepare previous reconstruction
         if scale == 0:
             prev_rec = torch.zeros_like(real_facies)
-            z_rec = ops.generate_noise(
+            z_rec = torch_utils.generate_noise(
                 (self.noise_channels, *real_facies.shape[2:]),
                 device=self.device,
                 num_samp=self.batch_size,
@@ -624,14 +618,14 @@ class Trainer:
 
         else:
             # For higher scales, upsample previous facies to current resolution
-            prev_rec = ops.interpolate(
+            prev_rec = torch_utils.interpolate(
                 self.facies[scale - 1][indexes], real_facies.shape[2:]
             ).to(self.device)
 
             # noise channel sizing for higher scales (empirical split)
             if wells is None:
                 if seismic is None:
-                    z_rec = ops.generate_noise(
+                    z_rec = torch_utils.generate_noise(
                         (
                             self.noise_channels,
                             *real_facies.shape[2:],
@@ -640,7 +634,7 @@ class Trainer:
                         num_samp=self.batch_size,
                     )
                 else:
-                    z_rec = ops.generate_noise(
+                    z_rec = torch_utils.generate_noise(
                         (
                             self.noise_channels - self.num_img_channels,
                             *real_facies.shape[2:],
@@ -651,7 +645,7 @@ class Trainer:
                     z_rec = torch.cat([z_rec, seismic], dim=1)
             else:
                 if seismic is None:
-                    z_rec = ops.generate_noise(
+                    z_rec = torch_utils.generate_noise(
                         (
                             self.noise_channels - self.num_img_channels,
                             *real_facies.shape[2:],
@@ -661,7 +655,7 @@ class Trainer:
                     )
                     z_rec = torch.cat([z_rec, wells], dim=1)
                 else:
-                    z_rec = ops.generate_noise(
+                    z_rec = torch_utils.generate_noise(
                         (
                             self.noise_channels - 2 * self.num_img_channels,
                             *real_facies.shape[2:],
@@ -721,10 +715,12 @@ class Trainer:
             )
 
             self.model.generator.gens[scale].load_state_dict(
-                ops.load(generator_path, self.device, as_type=Mapping[str, Any])
+                torch_utils.load(generator_path, self.device, as_type=Mapping[str, Any])
             )
-            self.model.discriminators[str(scale)].load_state_dict(
-                ops.load(discriminator_path, self.device, as_type=Mapping[str, Any])
+            self.model.discriminator.discs[scale].load_state_dict(
+                torch_utils.load(
+                    discriminator_path, self.device, as_type=Mapping[str, Any]
+                )
             )
         except Exception as e:
             print(f"Error loading models from {self.checkpoint_path}/{scale}: {e}")
@@ -742,28 +738,28 @@ class Trainer:
         """Load optimizer and scheduler state dictionaries from checkpoint."""
         try:
             generator_optimizer.load_state_dict(
-                ops.load(
+                torch_utils.load(
                     os.path.join(scale_path, OPT_G_FILE),
                     self.device,
                     as_type=dict[str, Any],
                 )
             )
             discriminator_optimizer.load_state_dict(
-                ops.load(
+                torch_utils.load(
                     os.path.join(scale_path, OPT_D_FILE),
                     self.device,
                     as_type=dict[str, Any],
                 )
             )
             generator_scheduler.load_state_dict(
-                ops.load(
+                torch_utils.load(
                     os.path.join(scale_path, SCH_G_FILE),
                     self.device,
                     as_type=dict[str, Any],
                 )
             )
             discriminator_scheduler.load_state_dict(
-                ops.load(
+                torch_utils.load(
                     os.path.join(scale_path, SCH_D_FILE),
                     self.device,
                     as_type=dict[str, Any],
@@ -777,8 +773,8 @@ class Trainer:
         epochs: "tqdm[int]",
         writer: SummaryWriter,
         epoch: int,
-        generator_metrics: GeneratorMetrics,
-        discriminator_metrics: DiscriminatorMetrics,
+        generator_metrics: GeneratorMetrics[torch.Tensor],
+        discriminator_metrics: DiscriminatorMetrics[torch.Tensor],
     ) -> None:
         """Log training metrics for the current epoch to TensorBoard and console.
 

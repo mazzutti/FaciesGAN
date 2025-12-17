@@ -36,12 +36,6 @@ class ExtractUniqueColors:
     _instance: Self | None = None
 
     def __new__(cls, *args: Any, **kwargs: Any) -> "ExtractUniqueColors":
-        """Return a singleton instance for the extractor.
-
-        This class intentionally implements a lightweight singleton so
-        callers may reuse the cached color extraction helper without
-        recreating internal caches.
-        """
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
@@ -49,15 +43,6 @@ class ExtractUniqueColors:
     def __init__(
         self, max_cache_size: int = 128, device: torch.device = torch.device("cpu")
     ) -> None:
-        """Initialize extractor cache and configuration.
-
-        Parameters
-        ----------
-        max_cache_size : int
-            Maximum number of cached entries.
-        device : torch.device
-            Device to use for optional tensor operations.
-        """
         # initialize cache once - safe even if __init__ called multiple times
         if getattr(self, "_cache", None) is None:
             # use OrderedDict for simple LRU eviction
@@ -69,20 +54,6 @@ class ExtractUniqueColors:
     def __call__(
         self, facies_tensor: torch.Tensor, tolerance: float = 0.01
     ) -> np.ndarray:
-        """Extract unique colors from the provided facies tensor.
-
-        Parameters
-        ----------
-        facies_tensor : torch.Tensor
-            Input facies tensor (CHW or BCHW) with values in [0, 1].
-        tolerance : float
-            Color clustering tolerance used to merge similar colors.
-
-        Returns
-        -------
-        np.ndarray
-            Array of unique RGB colors with shape (N, 3).
-        """
         # Compute a small thumbnail fingerprint to include in the cache key.
         # This avoids returning stale results when the image content changes
         # but shapes remain the same.
@@ -172,7 +143,7 @@ class ExtractUniqueColors:
         return unique_colors_array
 
     def clear_cache(self) -> None:
-        """Clear the internal cache used by the extractor."""
+        """Clear the internal cache."""
         self._cache.clear()
 
     @property
@@ -200,15 +171,6 @@ class PreprocessWellMask:
     def __init__(
         self, max_cache_size: int = 128, device: torch.device = torch.device("cpu")
     ) -> None:
-        """Initialize the PreprocessWellMask cache and configuration.
-
-        Parameters
-        ----------
-        max_cache_size : int
-            Maximum number of cached mask entries.
-        device : torch.device
-            Device hint for processing (not currently used for numpy ops).
-        """
         # OrderedDict for LRU eviction
         self._cache: OrderedDict[
             tuple[tuple[int, ...], tuple[int, int], str],
@@ -221,11 +183,6 @@ class PreprocessWellMask:
     _instance: Any | None = None
 
     def __new__(cls, *args: Any, **kwargs: Any) -> "PreprocessWellMask":
-        """Return singleton instance for PreprocessWellMask.
-
-        Ensures a single shared cache is used when the helper is invoked
-        multiple times across the visualization code.
-        """
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
@@ -233,11 +190,6 @@ class PreprocessWellMask:
     def __call__(
         self, mask: np.ndarray, target_shape: tuple[int, int]
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Preprocess a well mask and return (mask_2d, mask_bool, well_columns).
-
-        Resizes and post-processes the input mask into a boolean 2D mask and
-        a list of well column indices suitable for plotting overlays.
-        """
         mask_2d = np.squeeze(mask)
 
         # Compute a stable content hash for the mask using the full mask bytes.
@@ -281,7 +233,6 @@ class PreprocessWellMask:
         return result
 
     def clear_cache(self) -> None:
-        """Clear the PreprocessWellMask cache."""
         self._cache.clear()
 
 
@@ -295,11 +246,6 @@ class QuantizeToPureColors:
     _instance: Any | None = None
 
     def __new__(cls, *args: Any, **kwargs: Any) -> "QuantizeToPureColors":
-        """Return a singleton instance for the quantizer.
-
-        The quantizer keeps an LRU cache and is relatively heavy to create,
-        so callers should reuse the singleton when possible.
-        """
         if cls._instance is None:
             cls._instance = super().__new__(cls)
         return cls._instance
@@ -307,15 +253,6 @@ class QuantizeToPureColors:
     def __init__(
         self, max_cache_size: int = 128, device: torch.device = torch.device("cpu")
     ) -> None:
-        """Initialize the quantizer cache and device configuration.
-
-        Parameters
-        ----------
-        max_cache_size : int
-            Maximum number of cached quantization results.
-        device : torch.device
-            Device hint for torch-based quantization paths.
-        """
         if getattr(self, "_cache", None) is None:
             self._cache: OrderedDict[tuple[Any, ...], np.ndarray] = OrderedDict()
         self.max_cache_size = max_cache_size
@@ -335,24 +272,6 @@ class QuantizeToPureColors:
         pure_colors: np.ndarray | None = None,
         tolerance: float = 0.0,
     ) -> np.ndarray:
-        """Quantize an RGB image or tensor to a provided set of pure colors.
-
-        Parameters
-        ----------
-        rgb_array : np.ndarray | torch.Tensor
-            Input RGB image as a numpy array (H, W, 3) or a torch tensor
-            (C, H, W) or (B, C, H, W).
-        pure_colors : np.ndarray | None
-            Optional palette of pure colors to quantize to. If None, a
-            default 4-color palette is used.
-        tolerance : float
-            Unused in the current implementation, kept for API compatibility.
-
-        Returns
-        -------
-        np.ndarray
-            Quantized RGB image as a numpy array with dtype float32 in [0,1].
-        """
         # Handle torch.Tensor input with optional GPU acceleration
         if isinstance(rgb_array, torch.Tensor):
             t = rgb_array
@@ -445,12 +364,10 @@ class QuantizeToPureColors:
         return quantized
 
     def clear_cache(self) -> None:
-        """Clear the quantizer's internal cache."""
         self._cache.clear()
 
     @property
     def cache(self) -> dict[tuple[Any, ...], np.ndarray]:
-        """Return the internal cache mapping used by the quantizer."""
         return self._cache
 
 

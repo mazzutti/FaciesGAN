@@ -29,12 +29,12 @@ from background_workers import submit_plot_generated_facies
 from config import OPT_FILE
 from dataset import PyramidsDataset
 from log import format_time
-from models.facies_gan import FaciesGAN
+from models.torch.facies_gan import TorchFaciesGAN
 from ops import torch2np
 
 
 def generate_facies(
-    model: FaciesGAN, how_many: int, model_path: str, options: SimpleNamespace
+    model: TorchFaciesGAN, how_many: int, model_path: str, options: SimpleNamespace
 ) -> tuple[list[NDArray[np.float32]], list[int]]:
     """Generate facies realizations using trained FaciesGAN model.
 
@@ -82,7 +82,7 @@ def generate_facies(
 
 
 def generate_comparison_plots(
-    model: FaciesGAN,
+    model: TorchFaciesGAN,
     dataset: PyramidsDataset,
     model_path: str,
     out_path: str,
@@ -312,7 +312,7 @@ if __name__ == "__main__":
                 dim=0,
             )
         )
-    faciesGAN = FaciesGAN(args.device, options=args, wells=masked_facies)
+    faciesGAN = TorchFaciesGAN(options=args, wells=masked_facies, device=args.device)
 
     if arguments.comparison_plots:
         # Generate comparison plots instead of individual facies

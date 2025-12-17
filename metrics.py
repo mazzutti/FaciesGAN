@@ -8,25 +8,24 @@ or writing to external sinks.
 """
 
 from dataclasses import dataclass
-import torch
 
 
 @dataclass
-class DiscriminatorMetrics:
+class DiscriminatorMetrics[TTensor]:
     """Per-scale discriminator metric container.
 
     Fields are scalar ``torch.Tensor`` values representing the total loss,
     real/fake component losses and gradient penalty (``gp``).
     """
 
-    total: torch.Tensor
-    real: torch.Tensor
-    fake: torch.Tensor
-    gp: torch.Tensor
+    total: TTensor
+    real: TTensor
+    fake: TTensor
+    gp: TTensor
 
 
 @dataclass
-class GeneratorMetrics:
+class GeneratorMetrics[TTensor]:
     """Per-scale generator metric container.
 
     Fields are scalar ``torch.Tensor`` values for adversarial (``fake``),
@@ -34,20 +33,20 @@ class GeneratorMetrics:
     and aggregated total loss (``total``).
     """
 
-    total: torch.Tensor
-    fake: torch.Tensor
-    rec: torch.Tensor
-    well: torch.Tensor
-    div: torch.Tensor
+    total: TTensor
+    fake: TTensor
+    rec: TTensor
+    well: TTensor
+    div: TTensor
 
 
 @dataclass
-class ScaleMetrics:
+class ScaleMetrics[TTensor]:
     """Mapping of scale index to per-scale metric dataclasses.
 
     ``generator`` and ``discriminator`` map integer scale indices to the
     corresponding metric dataclasses defined above.
     """
 
-    generator: dict[int, GeneratorMetrics]
-    discriminator: dict[int, DiscriminatorMetrics]
+    generator: dict[int, GeneratorMetrics[TTensor]]
+    discriminator: dict[int, DiscriminatorMetrics[TTensor]]

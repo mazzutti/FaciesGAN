@@ -25,6 +25,8 @@ from log import init_output_logging
 from options import ResumeOptions
 from train import Trainer
 
+# from types import SimpleNamespace
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

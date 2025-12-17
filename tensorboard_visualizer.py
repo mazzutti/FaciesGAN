@@ -11,6 +11,7 @@ import time
 import numpy as np
 import torch
 from tensorboardX import SummaryWriter  # pyright: ignore
+
 from metrics import ScaleMetrics
 
 
@@ -90,7 +91,7 @@ class TensorBoardVisualizer:
     def update(
         self,
         epoch: int,
-        scale_metrics: ScaleMetrics | dict[int, dict[str, float]],
+        scale_metrics: ScaleMetrics[torch.Tensor] | dict[int, dict[str, float]],
         generated_samples: dict[int, torch.Tensor] | None = None,
         samples_processed: int = 0,
     ) -> None:

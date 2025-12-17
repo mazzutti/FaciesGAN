@@ -14,11 +14,11 @@
       "envFile": "${workspaceFolder}/.env",
       "args": [
         "--input-path",
-        "data/",
+        "data",
         "--output-path",
         "results/",
         "--num-train-pyramids",
-        "5",
+        "1",
         "--num-iter",
         "4000",
         "--num-parallel-scales",

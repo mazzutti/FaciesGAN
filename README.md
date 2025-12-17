@@ -236,9 +236,9 @@ opts = TrainningOptions(
 Switch between interpolation methods:
 
 ```python
+from interpolators.config import InterpolatorConfig
 from interpolators.nearest import NearestInterpolator
 from interpolators.neural import NeuralSmoother
-from interpolators.config import InterpolatorConfig
 
 # Fast nearest-neighbor interpolation
 nearest = NearestInterpolator(InterpolatorConfig())
