@@ -1,3 +1,4 @@
+from typing import Any, Generic, NamedTuple
 from collections.abc import Callable
 from typing import TypeVar
 
@@ -5,10 +6,10 @@ import mlx.core as mlx_core
 import mlx.nn as mlx_nn  # type: ignore
 import mlx.optimizers as mlx_optim  # type: ignore
 import torch
+from torch.utils.data import DataLoader
 
 # Generic type variables for type hinting
 T = TypeVar("T")
-
 
 # Tensor type variable (e.g., torch.Tensor or mx.array)
 TTensor = TypeVar("TTensor", torch.Tensor, mlx_core.array)
@@ -36,13 +37,31 @@ TScheduler = TypeVar(
     Callable[[float, float], Callable[[int], float]],
 )
 
-# Pyramid type variable
-TorchPyramid = tuple[torch.Tensor, ...]
-MLXPyramid = tuple[mlx_core.array, ...]
 
-# Masks type variable
-Pyramids = TypeVar(
-    "Pyramids",
-    tuple[TorchPyramid, TorchPyramid, TorchPyramid],
-    tuple[MLXPyramid, MLXPyramid, MLXPyramid],
-)
+# Container for a training batch of multi-scale pyramids.
+class Batch(NamedTuple, Generic[TTensor]):
+    """Container for a training batch of multi-scale pyramids.
+
+    Fields are per-scale tuples of tensors. `Batch` is a NamedTuple so it
+    subclasses `tuple` and is compatible with PyTorch's default collate.
+
+
+    Parameters
+    ----------
+    facies : Tuple[TTensor, ...]
+        Per-scale facies tensors.
+    wells : Tuple[TTensor, ...] | tuple[()]
+        Per-scale well-conditioning tensors (may be empty when unused).
+    seismic : Tuple[TTensor, ...] | tuple[()]
+        Per-scale seismic-conditioning tensors (may be empty when unused).
+    """
+
+    facies: tuple[TTensor, ...]
+    wells: tuple[TTensor, ...] | tuple[()]
+    seismic: tuple[TTensor, ...] | tuple[()]
+
+
+# Type variable for a data loader that yields batches of tensors
+IDataLoader = TypeVar(
+    "IDataLoader", DataLoader[Batch[torch.Tensor]], Any
+)  # mlx_core.data.DataLoader)
