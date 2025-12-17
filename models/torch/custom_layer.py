@@ -14,7 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-class ConvBlock(nn.Sequential):
+class TorchConvBlock(nn.Sequential):
     """Convolutional block with Conv2D, BatchNorm, and LeakyReLU.
 
     A standard building block for both generator and discriminator networks,
@@ -46,7 +46,7 @@ class ConvBlock(nn.Sequential):
 
         Parameters are documented on the class level.
         """
-        super(ConvBlock, self).__init__()
+        super(TorchConvBlock, self).__init__()
 
         self.add_module(
             "conv",
@@ -62,7 +62,7 @@ class ConvBlock(nn.Sequential):
         self.add_module("LeakyRelu", nn.LeakyReLU(0.2, inplace=True))
 
 
-class SPADE(nn.Module):
+class TorchSPADE(nn.Module):
     """Spatially-Adaptive Denormalization (SPADE) layer.
 
     Modulates normalized feature maps using spatially-varying scale (gamma)
@@ -152,7 +152,7 @@ class SPADE(nn.Module):
         return normalized * (1 + gamma) + beta
 
 
-class SPADEConvBlock(nn.Module):
+class TorchSPADEConvBlock(nn.Module):
     """Convolutional block with SPADE normalization for noise-conditioned generation.
 
     Replaces BatchNorm with SPADE to allow noise to modulate features at each
@@ -192,7 +192,7 @@ class SPADEConvBlock(nn.Module):
         """
         super().__init__()  # type: ignore
 
-        self.spade = SPADE(in_channels, cond_channels, spade_hidden, kernel_size)
+        self.spade = TorchSPADE(in_channels, cond_channels, spade_hidden, kernel_size)
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
@@ -223,7 +223,7 @@ class SPADEConvBlock(nn.Module):
         return x
 
 
-class SPADEGenerator(nn.Module):
+class TorchSPADEGenerator(nn.Module):
     """SPADE-based generator block for the coarsest scale.
 
     Uses SPADE normalization to inject noise into the generation process,
@@ -284,7 +284,7 @@ class SPADEGenerator(nn.Module):
             )
 
             self.spade_blocks.append(
-                SPADEConvBlock(
+                TorchSPADEConvBlock(
                     in_ch, out_ch, input_channels, kernel_size, padding_size, 1
                 )
             )
@@ -327,3 +327,169 @@ class SPADEGenerator(nn.Module):
         # Generate final output
         out = self.tail(x)
         return out
+
+
+class TorchSPADEDiscriminator(nn.Module):
+
+    def __init__(
+        self,
+        num_features: int,
+        min_num_features: int,
+        num_layer: int,
+        kernel_size: int,
+        padding_size: int,
+        input_channels: int,
+    ) -> None:
+        """Initialize the convolutional discriminator.
+
+        Parameters
+        ----------
+        num_features : int
+            Number of features in the first convolutional layer.
+        min_num_features : int
+            Minimum number of features used when reducing channels.
+        num_layer : int
+            Number of convolutional layers.
+        kernel_size : int
+            Convolution kernel size.
+        padding_size : int
+            Padding applied to convolutions.
+        input_channels : int
+            Number of input image channels.
+        """
+        # Initialize both the framework-agnostic base and the PyTorch module
+
+        nn.Module.__init__(self)
+
+        self.head = TorchConvBlock(
+            input_channels, num_features, kernel_size, padding_size, 1
+        )
+
+        self.body = nn.Sequential(
+            *[
+                TorchConvBlock(
+                    max(num_features // (2**i), min_num_features),
+                    max(num_features // (2 ** (i + 1)), min_num_features),
+                    kernel_size,
+                    padding_size,
+                    1,
+                )
+                for i in range(num_layer - 2)
+            ]
+        )
+
+        output_channels = max(num_features // (2 ** (num_layer - 2)), min_num_features)
+        self.tail = nn.Conv2d(
+            output_channels, 1, kernel_size=kernel_size, stride=1, padding=padding_size
+        )
+
+    def forward(self, generated_facie: torch.Tensor) -> torch.Tensor:
+        """Discriminate input facies images.
+
+        Parameters
+        ----------
+        generated_facie : torch.Tensor
+            Input tensor containing facies images.
+
+        Returns
+        -------
+        torch.Tensor
+            Discrimination scores with shape ``(B, 1, H_out, W_out)``. The
+            returned tensor is not reduced to a scalar so callers can compute
+            patch-wise or global losses as required.
+        """
+        scores = self.head(generated_facie)
+        scores = self.body(scores)
+        scores = self.tail(scores)
+
+        return scores
+
+
+class TorchColorQuantization(nn.Module):
+    """Quantize output to a small set of pure colors.
+
+    During training this module performs a soft (differentiable) assignment
+    of each pixel to a small palette of pure colors using a temperature-
+    scaled softmax over negative squared distances. During evaluation it
+    performs a hard nearest-color lookup to produce discrete colors.
+
+    The palette is registered as a buffer and expects generator outputs in
+    the ``[-1, 1]`` range (tanh output).
+    """
+
+    def __init__(self, temperature: float = 0.1) -> None:
+        """Create a ColorQuantization module.
+
+        Parameters
+        ----------
+        temperature : float, optional
+            Softmax temperature used during training for soft assignments.
+        """
+        super().__init__()
+        self.temperature = temperature
+
+        # Define pure colors in [-1, 1] range (tanh output range)
+        # Black, Red, Green, Blue
+        self.register_buffer(
+            "pure_colors",
+            torch.tensor(
+                [
+                    [-1.0, -1.0, -1.0],
+                    [1.0, -1.0, -1.0],
+                    [-1.0, 1.0, -1.0],
+                    [-1.0, -1.0, 1.0],
+                ],
+                dtype=torch.float32,
+            ),
+        )
+        self.pure_colors: torch.Tensor
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Quantize RGB output to pure colors.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape (B, 3, H, W) with values in [-1, 1].
+
+        Returns
+        -------
+        torch.Tensor
+            Quantized tensor with same shape.
+        """
+        if not self.training:
+            # Hard quantization during inference
+            b, c, h, w = x.shape
+            # Use contiguous to avoid view issues
+            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)
+
+            # Calculate distances to pure colors using explicit operations
+            # Avoid cdist which can create complex views
+            # ||x - c||^2 = ||x||^2 + ||c||^2 - 2*x*c
+            x_norm = (x_flat**2).sum(dim=1, keepdim=True)
+            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)
+            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, self.pure_colors.t())
+
+            # Get nearest color
+            indices = torch.argmin(distances, dim=1)
+            quantized = self.pure_colors[indices]
+
+            return quantized.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+        else:
+            # Soft quantization during training (differentiable)
+            b, c, h, w = x.shape
+            # Use contiguous to avoid view issues
+            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)
+
+            # Calculate distances using explicit operations (avoid cdist)
+            x_norm = (x_flat**2).sum(dim=1, keepdim=True)
+            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)
+            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, self.pure_colors.t())
+
+            # Soft assignment using softmax
+            weights = F.softmax(-distances / self.temperature, dim=1)
+
+            # Weighted sum of pure colors
+            quantized = torch.mm(weights, self.pure_colors)
+
+            return quantized.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
