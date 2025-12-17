@@ -9,6 +9,7 @@ input/output shapes where helpful.
 
 import hashlib
 from collections import OrderedDict
+import os
 from typing import Any, Self, cast
 
 import numpy as np
@@ -495,6 +496,26 @@ def apply_well_mask(
                 result[final_mask] = well_2d[final_mask, 0]
 
     return result
+
+
+def create_dirs(path: str) -> None:
+    """Create directory and all parent directories if they don't exist.
+
+    Parameters
+    ----------
+    path : str
+        Directory path to create.
+
+    Raises
+    ------
+    RuntimeError
+        If directory creation fails.
+    """
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError as e:
+        msg = "Error creating directory:"
+        raise RuntimeError(msg, path, e)
 
 
 def to_device(

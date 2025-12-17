@@ -7,7 +7,6 @@ gradient-penalty and noise generation.
 """
 
 import math
-import os
 import random
 from collections.abc import Sequence
 from typing import cast
@@ -352,23 +351,3 @@ def calc_diversity_loss(
     )
 
     return diversity_loss
-
-
-def create_dirs(path: str) -> None:
-    """Create directory and all parent directories if they don't exist.
-
-    Parameters
-    ----------
-    path : str
-        Directory path to create.
-
-    Raises
-    ------
-    RuntimeError
-        If directory creation fails.
-    """
-    try:
-        os.makedirs(path, exist_ok=True)
-    except OSError as e:
-        msg = "Error creating directory:"
-        raise RuntimeError(msg, path, e)

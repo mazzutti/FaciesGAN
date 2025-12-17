@@ -7,12 +7,13 @@ Much more responsive than matplotlib with better interactivity.
 # pyright: reportUnknownMemberType=false
 import os
 import time
+import torch
 
 import numpy as np
-import torch
 from tensorboardX import SummaryWriter  # pyright: ignore
 
 from metrics import ScaleMetrics
+from typedefs import TTensor
 
 
 class TensorBoardVisualizer:
@@ -91,8 +92,8 @@ class TensorBoardVisualizer:
     def update(
         self,
         epoch: int,
-        scale_metrics: ScaleMetrics[torch.Tensor] | dict[int, dict[str, float]],
-        generated_samples: dict[int, torch.Tensor] | None = None,
+        scale_metrics: ScaleMetrics[TTensor] | dict[int, dict[str, float]],
+        generated_samples: dict[int, TTensor] | None = None,
         samples_processed: int = 0,
     ) -> None:
         """Update TensorBoard with per-scale metrics and optional images.
@@ -203,7 +204,10 @@ class TensorBoardVisualizer:
             print(f"   Logging {len(generated_samples)} sample images...")
             for scale, sample in generated_samples.items():
                 # Convert to numpy
-                img = sample.detach().cpu().numpy()
+                if isinstance(sample, torch.Tensor):
+                    img = np.array(sample.detach().cpu())
+                else:
+                    img = np.array(sample)
 
                 # Handle different tensor formats
                 if img.ndim == 4:  # (B, C, H, W)
