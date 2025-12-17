@@ -16,7 +16,13 @@ This repository implements FaciesGAN to generate transversal geological facies r
 ## 🏗️ Architecture Components
 
 ### Core Modules
-* **`models/`** - Generator and Discriminator networks with custom layers
+* **`models/`** - Model code. The project uses a framework-agnostic base plus framework-specific
+    implementations under `models/torch/` (PyTorch).
+    - `models/base.py` - Framework-agnostic `FaciesGAN` base class and abstract hooks
+    - `models/torch/` - PyTorch adapter implementations: `generator.py`, `discriminator.py`,
+        `facies_gan.py`, and helper `types.py`
+    - Custom layers and utilities are colocated with the framework adapter to keep
+        framework-specific logic separated from the core orchestration.
 * **`interpolators/`** - Multi-scale interpolation strategies:
   - `BaseInterpolator`: Common functionality for all interpolators
   - `NearestInterpolator`: Fast nearest-neighbor interpolation
@@ -41,10 +47,11 @@ FaciesGAN/
 │   ├── neural.py            # Neural network interpolator
 │   └── well.py              # Well-conditioned interpolator
 ├── models/
-│   ├── generator.py         # Multi-scale generator
-│   ├── discriminator.py     # Multi-scale discriminator
-│   ├── custom_layer.py      # Custom neural network layers
-│   └── facies_gan.py        # Main FaciesGAN model
+│   ├── base.py              # Framework-agnostic FaciesGAN base class
+│   ├── torch/               # PyTorch framework-specific implementations
+│   │   ├── generator.py     # Multi-scale generator (PyTorch)
+│   │   ├── discriminator.py # Multi-scale discriminator (PyTorch)
+│   │   └── facies_gan.py    # PyTorch FaciesGAN adapter
 ├── results/                 # Training outputs and generated facies
 ├── train.py                 # Training script
 ├── gen_facies.py            # Facies generation script
@@ -88,6 +95,15 @@ python main.py --input_path data --num_iter 40 --batch_size 200 \
     --min_size 16 --max_size 128 --stop_scale 8 --num_parallel_scales 2
 ```
 
+### Smoke test (one-iteration run)
+Run a short smoke test to validate the environment and the recent refactors:
+```sh
+./.venv/bin/python main.py --input-path data --output-path results/ \\
+    --num-train-pyramids 1 --num-iter 1 --num-parallel-scales 7 \\
+    --no-tensorboard --use-wells --use-seismic
+```
+This is the exact command used during development for a quick end-to-end sanity check.
+
 ### Performance Profiling
 
 Enable PyTorch profiler with the `--use-profiler` flag to analyze performance bottlenecks.
@@ -126,13 +142,99 @@ python main.py --input_path data --num_iter 100 --batch_size 200 \
 must be captured during execution. Launch Instruments and start recording before running training.
 
 **Key Training Parameters:**
-* `--min_size`: Starting resolution for coarse scale (default: 16)
-* `--max_size`: Final high-resolution output (default: 128)
-* `--stop_scale`: Number of scales in the pyramid (default: 8)
-* `--num_train_facies`: Number of facies images to use for training
-* `--batch_size`: Batch size for training
-* `--num_iter`: Training iterations per scale
-* `--save_interval`: Save checkpoint every N iterations
+**Key Training Parameters:**
+- `--min_size`: Starting resolution for coarse scale (int, default: 16)
+- `--max_size`: Final high-resolution output (int, default: 128)
+- `--stop_scale`: Number of scales in the pyramid (int, default: 8)
+- `--num_train_pyramids`: Number of pyramid groups sampled per training step (int, default: 1)
+- `--num_train_facies`: Number of facies images to use for training (int, default: 200)
+- `--batch_size`: Batch size for training (int, default: 200)
+- `--num_iter`: Training iterations per scale (int, default: 40)
+- `--save_interval`: Save checkpoint every N iterations (int, default: 10)
+- `--num_parallel_scales`: Number of scales trained in parallel per group (int, default: 2)
+- `--well-loss-penalty`: Multiplier applied to well-conditioning loss (float, default: 10.0)
+- `--lr_g`, `--lr_d`: Learning rates for generator and discriminator (float, default: 0.0005)
+- `--alpha`: Reconstruction loss weight (float, default: 100)
+- `--beta`: Well conditioning weight (float, default: 0.1)
+- `--gpu_device`: GPU device index or identifier (int, default: 0). If not available, CPU or MPS backends are used when supported.
+- `--use-profiler`: Enable PyTorch profiler (flag). Produces Chrome traces on CUDA/CPU and OS Signpost traces for MPS.
+- `--no-tensorboard`: Disable TensorBoard logging (flag)
+- `--use-wells`, `--use-seismic`: Enable conditioning on well and seismic data respectively (flags)
+
+## Exact defaults
+
+The authoritative defaults live in [options.py](options.py). Below are the most commonly-used defaults copied from that file for quick reference; use the linked file for the full list and authoritative source of truth.
+
+- `alpha`: 10
+- `batch_size`: 1
+- `lr_g`, `lr_d`: 5e-05
+- `min_size`: 12
+- `max_size`: 1024
+- `stop_scale`: 6
+- `num_iter`: 2000
+- `num_train_pyramids`: 200
+- `num_parallel_scales`: 2
+- `save_interval`: 100
+- `output_path`: results
+- `gpu_device`: 0
+- `use_wells`: False
+- `use_seismic`: False
+- `well_loss_penalty`: 10.0
+
+See [options.py](options.py) for the complete `TrainningOptions` defaults and per-field documentation.
+
+Below is the complete `TrainningOptions` field list and defaults (authoritative source: [options.py](options.py)).
+
+- `alpha` (int): 10
+- `batch_size` (int): 1
+- `beta1` (float): 0.5
+- `crop_size` (int): 256
+- `discriminator_steps` (int): 3
+- `num_img_channels` (int): 3
+- `gamma` (float): 0.9
+- `generator_steps` (int): 3
+- `gpu_device` (int): 0
+- `img_color_range` (tuple[int,int]): (0, 255)
+- `input_path` (str): "data"
+- `kernel_size` (int): 3
+- `lambda_grad` (float): 0.1
+- `lr_d` (float): 5e-05
+- `lr_decay` (int): 1000
+- `lr_g` (float): 5e-05
+- `manual_seed` (int | None): None
+- `max_size` (int): 1024
+- `min_num_feature` (int): 32
+- `min_size` (int): 12
+- `noise_amp` (float): 0.1
+- `min_noise_amp` (float): 0.1
+- `scale0_noise_amp` (float): 1.0
+- `well_loss_penalty` (float): 10.0
+- `lambda_diversity` (float): 1.0
+- `num_diversity_samples` (int): 3
+- `num_feature` (int): 32
+- `num_generated_per_real` (int): 5
+- `num_iter` (int): 2000
+- `num_layer` (int): 5
+- `noise_channels` (int): 3
+- `num_real_facies` (int): 5
+- `num_train_pyramids` (int): 200
+- `num_parallel_scales` (int): 2
+- `num_workers` (int): 4
+- `output_path` (str): "results"
+- `padding_size` (int): 0
+- `regen_npy_gz` (bool): False
+- `save_interval` (int): 100
+- `start_scale` (int): 0
+- `stride` (int): 1
+- `stop_scale` (int): 6
+- `use_cpu` (bool): False
+- `use_wells` (bool): False
+- `use_seismic` (bool): False
+- `wells_mask_columns` (tuple[int, ...]): ()
+- `enable_tensorboard` (bool): True
+- `enable_plot_facies` (bool): True
+
+If you rely on these defaults programmatically, prefer importing `TrainningOptions` from `options.py` to ensure you always have the authoritative values.
 
 ### Generating New Facies
 Generate new facies realizations from trained models:
@@ -311,6 +413,20 @@ mypy .
 * ✅ **Performance Profiling**: Added `--use-profiler` flag with backend-specific
     profiling support: Chrome traces for CUDA/CPU, OS Signpost traces for MPS
     with automatic Xcode Instruments integration.
+
+- ✅ **Well-conditioning parameter**: Added `--well-loss-penalty` (float, default
+    10.0) to control the multiplier applied to well-conditioning loss terms during
+    training. Set this flag to adjust how strongly generated facies honor well
+    constraints.
+
+**Implementation notes & small tips**
+- `models/torch/` now contains the PyTorch-specific implementations; `models/base.py`
+    contains the framework-agnostic orchestration and abstract hooks.
+- `load_amp` support for scale amplitude files was added to `models/base.py` so
+    pyramid amplitude files (`*.pt`) are loaded automatically during resume.
+- Weight initialization: you can initialize model weights on CPU and then call
+    `model.to(device)`. This reduces unnecessary GPU memory use during init. If
+    a specific init requires device tensors, create them on the target device.
 
 ### Breaking Changes
 * `generate.py` renamed to `gen_facies.py`
