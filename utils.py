@@ -8,17 +8,20 @@ input/output shapes where helpful.
 """
 
 import hashlib
-from collections import OrderedDict
+import random
 import os
+from collections import OrderedDict
 from typing import Any, Self, cast
 
 import numpy as np
+from numpy.typing import NDArray
 import scipy.stats as st
 import torch
 from PIL import Image, ImageDraw, ImageFont
 
+import mlx.core as mx
+
 from config import RESULTS_DIR
-from ops import torch2np
 
 
 class ExtractUniqueColors:
@@ -371,7 +374,35 @@ class QuantizeToPureColors:
         return self._cache
 
 
-# Quantizer instances should be created where needed (see note above).
+def set_seed(seed: int = 42) -> None:
+    """Set seeds for torch, numpy and python.random at module level.
+
+    Keeping a module-level `set_seed` makes it easy for other modules to
+    call it without constructing a `NeuralSmoother` instance. The
+    `NeuralSmoother.set_seed` method remains as a thin wrapper that
+    delegates to this function to preserve backward compatibility.
+    """
+    seed_int = int(seed)
+    torch.manual_seed(seed_int)  # pyright: ignore
+    np.random.seed(seed_int)
+    random.seed(seed_int)
+
+
+def resolve_device() -> torch.device:
+    """Return the preferred device: MPS (Apple), CUDA, or CPU.
+
+    Exposed at module level so other modules can determine the best device
+    without constructing a `NeuralSmoother` instance.
+    """
+    if (
+        getattr(torch.backends, "mps", None) is not None
+        and getattr(torch.backends.mps, "is_available", lambda: False)()
+        and getattr(torch.backends.mps, "is_built", lambda: True)()
+    ):
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
 
 
 def apply_well_mask(
@@ -518,6 +549,186 @@ def create_dirs(path: str) -> None:
         raise RuntimeError(msg, path, e)
 
 
+def np2torch(np_array: NDArray[np.float32], normalize: bool = False) -> torch.Tensor:
+    """Convert NumPy array to PyTorch tensor with optional normalization.
+
+    Parameters
+    ----------
+    np_array : NDArray[np.float32]
+        Input NumPy array to convert.
+    normalize : bool, optional
+        Whether to normalize the tensor to [-1, 1] range. Defaults to False.
+
+    Returns
+    -------
+    torch.Tensor
+        Converted tensor, always normalized to [-1, 1] range.
+
+    Notes
+    -----
+    BUG: The function always applies normalization at the end, regardless of
+    the normalize parameter value. The normalize parameter causes double
+    normalization when True.
+    """
+    tensor = torch.from_numpy(np_array).float()  # type: ignore
+    if normalize:
+        tensor = norm(tensor)
+    return tensor
+
+
+def norm(x: torch.Tensor) -> torch.Tensor:
+    """Normalize tensor from [0, 1] to [-1, 1] range.
+
+    Parameters
+    ----------
+    x : torch.Tensor
+        Input tensor with values in [0, 1] range.
+
+    Returns
+    -------
+    torch.Tensor
+        Normalized tensor with values clamped to [-1, 1].
+    """
+    out = (x - 0.5) * 2
+    return out.clamp(-1, 1)
+
+
+def clamp(x: mx.array, min_val: float = -1.0, max_val: float = 1.0) -> mx.array:
+    """Clamp MLX array values to the range [min_val, max_val].
+
+    Uses elementwise minimum/maximum to avoid relying on a method
+    that may not be present on all MLX array versions.
+    """
+    return mx.minimum(
+        mx.maximum(x, mx.array(min_val, dtype=x.dtype)),
+        mx.array(max_val, dtype=x.dtype),
+    )
+
+
+def denorm(
+    tensor: torch.Tensor | mx.array, ceiling: bool = False
+) -> torch.Tensor | mx.array:
+    """Denormalize tensor from [-1, 1] to [0, 1] range.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        Input tensor with values in [-1, 1] range.
+    ceiling : bool, optional
+        Whether to set all positive values to 1. Currently not implemented.
+        Defaults to False.
+
+    Returns
+    -------
+    torch.Tensor
+        Denormalized tensor with values clamped to [0, 1].
+    """
+    tensor = (tensor + 1) / 2
+    if isinstance(tensor, torch.Tensor):
+        tensor = tensor.clamp(0, 1)
+    else:
+        tensor = clamp(tensor, 0, 1)
+    return tensor
+
+
+def torch2np(
+    tensor: torch.Tensor, denormalize: bool = False, ceiling: bool = False
+) -> NDArray[np.float32]:
+    """Convert PyTorch tensor to NumPy array with optional denormalization.
+
+    Transforms tensor from (B, C, H, W) format to (B, H, W, C) NumPy array,
+    optionally denormalizing from [-1, 1] to [0, 1] range.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor
+        Input tensor in (B, C, H, W) format.
+    denormalize : bool, optional
+        If True, denormalize from [-1, 1] to [0, 1]. Defaults to False.
+    ceiling : bool, optional
+        If True, set positive values to 1 during denormalization. Defaults to False.
+
+    Returns
+    -------
+    NDArray[np.float32]
+        NumPy array with shape (B, H, W, C) and values clipped to [0, 1].
+    """
+    if denormalize:
+        tensor = cast(torch.Tensor, denorm(tensor, ceiling))
+    np_array = tensor.detach().cpu().numpy()
+    # Support both batch tensors (B, C, H, W) and single samples (C, H, W).
+    if np_array.ndim == 4:
+        # (B, C, H, W) -> (B, H, W, C)
+        np_array = np.transpose(np_array, (0, 2, 3, 1))
+    elif np_array.ndim == 3:
+        # (C, H, W) -> (H, W, C)
+        np_array = np.transpose(np_array, (1, 2, 0))
+    else:
+        raise ValueError(f"Unsupported tensor ndim for torch2np: {np_array.ndim}")
+
+    np_array = np.clip(np_array, 0, 1)
+    return np_array.astype(np.float32)
+
+
+def mlx2np(
+    tensor: mx.array, denormalize: bool = False, ceiling: bool = False
+) -> NDArray[np.float32]:
+    """Convert PyTorch tensor to NumPy array with optional denormalization.
+
+    Transforms MLX array to NumPy array, optionally denormalizing from [-1, 1]
+    to [0, 1] range.
+
+    Parameters
+    ----------
+    tensor : mx.array
+        Input tensor in (B, C, H, W) format.
+    denormalize : bool, optional
+        If True, denormalize from [-1, 1] to [0, 1]. Defaults to False.
+    ceiling : bool, optional
+        If True, set positive values to 1 during denormalization. Defaults to False.
+
+    Returns
+    -------
+    NDArray[np.float32]
+        NumPy array with shape (B, H, W, C) and values clipped to [0, 1].
+    """
+    if denormalize:
+        tensor = cast(mx.array, denorm(tensor, ceiling))
+    np_array = np.array(tensor)
+    np_array = np.clip(np_array, 0, 1)
+    return np_array.astype(np.float32)
+
+
+def tensor2np(
+    tensor: torch.Tensor | mx.array,
+    denormalize: bool = False,
+    ceiling: bool = False,
+) -> NDArray[np.float32]:
+    """Convert PyTorch tensor or MLX array to NumPy array with optional denormalization.
+
+    Transforms tensor/array to NumPy array, optionally denormalizing from [-1, 1]
+    to [0, 1] range.
+
+    Parameters
+    ----------
+    tensor : torch.Tensor | mx.array
+        Input tensor in (B, C, H, W) format.
+    denormalize : bool, optional
+        If True, denormalize from [-1, 1] to [0, 1]. Defaults to False.
+    ceiling : bool, optional
+        If True, set positive values to 1 during denormalization. Defaults to False.
+
+    Returns
+    -------
+    NDArray[np.float32]
+        NumPy array with shape (B, H, W, C) and values clipped to [0, 1].
+    """
+    if isinstance(tensor, torch.Tensor):
+        return torch2np(tensor, denormalize, ceiling)
+    else:
+        return mlx2np(tensor, denormalize, ceiling)
+
+
 def to_device(
     tensor: torch.Tensor,
     device: torch.device,
@@ -619,11 +830,11 @@ def draw_well_arrows(
 
 
 def plot_generated_facies(
-    fake_facies: list[torch.Tensor],
-    real_facies: torch.Tensor,
+    fake_facies: list[torch.Tensor] | list[mx.array],
+    real_facies: torch.Tensor | mx.array,
     stage: int,
     index: int,
-    masks: torch.Tensor | None = None,
+    masks: torch.Tensor | mx.array | None = None,
     out_dir: str = RESULTS_DIR,
     save: bool = False,
     cell_size: int = 256,
@@ -659,19 +870,13 @@ def plot_generated_facies(
     if not save:
         return
 
-    # Support both torch.Tensor inputs and already-converted numpy arrays.
-    # If inputs are torch tensors, convert them to numpy using torch2np.
-
     num_real_facies = int(real_facies.shape[0])
     num_generated_per_real = int(fake_facies[0].shape[0])
+
     # Convert to numpy
-    fake_facies_arr = [
-        torch2np(fake_facie, denormalize=True) for fake_facie in fake_facies
-    ]
-    np_real_facies = torch2np(real_facies, denormalize=True, ceiling=True)
-    np_masks = None
-    if masks is not None:
-        np_masks = torch2np(masks)
+    fake_facies_arr = [tensor2np(fake_facie) for fake_facie in fake_facies]
+    np_real_facies = tensor2np(real_facies, denormalize=True, ceiling=True)
+    np_masks = tensor2np(masks) if masks is not None else None
 
     # Calculate grid dimensions with spacing and margins
     spacing = 20  # pixels between subplots
@@ -718,7 +923,7 @@ def plot_generated_facies(
     preprocessor = PreprocessWellMask(device=device)
     quantizer = QuantizeToPureColors(device=device)
 
-    pure_colors: np.ndarray = extractor(real_facies, 0.01)
+    pure_colors: np.ndarray = extractor(np2torch(np_real_facies), 0.01)
     pure_colors = np.asarray(pure_colors)  # Ensure pure_colors is always a ndarray
 
     for i in range(num_real_facies):

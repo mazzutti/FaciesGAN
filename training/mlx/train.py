@@ -1,0 +1,503 @@
+import os
+import random
+from typing import Any
+import mlx.core as mx
+import mlx.nn as nn  # type: ignore
+import mlx.optimizers as optim  # type: ignore
+from torch.utils.data import DataLoader
+
+import background_workers as bw
+from config import D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, SCH_D_FILE, SCH_G_FILE
+from datasets import PyramidsDataset
+from datasets.mlx.dataset import MLXPyramidsDataset
+from models import FaciesGAN
+from options import TrainningOptions
+
+from models.mlx.facies_gan import MLXFaciesGAN
+from training.base import Trainer
+from training.mlx.schedulers import MultiStepLR
+from typedefs import Batch
+from models.mlx import utils as mlx_utils
+import utils
+
+
+class MLXTrainer(
+    Trainer[
+        mx.array,
+        nn.Module,
+        optim.Optimizer,
+        MultiStepLR,
+        DataLoader[Batch[mx.array]],
+    ]
+):
+    """Parallel trainer for multi-scale progressive FaciesGAN training in MLX."""
+
+    def __init__(
+        self,
+        options: TrainningOptions,
+        fine_tuning: bool = False,
+        checkpoint_path: str = ".checkpoints",
+    ) -> None:
+        super().__init__(options, fine_tuning, checkpoint_path)
+
+    def create_dataloader(self) -> DataLoader[Batch[mx.array]]:
+        """Create and return a :class:`torch.utils.data.DataLoader` for the
+        trainer's dataset using configured batch size and worker settings.
+        """
+        return DataLoader(
+            self.dataset,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.options.num_workers,
+            persistent_workers=(self.options.num_workers > 0),
+        )
+
+    def create_model(self) -> FaciesGAN[mx.array, nn.Module]:
+        """Instantiate and return the :class:`TorchFaciesGAN` configured
+        with the trainer options and device.
+        """
+        return MLXFaciesGAN(
+            self.options,
+            self.wells,
+            self.seismic,
+            noise_channels=self.noise_channels,
+        )
+
+    def create_optimizers_and_schedulers(self, scales: list[int]) -> tuple[
+        dict[int, optim.Optimizer],
+        dict[int, optim.Optimizer],
+        dict[int, MultiStepLR],
+        dict[int, MultiStepLR],
+    ]:
+        """Create per-scale optimizers and learning-rate schedulers.
+
+        Parameters
+        ----------
+        scales : list[int]
+            List of scale indices to create optimizers/schedulers for.
+
+        Returns
+        -------
+        tuple
+            Four dictionaries mapping scale index -> optimizer/scheduler in the
+            order: ``(generator_optimizers, discriminator_optimizers,
+            generator_schedulers, discriminator_schedulers)``.
+        """
+        generator_optimizers: dict[int, optim.Optimizer] = {}
+        discriminator_optimizers: dict[int, optim.Optimizer] = {}
+        generator_schedulers: dict[int, MultiStepLR] = {}
+        discriminator_schedulers: dict[int, MultiStepLR] = {}
+
+        for scale in scales:
+            generator_optimizers[scale] = optim.Adam(
+                learning_rate=self.lr_g, betas=[self.beta1, 0.999]
+            )
+            generator_optimizers[scale].init(  # type: ignore
+                self.model.generator.gens[scale].trainable_parameters()
+            )
+            discriminator_optimizers[scale] = optim.Adam(
+                learning_rate=self.lr_d, betas=[self.beta1, 0.999]
+            )
+            discriminator_optimizers[scale].init(  # type: ignore
+                self.model.discriminator.discs[scale].trainable_parameters()
+            )
+            # Create and attach MLX MultiStepLR schedulers to optimizers
+            generator_schedulers[scale] = MultiStepLR(
+                init_lr=self.lr_g,
+                milestones=[self.lr_decay],
+                gamma=self.gamma,
+                optimizer=generator_optimizers[scale],
+            )
+            discriminator_schedulers[scale] = MultiStepLR(
+                init_lr=self.lr_d,
+                milestones=[self.lr_decay],
+                gamma=self.gamma,
+                optimizer=discriminator_optimizers[scale],
+            )
+        return (
+            generator_optimizers,
+            discriminator_optimizers,
+            generator_schedulers,
+            discriminator_schedulers,
+        )
+
+    def generate_visualization_samples(
+        self, scales: list[int], indexes: list[int]
+    ) -> dict[int, mx.array]:
+        """Generate fixed samples for visualization at specified scales.
+
+        Parameters
+        ----------
+        scales : list[int]
+            List of scale indices to generate samples for.
+        indexes : list[int]
+            List of batch sample indices.
+
+        Returns
+        -------
+        dict[int, mx.array]
+            A dictionary mapping scale indices to generated facies tensors
+            for visualization.
+        """
+        generated_samples: dict[int, mx.array] = {}
+
+        for scale in scales:
+            generated_samples[scale] = self.model.generate_fake(
+                self.model.get_noise(indexes, scale), scale
+            )
+        return generated_samples
+
+    def initialize_noise(
+        self,
+        scale: int,
+        real_facies: mx.array,
+        indexes: list[int],
+        wells: mx.array | None = None,
+        seismic: mx.array | None = None,
+    ) -> mx.array:
+        """Initialize reconstruction noise for a scale.
+
+        Parameters
+        ----------
+        scale : int
+            The current scale index.
+        real_facies : mx.array
+            The real facies tensor for the current scale.
+        indexes : list[int]
+            List of batch sample indices.
+        wells : mx.array | None, optional
+            Well-conditioning tensor for the current scale, by default None.
+        seismic : mx.array | None, optional
+            Seismic-conditioning tensor for the current scale, by default None.
+
+        Returns
+        -------
+        mx.array
+            The upsampled previous reconstruction (``prev_rec``) matching
+            ``real_facies`` spatial shape.
+
+        Side effects
+        ------------
+        - Appends the generated reconstruction noise ``z_rec`` to
+          ``self.model.rec_noise``.
+        - Updates or appends the noise amplitude entry in ``self.model.noise_amp``.
+        """
+        if scale == 0:
+            prev_rec = mx.zeros_like(real_facies)
+            z_rec = mlx_utils.generate_noise(
+                (*real_facies.shape[1:3], self.noise_channels),
+                num_samp=self.batch_size,
+            )
+            p = self.model.zero_padding
+            z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+            self.model.rec_noise.append(z_rec)
+
+            # Calculate noise amplitude for scale 0
+            fake = self.model.generator(
+                self.model.get_noise(indexes, scale),
+                [1.0] * (scale + 1),
+                stop_scale=scale,
+            )
+
+            rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
+            amp = self.options.scale0_noise_amp * rmse.item()
+            self.model.noise_amp.append(amp)
+        else:
+            # Interpolate previous scale facies
+            prev_rec = mlx_utils.interpolate(
+                self.facies[scale - 1][indexes],
+                real_facies.shape[1:3],
+            )
+
+            if wells is None:
+                if seismic is None:
+                    z_rec = mlx_utils.generate_noise(
+                        (
+                            self.noise_channels,
+                            *real_facies.shape[1:3],
+                        ),
+                        num_samp=self.batch_size,
+                    )
+                else:
+                    z_rec = mlx_utils.generate_noise(
+                        (
+                            self.noise_channels - self.num_img_channels,
+                            *real_facies.shape[1:3],
+                        ),
+                        num_samp=self.batch_size,
+                    )
+                    z_rec = mx.concatenate([z_rec, seismic], axis=1)
+            else:
+                if seismic is None:
+                    z_rec = mlx_utils.generate_noise(
+                        (
+                            self.noise_channels - self.num_img_channels,
+                            *real_facies.shape[1:3],
+                        ),
+                        num_samp=self.batch_size,
+                    )
+                    z_rec = mx.concatenate([z_rec, wells], axis=1)
+                else:
+                    z_rec = mlx_utils.generate_noise(
+                        (
+                            self.noise_channels - 2 * self.num_img_channels,
+                            *real_facies.shape[1:3],
+                        ),
+                        num_samp=self.batch_size,
+                    )
+                    z_rec = mx.concatenate([z_rec, wells, seismic], axis=1)
+
+            p = self.model.zero_padding
+            z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+            self.model.rec_noise.append(z_rec)
+
+            # Calculate noise amplitude based on reconstruction error
+            fake = self.model.generator(
+                self.model.get_noise(indexes, scale),
+                self.model.noise_amp + [1.0],
+                stop_scale=scale,
+            )
+
+            rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
+            amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
+            self.model.noise_amp.append(amp)
+
+            if scale < len(self.model.noise_amp):
+                self.model.noise_amp[scale] = (amp + self.model.noise_amp[scale]) / 2
+            else:
+                self.model.noise_amp.append(amp)
+
+        return prev_rec
+
+    def init_dataset(
+        self,
+    ) -> tuple[PyramidsDataset[mx.array], tuple[tuple[int, ...], ...]]:
+        """Initialize and possibly subsample the pyramids dataset.
+
+        Applies optional selection via ``options.wells_mask_columns`` or
+        subsamples the dataset randomly to ``options.num_train_pyramids``
+        if that value is smaller than the dataset size.
+
+        Returns
+        -------
+        tuple
+            A pair ``(dataset, scales)`` where ``dataset`` is a
+            :class:`datasets.mlx.dataset.MLXPyramidsDataset` instance and
+            ``scales`` is the tuple of pyramid scales present in the dataset.
+        """
+        dataset = MLXPyramidsDataset(self.options)
+        if len(self.options.wells_mask_columns) > 0:
+            sel = [int(i) for i in self.options.wells_mask_columns]
+            dataset.batches = [dataset.batches[i] for i in sel]
+        elif self.options.num_train_pyramids < len(dataset):
+            random.shuffle(dataset.batches)
+        return dataset, dataset.scales
+
+    def load_model(self, scale: int) -> None:
+        """Load generator and discriminator state dicts for a specific scale.
+
+        Parameters
+        ----------
+        scale : int
+            Scale index to load models for.
+        """
+        try:
+            generator_path = os.path.join(str(self.checkpoint_path), str(scale), G_FILE)
+            discriminator_path = os.path.join(
+                str(self.checkpoint_path), str(scale), D_FILE
+            )
+
+            self.model.generator.gens[scale].load_weights(
+                mlx_utils.load(generator_path)
+            )
+            self.model.discriminator.discs[scale].load_weights(
+                mlx_utils.load(discriminator_path)
+            )
+        except Exception as e:
+            print(f"Error loading models from {self.checkpoint_path}/{scale}: {e}")
+            raise
+
+    def load_optimizers(
+        self,
+        scale: int,
+        scale_path: str,
+        generator_optimizer: optim.Optimizer,
+        discriminator_optimizer: optim.Optimizer,
+        generator_scheduler: MultiStepLR,
+        discriminator_scheduler: MultiStepLR,
+    ) -> None:
+        """Load optimizer and scheduler state dictionaries from checkpoint.
+
+        If any checkpoint files are missing or incompatible a warning is
+        printed and the trainer continues without restoring those states.
+        """
+        try:
+            generator_optimizer.state = mlx_utils.load(
+                os.path.join(scale_path, OPT_G_FILE),
+                as_type=dict[str, Any],
+            )
+            discriminator_optimizer.state = mlx_utils.load(
+                os.path.join(scale_path, OPT_D_FILE),
+                as_type=dict[str, Any],
+            )
+            generator_scheduler.load_state_dict(
+                mlx_utils.load(
+                    os.path.join(scale_path, SCH_G_FILE),
+                    as_type=dict[str, Any],
+                )
+            )
+            discriminator_scheduler.load_state_dict(
+                mlx_utils.load(
+                    os.path.join(scale_path, SCH_D_FILE),
+                    as_type=dict[str, Any],
+                )
+            )
+        except Exception as e:
+            print(f"Warning: Could not load optimizers for scale {scale}: {e}")
+
+    def prepare_scale_batch(self, scales: list[int], indexes: list[int]) -> tuple[
+        dict[int, mx.array],
+        dict[int, mx.array],
+        dict[int, mx.array],
+        dict[int, mx.array],
+    ]:
+        """Prepare and move to device the batch tensors for given scales.
+
+        Parameters
+        ----------
+        scales : list[int]
+            List of scale indices to prepare batches for.
+        indexes : list[int]
+            List of batch sample indices.
+
+        Returns
+        -------
+        tuple containing:
+        - real_facies_dict: dict[int, mx.array]
+            Real facies tensors per scale moved to ``self.device`` (channels-last).
+        - masks_dict: dict[int, mx.array]
+            Well masks per scale moved to device (present when wells are used).
+        - wells_dict: dict[int, mx.array]
+            Well conditioning tensors per scale moved to device (channels-last).
+        - seismic_dict: dict[int, mx.array]
+            Seismic conditioning tensors per scale moved to device (channels-last).
+        """
+        real_facies_dict: dict[int, mx.array] = {}
+        masks_dict: dict[int, mx.array] = {}
+        wells_dict: dict[int, mx.array] = {}
+        seismic_dict: dict[int, mx.array] = {}
+
+        for scale in scales:
+            # Real facies
+            real_facies_dict[scale] = self.facies[scale][indexes]
+
+            # Wells (optional)
+            if len(self.wells) > 0:
+                wells_dev = self.wells[scale][indexes]
+                masks_dev = (wells_dev.abs().sum(dim=1, keepdim=True) > 0).int()
+                wells_dict[scale] = wells_dev
+                masks_dict[scale] = masks_dev
+
+            # Seismic (optional)
+            if len(self.seismic) > 0:
+                seismic_dev = self.seismic[scale][indexes]
+                seismic_dict[scale] = seismic_dev
+
+        return real_facies_dict, masks_dict, wells_dict, seismic_dict
+
+    def save_generated_facies(
+        self,
+        scale: int,
+        epoch: int,
+        results_path: str,
+        masks: mx.array | None = None,
+    ) -> None:
+        """Save generated facies visualizations to disk asynchronously.
+
+        This method samples noises, generates multiple facies images per real
+        sample, clips them to [-1, 1], moves them to CPU and submits a
+        background worker job to save the visualization images. Masks are
+        passed through for overlay if provided.
+        """
+        indexes = mx.random.randint(
+            0,
+            self.batch_size,
+            shape=(self.num_real_facies,),
+        )
+        real_facies = self.facies[scale][indexes]
+
+        noises = [
+            self.model.get_noise(
+                [int(index.item())] * self.num_generated_per_real, scale
+            )
+            for index in indexes
+        ]
+
+        generated_facies: list[mx.array] = [
+            self.model.generator(
+                noise, self.model.noise_amp[: scale + 1], stop_scale=scale
+            )
+            for noise in noises
+        ]
+        generated_facies = [utils.clamp(gen, -1, 1) for gen in generated_facies]
+
+        if self.enable_plot_facies:
+            # Submit background job to save the plot (non-blocking)
+            bw.submit_plot_generated_facies(
+                generated_facies,
+                real_facies,
+                scale,
+                epoch,
+                results_path,
+                masks,
+            )
+
+    def save_optimizers(
+        self,
+        scale_path: str,
+        generator_optimizer: optim.Optimizer,
+        discriminator_optimizer: optim.Optimizer,
+        generator_scheduler: MultiStepLR,
+        discriminator_scheduler: MultiStepLR,
+    ) -> None:
+        """Save optimizer and scheduler state dicts to disk using project
+        filename constants from :mod:`config`.
+        """
+        os.makedirs(scale_path, exist_ok=True)
+        mx.savez(  # type: ignore
+            os.path.join(scale_path, OPT_G_FILE),
+            **generator_optimizer.state,  # type: ignore
+        )
+        mx.savez(  # type: ignore
+            os.path.join(scale_path, OPT_D_FILE),
+            **discriminator_optimizer.state,  # type: ignore
+        )
+        mx.savez(  # type: ignore
+            os.path.join(scale_path, SCH_G_FILE),
+            **generator_scheduler.state_dict(),
+        )
+        mx.savez(  # type: ignore
+            os.path.join(scale_path, SCH_D_FILE),
+            **discriminator_scheduler.state_dict(),
+        )
+
+    def schedulers_step(
+        self,
+        generator_schedulers: dict[int, MultiStepLR],
+        discriminator_schedulers: dict[int, MultiStepLR],
+        scales: list[int],
+    ) -> None:
+        """Step the learning-rate schedulers for the provided scales.
+
+        Parameters
+        ----------
+        generator_schedulers : dict[int, MultiStepLR]
+            Generator learning-rate schedulers per scale.
+        discriminator_schedulers : dict[int, MultiStepLR]
+            Discriminator learning-rate schedulers per scale.
+        scales : list[int]
+            Scale indices to step the schedulers for.
+        """
+        for scale in scales:
+            generator_schedulers[scale].step()
+            discriminator_schedulers[scale].step()

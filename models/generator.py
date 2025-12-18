@@ -6,9 +6,13 @@ implementations (for example the PyTorch `Generator` in
 `models.torch.generator`) should implement this interface.
 """
 
+from __future__ import annotations
+
 import math
+
+import mlx.nn as nn  # type: ignore
 from abc import ABC, abstractmethod
-from typing import Any, Generic, Self
+from typing import Generic, Self
 
 from typedefs import TModule, TTensor
 
@@ -135,29 +139,50 @@ class Generator(ABC, Generic[TTensor, TModule]):
         """
 
     @abstractmethod
-    def __call__(self, *args: Any, **kwds: Any) -> TTensor:
+    def __call__(
+        self,
+        z: list[TTensor],
+        amp: list[float],
+        in_noise: TTensor | None = None,
+        start_scale: int = 0,
+        stop_scale: int | None = None,
+    ) -> TTensor:
         """Call the generator's forward method.
 
         Parameters
         ----------
-        *args : Any
-            Positional arguments to pass to `forward`.
-        **kwds : Any
-            Keyword arguments to pass to `forward`.
+        z : list[TTensor]
+            List of per-scale noise tensors.
+        amp : list[float]
+            List of per-scale amplitude scalars.
+        in_noise : TTensor | None, optional
+            Optional input noise tensor for the coarsest scale.
+            Defaults to None.
+        start_scale : int, optional
+            Scale index to start synthesis from. Defaults to 0.
+        stop_scale : int | None, optional
+            Scale index to stop synthesis at (exclusive). Defaults to None,
+            which means synthesis continues to the finest scale.
 
         Returns
         -------
         TTensor
             Output of the `forward` method.
         """
-        return super().__call__(*args, **kwds)  # type: ignore
+        return super().__call__(z, amp, in_noise, start_scale, stop_scale)  # type: ignore
 
+    @abstractmethod
     def eval(self) -> Self:
         """Set the module in evaluation mode.
 
         Returns
         -------
-        Self
+        Generator[torch.Tensor, nn.ModuleList]
             The generator instance in evaluation mode.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not implement this method.
         """
-        return super().eval()  # type: ignore
+        raise NotImplementedError("Subclasses must implement eval method.")

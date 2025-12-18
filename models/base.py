@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Generic
 
 from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
-from metrics import DiscriminatorMetrics, GeneratorMetrics
+from training.metrics import DiscriminatorMetrics, GeneratorMetrics
 from models.discriminator import Discriminator
 from models.generator import Generator
 from options import TrainningOptions
@@ -44,6 +44,9 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
     # The framework-specific discriminator instance
     discriminator: Discriminator[TTensor, TModule]
+
+    # Padding size for noise tensors
+    zero_padding: int
 
     def __init__(
         self,
@@ -203,7 +206,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         self.has_well = len(self.wells) > 0
 
     @abstractmethod
-    def backward_totals(self, totals: list[Any]) -> None:
+    def backward_totals(self, totals: list[TTensor]) -> TTensor | None:
         """Framework-specific backward operation for aggregated totals.
 
         Subclasses should implement this to call their framework's backward
@@ -214,6 +217,11 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         ----------
         totals : list[Any]
             List of total loss tensors from multiple scales to backpropagate.
+
+        Returns
+        -------
+        TTensor | None
+            Optional aggregated tensor returned by the backward call.
 
         Raises
         ------
@@ -639,12 +647,13 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         discriminator = self.discriminator.discs[scale]
         return -discriminator(fake).mean()  # type: ignore
 
+    @abstractmethod
     def compute_discriminator_metrics(
         self,
         indexes: list[int],
         scale: int,
         real_facies: TTensor,
-    ) -> DiscriminatorMetrics[TTensor]:
+    ) -> tuple[DiscriminatorMetrics[TTensor], dict[Any, Any] | None]:
         """Compute discriminator losses and gradient penalty for a scale.
 
         Parameters
@@ -658,22 +667,19 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
         Returns
         -------
-        DiscriminatorMetrics[TTensor]:
-            Container with total, real, fake and gp losses.
-        """
+        tuple[DiscriminatorMetrics[TTensor], dict[Any, Any] | None]:
+            Container with total, real, fake and gp losses, and optional gradients dict.
 
-        real_loss = -self.discriminator(scale, real_facies).mean()
-        noises = self.get_noise(indexes, scale)
-        fake = self.generate_fake(noises, scale)
-        fake_loss = self.discriminator(scale, fake.detach()).mean()  # type: ignore
-        gp_loss = self.compute_gradient_penalty(scale, real_facies, fake)
-        return DiscriminatorMetrics(
-            total=(real_loss + fake_loss + gp_loss),
-            real=real_loss,
-            fake=fake_loss,
-            gp=gp_loss,
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
+        """
+        raise NotImplementedError(
+            "Subclasses must implement compute_discriminator_metrics"
         )
 
+    @abstractmethod
     def compute_generator_metrics(
         self,
         indexes: list[int],
@@ -681,7 +687,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         real_facies: TTensor,
         masks_dict: dict[int, TTensor],
         rec_in_dict: dict[int, TTensor],
-    ) -> GeneratorMetrics[TTensor]:
+    ) -> tuple[GeneratorMetrics[TTensor], dict[Any, Any] | None]:
         """Common generator-metrics flow shared by frameworks.
 
         Parameters
@@ -699,33 +705,17 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
         Returns
         -------
-        GeneratorMetrics[TTensor]:
-            Container with total, fake, rec, well and div losses.
+        tuple[
+            GeneratorMetrics[TTensor] | dict[Any, Any] | None
+        ]:
+            Container with total, fake, rec, well and div losses, and optional gradients dict.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
         """
-
-        rec_in = rec_in_dict.get(scale)
-
-        # Generate diversity candidates (framework-agnostic forward)
-        fake_samples = self.generate_diverse_samples(indexes, scale)
-        fake = fake_samples[0]
-
-        # Delegate component computations to subclass hooks
-        adv = self.compute_adversarial_loss(scale, fake)
-        well = self.compute_masked_loss(scale, fake, real_facies, masks_dict)
-        div = self.compute_diversity_loss(fake_samples)
-        rec_loss = self.compute_recovery_loss(indexes, scale, rec_in, real_facies)
-
-        total = adv + well + rec_loss + div
-
-        metrics = GeneratorMetrics(
-            total=total,
-            fake=adv,
-            rec=rec_loss,
-            well=well,
-            div=div,
-        )
-
-        return metrics
+        raise NotImplementedError("Subclasses must implement compute_generator_metrics")
 
     def generate_diverse_samples(self, indexes: list[int], scale: int) -> list[TTensor]:
         """Generate multiple candidate outputs for `scale` using current generator.
@@ -1136,9 +1126,14 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
                 real_facies = real_facies_dict[scale]
 
-                step_metrics[scale] = self.compute_discriminator_metrics(
+                step_metrics[scale], gradients = self.compute_discriminator_metrics(
                     indexes, scale, real_facies
                 )
+
+                if gradients is not None:
+                    discriminator_optimizers[scale].update(
+                        self.discriminator.discs[scale], gradients
+                    )
 
             # Backward only the current step's totals
             if step_metrics:
@@ -1217,9 +1212,14 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
                         "Call the project's noise initialization before training."
                     )
 
-                metrics = self.compute_generator_metrics(
+                metrics, gradients = self.compute_generator_metrics(
                     indexes, scale, real_facies, masks_dict, rec_in_dict
                 )
+
+                if gradients is not None:
+                    generator_optimizers[scale].update(
+                        self.generator.gens[scale], gradients
+                    )
 
                 scale_results[scale] = metrics
 

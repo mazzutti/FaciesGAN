@@ -13,8 +13,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-import datasets.utils as utils
-from data_files import DataFiles
+import datasets.utils as data_utils
+from datasets.data_files import DataFiles
 from interpolators.base import BaseInterpolator
 from interpolators.config import InterpolatorConfig
 
@@ -75,9 +75,9 @@ class WellInterpolator(BaseInterpolator):
 
         logger.info("Rendering with trace-wise nearest neighbor interpolation...")
 
-        well_mapping = utils.as_wells_mapping(DataFiles.WELLS)
+        well_mapping = data_utils.as_wells_mapping(DataFiles.WELLS)
 
-        facie = utils.load_image(image_path)
+        facie = data_utils.load_image(image_path)
 
         height, width = facie.shape[:2]
         well_column = well_mapping[image_path.stem][0]

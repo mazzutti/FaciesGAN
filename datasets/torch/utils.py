@@ -13,8 +13,8 @@ import torch
 from joblib import Memory  # type: ignore
 
 import datasets.torch.utils as torch_utils
-import datasets.utils as utils
-from data_files import DataFiles
+import datasets.utils as data_utils
+from datasets.data_files import DataFiles
 from interpolators.config import InterpolatorConfig
 from interpolators.nearest import NearestInterpolator
 from interpolators.neural import NeuralSmoother
@@ -43,8 +43,8 @@ def to_facies_pyramids(
         A tuple where each element is a PyTorch tensor containing all facies at
         that scale with shape ``(N, C, H, W)`` (N images, C channels).
     """
-    facies_paths = utils.as_image_file_list(DataFiles.FACIES)
-    models_paths = utils.as_model_file_list(DataFiles.FACIES)
+    facies_paths = data_utils.as_image_file_list(DataFiles.FACIES)
+    models_paths = data_utils.as_model_file_list(DataFiles.FACIES)
 
     # If no facies files or models are available, return per-scale empty tensors
     if len(facies_paths) == 0 or len(models_paths) == 0:
@@ -90,7 +90,7 @@ def to_seismic_pyramids(
     -----
     Uses NearestInterpolator and caches results in ``./.cache``.
     """
-    seismic_paths = utils.as_image_file_list(DataFiles.SEISMIC)
+    seismic_paths = data_utils.as_image_file_list(DataFiles.SEISMIC)
     # If no seismic files available return empty per-scale tensors
     if len(seismic_paths) == 0:
         pyramids: list[torch.Tensor] = []
@@ -138,7 +138,7 @@ def to_wells_pyramids(
     """
     wells_interpolator = WellInterpolator(InterpolatorConfig())
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
-    wells_paths = utils.as_image_file_list(DataFiles.WELLS)
+    wells_paths = data_utils.as_image_file_list(DataFiles.WELLS)
 
     # If no wells files available return empty per-scale tensors
     if len(wells_paths) == 0:

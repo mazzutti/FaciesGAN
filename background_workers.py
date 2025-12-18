@@ -23,17 +23,18 @@ from concurrent.futures import Future, ProcessPoolExecutor
 from typing import Optional
 
 import torch
+import mlx.core as mx
 
 logger = logging.getLogger(__name__)
 
 
 def _save_plot_task(
-    fake_list: list[torch.Tensor],
-    real_arr: torch.Tensor,
+    fake_list: list[torch.Tensor] | list[mx.array],
+    real_arr: torch.Tensor | mx.array,
     stage: int,
     index: int,
     out_dir: str,
-    masks_arr: torch.Tensor | None = None,
+    masks_arr: torch.Tensor | mx.array | None = None,
 ) -> bool:
     # Import locally so the worker process has its own module imports
     from utils import plot_generated_facies
@@ -120,12 +121,12 @@ class BackgroundWorker:
 
     def submit_plot_generated_facies(
         self,
-        fake_list: list[torch.Tensor],
-        real: torch.Tensor,
+        fake_list: list[torch.Tensor] | list[mx.array],
+        real: torch.Tensor | mx.array,
         stage: int,
         index: int,
         out_dir: str,
-        masks: torch.Tensor | None = None,
+        masks: torch.Tensor | mx.array | None = None,
         wait_if_full: bool = True,
         timeout: Optional[float] = None,
     ) -> Future[bool]:
@@ -218,12 +219,12 @@ class BackgroundWorker:
 
 
 def submit_plot_generated_facies(
-    fake_list: list[torch.Tensor],
-    real: torch.Tensor,
+    fake_list: list[torch.Tensor] | list[mx.array],
+    real: torch.Tensor | mx.array,
     stage: int,
     index: int,
     out_dir: str,
-    masks: torch.Tensor | None = None,
+    masks: torch.Tensor | mx.array | None = None,
 ) -> Future[bool]:
     """Submit a plot job using the module-level BackgroundWorker.
 

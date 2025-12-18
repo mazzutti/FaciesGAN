@@ -1,12 +1,14 @@
-from typing import Any, Generic, NamedTuple
-from collections.abc import Callable
-from typing import TypeVar
+from __future__ import annotations
+
+from typing import Any, Generic, NamedTuple, TypeVar
 
 import mlx.core as mlx_core
 import mlx.nn as mlx_nn  # type: ignore
 import mlx.optimizers as mlx_optim  # type: ignore
 import torch
 from torch.utils.data import DataLoader
+
+from training.mlx.schedulers import MultiStepLR
 
 # Generic type variables for type hinting
 T = TypeVar("T")
@@ -20,7 +22,7 @@ TDiscriminator = TypeVar("TDiscriminator")
 # Noise type variable (e.g., torch.Tensor or mx.array)
 TNoise = TypeVar("TNoise")
 
-# Module type variable (e.g., torch.nn.Module or mlx.nn.Module)
+
 TModule = TypeVar("TModule", torch.nn.Module, mlx_nn.Module)
 
 # Optimizer type variable (e.g., torch.optim or mlx.optim)
@@ -34,7 +36,7 @@ TOptimizer = TypeVar(
 TScheduler = TypeVar(
     "TScheduler",
     torch.optim.lr_scheduler.LRScheduler,
-    Callable[[float, float], Callable[[int], float]],
+    MultiStepLR,
 )
 
 

@@ -20,32 +20,16 @@ from models.torch import utils
 from models.torch.discriminator import TorchDiscriminator
 from models.torch.generator import TorchGenerator
 from options import TrainningOptions
+from training.metrics import DiscriminatorMetrics, GeneratorMetrics
 
 
 class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
     """PyTorch adapter for the framework-agnostic FaciesGAN base.
 
-    Responsibilities
-    - Implement framework-specific construction for `Generator` and
-        `Discriminator` instances.
-    - Provide device placement via `move_to_device` and implement
-        PyTorch-based serialization/deserialization hooks.
-    - Implement small PyTorch-specific losses and helpers used by the
-        base training orchestration.
-
-    Usage
-    - Instantiate with a populated `TrainningOptions` and optional
-        per-scale `wells`/`seismic` tensors. The base class handles
-        generic bookkeeping; this subclass creates framework objects and
-        implements the abstract hooks.
-
-    Notes
-    - Weight initialization is applied in `finalize_*_scale` methods. If
-        you need to initialize weights on-device (to avoid host->device
-        transfers), move modules to `self.device` before applying init.
-    - Methods in this class are small PyTorch-specific adapters; the
-        training loop and high-level orchestration remain in
-        `models.base.FaciesGAN`.
+    This class manages the lifecycle of Generators and Discriminators,
+    initializes them, and provides helpers for the training loop.
+    Unlike PyTorch, we don't inherit from a base class with a strict
+    call graph here, but rather provide the necessary functional hooks.
     """
 
     def __init__(
@@ -120,6 +104,103 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
             self.gen_input_channels,
             self.gen_output_channels,
         ).to(self.device)
+
+    def compute_discriminator_metrics(
+        self,
+        indexes: list[int],
+        scale: int,
+        real_facies: torch.Tensor,
+    ) -> tuple[DiscriminatorMetrics[torch.Tensor], dict[Any, Any] | None]:
+        """Compute discriminator losses and gradient penalty for a scale.
+
+        Parameters
+        ----------
+        indexes (list[int]):
+            Batch/sample indices used to generate fake inputs.
+        scale (int):
+            Pyramid scale index for which to compute the metrics.
+        real_facies (torch.Tensor):
+            Ground-truth tensor for the current scale.
+
+        Returns
+        -------
+        tuple[DiscriminatorMetrics[torch.Tensor], dict[Any, Any] | None]:
+            Container with total, real, fake and gp losses, and optional gradients dict.
+        """
+
+        real_loss = -self.discriminator(scale, real_facies).mean()
+        noises = self.get_noise(indexes, scale)
+        fake = self.generate_fake(noises, scale)
+        fake_loss = self.discriminator(scale, fake.detach()).mean()  # type: ignore
+        gp_loss = self.compute_gradient_penalty(scale, real_facies, fake)
+        return (
+            DiscriminatorMetrics(
+                total=(real_loss + fake_loss + gp_loss),
+                real=real_loss,
+                fake=fake_loss,
+                gp=gp_loss,
+            ),
+            None,
+        )
+
+    def compute_generator_metrics(
+        self,
+        indexes: list[int],
+        scale: int,
+        real_facies: torch.Tensor,
+        masks_dict: dict[int, torch.Tensor],
+        rec_in_dict: dict[int, torch.Tensor],
+    ) -> tuple[GeneratorMetrics[torch.Tensor], dict[Any, Any] | None]:
+        """Common generator-metrics flow shared by frameworks.
+
+        Parameters
+        ----------
+        indexes (list[int]):
+            Batch/sample indices used to generate noise.
+        scale (int):
+            Pyramid scale index for which to compute the metrics.
+        real_facies (TTensor):
+            Ground-truth tensor for the current scale.
+        masks_dict (dict[int, TTensor]):
+            Dictionary mapping scale indices to well/mask tensors.
+        rec_in_dict (dict[int, TTensor]):
+            Dictionary mapping scale indices to reconstruction inputs.
+
+        Returns
+        -------
+        tuple[
+            GeneratorMetrics[TTensor] | dict[Any, Any] | None
+        ]:
+            Container with total, fake, rec, well and div losses, and optional gradients dict.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
+        """
+        rec_in = rec_in_dict.get(scale)
+
+        # Generate diversity candidates (framework-agnostic forward)
+        fake_samples = self.generate_diverse_samples(indexes, scale)
+        fake = fake_samples[0]
+
+        # Delegate component computations to subclass hooks
+        adv = self.compute_adversarial_loss(scale, fake)
+        well = self.compute_masked_loss(scale, fake, real_facies, masks_dict)
+        div = self.compute_diversity_loss(fake_samples)
+        rec_loss = self.compute_recovery_loss(indexes, scale, rec_in, real_facies)
+
+        total = adv + well + rec_loss + div
+
+        metrics = GeneratorMetrics(
+            total=total,
+            fake=adv,
+            rec=rec_loss,
+            well=well,
+            div=div,
+        )
+
+        return metrics, None
 
     def concatenate_tensors(
         self, tensors: list[torch.Tensor], dim: int

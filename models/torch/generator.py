@@ -5,7 +5,7 @@ facies images from per-scale noise tensors, along with a simple
 ``ColorQuantization`` module used to snap outputs to a small palette.
 """
 
-from typing import Any, cast
+from typing import Self, cast
 
 import torch
 import torch.nn as nn
@@ -13,11 +13,14 @@ import torch.nn.functional as F
 
 from models.generator import Generator
 from models.torch import utils
-from models.torch.custom_layer import (TorchColorQuantization, TorchConvBlock,
-                                       TorchSPADEGenerator)
+from models.torch.custom_layer import (
+    TorchColorQuantization,
+    TorchConvBlock,
+    TorchSPADEGenerator,
+)
 
 
-class TorchGenerator(Generator[torch.Tensor, nn.ModuleList], nn.Module):
+class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
     """Multi-scale progressive generator for FaciesGAN.
 
     The generator is composed of a sequence of per-scale modules appended
@@ -49,6 +52,16 @@ class TorchGenerator(Generator[torch.Tensor, nn.ModuleList], nn.Module):
         Set of scales that use SPADE-based generation (usually coarse scales).
     color_quantizer : ColorQuantization
         Module used to quantize outputs to a small palette of colors.
+
+    Methods
+    -------
+    __call__(z, amp, in_noise=None, start_scale=0, stop_scale
+    ) -> torch.Tensor
+        Calls the generator's forward method.
+    eval() -> Self
+        Sets the module in evaluation mode.
+    forward(z, amp, in_noise=None, start_scale=0, stop_scale=None) -> torch.Tensor
+        Forward pass through the multi-scale generator.
     """
 
     def __init__(
@@ -58,7 +71,7 @@ class TorchGenerator(Generator[torch.Tensor, nn.ModuleList], nn.Module):
         padding_size: int,
         input_channels: int,
         output_channels: int = 3,
-    ):
+    ) -> None:
         """Initialize the multi-scale Generator.
 
         Parameters
@@ -77,17 +90,61 @@ class TorchGenerator(Generator[torch.Tensor, nn.ModuleList], nn.Module):
         # Initialize framework-agnostic configuration in the Generator base
         super(TorchGenerator, self).__init__(
             num_layer, kernel_size, padding_size, input_channels, output_channels
-        )  # type: ignore
+        )
         super(nn.Module, self).__init__()
 
         # Replace the generic gens container with PyTorch ModuleList
-        self.gens = cast(list[nn.Module], nn.ModuleList())
+        self.gens: list[nn.Module] = list()
 
         # Color quantization layer (framework-specific)
         self.color_quantizer = TorchColorQuantization(temperature=0.1)
 
-    def __call__(self, *args: Any, **kwds: Any) -> torch.Tensor:
-        return super().__call__(*args, **kwds)  # type: ignore
+    def __call__(
+        self,
+        z: list[torch.Tensor],
+        amp: list[float],
+        in_noise: torch.Tensor | None = None,
+        start_scale: int = 0,
+        stop_scale: int | None = None,
+    ) -> torch.Tensor:
+        """Call the generator's forward method.
+
+        Parameters
+        ----------
+        z : list[TTensor]
+            List of per-scale noise tensors.
+        amp : list[float]
+            List of per-scale amplitude scalars.
+        in_noise : TTensor | None, optional
+            Optional input noise tensor for the coarsest scale.
+            Defaults to None.
+        start_scale : int, optional
+            Scale index to start synthesis from. Defaults to 0.
+        stop_scale : int | None, optional
+            Scale index to stop synthesis at (exclusive). Defaults to None,
+            which means synthesis continues to the finest scale.
+        Returns
+        -------
+        TTensor
+            Output of the `forward` method.
+        """
+        return super().__call__(
+            z,
+            amp,
+            in_noise=in_noise,
+            start_scale=start_scale,
+            stop_scale=stop_scale,
+        )
+
+    def eval(self) -> Self:
+        """Set the module in evaluation mode.
+
+        Returns
+        -------
+        Self
+            The generator instance in evaluation mode.
+        """
+        return cast(Self, nn.Module.eval(self))
 
     def forward(
         self,
@@ -121,11 +178,12 @@ class TorchGenerator(Generator[torch.Tensor, nn.ModuleList], nn.Module):
         """
         if in_noise is None:
             channels = self.output_channels
+            batch_size = z[start_scale].shape[0]
             height, width = tuple(
                 dim - self.full_zero_padding for dim in z[start_scale].shape[2:]
             )
             out_facie = torch.zeros(
-                (z[start_scale].shape[0], channels, height, width),
+                (batch_size, channels, height, width),
                 device=z[start_scale].device,
             )
         else:

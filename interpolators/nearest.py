@@ -15,7 +15,7 @@ import torch
 from numpy.typing import NDArray
 from scipy.ndimage import zoom
 
-import datasets.utils as utils
+import datasets.utils as data_utils
 from interpolators.base import BaseInterpolator
 from interpolators.config import InterpolatorConfig
 
@@ -77,7 +77,7 @@ class NearestInterpolator(BaseInterpolator):
         # Get dimensions using base helper method
         super_height, super_width = resolutions[-1][2:]
 
-        img_np = utils.load_image(image_path)
+        img_np = data_utils.load_image(image_path)
         high_res_img = self._upsample_image(img_np, super_height, super_width)
         for _, _, new_h, new_w in resolutions[:-1]:
             interpolated_img = self._downsample_image(high_res_img, new_h, new_w)

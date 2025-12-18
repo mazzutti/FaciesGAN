@@ -11,28 +11,24 @@ fields and exposes abstract methods concrete trainers must implement.
 from __future__ import annotations
 
 import math
-from abc import ABC, abstractmethod
 import os
 import time
-from typing import Any
-
-
-from config import RESULT_FACIES_PATH
-from log import format_time
-from metrics import GeneratorMetrics, DiscriminatorMetrics, ScaleMetrics
-import utils
+from abc import ABC, abstractmethod
+from typing import Any, Dict
 
 from tensorboardX import SummaryWriter  # type: ignore
 from tqdm import tqdm
 from typing_extensions import Generic
 
+import utils
+from config import RESULT_FACIES_PATH
 from datasets import PyramidsDataset
+import log
+from training.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
 from models.base import FaciesGAN
 from options import TrainningOptions
 from tensorboard_visualizer import TensorBoardVisualizer
 from typedefs import IDataLoader, TModule, TOptimizer, TScheduler, TTensor
-from metrics import ScaleMetrics
-from typing import Dict
 
 
 class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader]):
@@ -727,7 +723,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 writer.close()
 
             group_end_time = time.time()
-            elapsed = format_time(int(group_end_time - group_start_time))
+            elapsed = log.format_time(int(group_end_time - group_start_time))
             print(f"\nScales {scales_to_train} training time: {elapsed}")
 
             scale += num_scales_in_group
@@ -735,7 +731,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         end_train_time = time.time()
         print(
             "\nTotal training time:",
-            format_time(int(end_train_time - start_train_time)),
+            log.format_time(int(end_train_time - start_train_time)),
         )
 
         # Close TensorBoard writer

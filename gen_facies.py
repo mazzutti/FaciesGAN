@@ -30,7 +30,7 @@ from config import OPT_FILE
 from datasets.torch.dataset import TorchPyramidsDataset
 from log import format_time
 from models.torch.facies_gan import TorchFaciesGAN
-from ops import torch2np
+import utils
 
 
 def generate_facies(
@@ -75,7 +75,7 @@ def generate_facies(
 
     with torch.no_grad():
         generated_facies: list[NDArray[np.float32]] = [
-            torch2np(gen_facie.unsqueeze(0), denormalize=True)
+            utils.torch2np(gen_facie.unsqueeze(0), denormalize=True)
             for gen_facie in model.generator(noises, model.noise_amp)
         ]
     return generated_facies, mask_indexes
@@ -119,8 +119,7 @@ def generate_comparison_plots(
     if scale is None:
         scale = len(model.noise_amp) - 1
 
-    facies_scale = dataset.facies_pyramids[scale]
-    wells_scale = dataset.wells_pyramids[scale]
+    facies_scale, wells_scale, _ = dataset.get_scale_data(scale)
     num_images = facies_scale.shape[0]
 
     print(f"Generating comparison plots for {num_images} facies at scale {scale}...")
@@ -181,10 +180,10 @@ def plot_mds(
     # to an ndarray (which would violate the annotated type). Use a new local
     # variable for the stacked ndarray representation.
     fake_facies_arr = np.stack(fake_facies, 0).squeeze(-1)
-    real_facies = dataset.facies_pyramids[-1]
+    real_facies, _, _ = dataset.get_scale_data(-1)
     real_facies = np.reshape(
-        torch2np(real_facies, denormalize=True),
-        [dataset.facies_pyramids[-1].shape[0], -1],
+        utils.torch2np(real_facies, denormalize=True),
+        [real_facies.shape[0], -1],
     )
     fake_facies_arr = np.reshape(fake_facies_arr, [len(mask_indexes), -1])
 
@@ -300,13 +299,14 @@ if __name__ == "__main__":
 
     dataset: TorchPyramidsDataset = TorchPyramidsDataset(options)
     masked_facies: list[torch.Tensor] = []
-    for i in range(len(dataset.facies_pyramids)):
+
+    for i in range(len(dataset)):
         masked_facies.append(
             torch.stack(
                 [
                     mask * facie
                     for mask, facie in zip(
-                        dataset.wells_pyramids[i], dataset.facies_pyramids[i]
+                        dataset.get_scale_data(i), dataset.get_scale_data(i)
                     )
                 ],
                 dim=0,

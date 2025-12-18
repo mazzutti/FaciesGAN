@@ -8,7 +8,7 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
-from data_files import DataFiles
+from datasets.data_files import DataFiles
 from options import TrainningOptions
 
 

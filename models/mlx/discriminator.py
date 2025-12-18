@@ -1,25 +1,21 @@
-"""Discriminator module used by FaciesGAN.
-
-Provides a multi-layer convolutional discriminator with a small API that
-returns per-pixel critic scores (suitable for WGAN-style losses).
-"""
-
-from typing import Self, cast
-
-import torch
-import torch.nn as nn
+import mlx.nn as nn  # type: ignore
+import mlx.core as mx
 
 from models.discriminator import Discriminator
-from models.torch.custom_layer import TorchSPADEDiscriminator
+from typing import Self, cast
+
+from models.mlx.custom_layer import MLXSPADEDiscriminator
 
 
-class TorchDiscriminator(Discriminator[torch.Tensor, nn.Module], nn.Module):
-    """Convolutional critic for facies images (WGAN-GP compatible).
+class MLXDiscriminator(Discriminator[mx.array, nn.Module], nn.Module):
+    """Convolutional critic for facies images (WGAN-GP compatible) in MLX.
+
 
     The discriminator produces a single-channel feature map of scores; for a
-    given input tensor of shape ``(B, C, H, W)`` the output shape is
-    ``(B, 1, H_out, W_out)`` where ``H_out``/``W_out`` depend on padding and
+    given input tensor of shape ``(B, H, W, C)`` the output shape is
+    ``(B, H_out, W_out, 1)`` where ``H_out``/``W_out`` depend on padding and
     kernel sizes. Higher values indicate more-realistic patches.
+
 
     Parameters
     ----------
@@ -35,6 +31,7 @@ class TorchDiscriminator(Discriminator[torch.Tensor, nn.Module], nn.Module):
         Padding size for convolutions.
     input_channels : int
         Number of input facies channels.
+
 
     Attributes
     ----------
@@ -53,24 +50,6 @@ class TorchDiscriminator(Discriminator[torch.Tensor, nn.Module], nn.Module):
         padding_size: int,
         input_channels: int,
     ) -> None:
-        """Initialize the convolutional discriminator.
-
-        Parameters
-        ----------
-        num_features : int
-            Number of features in the first convolutional layer.
-        min_num_features : int
-            Minimum number of features used when reducing channels.
-        num_layer : int
-            Number of convolutional layers.
-        kernel_size : int
-            Convolution kernel size.
-        padding_size : int
-            Padding applied to convolutions.
-        input_channels : int
-            Number of input image channels.
-        """
-        # Initialize both the framework-agnostic base and the PyTorch module
         Discriminator.__init__(  # type: ignore
             self, num_layer, kernel_size, padding_size, input_channels
         )
@@ -78,7 +57,7 @@ class TorchDiscriminator(Discriminator[torch.Tensor, nn.Module], nn.Module):
 
         self.discs: list[nn.Module] = list()
 
-    def __call__(self, scale: int, input_tensor: torch.Tensor) -> torch.Tensor:
+    def __call__(self, scale: int, input_tensor: mx.array) -> mx.array:
         return super().__call__(scale, input_tensor)
 
     def eval(self) -> Self:
@@ -91,12 +70,12 @@ class TorchDiscriminator(Discriminator[torch.Tensor, nn.Module], nn.Module):
         """
         return cast(Self, nn.Module.eval(self))
 
-    def forward(self, scale: int, input_tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, scale: int, input_tensor: mx.array) -> mx.array:
         """Discriminate input tensor and return score map tensor."""
-        return self.discs[scale](input_tensor)
+        return cast(MLXSPADEDiscriminator, self.discs[scale])(input_tensor)
 
     def create_scale(self, num_features: int, min_num_features: int) -> None:
-        spade_gen = TorchSPADEDiscriminator(
+        spade_gen = MLXSPADEDiscriminator(
             num_layer=self.num_layer,
             kernel_size=self.kernel_size,
             padding_size=self.padding_size,

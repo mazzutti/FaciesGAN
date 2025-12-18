@@ -25,27 +25,19 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
-from tensorboardX import SummaryWriter  # type: ignore
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 
-from datasets import PyramidsDataset
-from models import FaciesGAN, TorchFaciesGAN
-from typedefs import Batch
-import utils
 import background_workers as bw
-from config import (
-    D_FILE,
-    G_FILE,
-    OPT_D_FILE,
-    OPT_G_FILE,
-    SCH_D_FILE,
-    SCH_G_FILE,
-)
+import utils
+from config import D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, SCH_D_FILE, SCH_G_FILE
+from datasets import PyramidsDataset
 from datasets.torch.dataset import TorchPyramidsDataset
+from models import FaciesGAN, TorchFaciesGAN
 from models.torch import utils as torch_utils
 from options import TrainningOptions
 from training.base import Trainer
+from typedefs import Batch
 
 
 class TorchTrainer(
@@ -59,26 +51,36 @@ class TorchTrainer(
 ):
     """Parallel trainer for multi-scale progressive FaciesGAN training.
 
-    This class manages simultaneous training of multiple pyramid scales by
-    grouping scales and training each group in parallel. Each scale retains
-    its own discriminator and optimizer while the shared generator is
-    exposed through the central :class:`models.facies_gan.FaciesGAN` model.
+    Manages simultaneous training of multiple pyramid scales by grouping
+    scales and training each group in parallel. Each scale keeps its own
+    discriminator and optimizer while the shared generator is exposed via
+    the :class:`models.facies_gan.FaciesGAN` instance attached to this
+    trainer.
 
     Parameters
     ----------
     options : TrainningOptions
         Training configuration containing hyperparameters and paths.
     fine_tuning : bool, optional
-        Whether to load and fine-tune from existing checkpoints. Defaults to False.
+        Whether to load and fine-tune from existing checkpoints.
     checkpoint_path : str, optional
-        Path to load checkpoints from when fine-tuning. Defaults to ".checkpoints".
+        Base path used to load/save per-scale checkpoints.
     device : torch.device
-        Device for training (CPU, CUDA, or MPS).
+        Device used for training (cpu/cuda/mps).
 
     Attributes
     ----------
     device : torch.device
         Training device.
+    model : FaciesGAN
+        The multi-scale model instance managed by the trainer.
+
+    Notes
+    -----
+    - The trainer updates ``self.model.rec_noise`` and ``self.model.noise_amp``
+      as part of noise initialization (see :meth:`initialize_noise`).
+    - Conditioning tensors (wells/seismic) are expected channels-last when
+      prepared and returned by :meth:`prepare_scale_batch`.
     """
 
     def __init__(
@@ -104,58 +106,9 @@ class TorchTrainer(
         self.device: torch.device = device
         super().__init__(options, fine_tuning, checkpoint_path)
 
-    def init_dataset(
-        self,
-    ) -> tuple[PyramidsDataset[torch.Tensor], tuple[tuple[int, ...], ...]]:
-        """Initialize the dataset used by the trainer.
-
-        Parameters
-        ----------
-        options : TrainningOptions
-            Training options used to configure the dataset.
-
-        Returns
-        -------
-        Any
-            The dataset instance used by the trainer.
-
-        Raises
-        ------
-        NotImplementedError
-            If the subclass does not implement this method.
-        """
-        dataset = TorchPyramidsDataset(self.options)
-        if len(self.options.wells_mask_columns) > 0:
-            sel = [int(i) for i in self.options.wells_mask_columns]
-            dataset.batches = [dataset.batches[i] for i in sel]
-        elif self.options.num_train_pyramids < len(dataset):
-            idxs = torch.randperm(len(dataset))[: self.options.num_train_pyramids]
-            dataset.batches = [dataset.batches[i] for i in idxs]
-        return dataset, dataset.scales
-
-    def create_model(self) -> FaciesGAN[torch.Tensor, torch.nn.Module]:
-        """Create the model used by the trainer.
-
-        Raises
-        ------
-        NotImplementedError
-            If the subclass does not implement this method.
-        """
-        return TorchFaciesGAN(
-            self.options,
-            self.wells,
-            self.seismic,
-            self.device,
-            noise_channels=self.noise_channels,
-        )
-
     def create_dataloader(self) -> DataLoader[Batch[torch.Tensor]]:
-        """Create the data loader used by the trainer.
-
-        Raises
-        ------
-        NotImplementedError
-            If the subclass does not implement this method.
+        """Create and return a :class:`torch.utils.data.DataLoader` for the
+        trainer's dataset using configured batch size and worker settings.
         """
         return DataLoader(
             self.dataset,
@@ -166,31 +119,17 @@ class TorchTrainer(
             persistent_workers=(self.options.num_workers > 0),
         )
 
-    def schedulers_step(
-        self,
-        generator_schedulers: dict[int, LRScheduler],
-        discriminator_schedulers: dict[int, LRScheduler],
-        scales: list[int],
-    ) -> None:
-        """Step the learning rate schedulers for a specific scale.
-
-        Parameters
-        ----------
-        generator_schedulers : dict[int, TScheduler]
-            Generator learning rate schedulers per scale.
-        discriminator_schedulers : dict[int, TScheduler]
-            Discriminator learning rate schedulers per scale.
-        scales : list[int]
-            Scale indices to step the schedulers for.
-
-        Raises
-        ------
-        NotImplementedError
-            If the subclass does not implement this method.
+    def create_model(self) -> FaciesGAN[torch.Tensor, torch.nn.Module]:
+        """Instantiate and return the :class:`TorchFaciesGAN` configured
+        with the trainer options and device.
         """
-        for scale in scales:
-            generator_schedulers[scale].step()
-            discriminator_schedulers[scale].step()
+        return TorchFaciesGAN(
+            self.options,
+            self.wells,
+            self.seismic,
+            self.device,
+            noise_channels=self.noise_channels,
+        )
 
     def create_optimizers_and_schedulers(self, scales: list[int]) -> tuple[
         dict[int, optim.Optimizer],
@@ -200,10 +139,17 @@ class TorchTrainer(
     ]:
         """Create per-scale optimizers and learning-rate schedulers.
 
+        Parameters
+        ----------
+        scales : list[int]
+            List of scale indices to create optimizers/schedulers for.
+
         Returns
         -------
-        tuple of four dicts: (generator_optimizers, discriminator_optimizers,
-        generator_schedulers, discriminator_schedulers)
+        tuple
+            Four dictionaries mapping scale index -> optimizer/scheduler in the
+            order: ``(generator_optimizers, discriminator_optimizers,
+            generator_schedulers, discriminator_schedulers)``.
         """
         generator_optimizers: dict[int, optim.Optimizer] = {}
         discriminator_optimizers: dict[int, optim.Optimizer] = {}
@@ -239,67 +185,6 @@ class TorchTrainer(
             discriminator_schedulers,
         )
 
-    def prepare_scale_batch(self, scales: list[int], indexes: list[int]) -> tuple[
-        dict[int, torch.Tensor],
-        dict[int, torch.Tensor],
-        dict[int, torch.Tensor],
-        dict[int, torch.Tensor],
-    ]:
-        """Prepare and move to device the batch tensors for given scales.
-
-        Parameters
-        ----------
-        scales : list[int]
-            List of scale indices to prepare batches for.
-        indexes : list[int]
-            List of batch sample indices.
-
-        Returns
-        -------
-        tuple containing:
-        - real_facies_dict: dict[int, torch.Tensor]
-            Real facies tensors per scale moved to device.
-        - masks_dict: dict[int, torch.Tensor]
-            Well masks per scale moved to device (if wells are used).
-        - wells_dict: dict[int, torch.Tensor]
-            Well conditioning tensors per scale moved to device (if wells are used).
-        - seismic_dict: dict[int, torch.Tensor]
-            Seismic conditioning tensors per scale moved to device (if seismic is used).
-        """
-        real_facies_dict: dict[int, torch.Tensor] = {}
-        masks_dict: dict[int, torch.Tensor] = {}
-        wells_dict: dict[int, torch.Tensor] = {}
-        seismic_dict: dict[int, torch.Tensor] = {}
-
-        for scale in scales:
-            facies_batch = self.facies[scale][indexes]
-
-            # Wells (optional)
-            if len(self.wells) > 0:
-                wells_batch = self.wells[scale][indexes]
-                wells_dev = utils.to_device(
-                    wells_batch, self.device, channels_last=True
-                )
-                masks_dev = (wells_dev.abs().sum(dim=1, keepdim=True) > 0).int()
-                masks_dev = utils.to_device(masks_dev, self.device, channels_last=True)
-                wells_dict[scale] = wells_dev
-                masks_dict[scale] = masks_dev
-
-            # Seismic (optional)
-            if len(self.seismic) > 0:
-                seismic_batch = self.seismic[scale][indexes]
-                seismic_dev = utils.to_device(
-                    seismic_batch, self.device, channels_last=True
-                )
-                seismic_dict[scale] = seismic_dev
-
-            # Real facies
-            real_facies_dict[scale] = utils.to_device(
-                facies_batch, self.device, channels_last=True
-            )
-
-        return real_facies_dict, masks_dict, wells_dict, seismic_dict
-
     def generate_visualization_samples(
         self, scales: list[int], indexes: list[int]
     ) -> dict[int, torch.Tensor]:
@@ -334,25 +219,39 @@ class TorchTrainer(
         wells: torch.Tensor | None = None,
         seismic: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Initialize reconstruction noise for a specific scale.
+        """Initialize and append reconstruction noise for a specific scale.
+
+        For ``scale == 0`` this generates an initial ``z_rec`` and computes the
+        initial noise amplitude appended to ``self.model.noise_amp``. For
+        higher scales it upsamples the previous reconstruction, composes the
+        correct noise channels (optionally concatenating wells/seismic), and
+        stores the resulting ``z_rec`` in ``self.model.rec_noise``.
 
         Parameters
         ----------
         scale : int
             Current pyramid scale index.
-        wells : torch.Tensor
-            Well conditioning data.
         real_facies : torch.Tensor
-            Real facies data at the current scale.
+            Real facies data at the current scale (channels-last expected).
         indexes : list[int]
-            Batch sample indices.
+            Batch sample indices used to generate noise with deterministic
+            indexing.
+        wells : torch.Tensor | None
+            Optional wells conditioning tensor for this batch (channels-last).
+        seismic : torch.Tensor | None
+            Optional seismic conditioning tensor for this batch (channels-last).
 
-                Returns
-                -------
-                torch.Tensor
-                        The upsampled previous reconstruction (``prev_rec``) matching
-                        ``real_facies`` spatial shape. Note: reconstruction noise ``z_rec``
-                        is stored in ``self.model.rec_noise`` and is not returned.
+        Returns
+        -------
+        torch.Tensor
+            The upsampled previous reconstruction (``prev_rec``) matching
+            ``real_facies`` spatial shape.
+
+        Side effects
+        ------------
+        - Appends the generated reconstruction noise ``z_rec`` to
+          ``self.model.rec_noise``.
+        - Updates or appends the noise amplitude entry in ``self.model.noise_amp``.
         """
         # Prepare previous reconstruction
         if scale == 0:
@@ -446,6 +345,31 @@ class TorchTrainer(
 
         return prev_rec
 
+    def init_dataset(
+        self,
+    ) -> tuple[PyramidsDataset[torch.Tensor], tuple[tuple[int, ...], ...]]:
+        """Initialize and possibly subsample the pyramids dataset.
+
+        Applies optional selection via ``options.wells_mask_columns`` or
+        subsamples the dataset randomly to ``options.num_train_pyramids``
+        if that value is smaller than the dataset size.
+
+        Returns
+        -------
+        tuple
+            A pair ``(dataset, scales)`` where ``dataset`` is a
+            :class:`datasets.torch.dataset.TorchPyramidsDataset` instance and
+            ``scales`` is the tuple of pyramid scales present in the dataset.
+        """
+        dataset = TorchPyramidsDataset(self.options)
+        if len(self.options.wells_mask_columns) > 0:
+            sel = [int(i) for i in self.options.wells_mask_columns]
+            dataset.batches = [dataset.batches[i] for i in sel]
+        elif self.options.num_train_pyramids < len(dataset):
+            idxs = torch.randperm(len(dataset))[: self.options.num_train_pyramids]
+            dataset.batches = [dataset.batches[i] for i in idxs]
+        return dataset, dataset.scales
+
     def load_model(self, scale: int) -> None:
         """Load generator and discriminator state dicts for a specific scale.
 
@@ -481,7 +405,11 @@ class TorchTrainer(
         generator_scheduler: optim.lr_scheduler.LRScheduler,
         discriminator_scheduler: optim.lr_scheduler.LRScheduler,
     ) -> None:
-        """Load optimizer and scheduler state dictionaries from checkpoint."""
+        """Load optimizer and scheduler state dictionaries from checkpoint.
+
+        If any checkpoint files are missing or incompatible a warning is
+        printed and the trainer continues without restoring those states.
+        """
         try:
             generator_optimizer.load_state_dict(
                 torch_utils.load(
@@ -513,6 +441,67 @@ class TorchTrainer(
             )
         except Exception as e:
             print(f"Warning: Could not load optimizers for scale {scale}: {e}")
+
+    def prepare_scale_batch(self, scales: list[int], indexes: list[int]) -> tuple[
+        dict[int, torch.Tensor],
+        dict[int, torch.Tensor],
+        dict[int, torch.Tensor],
+        dict[int, torch.Tensor],
+    ]:
+        """Prepare and move to device the batch tensors for given scales.
+
+        Parameters
+        ----------
+        scales : list[int]
+            List of scale indices to prepare batches for.
+        indexes : list[int]
+            List of batch sample indices.
+
+        Returns
+        -------
+        tuple containing:
+        - real_facies_dict: dict[int, torch.Tensor]
+            Real facies tensors per scale moved to ``self.device`` (channels-last).
+        - masks_dict: dict[int, torch.Tensor]
+            Well masks per scale moved to device (present when wells are used).
+        - wells_dict: dict[int, torch.Tensor]
+            Well conditioning tensors per scale moved to device (channels-last).
+        - seismic_dict: dict[int, torch.Tensor]
+            Seismic conditioning tensors per scale moved to device (channels-last).
+        """
+        real_facies_dict: dict[int, torch.Tensor] = {}
+        masks_dict: dict[int, torch.Tensor] = {}
+        wells_dict: dict[int, torch.Tensor] = {}
+        seismic_dict: dict[int, torch.Tensor] = {}
+
+        for scale in scales:
+            facies_batch = self.facies[scale][indexes]
+
+            # Wells (optional)
+            if len(self.wells) > 0:
+                wells_batch = self.wells[scale][indexes]
+                wells_dev = utils.to_device(
+                    wells_batch, self.device, channels_last=True
+                )
+                masks_dev = (wells_dev.abs().sum(dim=1, keepdim=True) > 0).int()
+                masks_dev = utils.to_device(masks_dev, self.device, channels_last=True)
+                wells_dict[scale] = wells_dev
+                masks_dict[scale] = masks_dev
+
+            # Seismic (optional)
+            if len(self.seismic) > 0:
+                seismic_batch = self.seismic[scale][indexes]
+                seismic_dev = utils.to_device(
+                    seismic_batch, self.device, channels_last=True
+                )
+                seismic_dict[scale] = seismic_dev
+
+            # Real facies
+            real_facies_dict[scale] = utils.to_device(
+                facies_batch, self.device, channels_last=True
+            )
+
+        return real_facies_dict, masks_dict, wells_dict, seismic_dict
 
     def save_generated_facies(
         self,
@@ -587,3 +576,24 @@ class TorchTrainer(
         torch.save(
             discriminator_scheduler.state_dict(), os.path.join(scale_path, SCH_D_FILE)
         )
+
+    def schedulers_step(
+        self,
+        generator_schedulers: dict[int, LRScheduler],
+        discriminator_schedulers: dict[int, LRScheduler],
+        scales: list[int],
+    ) -> None:
+        """Step the learning-rate schedulers for the provided scales.
+
+        Parameters
+        ----------
+        generator_schedulers : dict[int, LRScheduler]
+            Generator learning-rate schedulers per scale.
+        discriminator_schedulers : dict[int, LRScheduler]
+            Discriminator learning-rate schedulers per scale.
+        scales : list[int]
+            Scale indices to step the schedulers for.
+        """
+        for scale in scales:
+            generator_schedulers[scale].step()
+            discriminator_schedulers[scale].step()

@@ -7,7 +7,7 @@ store numeric configuration and then implement the abstract methods.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Generic, Self
+from typing import Generic, Self
 
 from typedefs import TModule, TTensor
 
@@ -64,23 +64,24 @@ class Discriminator(ABC, Generic[TTensor, TModule]):
             Minimum number of features used when reducing channels.
         """
 
-    def __call__(self, *args: Any, **kwds: Any) -> TTensor:
+    def __call__(self, scale: int, input_tensor: TTensor) -> TTensor:
         """ "Call the discriminator's forward method.
 
         Parameters
         ----------
-        *args : Any
-            Positional arguments to pass to `forward`.
-        **kwds : Any
-            Keyword arguments to pass to `forward`.
+        scale : int
+            Scale index to select the appropriate per-scale block.
+        input_tensor : TTensor
+            Input tensor to be discriminated.
 
         Returns
         -------
         TTensor
             Output of the `forward` method.
         """
-        return super().__call__(*args, **kwds)  # type: ignore
+        return super().__call__(scale, input_tensor)  # type: ignore
 
+    @abstractmethod
     def eval(self) -> Self:
         """Set the discriminator to evaluation mode (framework-specific).
 
@@ -88,5 +89,10 @@ class Discriminator(ABC, Generic[TTensor, TModule]):
         -------
         Self
             The discriminator instance in evaluation mode.
+
+        Raises
+        ------
+        NotImplementedError
+            If the method is not implemented by the subclass.
         """
-        return super().eval()  # type: ignore
+        raise NotImplementedError("eval method must be implemented by subclasses.")

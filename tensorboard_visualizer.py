@@ -7,12 +7,12 @@ Much more responsive than matplotlib with better interactivity.
 # pyright: reportUnknownMemberType=false
 import os
 import time
-import torch
 
 import numpy as np
+import torch
 from tensorboardX import SummaryWriter  # pyright: ignore
 
-from metrics import ScaleMetrics
+from training.metrics import ScaleMetrics
 from typedefs import TTensor
 
 

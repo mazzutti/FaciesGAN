@@ -11,7 +11,7 @@ from itertools import repeat
 from torch.utils.data import Dataset
 
 from options import TrainningOptions
-from typedefs import TTensor, Batch
+from typedefs import Batch, TTensor
 
 
 class PyramidsDataset(Dataset[Batch[TTensor]]):
@@ -134,3 +134,36 @@ class PyramidsDataset(Dataset[Batch[TTensor]]):
             If the subclass does not implement this method.
         """
         raise NotImplementedError("Subclasses must implement the clean_cache method.")
+
+    @abstractmethod
+    def get_scale_data(self, scale: int) -> tuple[TTensor, ...]:
+        """Return the facies, wells and seismic tensors for a given scale.
+
+        Parameters
+        ----------
+        scale : int | None
+            Index of the scale to return. If ``None`` the finest (last)
+            scale is returned.
+
+        Returns
+        -------
+        tuple[TTensor, TTensor, TTensor]
+            Facies, wells and seismic tensors for the requested scale.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not implement this method.
+
+        Notes
+        -----
+        Subclasses are expected to populate ``self.facies_pyramids``,
+        ``self.wells_pyramids`` and ``self.seismic_pyramids`` when
+        generating pyramids (see :meth:`generate_pyramids`). If those
+        attributes are not present this method will call
+        ``self.generate_pyramids()`` and cache the results on the
+        instance before returning the requested scale.
+        """
+        raise NotImplementedError(
+            "Subclasses must implement the get_scale_data method."
+        )
