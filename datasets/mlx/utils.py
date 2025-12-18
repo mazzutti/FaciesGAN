@@ -39,7 +39,7 @@ def to_facies_pyramids(
     mlx_pyramids: list[mx.array] = []
     for pyramid in torch_pyramids:
         pyramid_mx = mx.array(pyramid.numpy())
-        pyramid_mx = cast(mx.array, mx.permute(pyramid_mx, (0, 2, 3, 1)))  # type: ignore
+        pyramid_mx = cast(mx.array, mx.transpose(pyramid_mx, (0, 2, 3, 1)))  # type: ignore
         mlx_pyramids.append(pyramid_mx)
     return tuple(mlx_pyramids)
 
@@ -69,7 +69,7 @@ def to_seismic_pyramids(
     mlx_pyramids: list[mx.array] = []
     for pyramid in torch_pyramids:
         pyramid_mx = mx.array(pyramid.numpy())
-        pyramid_mx = cast(mx.array, mx.permute(pyramid_mx, (0, 2, 3, 1)))  # type: ignore
+        pyramid_mx = cast(mx.array, mx.transpose(pyramid_mx, (0, 2, 3, 1)))  # type: ignore
         mlx_pyramids.append(pyramid_mx)
     return tuple(mlx_pyramids)
 
@@ -101,7 +101,7 @@ def to_wells_pyramids(
     mlx_pyramids: list[mx.array] = []
     for pyramid in torch_pyramids:
         pyramid_mx = mx.array(pyramid.numpy())
-        pyramid_mx = cast(mx.array, mx.permute(pyramid_mx, (0, 2, 3, 1)))  # type: ignore
+        pyramid_mx = cast(mx.array, mx.transpose(pyramid_mx, (0, 2, 3, 1)))  # type: ignore
         mlx_pyramids.append(pyramid_mx)
     return tuple(mlx_pyramids)
 
