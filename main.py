@@ -209,6 +209,11 @@ def get_arguments() -> ArgumentParser:
         help="enable using seismic data during data loading",
     )
     parser.add_argument(
+        "--use-mlx",
+        action="store_true",
+        help="enable MLX backend/model implementations when available",
+    )
+    parser.add_argument(
         "--no-tensorboard",
         action="store_true",
         help="disable TensorBoard logging during training",

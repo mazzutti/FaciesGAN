@@ -64,6 +64,7 @@ class TrainningOptions(argparse.Namespace):
         stride: int = 1,
         stop_scale: int = 6,
         use_cpu: bool = False,
+        use_mlx: bool = False,
         use_wells: bool = False,
         use_seismic: bool = False,
         wells_mask_columns: tuple[int, ...] = (),
@@ -222,6 +223,7 @@ class TrainningOptions(argparse.Namespace):
         self.stride = stride
         self.stop_scale = stop_scale
         self.use_cpu = use_cpu
+        self.use_mlx = use_mlx
         self.use_wells = use_wells
         self.use_seismic = use_seismic
         self.wells_mask_columns = wells_mask_columns
