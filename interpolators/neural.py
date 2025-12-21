@@ -213,7 +213,11 @@ class NeuralSmoother(BaseInterpolator):
             palette = self.encoder.palette_tensor.to(self.device).float()
             smooth_imgs: list[torch.Tensor] = []
 
-            for _, _, new_h, new_w in resolutions:
+            for resolution in resolutions:
+                if self.config.channels_last:
+                    _, new_h, new_w, _ = resolution
+                else:
+                    _, _, new_h, new_w = resolution
 
                 inter_probs = F.interpolate(
                     probs,
@@ -222,6 +226,7 @@ class NeuralSmoother(BaseInterpolator):
                     align_corners=False,
                     antialias=True,
                 )
+
                 inter_probs = (
                     inter_probs.squeeze(0)
                     .permute(1, 2, 0)

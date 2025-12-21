@@ -24,9 +24,42 @@ from interpolators.well import WellInterpolator
 memory = Memory("./.cache", verbose=0)
 
 
+def _stack_and_format(
+    pyramids_list: list[list[torch.Tensor]], channels_last: bool
+) -> list[torch.Tensor]:
+    """Stack per-scale lists into properly ordered tensors.
+
+    Returns a list of stacked tensors. If `channels_last` is True the
+    returned tensors have shape `(N, H, W, C)` (squeezing a trailing
+    singleton channel). Otherwise they are returned in `(N, C, H, W)`
+    by permuting the stacked result.
+    """
+    if channels_last:
+        return [torch.stack(pyramid, dim=0).squeeze(-1) for pyramid in pyramids_list]
+    return [
+        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2)
+        for pyramid in pyramids_list
+    ]
+
+
+def _empty_pyramid_tensor(scale: tuple[int, ...], channels_last: bool) -> torch.Tensor:
+    """Return an empty per-scale tensor with the correct layout.
+
+    If `channels_last` is True the returned tensor has shape
+    `(0, H, W, C)`, otherwise `(0, C, H, W)`.
+    """
+    if channels_last:
+        _, height, width, channels = scale
+        return torch.empty((0, height, width, channels), dtype=torch.float32)
+    else:
+        _, channels, height, width = scale
+        return torch.empty((0, channels, height, width), dtype=torch.float32)
+
+
 @memory.cache  # type: ignore
 def to_facies_pyramids(
     scale_list: tuple[tuple[int, ...], ...],
+    channels_last: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Generate multi-scale pyramid tensors for facies images using a neural interpolator.
 
@@ -36,6 +69,8 @@ def to_facies_pyramids(
         Tuple of scale descriptors as produced by ``ops.generate_scales``. Each
         element must be a 4-tuple ``(batch, channels, height, width)`` describing
         the target resolution.
+    channels_last : bool, optional
+            Whether the channel dimension is last in the tensor shape, by default False.
 
     Returns
     -------
@@ -48,31 +83,27 @@ def to_facies_pyramids(
 
     # If no facies files or models are available, return per-scale empty tensors
     if len(facies_paths) == 0 or len(models_paths) == 0:
-        pyramids: list[torch.Tensor] = []
-        for scale in scale_list:
-            _, channels, height, width = scale
-            pyramids.append(
-                torch.empty((0, channels, height, width), dtype=torch.float32)
-            )
-        return tuple(pyramids)
+        return tuple(
+            _empty_pyramid_tensor(scale, channels_last) for scale in scale_list
+        )
 
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
 
     for facie_path, model_path in zip(facies_paths, models_paths):
-        neural_smoother = NeuralSmoother(model_path, InterpolatorConfig())
+        neural_smoother = NeuralSmoother(
+            model_path, InterpolatorConfig(channels_last=channels_last)
+        )
         pyramid = neural_smoother.interpolate(facie_path, scale_list)
         for i in range(len(scale_list)):
             pyramids_list[i].append(torch_utils.norm(pyramid[i]))
-    pyramids = [
-        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2)
-        for pyramid in pyramids_list
-    ]
+    pyramids = _stack_and_format(pyramids_list, channels_last)
     return tuple(pyramids)
 
 
 @memory.cache  # type: ignore
 def to_seismic_pyramids(
     scale_list: tuple[tuple[int, ...], ...],
+    channels_last: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Generate multi-scale pyramid tensors for seismic images using nearest interpolation.
 
@@ -80,6 +111,8 @@ def to_seismic_pyramids(
     ----------
     scale_list : tuple[tuple[int, ...], ...]
         Tuple of scale descriptors ``(batch, channels, height, width)``.
+    channels_last : bool, optional
+        Whether the channel dimension is last in the tensor shape, by default False.
 
     Returns
     -------
@@ -93,30 +126,27 @@ def to_seismic_pyramids(
     seismic_paths = data_utils.as_image_file_list(DataFiles.SEISMIC)
     # If no seismic files available return empty per-scale tensors
     if len(seismic_paths) == 0:
-        pyramids: list[torch.Tensor] = []
-        for scale in scale_list:
-            _, channels, height, width = scale
-            pyramids.append(
-                torch.empty((0, channels, height, width), dtype=torch.float32)
-            )
-        return tuple(pyramids)
+        return tuple(
+            _empty_pyramid_tensor(scale, channels_last) for scale in scale_list
+        )
 
-    seismic_interpolator = NearestInterpolator(InterpolatorConfig())
+    seismic_interpolator = NearestInterpolator(
+        InterpolatorConfig(channels_last=channels_last)
+    )
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
     for seismic_path in seismic_paths:
         pyramid = seismic_interpolator.interpolate(seismic_path, scale_list)
         for i in range(len(scale_list)):
             pyramids_list[i].append(norm(pyramid[i]))
-    pyramids = [
-        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2)
-        for pyramid in pyramids_list
-    ]
+
+    pyramids = _stack_and_format(pyramids_list, channels_last)
     return tuple(pyramids)
 
 
 @memory.cache  # type: ignore
 def to_wells_pyramids(
     scale_list: tuple[tuple[int, ...], ...],
+    channels_last: bool = False,
 ) -> tuple[torch.Tensor, ...]:
     """Generate multi-scale pyramid tensors for well location data.
 
@@ -124,6 +154,8 @@ def to_wells_pyramids(
     ----------
     scale_list : tuple[tuple[int, ...], ...]
         Tuple of scale descriptors ``(batch, channels, height, width)``.
+    channels_last : bool, optional
+        Whether the channel dimension is last in the tensor shape, by default False.
 
     Returns
     -------
@@ -136,19 +168,17 @@ def to_wells_pyramids(
     -----
     Uses ``WellInterpolator`` and caches results in ``./.cache``.
     """
-    wells_interpolator = WellInterpolator(InterpolatorConfig())
+    wells_interpolator = WellInterpolator(
+        InterpolatorConfig(channels_last=channels_last)
+    )
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
     wells_paths = data_utils.as_image_file_list(DataFiles.WELLS)
 
     # If no wells files available return empty per-scale tensors
     if len(wells_paths) == 0:
-        pyramids: list[torch.Tensor] = []
-        for scale in scale_list:
-            _, channels, height, width = scale
-            pyramids.append(
-                torch.empty((0, channels, height, width), dtype=torch.float32)
-            )
-        return tuple(pyramids)
+        return tuple(
+            _empty_pyramid_tensor(scale, channels_last) for scale in scale_list
+        )
 
     for facie_path in wells_paths:
         pyramid = wells_interpolator.interpolate(facie_path, scale_list)  # type: ignore
@@ -159,10 +189,8 @@ def to_wells_pyramids(
             mask = (well_data.abs() > 0.001).float()
             normalized = norm(well_data) * mask
             pyramids_list[i].append(normalized)
-    pyramids = [
-        torch.stack(pyramid, dim=0).squeeze(1).permute(0, 3, 1, 2)
-        for pyramid in pyramids_list
-    ]
+
+    pyramids = _stack_and_format(pyramids_list, channels_last)
     return tuple(pyramids)
 
 

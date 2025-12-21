@@ -84,7 +84,11 @@ class WellInterpolator(BaseInterpolator):
         well_trace = facie[:, well_column, :]
 
         # Process each resolution
-        for _, _, new_h, new_w in resolutions:
+        for resolution in resolutions:
+            if self.config.channels_last:
+                _, new_h, new_w, _ = resolution
+            else:
+                _, _, new_h, new_w = resolution
             # Scale the column position proportionally
             scaled_column = int(well_column * new_w / width)
             scaled_column = min(new_w - 1, max(0, scaled_column))

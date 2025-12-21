@@ -71,6 +71,7 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
         options: TrainningOptions,
         shuffle: bool = False,
         regenerate: bool = False,
+        channels_last: bool = True,
     ) -> None:
         """Initialize dataset and optionally shuffle or regenerate caches.
 
@@ -81,13 +82,22 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
             `use_seismic` and scale generation parameters.
         shuffle : bool, optional
             Shuffle dataset order immediately after loading, by default False.
-        regenerate : bool, optional
+        regenerate : bool, optional`
             Clear in-memory pyramid cache and regenerate precomputed pyramids,
             by default False.
+        channels_last : bool, optional
+            Whether the channel dimension is last in the tensor shape, by
         """
-        super().__init__(options, shuffle=shuffle, regenerate=regenerate)
+        super().__init__(
+            options,
+            shuffle=shuffle,
+            regenerate=regenerate,
+            channels_last=channels_last,
+        )
 
-    def generate_pyramids(self) -> tuple[tuple[mx.array, ...], ...]:
+    def generate_pyramids(
+        self, channels_last: bool = True
+    ) -> tuple[tuple[mx.array, ...], ...]:
         """Generate the scales list used by the dataset.
 
         Returns
@@ -100,26 +110,36 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
         NotImplementedError
             If the subclass does not implement this method.
         """
-        facies_pyramids = mlx_utils.to_facies_pyramids(self.scales)
-        wells_pyramids = mlx_utils.to_wells_pyramids(self.scales)
-        seismic_pyramids = mlx_utils.to_seismic_pyramids(self.scales)
+        facies_pyramids = mlx_utils.to_facies_pyramids(
+            self.scales, channels_last=channels_last
+        )
+        wells_pyramids = mlx_utils.to_wells_pyramids(
+            self.scales, channels_last=channels_last
+        )
+        seismic_pyramids = mlx_utils.to_seismic_pyramids(
+            self.scales, channels_last=channels_last
+        )
 
         return facies_pyramids, wells_pyramids, seismic_pyramids
 
-    def generate_scales(self, options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
+    def generate_scales(
+        self, options: TrainningOptions, channels_last: bool = True
+    ) -> tuple[tuple[int, ...], ...]:
         """Generate the scales list used by the dataset.
 
         Parameters
         ----------
         options : TrainningOptions
             Training options that include scale generation parameters.
+        channels_last : bool, optional
+            Whether the channel dimension is last in the tensor shape, by default True.
 
         Returns
         -------
         tuple[tuple[int, ...], ...]
             Tuple of scale descriptors as produced by ``utils.generate_scales``.
         """
-        return data_utils.generate_scales(options)
+        return data_utils.generate_scales(options, channels_last)
 
     def shuffle(self) -> None:
         """Shuffle the dataset samples in-place."""

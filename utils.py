@@ -11,7 +11,7 @@ import hashlib
 import random
 import os
 from collections import OrderedDict
-from typing import Any, Self, cast
+from typing import Any, Self, cast, Sequence
 
 import numpy as np
 from numpy.typing import NDArray
@@ -570,9 +570,19 @@ def np2torch(np_array: NDArray[np.float32], normalize: bool = False) -> torch.Te
     the normalize parameter value. The normalize parameter causes double
     normalization when True.
     """
-    tensor = torch.from_numpy(np_array).float()  # type: ignore
+    # Support input layouts: (B, H, W, C), (H, W, C) or (H, W) grayscale.
+    arr = np_array
+    if arr.ndim == 4:
+        # (B, H, W, C) -> (B, C, H, W)
+        arr = np.transpose(arr, (0, 3, 1, 2))
+    elif arr.ndim == 3:
+        # (H, W, C) -> (C, H, W)
+        arr = np.transpose(arr, (2, 0, 1))
+    # For 2D arrays leave as-is (H, W) -> treat as single-channel
+    tensor = torch.from_numpy(arr).float()  # type: ignore
     if normalize:
         tensor = norm(tensor)
+    mx.eval(tensor)  # type: ignore
     return tensor
 
 
@@ -599,10 +609,11 @@ def clamp(x: mx.array, min_val: float = -1.0, max_val: float = 1.0) -> mx.array:
     Uses elementwise minimum/maximum to avoid relying on a method
     that may not be present on all MLX array versions.
     """
-    return mx.minimum(
-        mx.maximum(x, mx.array(min_val, dtype=x.dtype)),
-        mx.array(max_val, dtype=x.dtype),
-    )
+    min_arr = mx.zeros_like(x) + float(min_val)
+    max_arr = mx.zeros_like(x) + float(max_val)
+    tensor = mx.minimum(mx.maximum(x, min_arr), max_arr)
+    mx.eval(tensor)  # type: ignore
+    return tensor
 
 
 def denorm(
@@ -671,7 +682,9 @@ def torch2np(
 
 
 def mlx2np(
-    tensor: mx.array, denormalize: bool = False, ceiling: bool = False
+    tensor: mx.array | NDArray[np.float32],
+    denormalize: bool = False,
+    ceiling: bool = False,
 ) -> NDArray[np.float32]:
     """Convert PyTorch tensor to NumPy array with optional denormalization.
 
@@ -692,15 +705,24 @@ def mlx2np(
     NDArray[np.float32]
         NumPy array with shape (B, H, W, C) and values clipped to [0, 1].
     """
+    # Support both MLX arrays and host NumPy arrays. If a NumPy ndarray is
+    # provided we must avoid calling MLX helpers (like `clamp`) which expect
+    # MLX types; instead perform denormalization/clipping with NumPy.
+    if isinstance(tensor, np.ndarray):
+        if denormalize:
+            tensor = (tensor + 1.0) / 2.0
+        np_array = np.clip(tensor, 0.0, 1.0)
+        return np_array.astype(np.float32)
+
     if denormalize:
         tensor = cast(mx.array, denorm(tensor, ceiling))
     np_array = np.array(tensor)
-    np_array = np.clip(np_array, 0, 1)
+    np_array = np.clip(np_array, 0.0, 1.0)
     return np_array.astype(np.float32)
 
 
 def tensor2np(
-    tensor: torch.Tensor | mx.array,
+    tensor: torch.Tensor | mx.array | NDArray[np.float32],
     denormalize: bool = False,
     ceiling: bool = False,
 ) -> NDArray[np.float32]:
@@ -725,6 +747,8 @@ def tensor2np(
     """
     if isinstance(tensor, torch.Tensor):
         return torch2np(tensor, denormalize, ceiling)
+    elif isinstance(tensor, np.ndarray):
+        return mlx2np(tensor, denormalize, ceiling)
     else:
         return mlx2np(tensor, denormalize, ceiling)
 
@@ -830,11 +854,11 @@ def draw_well_arrows(
 
 
 def plot_generated_facies(
-    fake_facies: list[torch.Tensor] | list[mx.array],
-    real_facies: torch.Tensor | mx.array,
+    fake_facies: Sequence[torch.Tensor | mx.array | NDArray[np.float32]],
+    real_facies: torch.Tensor | mx.array | NDArray[np.float32],
     stage: int,
     index: int,
-    masks: torch.Tensor | mx.array | None = None,
+    masks: torch.Tensor | mx.array | NDArray[np.float32] | None = None,
     out_dir: str = RESULTS_DIR,
     save: bool = False,
     cell_size: int = 256,
@@ -847,13 +871,14 @@ def plot_generated_facies(
 
     Parameters
     ----------
-    fake_facies : list[torch.Tensor]
-        List of generated facies tensors, one tensor per real facie containing
-        multiple generated samples.
-    real_facies : torch.Tensor
-        Tensor of real facies images.
-    masks : torch.Tensor
-        Tensor of well location masks corresponding to the real facies.
+    fake_facies : Sequence[torch.Tensor | mx.array | np.ndarray]
+        Sequence of generated facies tensors/arrays, one entry per real facie
+        containing multiple generated samples. Accepts PyTorch tensors, MLX
+        arrays or NumPy arrays (host-side) for worker process compatibility.
+    real_facies : torch.Tensor | mx.array | np.ndarray
+        Real facies batch as a tensor/array.
+    masks : torch.Tensor | mx.array | np.ndarray
+        Optional well-location masks corresponding to `real_facies`.
     stage : int
         Current training stage/scale for labeling.
     index : int
@@ -873,10 +898,26 @@ def plot_generated_facies(
     num_real_facies = int(real_facies.shape[0])
     num_generated_per_real = int(fake_facies[0].shape[0])
 
-    # Convert to numpy
-    fake_facies_arr = [tensor2np(fake_facie) for fake_facie in fake_facies]
-    np_real_facies = tensor2np(real_facies, denormalize=True, ceiling=True)
-    np_masks = tensor2np(masks) if masks is not None else None
+    # Convert inputs to NumPy. If callers already provided host-side NumPy
+    # arrays (common when using the background worker) treat them as already
+    # denormalized in [0, 1]. Otherwise convert/denormalize as needed.
+    fake_facies_arr: list[np.ndarray] = []
+    for ff in fake_facies:
+        if isinstance(ff, np.ndarray):
+            fake_facies_arr.append(ff.astype(np.float32))
+        else:
+            fake_facies_arr.append(tensor2np(ff, denormalize=True))
+
+    if isinstance(real_facies, np.ndarray):
+        np_real_facies = real_facies.astype(np.float32)
+    else:
+        np_real_facies = tensor2np(real_facies, denormalize=True, ceiling=True)
+
+    np_masks = (
+        masks
+        if isinstance(masks, np.ndarray)
+        else (tensor2np(masks) if masks is not None else None)
+    )
 
     # Calculate grid dimensions with spacing and margins
     spacing = 20  # pixels between subplots

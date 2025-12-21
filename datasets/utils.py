@@ -31,7 +31,9 @@ def load_image(image_path: Path) -> NDArray[np.float32]:
     return img_np
 
 
-def generate_scales(options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
+def generate_scales(
+    options: TrainningOptions, channels_last: bool = False
+) -> tuple[tuple[int, ...], ...]:
     """Generate multi-scale pyramid resolutions for progressive training.
 
     Creates a tuple of shapes representing different scales from coarse to fine
@@ -78,7 +80,10 @@ def generate_scales(options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
         )
         if out_shape[0] % 2 != 0:
             out_shape = [int(shape + 1) for shape in out_shape]
-        shapes.append((options.batch_size, options.num_img_channels, *out_shape))
+        if channels_last:
+            shapes.append((options.batch_size, *out_shape, options.num_img_channels))
+        else:
+            shapes.append((options.batch_size, options.num_img_channels, *out_shape))
 
     return tuple(shapes)
 

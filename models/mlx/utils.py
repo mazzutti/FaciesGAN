@@ -1,5 +1,6 @@
 from typing import TypeVar, cast
 import mlx.core as mx
+import mlx.nn.layers.upsample as upsample  # type: ignore
 import mlx.nn as nn  # type: ignore
 
 from collections.abc import Callable, Iterable
@@ -43,24 +44,42 @@ def calc_gradient_penalty(
     """
     # Random interpolation factor
     batch_size = real_data.shape[0]
-    alpha = mx.random.uniform(shape=(batch_size, 1, 1, 1))
+    alpha = mx.random.uniform(shape=(batch_size, 1, 1, 1), stream=mx.cpu)  # type: ignore
 
     interpolates = alpha * real_data + (1 - alpha) * fake_data
 
     def grad_fn(x: mx.array) -> mx.array:
         # Discriminator output for interpolates
         out: mx.array = cast(mx.array, discriminator(x))
-        return mx.sum(out)
+        return mx.sum(out, stream=mx.cpu)  # type: ignore
 
     # Calculate gradients of the output w.r.t. the interpolates
-    gradients = cast(mx.array, mx.grad(grad_fn)(interpolates))  # type: ignore
+    gradients = cast(mx.array, grad_fn(interpolates))  # type: ignore
+    # mx.eval(gradients)  # type: ignore
 
     # Compute L2 norm of gradients along the (H, W, C) dimensions
     # In MLX, we flatten the non-batch dimensions to calculate the norm per sample
     gradients_flat = gradients.reshape(batch_size, -1)  # type: ignore
-    grad_norm = mx.sqrt(mx.sum(mx.square(gradients_flat), axis=1) + 1e-12)
+    grad_norm = mx.sqrt(
+        mx.sum(
+            mx.square(gradients_flat, stream=mx.cpu),  # type: ignore
+            axis=1,
+            stream=mx.cpu,  # type: ignore
+        )
+        + 1e-12,
+    )
 
-    gradient_penalty = mx.mean(mx.square(grad_norm - 1.0)) * LAMBDA
+    gradient_penalty = (
+        mx.mean(
+            mx.square(
+                grad_norm - 1.0,
+                stream=mx.cpu,  # type: ignore
+            ),
+            stream=mx.cpu,  # type: ignore
+        )
+        * LAMBDA
+    )  # type: ignore
+    mx.eval(gradient_penalty)  # type: ignore
     return gradient_penalty
 
 
@@ -85,15 +104,17 @@ def generate_noise(
     """
     h, w, c = size
     noise_shape = (num_samp, round(h / scale), round(w / scale), c)
-    noise = mx.random.normal(shape=noise_shape)
+    # Prefer float32 for noise arrays to reduce memory on device backends.
+    noise = mx.random.normal(shape=noise_shape, dtype=mx.float32, stream=mx.cpu)  # type: ignore
 
     if scale != 1.0:
-        noise = cast(mx.array, mx.image.resize(noise, h, w))  # type: ignore
+        noise = interpolate(noise, (h, w))
 
+    mx.eval(noise)  # type: ignore
     return noise
 
 
-def interpolate(tensor: mx.array, size: tuple[int, ...]) -> mx.array:
+def interpolate(tensor: mx.array, size: tuple[float, ...]) -> mx.array:
     """Resize array using bilinear interpolation.
 
     Parameters
@@ -108,8 +129,16 @@ def interpolate(tensor: mx.array, size: tuple[int, ...]) -> mx.array:
     mx.array
         Resized array.
     """
-    upsample_layer = nn.Upsample((size[0], size[1]), mode="linear", align_corners=True)
-    resized_tensor = upsample_layer(tensor)
+    scale_factor = (tensor.shape[1] / size[0], tensor.shape[2] / size[1])
+    resized_tensor = cast(
+        mx.array,
+        upsample.upsample_linear(  # type: ignore
+            tensor,
+            scale_factor=scale_factor,
+            align_corners=True,
+        ),
+    )
+    mx.eval(resized_tensor)  # type: ignore
     return resized_tensor
 
 
@@ -134,14 +163,27 @@ def init_weights(model: nn.Module | Callable[[mx.array], mx.array]) -> None:
     and ``bias``) rather than returning a new model object.
     """
 
-    def initialize(m: nn.Module | Callable[[mx.array], mx.array]) -> None:
+    def initialize(m: nn.Module) -> None:
         if isinstance(m, nn.Conv2d):
             # Normal distribution N(0, 0.02)
-            m.weight = mx.random.normal(shape=m.weight.shape, scale=0.02)
-            m.bias = mx.zeros_like(m.bias)
+            m.weight = mx.random.normal(
+                shape=m.weight.shape,
+                scale=0.02,
+                dtype=m.weight.dtype,
+                stream=mx.cpu,  # type: ignore
+            )
+            m.bias = mx.zeros_like(m.bias, stream=mx.cpu)  # type: ignore
         elif isinstance(m, (nn.BatchNorm, nn.InstanceNorm)):
-            m.weight = mx.random.normal(shape=m.weight.shape, loc=1.0, scale=0.02)
-            m.bias = mx.zeros_like(m.bias)
+            if getattr(m, "weight", None) is not None:
+                m.weight = mx.random.normal(
+                    shape=m.weight.shape,
+                    loc=1.0,
+                    scale=0.02,
+                    dtype=m.weight.dtype,
+                    stream=mx.cpu,  # type: ignore
+                )
+            if getattr(m, "bias", None) is not None:
+                m.bias = mx.zeros_like(m.bias, stream=mx.cpu)  # type: ignore
 
     # Walk through modules and initialize
     for _, module in cast(
@@ -176,7 +218,7 @@ def load(
     T
         The loaded object, cast to the requested generic return type.
     """
-    obj = mx.load(path)  # type: ignore
+    obj = mx.load(path, stream=mx.cpu)  # type: ignore
     if as_type is not None:
         # `as_type` should be a concrete runtime class (e.g., `dict` or `list`).
         # For typing constructs like `Mapping[str, Any]` you should annotate the

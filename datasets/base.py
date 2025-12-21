@@ -34,12 +34,15 @@ class PyramidsDataset(Dataset[Batch[TTensor]]):
     """
 
     def __init__(
-        self, options: TrainningOptions, shuffle: bool = False, regenerate: bool = False
+        self,
+        options: TrainningOptions,
+        shuffle: bool = False,
+        regenerate: bool = False,
+        channels_last: bool = False,
     ) -> None:
         self.data_dir = options.input_path
         self.batches: list[Batch[TTensor]] = []
-        self.scales = self.generate_scales(options)
-
+        self.scales = self.generate_scales(options, channels_last)
         if regenerate:
             self.clean_cache()
 
@@ -91,13 +94,17 @@ class PyramidsDataset(Dataset[Batch[TTensor]]):
         )
 
     @abstractmethod
-    def generate_scales(self, options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
+    def generate_scales(
+        self, options: TrainningOptions, channels_last: bool = False
+    ) -> tuple[tuple[int, ...], ...]:
         """Generate the scales list used by the dataset.
 
         Parameters
         ----------
         options : TrainningOptions
             Training options that include scale generation parameters.
+        channels_last : bool, optional
+            Whether the channel dimension is last in the tensor shape, by default False.
 
         Returns
         -------

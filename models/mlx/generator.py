@@ -1,4 +1,6 @@
-from typing import Generator, Self, cast
+from typing import Any, Generator, cast
+
+import mlx.nn.layers.upsample as upsample  # type: ignore
 
 from models.generator import Generator
 import mlx.core as mx
@@ -9,9 +11,7 @@ from models.mlx.custom_layer import (
     MLXConvBlock,
     MLXSPADEGenerator,
     MLXScaleModule,
-    MLXTanh,
 )
-import models.mlx.utils as utils
 
 
 class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
@@ -70,50 +70,27 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
 
     def __call__(
         self,
-        z: list[mx.array],
-        amp: list[float],
-        in_noise: mx.array | None = None,
-        start_scale: int = 0,
-        stop_scale: int | None = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> mx.array:
         """Call the generator's forward method.
 
         Parameters
         ----------
-        z : list[mx.array]
-            List of per-scale noise tensors.
-        amp : list[float]
-            List of per-scale amplitude scalars.
-        in_noise : mx.array | None, optional
-            Optional input noise tensor for the coarsest scale.
-            Defaults to None.
-        start_scale : int, optional
-            Scale index to start synthesis from. Defaults to 0.
-        stop_scale : int | None, optional
-            Scale index to stop synthesis at (exclusive). Defaults to None,
-            which means synthesis continues to the finest scale.
+        *args : Any
+            Positional arguments for the forward method.
+        **kwargs : Any
+            Keyword arguments for the forward method.
+
         Returns
         -------
         mx.array
             Output of the `forward` method.
         """
-        return super().__call__(
-            z,
-            amp,
-            in_noise=in_noise,
-            start_scale=start_scale,
-            stop_scale=stop_scale,
-        )
-
-    def eval(self) -> Self:
-        """Set the module in evaluation mode.
-
-        Returns
-        -------
-        Self
-            The generator instance in evaluation mode.
-        """
-        return cast(Self, nn.Module.eval(self))
+        # Call `forward` directly to avoid passing unexpected keyword
+        # arguments through MLX's `nn.Module.__call__` which may not
+        # accept arbitrary kwargs like `stop_scale`.
+        return self.forward(*args, **kwargs)
 
     def forward(
         self,
@@ -150,26 +127,26 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             height, width = tuple(
                 dim - self.full_zero_padding for dim in z[start_scale].shape[1:3]
             )
-            out_facie = mx.zeros((batch_size, height, width, channels))
+            out_facie = mx.zeros((batch_size, height, width, channels), stream=mx.cpu)  # type: ignore
         else:
             out_facie = in_noise
 
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
 
         for index in range(start_scale, stop_scale + 1):
-            out_facie = utils.interpolate(
+            height, width = out_facie.shape[1:3]
+
+            scale_h = (z[index].shape[1] - self.full_zero_padding) / height
+            scale_w = (z[index].shape[2] - self.full_zero_padding) / width
+            out_facie = upsample.upsample_linear(  # type: ignore
                 out_facie,
-                (
-                    z[index].shape[2] - self.full_zero_padding,
-                    z[index].shape[3] - self.full_zero_padding,
-                ),
+                (scale_h, scale_w),
+                align_corners=True,
             )
 
             if index in self.spade_scales:
 
-                # SPADE-based generation at coarse scale
-                # Apply amplitude scaling to noise channels
-                z_in = cast(mx.array, mx.copy(z[index]))  # type: ignore
+                z_in = cast(mx.array, z[index])  # type: ignore
                 if self.has_cond_channels:
                     z_in[..., : self.output_channels] = (
                         amp[index] * z_in[..., : self.output_channels]
@@ -178,14 +155,14 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                     z_in = amp[index] * z_in
 
                 p = self.zero_padding
-                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)], stream=mx.cpu)  # type: ignore
 
                 if self.has_cond_channels:
                     num_repeats = self.cond_channels // self.output_channels
-                    padded_facie = mx.repeat(padded_facie, num_repeats, axis=-1)
+                    padded_facie = mx.repeat(padded_facie, num_repeats, axis=-1, stream=mx.cpu)  # type: ignore
                     # Add padded output facie to well conditioning channels
-                    z_in[..., : self.output_channels] = (
-                        z_in[..., : self.output_channels] + padded_facie
+                    z_in[..., self.output_channels :] = (
+                        z_in[..., self.output_channels :] + padded_facie
                     )
                 else:
                     z_in = z_in + padded_facie
@@ -195,7 +172,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             else:
                 # Standard concatenation-based generation at finer scales
                 # Apply amplitude scaling to noise channels (first N channels)
-                z_in = cast(mx.array, mx.copy(z[index]))  # type: ignore
+                z_in = cast(mx.array, z[index])  # type: ignore
                 if self.has_cond_channels:
                     z_in[..., : self.output_channels] = (
                         amp[index] * z[index][..., : self.output_channels]
@@ -206,22 +183,23 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                 # Add padded output facie ONLY to conditioning channels (not noise)
                 # This ensures random noise always has direct impact on generation
                 p = self.zero_padding
-                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)], stream=mx.cpu)  # type: ignore
 
                 if self.has_cond_channels:
                     num_repeats = self.cond_channels // self.output_channels
-                    padded_facie = mx.repeat(padded_facie, num_repeats, axis=-1)
-                    z_in[..., : self.output_channels] = (
+                    padded_facie = mx.repeat(padded_facie, num_repeats, axis=-1, stream=mx.cpu)  # type: ignore
+                    z_in[..., self.output_channels :] = (
                         z_in[..., self.output_channels :] + padded_facie
                     )
                 else:
                     z_in = z_in + padded_facie
 
                 out_facie = cast(mx.array, self.gens[index](z_in)) + out_facie
+            mx.eval(out_facie)  # type: ignore
 
         # Apply color quantization to enforce pure colors
         out_facie = self.color_quantizer(out_facie)
-
+        mx.eval(out_facie)  # type: ignore
         return out_facie
 
     def create_scale(
@@ -296,7 +274,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                     self.kernel_size,
                     padding=self.padding_size,
                 ),
-                MLXTanh(),
+                nn.Tanh(),
             )
 
             self.gens.append(MLXScaleModule(head, body, tail))

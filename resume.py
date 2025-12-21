@@ -23,7 +23,7 @@ import torch
 from config import G_FILE, OPT_FILE, RESULT_FACIES_PATH
 from log import init_output_logging
 from options import ResumeOptions
-from training.torch.train import TorchTrainer
+from training.torch.trainer import TorchTrainer
 
 # from types import SimpleNamespace
 

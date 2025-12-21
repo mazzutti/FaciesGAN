@@ -405,7 +405,6 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             generator_metrics = self.model.optimize_generator(
                 indexes, real_facies_dict, masks_dict, rec_in_dict, generator_optimizers
             )
-
             scale_metrics = ScaleMetrics(
                 generator=generator_metrics, discriminator=discriminator_metrics
             )
@@ -427,6 +426,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 discriminator_schedulers=discriminator_schedulers,
                 progress=progress,
             )
+            del scale_metrics
 
         # Save optimizers for all scales
         for scale in scales:
@@ -599,28 +599,36 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         # Print formatted metrics table occasionally
         if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
-            progress.write(
+            # Build the entire metrics box as a single string and write it
+            # with one `progress.write` call to avoid interleaving with other
+            # prints from other threads/processes.
+            lines: list[str] = []
+            lines.append(
                 f"\n  Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch + 1:4d}/{self.num_iter}]"
             )
-            progress.write("  ┌" + "─" * 99 + "┐")
-            progress.write(
-                f"  │ {'Scale':^5} │ {'G_total':>8} │ {'G_adv':>7} │ {'G_rec':>7} │ "
-                f"{'G_well':>7} │ {'G_div':>7} │ {'D_total':>8} │ {'D_real':>7} │ "
-                f"{'D_fake':>7} │ {'D_gp':>7} │"
+            lines.append("  ┌" + "─" * 99 + "┐")
+            lines.append(
+                (
+                    f"  │ {'Scale':^5} │ {'G_total':>8} │ {'G_adv':>7} │ {'G_rec':>7} │ "
+                    f"{'G_well':>7} │ {'G_div':>7} │ {'D_total':>8} │ {'D_real':>7} │ "
+                    f"{'D_fake':>7} │ {'D_gp':>7} │"
+                )
             )
-            progress.write("  ├" + "─" * 99 + "┤")
+            lines.append("  ├" + "─" * 99 + "┤")
 
             for scale in scales:
                 g = scale_metrics.generator[scale]
                 d = scale_metrics.discriminator[scale]
-
-                progress.write(
-                    f"  │ {scale:^5} │ {g.total.item():8.3f} │ {g.fake.item():7.3f} │ {g.rec.item():7.3f} │ "
-                    f"{g.well.item():7.3f} │ {g.div.item():7.3f} │ {d.total.item():8.3f} │ {d.real.item():7.3f} │ "
-                    f"{d.fake.item():7.3f} │ {d.gp.item():7.3f} │"
+                lines.append(
+                    (
+                        f"  │ {scale:^5} │ {g.total.item():8.3f} │ {g.fake.item():7.3f} │ {g.rec.item():7.3f} │ "
+                        f"{g.well.item():7.3f} │ {g.div.item():7.3f} │ {d.total.item():8.3f} │ {d.real.item():7.3f} │ "
+                        f"{d.fake.item():7.3f} │ {d.gp.item():7.3f} │"
+                    )
                 )
 
-            progress.write("  └" + "─" * 99 + "┘")
+            lines.append("  └" + "─" * 99 + "┘")
+            progress.write("\n".join(lines))
 
         else:
             # When not printing samples, still ensure visualizer updated (handled above)

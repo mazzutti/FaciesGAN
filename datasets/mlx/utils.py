@@ -9,7 +9,6 @@ and return a list of PyTorch tensors, one tensor per scale, with shape
 ``(N, C, H, W)``.
 """
 
-from typing import cast
 import mlx.core as mx
 import datasets.torch.utils as torch_utils
 import utils
@@ -17,6 +16,7 @@ import utils
 
 def to_facies_pyramids(
     scale_list: tuple[tuple[int, ...], ...],
+    channels_last: bool = False,
 ) -> tuple[mx.array, ...]:
     """Generate multi-scale pyramid tensors for facies images using a neural interpolator.
 
@@ -33,19 +33,19 @@ def to_facies_pyramids(
         A tuple where each element is a MLX array containing all facies at
         that scale with shape ``(N, H, W, C)`` (N images, C channels).
     """
-    torch_pyramids = torch_utils.to_facies_pyramids(scale_list)
-    # Convert each PyTorch tensor to MLX array and permute to (N, H, W, C)
-    # (N, C, H, W) -> (N, H, W, C)
+    torch_pyramids = torch_utils.to_facies_pyramids(
+        scale_list, channels_last=channels_last
+    )
     mlx_pyramids: list[mx.array] = []
     for pyramid in torch_pyramids:
         pyramid_mx = mx.array(pyramid.numpy())
-        pyramid_mx = cast(mx.array, mx.transpose(pyramid_mx, (0, 2, 3, 1)))  # type: ignore
         mlx_pyramids.append(pyramid_mx)
     return tuple(mlx_pyramids)
 
 
 def to_seismic_pyramids(
     scale_list: tuple[tuple[int, ...], ...],
+    channels_last: bool = False,
 ) -> tuple[mx.array, ...]:
     """Generate multi-scale pyramid tensors for seismic images using nearest interpolation.
 
@@ -63,19 +63,19 @@ def to_seismic_pyramids(
     -----
     Uses NearestInterpolator and caches results in ``./.cache``.
     """
-    torch_pyramids = torch_utils.to_seismic_pyramids(scale_list)
-    # Convert each PyTorch tensor to MLX array and permute to (N, H, W, C)
-    # (N, C, H, W) -> (N, H, W, C)
+    torch_pyramids = torch_utils.to_seismic_pyramids(
+        scale_list, channels_last=channels_last
+    )
     mlx_pyramids: list[mx.array] = []
     for pyramid in torch_pyramids:
         pyramid_mx = mx.array(pyramid.numpy())
-        pyramid_mx = cast(mx.array, mx.transpose(pyramid_mx, (0, 2, 3, 1)))  # type: ignore
         mlx_pyramids.append(pyramid_mx)
     return tuple(mlx_pyramids)
 
 
 def to_wells_pyramids(
     scale_list: tuple[tuple[int, ...], ...],
+    channels_last: bool = False,
 ) -> tuple[mx.array, ...]:
     """Generate multi-scale pyramid tensors for well location data.
 
@@ -95,13 +95,12 @@ def to_wells_pyramids(
     -----
     Uses ``WellInterpolator`` and caches results in ``./.cache``.
     """
-    torch_pyramids = torch_utils.to_wells_pyramids(scale_list)
-    # Convert each PyTorch tensor to MLX array and permute to (N, H, W, C)
-    # (N, C, H, W) -> (N, H, W, C)
+    torch_pyramids = torch_utils.to_wells_pyramids(
+        scale_list, channels_last=channels_last
+    )
     mlx_pyramids: list[mx.array] = []
     for pyramid in torch_pyramids:
         pyramid_mx = mx.array(pyramid.numpy())
-        pyramid_mx = cast(mx.array, mx.transpose(pyramid_mx, (0, 2, 3, 1)))  # type: ignore
         mlx_pyramids.append(pyramid_mx)
     return tuple(mlx_pyramids)
 

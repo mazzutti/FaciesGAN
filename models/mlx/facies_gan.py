@@ -5,6 +5,7 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn  # type: ignore
+import gc
 
 
 from config import D_FILE, G_FILE, M_FILE, SHAPE_FILE
@@ -56,45 +57,24 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         self.setup_framework()
         self.wells, self.seismic = wells, seismic
 
-    def backward_totals(self, totals: list[mx.array]) -> mx.array:
-        """Framework-specific backward operation for aggregated totals.
+    def backward_grads(
+        self,
+        losses: list[mx.array],
+        gradients: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Call MLX backward on aggregated gradients.
 
-        Parameters
+        Parameters:
         ----------
-        totals : list[mx.array]
-            List of total loss tensors from multiple scales to backpropagate.
-
-        Returns
-        -------
-        mx.array
-            Aggregated tensor returned by the backward call.
+        losses (list[mx.array]): List of gradient tensors to evaluate
+            through the tree via `mx.eval`.
+        gradients (list[dict[str, Any]] | None, optional):
+            Optional list of dictionaries mapping parameter names to gradients
+            to populate during the backward call (default is None).
         """
-        # # Update specific generator block with parameters for differentiation
-        # cast(nn.Module, self.generator.gens[scale]).update(generator_params)  # type: ignore
 
-        # indexes = cast(list[int], batch_data["indexes"])
-        # real = cast(mx.array, batch_data[scale]["real"])
-
-        # # Re-generate fake (connected graph)
-        # noises = self.get_noise(indexes, scale)
-        # fake = self.generator(noises, self.noise_amp[: scale + 1], stop_scale=scale)
-
-        # # Discriminator (frozen w.r.t G update)
-        # pred_fake = self.discriminator.discs[scale](fake)
-
-        # # Adversarial Loss
-        # err_g = -mx.mean(pred_fake)
-
-        # # Auxiliary Losses
-        # div_loss = self.compute_diversity_loss([fake])
-
-        # mask_loss = mx.array(0.0)
-        # if scale in batch_data and "masks" in batch_data[scale]:
-        #     mask_loss = self.compute_masked_loss(
-        #         scale, fake, real, {scale: batch_data[scale]["masks"]}
-        #     )
-
-        return mx.sum(mx.stack(totals))
+        mx.eval(*losses, *(gradients or []))  # type: ignore
+        gc.collect()
 
     def build_discriminator(self) -> MLXDiscriminator:
         return MLXDiscriminator(
@@ -123,7 +103,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         indexes: list[int],
         scale: int,
         real_facies: mx.array,
-    ) -> tuple[DiscriminatorMetrics[mx.array], dict[Any, Any] | None]:
+    ) -> tuple[DiscriminatorMetrics[mx.array], list[dict[str, Any]] | None]:
         """Compute discriminator losses and gradient penalty for a scale.
 
         Parameters
@@ -137,14 +117,15 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
 
         Returns
         -------
-        tuple[DiscriminatorMetrics[torch.Tensor], dict[Any, Any] | None]:
-            Container with total, real, fake and gp losses, and optional gradients dict.
+        tuple[DiscriminatorMetrics[mx.array], list[dict[Any, Any]] | None]:
+            Container with total, real, fake and gp losses, and optional gradients list.
         """
         metrics: DiscriminatorMetrics[mx.array] = DiscriminatorMetrics(
             mx.array(0.0), mx.array(0.0), mx.array(0.0), mx.array(0.0)
         )
 
-        def compute_metrics() -> mx.array:
+        def compute_metrics(params: dict[str, Any]) -> mx.array:
+            cast(MLXDiscriminator, self.discriminator.discs[scale]).update(params)  # type: ignore
             noises = self.get_noise(indexes, scale)
             fake = self.generate_fake(noises, scale)
             metrics.real = -self.discriminator(scale, real_facies).mean()
@@ -152,8 +133,16 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
             metrics.gp = self.compute_gradient_penalty(scale, real_facies, fake)
             return metrics.real + metrics.fake + metrics.gp
 
-        metrics.total, gradients = mx.value_and_grad(compute_metrics)()  # type: ignore
-        return metrics, cast(dict[Any, Any], gradients)
+        params = cast(
+            dict[str, Any], self.discriminator.discs[scale].trainable_parameters()
+        )
+        metrics.total, gradients = mx.value_and_grad(compute_metrics)(params)  # type: ignore # type: ignore
+
+        return metrics, [
+            gradients,
+            params,
+            self.discriminator.discs[scale].parameters(),
+        ]
 
     def compute_generator_metrics(
         self,
@@ -162,7 +151,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         real_facies: mx.array,
         masks_dict: dict[int, mx.array],
         rec_in_dict: dict[int, mx.array],
-    ) -> tuple[GeneratorMetrics[mx.array], dict[Any, Any] | None]:
+    ) -> tuple[GeneratorMetrics[mx.array], list[dict[str, Any]] | None]:
         """Common generator-metrics flow shared by frameworks.
 
         Parameters
@@ -181,9 +170,9 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         Returns
         -------
         tuple[
-            GeneratorMetrics[TTensor] | dict[Any, Any] | None
+            GeneratorMetrics[TTensor], list[dict[Any, Any]] | None
         ]:
-            Container with total, fake, rec, well and div losses, and optional gradients dict.
+            Container with total, fake, rec, well and div losses, and optional gradients list.
 
         Raises
         ------
@@ -195,11 +184,17 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         )
         rec_in = rec_in_dict[scale]
 
-        # Generate diversity candidates (framework-agnostic forward)
-        fake_samples = self.generate_diverse_samples(indexes, scale)
-        fake = fake_samples[0]
+        def compute_metrics(params: dict[str, Any]) -> mx.array:
+            # Ensure the generator uses the provided parameters for the
+            # functional/gradient computation.
+            self.generator.gens[scale].update(params)  # type: ignore
+            # Generate diversity candidates inside the gradient function so
+            # intermediate activations are scoped to the autodiff call and
+            # can be freed promptly. Generating them outside kept the
+            # forward graph alive across iterations and caused memory growth.
+            fake_samples = self.generate_diverse_samples(indexes, scale)
+            fake = fake_samples[0]
 
-        def compute_metrics() -> mx.array:
             metrics.fake = self.compute_adversarial_loss(scale, fake)
             metrics.well = self.compute_masked_loss(
                 scale, fake, real_facies, masks_dict
@@ -211,15 +206,22 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
             total = metrics.fake + metrics.well + metrics.rec + metrics.div
             return total
 
-        metrics.total, gradients = mx.value_and_grad(compute_metrics)()  # type: ignore
-        return metrics, cast(dict[Any, Any], gradients)
+        params = cast(dict[str, Any], self.generator.gens[scale].trainable_parameters())
+        metrics.total, gradients = mx.value_and_grad(compute_metrics)(params)  # type: ignore
+        mx.eval(metrics.total, *gradients)  # type: ignore
+        return metrics, cast(
+            list[dict[Any, Any]],
+            [gradients, params, self.generator.gens[scale].parameters],
+        )
 
-    def concatenate_tensors(self, tensors: list[mx.array], dim: int) -> mx.array:
+    def concatenate_tensors(self, tensors: list[mx.array]) -> mx.array:
         """Concatenate a list of tensors along dimension `dim`.
 
         Uses MLX `mx.concat` and preserves device placement.
         """
-        return mx.concat(tensors, axis=dim)
+        concat_tensor = mx.concat(tensors, axis=-1)  # type: ignore
+        mx.eval(concat_tensor)  # type: ignore
+        return concat_tensor
 
     def compute_diversity_loss(self, fake_samples: list[mx.array]) -> mx.array:
         """Compute diversity loss across multiple generated `fake_samples`.
@@ -239,18 +241,20 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
             return mx.array(0.0)
 
         n = len(fake_samples)
-        # Flatten: (N, D)
+        # Flatten each sample to (D,) and stack -> (N, D)
         stacked = mx.stack([x.flatten() for x in fake_samples])
 
-        # Compute pairwise squared differences: (N, 1, D) - (1, N, D)
-        diffs = stacked[:, None, :] - stacked[None, :, :]
-        distances = mx.mean(diffs**2, axis=2)
+        # Compute pairwise squared distances via dot-product identity to
+        # avoid allocating the (N, N, D) diffs tensor which can blow up
+        # memory for large images. distances[i,j] = ||x_i - x_j||^2
+        norms = mx.sum(stacked * stacked, axis=1)  # (N,)
+        # (N,1) + (1,N) - 2 * (N,N) -> pairwise squared distances
+        distances = norms[:, None] + norms[None, :] - 2 * (stacked @ stacked.T)
         diversity_loss = mx.exp(-distances * 10)
         mask = 1 - mx.eye(n)
         masked_loss = diversity_loss * mask
         avg_loss = mx.sum(masked_loss) / (n * (n - 1))
-        num_pairs = distances.size
-        return self.lambda_diversity * (avg_loss if num_pairs > 0 else mx.array(0.0))
+        return self.lambda_diversity * (avg_loss if n > 1 else mx.array(0.0))
 
     def compute_gradient_penalty(
         self, scale: int, real: mx.array, fake: mx.array
@@ -329,6 +333,26 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         return mx.pad(  # type: ignore
             z, [(0, 0), (p, p), (p, p), (0, 0)], constant_values=value
         )
+
+    def get_noise_shape(
+        self, scale: int, use_base_channel: bool = True
+    ) -> tuple[int, ...]:
+        """Return the noise shape tuple for a given `scale`.
+
+        Args:
+            scale (int): Scale index for which to get the noise shape.
+
+        Returns:
+            tuple[int, ...]: Noise shape tuple as (channels, height, width).
+        """
+        return (
+            (*self.shapes[scale][1:3], self.base_channel)
+            if use_base_channel
+            else self.shapes[scale][1:3]
+        )
+
+    def get_rec_noise(self, scale: int) -> list[mx.array]:
+        return [mx.array(tensor) for tensor in self.rec_noise[: scale + 1]]
 
     def load_amp(self, scale_path: str) -> None:
         amp_path = os.path.join(scale_path, "amp.txt")  # Assuming filename

@@ -17,7 +17,8 @@ from dateutil import tz
 from config import CHECKPOINT_PATH, OPT_FILE
 from log import init_output_logging
 from options import TrainningOptions
-from training.torch.train import TorchTrainer
+from training import TorchTrainer, MLXTrainer
+import mlx.core as mx  # type: ignore
 
 
 def get_arguments() -> ArgumentParser:
@@ -304,7 +305,13 @@ def main() -> None:
     except Exception:
         pass
 
-    trainer = TorchTrainer(options, device=device)
+    if options.use_mlx:
+        mx.default_stream(mx.cpu)  # type: ignore
+        trainer = MLXTrainer(options)
+        print("Using MLX backend for training.")
+    else:
+        trainer = TorchTrainer(options, device=device)
+        print("Using Torch backend for training.")
 
     # Optionally run the trainer under the PyTorch profiler and export traces.
     # MPS backend uses a different profiler API (torch.mps.profiler) that
@@ -371,4 +378,5 @@ if __name__ == "__main__":
     import lovely_tensors as lt  # type: ignore
 
     lt.monkey_patch()
+
     main()

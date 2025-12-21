@@ -206,17 +206,23 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         self.has_well = len(self.wells) > 0
 
     @abstractmethod
-    def backward_totals(self, totals: list[TTensor]) -> TTensor | None:
-        """Framework-specific backward operation for aggregated totals.
+    def backward_grads(
+        self,
+        losses: list[TTensor],
+        gradients: list[dict[str, Any]] | None = None,
+    ) -> TTensor | None:
+        """Framework-specific backward operation for aggregated losses.
 
         Subclasses should implement this to call their framework's backward
-        API (e.g., `torch.autograd.backward(totals)`). Keeping this abstract
-        prevents importing heavy frameworks into the base module.
+        API (e.g., `torch.autograd.backward(losses)`, `mx.eval(losses)`). Keeping this
+        abstract prevents importing heavy frameworks into the base module.
 
         Parameters
         ----------
-        totals : list[Any]
-            List of total loss tensors from multiple scales to backpropagate.
+        losses : list[Any]
+            List of tensors from multiple scales to backpropagate.
+        gradients : list[dict[str, Any]] | None, optional
+            Optional list of parameter gradients to populate during the backward call (default is None).
 
         Returns
         -------
@@ -228,7 +234,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         NotImplementedError
             If the subclass does not override this method.
         """
-        raise NotImplementedError("Subclasses must implement backward_totals")
+        raise NotImplementedError("Subclasses must implement backward_grads")
 
     @abstractmethod
     def build_discriminator(self) -> Discriminator[TTensor, TModule]:
@@ -269,16 +275,13 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         raise NotImplementedError("Subclasses must implement build_generator")
 
     @abstractmethod
-    def concatenate_tensors(self, tensors: list[TTensor], dim: int) -> TTensor:
+    def concatenate_tensors(self, tensors: list[TTensor]) -> TTensor:
         """Concatenate a list of tensors along a specified dimension.
 
         Parameters
         ----------
         tensors : list[TTensor]
             List of tensors to concatenate.
-        dim : int
-            Dimension along which to concatenate the tensors.
-
         Returns
         -------
         TTensor
@@ -492,6 +495,49 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         raise NotImplementedError("Subclasses must implement generate_padding")
 
     @abstractmethod
+    def get_noise_shape(
+        self, scale: int, use_base_channel: bool = True
+    ) -> tuple[int, ...]:
+        """Get the noise tensor shape for a specific scale.
+
+        Parameters
+        ----------
+        scale : int
+            Scale index for which to get the noise shape.
+
+        Returns
+        -------
+        tuple[int, ...]
+            Shape of the noise tensor for the specified scale.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
+        """
+        raise NotImplementedError("Subclasses must implement get_noise_shape")
+
+    def get_rec_noise(self, scale: int) -> list[TTensor]:
+        """Get the reconstruction noise tensor for a specific scale.
+
+        Parameters
+        ----------
+        scale : int
+            Scale index for which to get the reconstruction noise.
+
+        Returns
+        -------
+        TTensor
+            Reconstruction noise tensor for the specified scale.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
+        """
+        raise NotImplementedError("Subclasses must implement get_rec_noise")
+
+    @abstractmethod
     def load_discriminator_state(self, scale_path: str, scale: int) -> None:
         """Load discriminator state for a given scale from disk.
 
@@ -653,7 +699,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         indexes: list[int],
         scale: int,
         real_facies: TTensor,
-    ) -> tuple[DiscriminatorMetrics[TTensor], dict[Any, Any] | None]:
+    ) -> tuple[DiscriminatorMetrics[TTensor], list[dict[str, Any]] | None]:
         """Compute discriminator losses and gradient penalty for a scale.
 
         Parameters
@@ -667,7 +713,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
         Returns
         -------
-        tuple[DiscriminatorMetrics[TTensor], dict[Any, Any] | None]:
+        tuple[DiscriminatorMetrics[TTensor], list[dict[str, Any]] | None]:
             Container with total, real, fake and gp losses, and optional gradients dict.
 
         Raises
@@ -687,7 +733,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         real_facies: TTensor,
         masks_dict: dict[int, TTensor],
         rec_in_dict: dict[int, TTensor],
-    ) -> tuple[GeneratorMetrics[TTensor], dict[Any, Any] | None]:
+    ) -> tuple[GeneratorMetrics[TTensor], list[dict[str, Any]] | None]:
         """Common generator-metrics flow shared by frameworks.
 
         Parameters
@@ -706,9 +752,9 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         Returns
         -------
         tuple[
-            GeneratorMetrics[TTensor] | dict[Any, Any] | None
+            GeneratorMetrics[TTensor], list[dict[str, Any]] | None
         ]:
-            Container with total, fake, rec, well and div losses, and optional gradients dict.
+            Container with total, fake, rec, well and div losses, and optional gradients list.
 
         Raises
         ------
@@ -771,7 +817,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
             List of noise tensors from scale 0 up to `scale`.
         """
         if rec:
-            return self.rec_noise[: scale + 1].copy()
+            return self.get_rec_noise(scale)
         return [self._generate_noise(i, indexes) for i in range(scale + 1)]
 
     def get_noise_aplitude(self, scale: int) -> list[float]:
@@ -1113,13 +1159,11 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         final_metrics: dict[int, DiscriminatorMetrics[TTensor]] = {}
 
         for _ in range(self.discriminator_steps):
-            # Zero all discriminator gradients at once
-            for scale in self.active_scales:
-                if scale in real_facies_dict:
-                    discriminator_optimizers[scale].zero_grad()
 
             # Compute metrics for this discriminator step only
             step_metrics: dict[int, DiscriminatorMetrics[TTensor]] = {}
+            step_gradients: list[dict[str, Any]] = []
+            losses: list[Any] = []
             for scale in self.active_scales:
                 if scale not in real_facies_dict:
                     continue
@@ -1132,20 +1176,21 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
                 if gradients is not None:
                     discriminator_optimizers[scale].update(
-                        self.discriminator.discs[scale], gradients
+                        self.discriminator.discs[scale], gradients[0]
                     )
+                    step_gradients.extend(gradients)
+                    step_gradients.append(discriminator_optimizers[scale].state)
 
-            # Backward only the current step's totals
-            if step_metrics:
-                totals: list[Any] = []
-                for step in step_metrics.values():
-                    totals.extend([step.real, step.fake, step.gp])
-                self.backward_totals(totals)
+                losses.extend(
+                    [
+                        step_metrics[scale].total,
+                        step_metrics[scale].real,
+                        step_metrics[scale].fake,
+                        step_metrics[scale].gp,
+                    ]
+                )
 
-            # Step optimizers for each active scale
-            for scale in self.active_scales:
-                if scale in real_facies_dict:
-                    discriminator_optimizers[scale].step()
+            self.backward_grads(losses, gradients=step_gradients)
 
             # Record metrics from this step
             for scale, metrics in step_metrics.items():
@@ -1190,13 +1235,11 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         final_metrics: dict[int, GeneratorMetrics[TTensor]] = {}
 
         for _ in range(self.generator_steps):
-            # Zero all generator gradients at once
-            for scale in self.active_scales:
-                if scale in real_facies_dict:
-                    generator_optimizers[scale].zero_grad()
 
             # Compute per-scale metrics using subclass hook
-            scale_results: dict[int, GeneratorMetrics[TTensor]] = {}
+            step_metrics: dict[int, GeneratorMetrics[TTensor]] = {}
+            step_gradients: list[dict[str, Any]] = []
+            losses: list[Any] = []
             for scale in self.active_scales:
                 if scale not in real_facies_dict:
                     continue
@@ -1218,23 +1261,27 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
                 if gradients is not None:
                     generator_optimizers[scale].update(
-                        self.generator.gens[scale], gradients
+                        self.generator.gens[scale], gradients[0]
                     )
+                    step_gradients.extend(gradients)
+                    step_gradients.append(generator_optimizers[scale].state)
 
-                scale_results[scale] = metrics
+                step_metrics[scale] = metrics
 
-            # Backward pass across aggregated totals
-            if scale_results:
-                totals = [res.total for res in scale_results.values()]
-                self.backward_totals(totals)
+                losses.extend(
+                    [
+                        step_metrics[scale].total,
+                        step_metrics[scale].fake,
+                        step_metrics[scale].div,
+                        step_metrics[scale].rec,
+                        step_metrics[scale].well,
+                    ]
+                )
 
-            # Step optimizers
-            for scale in self.active_scales:
-                if scale in real_facies_dict:
-                    generator_optimizers[scale].step()
+            self.backward_grads(losses, gradients=step_gradients)
 
             # Record metrics for this iteration (tensor-valued)
-            for scale, metrics in scale_results.items():
+            for scale, metrics in step_metrics.items():
                 final_metrics[scale] = metrics
 
         return final_metrics
@@ -1332,25 +1379,28 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
             and/or seismic conditioning.
         """
 
-        shape = self.shapes[index][2:]
         batch = len(indexes)
 
         if self.use_wells(index) and self.use_seismic(index):
-            z = self.generate_noise((self.base_channel, *shape), num_samp=batch)
+            shape = self.get_noise_shape(index)
+            z = self.generate_noise(shape, num_samp=batch)
             well = self.move_to_device(self._wells[index][indexes])
             seismic = self.move_to_device(self._seismic[index][indexes])
-            z = self.concatenate_tensors([z, well, seismic], dim=1)
+            z = self.concatenate_tensors([z, well, seismic])
         elif self.use_wells(index):
-            z = self.generate_noise((self.base_channel, *shape), num_samp=batch)
+            shape = self.get_noise_shape(index)
+            z = self.generate_noise(shape, num_samp=batch)
             well = self.move_to_device(self._wells[index][indexes])
-            z = self.concatenate_tensors([z, well], dim=1)
+            z = self.concatenate_tensors([z, well])
         elif self.use_seismic(index):
-            z = self.generate_noise((self.base_channel, *shape), num_samp=batch)
+            shape = self.get_noise_shape(index)
+            z = self.generate_noise(shape, num_samp=batch)
             seismic = self.move_to_device(self._seismic[index][indexes])
-            z = self.concatenate_tensors([z, seismic], dim=1)
+            z = self.concatenate_tensors([z, seismic])
         else:
+            shape = self.get_noise_shape(index, use_base_channel=False)
             z = self.generate_noise(
-                (self.gen_input_channels, *shape),
+                (*shape, self.gen_input_channels),
                 num_samp=batch,
             )
 

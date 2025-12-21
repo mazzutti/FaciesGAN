@@ -42,3 +42,4 @@ class InterpolatorConfig:
     upsample: int = 4
     chunk_size: int = 65536
     geometry: tuple[int, int] = (150, 120)
+    channels_last: bool = False

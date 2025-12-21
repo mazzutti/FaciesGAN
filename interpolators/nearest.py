@@ -75,11 +75,17 @@ class NearestInterpolator(BaseInterpolator):
         logger.info("Rendering with trace-wise nearest neighbor interpolation...")
 
         # Get dimensions using base helper method
-        super_height, super_width = resolutions[-1][2:]
+        super_height, super_width = (
+            resolutions[-1][1:3] if self.config.channels_last else resolutions[-1][2:]
+        )
 
         img_np = data_utils.load_image(image_path)
         high_res_img = self._upsample_image(img_np, super_height, super_width)
-        for _, _, new_h, new_w in resolutions[:-1]:
+        for resolution in resolutions[:-1]:
+            if self.config.channels_last:
+                _, new_h, new_w, _ = resolution
+            else:
+                _, _, new_h, new_w = resolution
             interpolated_img = self._downsample_image(high_res_img, new_h, new_w)
             interpolated_img = interpolated_img.astype(np.float32).clip(0.0, 1.0)
             smooth_imgs.append(torch.from_numpy(interpolated_img))  # type: ignore

@@ -1,5 +1,4 @@
 import os
-import random
 from typing import Any
 import mlx.core as mx
 import mlx.nn as nn  # type: ignore
@@ -15,6 +14,7 @@ from options import TrainningOptions
 
 from models.mlx.facies_gan import MLXFaciesGAN
 from training.base import Trainer
+from training.mlx.collate import mlx_collate
 from training.mlx.schedulers import MultiStepLR
 from typedefs import Batch
 from models.mlx import utils as mlx_utils
@@ -50,6 +50,7 @@ class MLXTrainer(
             shuffle=False,
             num_workers=self.options.num_workers,
             persistent_workers=(self.options.num_workers > 0),
+            collate_fn=mlx_collate,
         )
 
     def create_model(self) -> FaciesGAN[mx.array, nn.Module]:
@@ -183,7 +184,7 @@ class MLXTrainer(
         - Updates or appends the noise amplitude entry in ``self.model.noise_amp``.
         """
         if scale == 0:
-            prev_rec = mx.zeros_like(real_facies)
+            prev_rec = mx.zeros_like(real_facies, stream=mx.cpu)  # type: ignore
             z_rec = mlx_utils.generate_noise(
                 (*real_facies.shape[1:3], self.noise_channels),
                 num_samp=self.batch_size,
@@ -213,16 +214,16 @@ class MLXTrainer(
                 if seismic is None:
                     z_rec = mlx_utils.generate_noise(
                         (
-                            self.noise_channels,
                             *real_facies.shape[1:3],
+                            self.noise_channels,
                         ),
                         num_samp=self.batch_size,
                     )
                 else:
                     z_rec = mlx_utils.generate_noise(
                         (
-                            self.noise_channels - self.num_img_channels,
                             *real_facies.shape[1:3],
+                            self.noise_channels - self.num_img_channels,
                         ),
                         num_samp=self.batch_size,
                     )
@@ -231,21 +232,21 @@ class MLXTrainer(
                 if seismic is None:
                     z_rec = mlx_utils.generate_noise(
                         (
-                            self.noise_channels - self.num_img_channels,
                             *real_facies.shape[1:3],
+                            self.noise_channels - self.num_img_channels,
                         ),
                         num_samp=self.batch_size,
                     )
-                    z_rec = mx.concatenate([z_rec, wells], axis=1)
+                    z_rec = mx.concatenate([z_rec, wells], axis=-1)
                 else:
                     z_rec = mlx_utils.generate_noise(
                         (
-                            self.noise_channels - 2 * self.num_img_channels,
                             *real_facies.shape[1:3],
+                            self.noise_channels - 2 * self.num_img_channels,
                         ),
                         num_samp=self.batch_size,
                     )
-                    z_rec = mx.concatenate([z_rec, wells, seismic], axis=1)
+                    z_rec = mx.concatenate([z_rec, wells, seismic], axis=-1)
 
             p = self.model.zero_padding
             z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
@@ -266,7 +267,12 @@ class MLXTrainer(
                 self.model.noise_amp[scale] = (amp + self.model.noise_amp[scale]) / 2
             else:
                 self.model.noise_amp.append(amp)
-
+        # Use mx.eval to log and avoid uncontrolled OOM during evaluation
+        mx.eval(  # type: ignore
+            self.model.rec_noise[-1],
+            prev_rec,
+            self.model.noise_amp[-1],
+        )
         return prev_rec
 
     def init_dataset(
@@ -285,12 +291,15 @@ class MLXTrainer(
             :class:`datasets.mlx.dataset.MLXPyramidsDataset` instance and
             ``scales`` is the tuple of pyramid scales present in the dataset.
         """
-        dataset = MLXPyramidsDataset(self.options)
+        dataset = MLXPyramidsDataset(self.options, channels_last=True)
         if len(self.options.wells_mask_columns) > 0:
             sel = [int(i) for i in self.options.wells_mask_columns]
             dataset.batches = [dataset.batches[i] for i in sel]
         elif self.options.num_train_pyramids < len(dataset):
-            random.shuffle(dataset.batches)
+            idxs = mx.random.permutation(mx.arange(len(dataset)))[
+                : self.options.num_train_pyramids
+            ]
+            dataset.batches = [dataset.batches[int(i)] for i in idxs]
         return dataset, dataset.scales
 
     def load_model(self, scale: int) -> None:
@@ -394,7 +403,11 @@ class MLXTrainer(
             # Wells (optional)
             if len(self.wells) > 0:
                 wells_dev = self.wells[scale][indexes]
-                masks_dev = (wells_dev.abs().sum(dim=1, keepdim=True) > 0).int()
+                # wells_dev is MLX array in channel-last format (N, H, W, C).
+                # Compute mask where any channel is non-zero using MLX ops.
+                masks_dev = mx.sum(mx.abs(wells_dev), axis=3, keepdims=True)
+                masks_dev = mx.greater(masks_dev, 0)
+                masks_dev = masks_dev.astype(mx.int32)
                 wells_dict[scale] = wells_dev
                 masks_dict[scale] = masks_dev
 
@@ -442,14 +455,24 @@ class MLXTrainer(
         generated_facies = [utils.clamp(gen, -1, 1) for gen in generated_facies]
 
         if self.enable_plot_facies:
+            # Convert MLX arrays to NumPy (host) objects before pickling.
+            # MLX tensors are in [-1, 1], so request denormalization to [0, 1]
+            # to match the Torch branch behavior and avoid clipping negatives
+            # to zero later in the plotting code.
+            generated_facies_cpu = [
+                utils.tensor2np(g, denormalize=True) for g in generated_facies
+            ]
+            real_facies_cpu = utils.tensor2np(real_facies, denormalize=True)
+            masks_cpu = utils.tensor2np(masks[indexes]) if masks is not None else None
+
             # Submit background job to save the plot (non-blocking)
             bw.submit_plot_generated_facies(
-                generated_facies,
-                real_facies,
+                generated_facies_cpu,
+                real_facies_cpu,
                 scale,
                 epoch,
                 results_path,
-                masks,
+                masks_cpu,
             )
 
     def save_optimizers(
@@ -464,22 +487,38 @@ class MLXTrainer(
         filename constants from :mod:`config`.
         """
         os.makedirs(scale_path, exist_ok=True)
-        mx.savez(  # type: ignore
-            os.path.join(scale_path, OPT_G_FILE),
-            **generator_optimizer.state,  # type: ignore
-        )
-        mx.savez(  # type: ignore
-            os.path.join(scale_path, OPT_D_FILE),
-            **discriminator_optimizer.state,  # type: ignore
-        )
-        mx.savez(  # type: ignore
-            os.path.join(scale_path, SCH_G_FILE),
-            **generator_scheduler.state_dict(),
-        )
-        mx.savez(  # type: ignore
-            os.path.join(scale_path, SCH_D_FILE),
-            **discriminator_scheduler.state_dict(),
-        )
+        # Create a dump of optimizer states for debugging (non-fatal)
+        try:
+            mx.savez(  # type: ignore
+                os.path.join(scale_path, OPT_G_FILE),
+                **generator_optimizer.state,  # type: ignore
+            )
+        except Exception as e:
+            print(f"Failed to save generator optimizer state: {e}")
+
+        try:
+            mx.savez(  # type: ignore
+                os.path.join(scale_path, OPT_D_FILE),
+                **discriminator_optimizer.state,  # type: ignore
+            )
+        except Exception as e:
+            print(f"Failed to save discriminator optimizer state: {e}")
+
+        try:
+            mx.savez(  # type: ignore
+                os.path.join(scale_path, SCH_G_FILE),
+                **generator_scheduler.state_dict(),
+            )
+        except Exception as e:
+            print(f"Failed to save generator scheduler state: {e}")
+
+        try:
+            mx.savez(  # type: ignore
+                os.path.join(scale_path, SCH_D_FILE),
+                **discriminator_scheduler.state_dict(),
+            )
+        except Exception as e:
+            print(f"Failed to save discriminator scheduler state: {e}")
 
     def schedulers_step(
         self,

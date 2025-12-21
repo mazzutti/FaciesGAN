@@ -139,6 +139,7 @@ class TorchSPADE(nn.Module):
 
         # Resize conditioning to match feature map size if needed
         if cond.shape[2:] != x.shape[2:]:
+            print(f"{cond.shape[2:]} -> {x.shape[2:]}")
             cond = F.interpolate(
                 cond, size=x.shape[2:], mode="bilinear", align_corners=True
             )

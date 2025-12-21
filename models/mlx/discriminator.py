@@ -2,7 +2,7 @@ import mlx.nn as nn  # type: ignore
 import mlx.core as mx
 
 from models.discriminator import Discriminator
-from typing import Self, cast
+from typing import cast
 
 from models.mlx.custom_layer import MLXSPADEDiscriminator
 
@@ -60,19 +60,11 @@ class MLXDiscriminator(Discriminator[mx.array, nn.Module], nn.Module):
     def __call__(self, scale: int, input_tensor: mx.array) -> mx.array:
         return super().__call__(scale, input_tensor)
 
-    def eval(self) -> Self:
-        """Set the module in evaluation mode.
-
-        Returns
-        -------
-        Self
-            The discriminator instance in evaluation mode.
-        """
-        return cast(Self, nn.Module.eval(self))
-
     def forward(self, scale: int, input_tensor: mx.array) -> mx.array:
         """Discriminate input tensor and return score map tensor."""
-        return cast(MLXSPADEDiscriminator, self.discs[scale])(input_tensor)
+        output_tensor = cast(MLXSPADEDiscriminator, self.discs[scale])(input_tensor)  # type: ignore
+        mx.eval(output_tensor)  # type: ignore
+        return output_tensor
 
     def create_scale(self, num_features: int, min_num_features: int) -> None:
         spade_gen = MLXSPADEDiscriminator(

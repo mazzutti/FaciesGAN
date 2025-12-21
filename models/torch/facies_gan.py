@@ -69,14 +69,22 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         self.setup_framework()
         self.wells, self.seismic = wells, seismic
 
-    def backward_totals(self, totals: list[torch.Tensor]) -> None:
-        """Call PyTorch backward on aggregated totals.
+    def backward_grads(
+        self,
+        losses: list[torch.Tensor],
+        gradients: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Call PyTorch backward on aggregated losses.
 
-        Args:
-            totals (list[torch.Tensor]): List of gradient tensors to backpropagate
-                through the graph via `torch.autograd.backward`.
+        Parameters:
+        ----------
+        losses  (list[torch.Tensor]): List of gradient tensors to backpropagate
+            through the graph via `torch.autograd.backward`.
+        gradients (list[dict[str, Any]] | None, optional):
+            Optional list of dictionaries mapping parameter names to gradients
+            to populate during the backward call (default is None).
         """
-        torch.autograd.backward(totals)
+        torch.autograd.backward(losses)
 
     def build_discriminator(self) -> TorchDiscriminator:
         """Build and return the PyTorch `Discriminator` instance (not moved).
@@ -110,7 +118,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         indexes: list[int],
         scale: int,
         real_facies: torch.Tensor,
-    ) -> tuple[DiscriminatorMetrics[torch.Tensor], dict[Any, Any] | None]:
+    ) -> tuple[DiscriminatorMetrics[torch.Tensor], list[dict[str, Any]] | None]:
         """Compute discriminator losses and gradient penalty for a scale.
 
         Parameters
@@ -150,7 +158,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         real_facies: torch.Tensor,
         masks_dict: dict[int, torch.Tensor],
         rec_in_dict: dict[int, torch.Tensor],
-    ) -> tuple[GeneratorMetrics[torch.Tensor], dict[Any, Any] | None]:
+    ) -> tuple[GeneratorMetrics[torch.Tensor], list[dict[str, Any]] | None]:
         """Common generator-metrics flow shared by frameworks.
 
         Parameters
@@ -202,14 +210,12 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
         return metrics, None
 
-    def concatenate_tensors(
-        self, tensors: list[torch.Tensor], dim: int
-    ) -> torch.Tensor:
+    def concatenate_tensors(self, tensors: list[torch.Tensor]) -> torch.Tensor:
         """Concatenate a list of tensors along dimension `dim`.
 
         Uses PyTorch `torch.cat` and preserves device placement.
         """
-        return torch.cat(tensors, dim=dim)
+        return torch.cat(tensors, dim=1)
 
     def compute_diversity_loss(self, fake_samples: list[torch.Tensor]) -> torch.Tensor:
         """Compute diversity loss across multiple generated `fake_samples`.
@@ -380,6 +386,9 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         """
         return utils.generate_noise(shape, num_samp=num_samp, device=self.device)
 
+    def get_rec_noise(self, scale: int) -> list[torch.Tensor]:
+        return [tensor.clone() for tensor in self.rec_noise[: scale + 1]]
+
     def generate_padding(self, z: torch.Tensor, value: int = 0) -> torch.Tensor:
         """Pad tensor `z` using the model's zero-padding size.
 
@@ -403,6 +412,23 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         if os.path.exists(amp_path):
             with open(amp_path, "r") as f:
                 self.noise_amp.append(float(f.read().strip()))
+
+    def get_noise_shape(
+        self, scale: int, use_base_channel: bool = True
+    ) -> tuple[int, ...]:
+        """Return the noise shape tuple for a given `scale`.
+
+        Args:
+            scale (int): Scale index for which to get the noise shape.
+
+        Returns:
+            tuple[int, ...]: Noise shape tuple as (channels, height, width).
+        """
+        return (
+            (self.base_channel, *self.shapes[scale][2:])
+            if use_base_channel
+            else self.shapes[scale][2:]
+        )
 
     def load_discriminator_state(self, scale_path: str, scale: int) -> None:
         """Load discriminator state dict for `scale` from `scale_path` if present.

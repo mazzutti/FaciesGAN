@@ -5,7 +5,7 @@ facies images from per-scale noise tensors, along with a simple
 ``ColorQuantization`` module used to snap outputs to a small palette.
 """
 
-from typing import Self, cast
+from typing import Any, Self, cast
 
 import torch
 import torch.nn as nn
@@ -101,40 +101,24 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
 
     def __call__(
         self,
-        z: list[torch.Tensor],
-        amp: list[float],
-        in_noise: torch.Tensor | None = None,
-        start_scale: int = 0,
-        stop_scale: int | None = None,
+        *args: Any,
+        **kwargs: Any,
     ) -> torch.Tensor:
         """Call the generator's forward method.
 
         Parameters
         ----------
-        z : list[TTensor]
-            List of per-scale noise tensors.
-        amp : list[float]
-            List of per-scale amplitude scalars.
-        in_noise : TTensor | None, optional
-            Optional input noise tensor for the coarsest scale.
-            Defaults to None.
-        start_scale : int, optional
-            Scale index to start synthesis from. Defaults to 0.
-        stop_scale : int | None, optional
-            Scale index to stop synthesis at (exclusive). Defaults to None,
-            which means synthesis continues to the finest scale.
+        *args : Any
+            Positional arguments for the `forward` method.
+        **kwargs : Any
+            Keyword arguments for the `forward` method.
+
         Returns
         -------
         TTensor
             Output of the `forward` method.
         """
-        return super().__call__(
-            z,
-            amp,
-            in_noise=in_noise,
-            start_scale=start_scale,
-            stop_scale=stop_scale,
-        )
+        return nn.Module.__call__(self, *args, **kwargs)
 
     def eval(self) -> Self:
         """Set the module in evaluation mode.

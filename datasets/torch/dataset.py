@@ -78,6 +78,7 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
         options: TrainningOptions,
         shuffle: bool = False,
         regenerate: bool = False,
+        channels_last: bool = False,
     ) -> None:
         """Initialize dataset and optionally shuffle or regenerate caches.
 
@@ -92,7 +93,12 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
             Clear in-memory pyramid cache and regenerate precomputed pyramids,
             by default False.
         """
-        super().__init__(options, shuffle=shuffle, regenerate=regenerate)
+        super().__init__(
+            options,
+            shuffle=shuffle,
+            regenerate=regenerate,
+            channels_last=channels_last,
+        )
 
     def generate_pyramids(self) -> tuple[tuple[torch.Tensor, ...], ...]:
         """Generate the scales list used by the dataset.
@@ -119,7 +125,9 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
 
         return facies_pyramids, wells_pyramids, seismic_pyramids
 
-    def generate_scales(self, options: TrainningOptions) -> tuple[tuple[int, ...], ...]:
+    def generate_scales(
+        self, options: TrainningOptions, channels_last: bool = False
+    ) -> tuple[tuple[int, ...], ...]:
         """Generate the scales list used by the dataset.
 
         Parameters
@@ -132,7 +140,7 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
         tuple[tuple[int, ...], ...]
             Tuple of scale descriptors as produced by ``utils.generate_scales``.
         """
-        return data_utils.generate_scales(options)
+        return data_utils.generate_scales(options, channels_last)
 
     def shuffle(self) -> None:
         """Shuffle the dataset samples in-place."""

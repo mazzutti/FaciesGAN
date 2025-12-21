@@ -60,7 +60,7 @@ def generate_facies(
         indices used.
     """
     model.load(model_path, load_discriminator=False, load_wells=False)
-    model.generator.eval()
+    # model.generator.eval()
 
     mask_indexes = [random.choice(options.wells) for _ in range(how_many)]
 
@@ -113,7 +113,7 @@ def generate_comparison_plots(
         Pyramid scale to use. If None, uses the finest scale. Defaults to None.
     """
     model.load(model_path, load_discriminator=False, load_wells=False)
-    model.generator.eval()
+    # model.generator.eval()
 
     # Use finest scale if not specified
     if scale is None:

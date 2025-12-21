@@ -1,6 +1,18 @@
-from typing import cast
+from typing import Literal, cast
 import mlx.core as mx
 import mlx.nn as nn  # type: ignore
+
+
+class MLXLeakyReLU(nn.LeakyReLU):
+    """LeakyReLU wrapper exposed as an `nn.Module`-compatible callable.
+
+    This small module allows using a leaky ReLU as an element of lists
+    of modules (e.g. ``mlp_shared``) where a callable object is
+    expected to implement the module interface.
+    """
+
+    def __init__(self, negative_slope: float = 0.2) -> None:
+        super().__init__(negative_slope=negative_slope)
 
 
 class MLXConvBlock(nn.Module):
@@ -42,42 +54,61 @@ class MLXConvBlock(nn.Module):
             padding=padding,
         )
         self.norm = nn.BatchNorm(num_features=out_channels)
+        self.activation = MLXLeakyReLU(negative_slope=0.2)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.conv(x)
         x = self.norm(x)
-        x = cast(mx.array, nn.leaky_relu(x, negative_slope=0.2))  # type: ignore
+        x = cast(mx.array, self.activation(x))
         return x
 
 
-class MLXLeakyReLU(nn.Module):
-    """LeakyReLU wrapper exposed as an `nn.Module`-compatible callable.
+class MLXUpsample(nn.Module):
+    """Upsample subclass that stores expected output size and scale.
 
-    This small module allows using a leaky ReLU as an element of lists
-    of modules (e.g. ``mlp_shared``) where a callable object is
-    expected to implement the module interface.
+    Subclassing `nn.Upsample` keeps the operator directly available while
+    allowing a fast no-op when the input already matches the expected
+    output `size` to avoid unnecessary backend work/allocations.
     """
 
-    def __init__(self, negative_slope: float = 0.2) -> None:
-        super().__init__()
-        self.negative_slope = negative_slope
+    def __init__(
+        self,
+        size: tuple[int, ...],
+        mode: Literal["nearest", "linear", "cubic"] = "linear",
+        align_corners: bool = True,
+    ) -> None:
+        self.height, self.width = (int(size[0]), int(size[1]))
+        self.mode = mode
+        self.align_corners = align_corners
 
     def __call__(self, x: mx.array) -> mx.array:
-        return cast(mx.array, nn.leaky_relu(x, negative_slope=self.negative_slope))  # type: ignore
+        in_height, in_width = x.shape[1:3]
+        if (in_height, in_width) == (self.height, self.width):
+            return x
 
-
-class MLXTanh(nn.Module):
-    """Tanh activation wrapper as an `nn.Module`.
-
-    This small module allows using `mx.tanh` inside lists of modules
-    (for example, the `tail` list in `MLXScaleModule`).
-    """
-
-    def __init__(self) -> None:
-        super().__init__()
-
-    def __call__(self, x: mx.array) -> mx.array:
-        return mx.tanh(x)
+        scale_factor = (self.height / in_height, self.width / in_width)
+        if self.mode == "nearest":
+            return nn.layers.upsample.upsample_nearest(x, scale_factor)  # type: ignore
+        elif self.mode == "linear":
+            return cast(
+                mx.array,
+                nn.layers.upsample.upsample_linear(  # type: ignore
+                    x,
+                    scale_factor,
+                    self.align_corners,
+                ),
+            )
+        elif self.mode == "cubic":
+            return cast(
+                mx.array,
+                nn.layers.upsample.upsample_cubic(  # type: ignore
+                    x,
+                    scale_factor,
+                    self.align_corners,
+                ),
+            )
+        else:
+            raise Exception(f"Unknown interpolation mode: {self.mode}")
 
 
 class MLXSPADE(nn.Module):
@@ -134,31 +165,54 @@ class MLXSPADE(nn.Module):
         self.mlp_beta = nn.Conv2d(
             hidden_nc, norm_nc, kernel_size=kernel_size, padding=padding
         )
+        # Cache of upsample layers keyed by target (height, width).
+        # We create them lazily on first use to avoid re-allocating
+        # Upsample modules on every forward call. Optionally the caller
+        # can provide a list of targets to preallocate common sizes.
+        self._upsample_cache: dict[tuple[int, ...], nn.Module] = {}
 
-    def __call__(self, x: mx.array, conditioning_input: mx.array) -> mx.array:
-        # Normalize the input features (B, H, W, C)
-        normalized = self.norm(x)
+    def ensure_upsample(
+        self,
+        target: tuple[int, ...],
+        mode: Literal["linear"] = "linear",
+        align_corners: bool = True,
+    ) -> nn.Module:
+        """Return a cached Upsample module for `target` size and optional `scale`.
 
-        # Resize conditioning to match feature map size if needed
-        # x.shape is (B, H, W, C)
-        if conditioning_input.shape[1:3] != x.shape[1:3]:
-            conditioning_input = cast(
-                mx.array,
-                mx.image.resize(  # type: ignore
-                    conditioning_input,
-                    x.shape[1],
-                    x.shape[2],
-                ),
+        `target` is the desired output size (height, width). If `scale` is
+        provided the underlying `MLXUpsample` will be created with
+        `scale_factor` to satisfy backends that prefer it.
+        """
+        up = self._upsample_cache.get(target)
+        if up is None:
+            up = MLXUpsample(
+                size=target,
+                mode=mode,
+                align_corners=align_corners,
             )
+            self._upsample_cache[target] = up
+        return up
 
-        # Generate spatially-varying gamma and beta
-        activated_input: mx.array = conditioning_input
+    def __call__(
+        self,
+        x: mx.array,
+        conditioning_input: mx.array,
+        mode: Literal["linear"] = "linear",
+        align_corners: bool = True,
+    ) -> mx.array:
+        activated_input = cast(
+            mx.array,
+            self.ensure_upsample(
+                x.shape[1:3],
+                mode=mode,
+                align_corners=align_corners,
+            )(conditioning_input),
+        )
         for layer in self.mlp_shared:
-            activated_input = cast(mx.array, layer(activated_input))  # type: ignore
-
+            activated_input = cast(mx.array, layer(activated_input))
         gamma = self.mlp_gamma(activated_input)
         beta = self.mlp_beta(activated_input)
-
+        normalized = self.norm(x)
         return normalized * (1 + gamma) + beta
 
 
@@ -204,9 +258,11 @@ class MLXSPADEConvBlock(nn.Module):
             padding=padding,
         )
 
+        self.activation = MLXLeakyReLU(negative_slope=0.2)
+
     def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
         x = self.spade(x, cond)
-        x = cast(mx.array, nn.leaky_relu(x, negative_slope=0.2))  # type: ignore
+        x = cast(mx.array, self.activation(x))
         x = self.conv(x)
         return x
 
@@ -280,17 +336,20 @@ class MLXSPADEGenerator(nn.Module):
             padding=padding_size,
         )
 
+        self.leaky_relu = MLXLeakyReLU(negative_slope=0.2)
+        self.activation = nn.Tanh()
+
     def __call__(self, cond: mx.array) -> mx.array:
         # Initial feature extraction
         x = self.init_conv(cond)
-        x = cast(mx.array, nn.leaky_relu(x, negative_slope=0.2))  # type: ignore
+        x = cast(mx.array, self.leaky_relu(x))
 
         # Apply SPADE blocks
         for block in self.spade_blocks:
             x = block(x, cond)
 
         # Final output layer
-        out = mx.tanh(self.tail_conv(x))
+        out = cast(mx.array, self.activation(self.tail_conv(x)))
         return out
 
 

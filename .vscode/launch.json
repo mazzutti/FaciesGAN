@@ -19,10 +19,12 @@
         "results/",
         "--num-train-pyramids",
         "1",
+        "--num-workers",
+        "0",
         "--num-iter",
         "4000",
         "--num-parallel-scales",
-        "7",
+        "3",
         "--alpha",
         "10",
         "--scale0-noise-amp",
@@ -33,7 +35,8 @@
         "1.0",
         "--no-tensorboard",
         "--use-wells",
-        "--use-seismic"
+        "--use-seismic",
+        "--use-mlx"
         // "--use-profiler"
       ]
     }

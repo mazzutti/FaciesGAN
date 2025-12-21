@@ -7,7 +7,7 @@ store numeric configuration and then implement the abstract methods.
 """
 
 from abc import ABC, abstractmethod
-from typing import Generic, Self
+from typing import Generic
 
 from typedefs import TModule, TTensor
 
@@ -79,20 +79,20 @@ class Discriminator(ABC, Generic[TTensor, TModule]):
         TTensor
             Output of the `forward` method.
         """
-        return super().__call__(scale, input_tensor)  # type: ignore
+        return self.forward(scale, input_tensor)  # type: ignore
 
-    @abstractmethod
-    def eval(self) -> Self:
-        """Set the discriminator to evaluation mode (framework-specific).
+    # @abstractmethod
+    # def eval(self) -> Self:
+    #     """Set the discriminator to evaluation mode (framework-specific).
 
-        Returns
-        -------
-        Self
-            The discriminator instance in evaluation mode.
+    #     Returns
+    #     -------
+    #     Self
+    #         The discriminator instance in evaluation mode.
 
-        Raises
-        ------
-        NotImplementedError
-            If the method is not implemented by the subclass.
-        """
-        raise NotImplementedError("eval method must be implemented by subclasses.")
+    #     Raises
+    #     ------
+    #     NotImplementedError
+    #         If the method is not implemented by the subclass.
+    #     """
+    #     raise NotImplementedError("eval method must be implemented by subclasses.")
