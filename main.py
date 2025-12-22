@@ -18,7 +18,6 @@ from config import CHECKPOINT_PATH, OPT_FILE
 from log import init_output_logging
 from options import TrainningOptions
 from training import TorchTrainer, MLXTrainer
-import mlx.core as mx  # type: ignore
 
 
 def get_arguments() -> ArgumentParser:
@@ -306,7 +305,6 @@ def main() -> None:
         pass
 
     if options.use_mlx:
-        mx.default_stream(mx.cpu)  # type: ignore
         trainer = MLXTrainer(options)
         print("Using MLX backend for training.")
     else:

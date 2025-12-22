@@ -35,8 +35,8 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
     def __init__(
         self,
         options: TrainningOptions,
-        wells: list[torch.Tensor] = [],
-        seismic: list[torch.Tensor] = [],
+        wells: tuple[torch.Tensor, ...] = (),
+        seismic: tuple[torch.Tensor, ...] = (),
         device: torch.device = torch.device("cpu"),
         noise_channels: int = 3,
         *args: tuple[Any, ...],
@@ -118,7 +118,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         indexes: list[int],
         scale: int,
         real_facies: torch.Tensor,
-    ) -> tuple[DiscriminatorMetrics[torch.Tensor], list[dict[str, Any]] | None]:
+    ) -> tuple[DiscriminatorMetrics[torch.Tensor], dict[str, Any] | None]:
         """Compute discriminator losses and gradient penalty for a scale.
 
         Parameters
@@ -158,7 +158,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         real_facies: torch.Tensor,
         masks_dict: dict[int, torch.Tensor],
         rec_in_dict: dict[int, torch.Tensor],
-    ) -> tuple[GeneratorMetrics[torch.Tensor], list[dict[str, Any]] | None]:
+    ) -> tuple[GeneratorMetrics[torch.Tensor], dict[str, Any] | None]:
         """Common generator-metrics flow shared by frameworks.
 
         Parameters
@@ -210,12 +210,14 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
         return metrics, None
 
-    def concatenate_tensors(self, tensors: list[torch.Tensor]) -> torch.Tensor:
+    def concatenate_tensors(
+        self, tensors: list[torch.Tensor], dim: int = 1
+    ) -> torch.Tensor:
         """Concatenate a list of tensors along dimension `dim`.
 
         Uses PyTorch `torch.cat` and preserves device placement.
         """
-        return torch.cat(tensors, dim=1)
+        return torch.cat(tensors, dim=dim)
 
     def compute_diversity_loss(self, fake_samples: list[torch.Tensor]) -> torch.Tensor:
         """Compute diversity loss across multiple generated `fake_samples`.
@@ -472,13 +474,15 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         Args:
             scale_path (str): Directory path for the given scale.
         """
-        self.wells.append(
+        wells: list[torch.Tensor] = []
+        wells.append(
             utils.load(
                 os.path.join(scale_path, M_FILE),
                 self.device,
                 as_type=torch.Tensor,
             )
         )
+        self.wells = tuple(wells)
 
     def move_to_device(self, obj: Any, device: torch.device | None = None) -> Any:
         """Move PyTorch modules or tensors to a target device.
@@ -525,3 +529,27 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         if scale < len(self.shapes):
             shape_path = os.path.join(scale_path, SHAPE_FILE)
             torch.save(self.shapes[scale], shape_path)
+
+    def update_discriminator_weights(
+        self,
+        scale: int,
+        optimizer: torch.optim.Optimizer,
+        loss: torch.Tensor,
+        gradients: Any | None,
+    ) -> dict[str, Any] | None:
+        """Perform standard PyTorch optimization step."""
+        optimizer.zero_grad()
+        torch.autograd.backward(loss)
+        optimizer.step()
+
+    def update_generator_weights(
+        self,
+        scale: int,
+        optimizer: torch.optim.Optimizer,
+        loss: torch.Tensor,
+        gradients: Any | None,
+    ) -> dict[str, Any] | None:
+        """Perform standard PyTorch optimization step."""
+        optimizer.zero_grad()
+        torch.autograd.backward(loss)
+        optimizer.step()

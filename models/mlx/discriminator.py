@@ -63,7 +63,6 @@ class MLXDiscriminator(Discriminator[mx.array, nn.Module], nn.Module):
     def forward(self, scale: int, input_tensor: mx.array) -> mx.array:
         """Discriminate input tensor and return score map tensor."""
         output_tensor = cast(MLXSPADEDiscriminator, self.discs[scale])(input_tensor)  # type: ignore
-        mx.eval(output_tensor)  # type: ignore
         return output_tensor
 
     def create_scale(self, num_features: int, min_num_features: int) -> None:

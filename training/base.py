@@ -14,7 +14,7 @@ import math
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict
+from typing import Any, Dict, Iterator
 
 from tensorboardX import SummaryWriter  # type: ignore
 from tqdm import tqdm
@@ -28,7 +28,7 @@ from training.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetric
 from models.base import FaciesGAN
 from options import TrainningOptions
 from tensorboard_visualizer import TensorBoardVisualizer
-from typedefs import IDataLoader, TModule, TOptimizer, TScheduler, TTensor
+from typedefs import IDataLoader, TModule, TOptimizer, TScheduler, TTensor, Batch
 
 
 class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader]):
@@ -104,9 +104,9 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self.min_noise_amp: float = options.min_noise_amp
         self.scale0_noise_amp: float = options.scale0_noise_amp
         # Containers populated by concrete trainers at runtime
-        self.facies: list[Any] = []
-        self.wells: list[Any] = []
-        self.seismic: list[Any] = []
+        self.facies: tuple[TTensor, ...] = ()
+        self.wells: tuple[TTensor, ...] = ()
+        self.seismic: tuple[TTensor, ...] = ()
         dataset, scales = self.init_dataset()
         self.dataset: PyramidsDataset[TTensor] = dataset
         self.num_of_batchs: int = len(self.dataset) // self.batch_size
@@ -297,33 +297,30 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         )
 
     @abstractmethod
-    def prepare_scale_batch(self, scales: list[int], indexes: list[int]) -> tuple[
-        dict[int, TTensor],
-        dict[int, TTensor],
-        dict[int, TTensor],
-        dict[int, TTensor],
-    ]:
-        """Prepare and move to device the batch tensors for given scales.
+    def create_batch_iterator(
+        self, loader: IDataLoader, scales: list[int]
+    ) -> Iterator[tuple[Batch[TTensor], Any]]:
+        """Create an iterator that yields batches for training.
+
+        Subclasses must implement this to define how data is fetched and
+        prepared (e.g., using a prefetcher or standard iteration).
 
         Parameters
         ----------
+        loader : IDataLoader
+            The data loader to iterate over.
         scales : list[int]
-            List of scale indices to prepare batches for.
-        indexes : list[int]
-            List of batch sample indices.
+            List of scale indices being trained.
 
-        Returns
-        -------
-        tuple containing:
-        - real_facies_dict: dict[int, TTensor]
-            Real facies tensors per scale moved to device.
-        - masks_dict: dict[int, TTensor]
-            Well masks per scale moved to device (if wells are used).
-        - wells_dict: dict[int, TTensor]
-            Well conditioning tensors per scale moved to device (if wells are used).
-        - seismic_dict: dict[int, TTensor]
-            Seismic conditioning tensors per scale moved to device (if seismic is used).
+        Yields
+        ------
+        tuple[Batch[TTensor], Any]
+            A tuple containing:
+            1. The raw batch from the loader.
+            2. The prepared batch data (tuple of dicts: real_facies, masks,
+               wells, seismic). THIS MUST NOT BE NONE.
         """
+        raise NotImplementedError("Subclasses must implement create_batch_iterator")
 
     def train_scales(
         self,
@@ -333,33 +330,17 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         results_paths: dict[int, str],
         batch_id: int,
         progress: "tqdm[Any]",
+        real_facies_dict: dict[int, TTensor],
+        masks_dict: dict[int, TTensor],
+        wells_dict: dict[int, TTensor],
+        seismic_dict: dict[int, TTensor],
     ) -> None:
         """Train multiple pyramid scales simultaneously.
 
-        Parameters
-        ----------
-        scales : list[int]
-            List of scale indices to train in parallel.
-        writers : dict[int, SummaryWriter]
-            Dictionary mapping scale indices to TensorBoard writers.
-        scale_paths : dict[int, str]
-            Dictionary mapping scale indices to checkpoint directories.
-        results_paths : dict[int, str]
-            Dictionary mapping scale indices to results directories.
-        batch_id : int
-            Current batch index within the epoch.
+        Accepts prepared data dictionaries directly.
         """
 
-        # Prepare batch sample indexes
         indexes = list(range(self.batch_size))
-
-        # Prepare batch data for all scales
-        (
-            real_facies_dict,
-            masks_dict,
-            wells_dict,
-            seismic_dict,
-        ) = self.prepare_scale_batch(scales, indexes)
 
         # Create optimizers for all scales
         (
@@ -390,9 +371,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             )
             rec_in_dict[scale] = prev_rec
 
-        # Training loop - iterate epochs (0-based) and update the single progress bar
+        # Training loop - iterate epochs (0-based)
         for epoch in range(self.num_iter):
-            # Update progress description with current batch and epoch
             progress.set_description(
                 f"Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch+1:4d}/{self.num_iter}]"
             )
@@ -409,11 +389,9 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 generator=generator_metrics, discriminator=discriminator_metrics
             )
 
-            # Optionally generate visualization samples (backend-specific)
             if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
                 generated_samples = self.generate_visualization_samples(scales, indexes)
 
-            # Delegate shared end-of-epoch work (visualizer, logging, saving, schedulers, progress)
             self.handle_epoch_end(
                 scales=scales,
                 epoch=epoch,
@@ -426,9 +404,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 discriminator_schedulers=discriminator_schedulers,
                 progress=progress,
             )
-            del scale_metrics
 
-        # Save optimizers for all scales
         for scale in scales:
             self.save_optimizers(
                 scale_paths[scale],
@@ -447,27 +423,6 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         generator_scheduler: TScheduler,
         discriminator_scheduler: TScheduler,
     ) -> None:
-        """Save optimizer and scheduler state dicts to disk using project
-        filename constants from :mod:`config`.
-
-        Parameters
-        ----------
-        scale_path : str
-            Path to the scale directory where optimizers will be saved.
-        generator_optimizer : TOptimizer
-            Generator optimizer instance to save.
-        discriminator_optimizer : TOptimizer
-            Discriminator optimizer instance to save.
-        generator_scheduler : TScheduler
-            Generator learning rate scheduler instance to save.
-        discriminator_scheduler : TScheduler
-            Discriminator learning rate scheduler instance to save.
-
-        Raises
-        ------
-        NotImplementedError
-            If the subclass does not implement this method.
-        """
         raise NotImplementedError("Subclasses must implement save_optimizers")
 
     def load(self, path: str, until_scale: int | None = None) -> None:
@@ -699,7 +654,13 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             # Single progress bar for all batches and epochs in this group
             total_batches = len(self.data_loader)
             progress = tqdm(total=self.num_iter * total_batches, position=0)
-            for batch_id, batch in enumerate(self.data_loader):
+
+            # Use create_batch_iterator to allow subclasses to inject prefetching logic
+            batch_iterator = self.create_batch_iterator(
+                self.data_loader, scales_to_train
+            )
+
+            for batch_id, (batch, prepared_batch) in enumerate(batch_iterator):
                 # Each iteration yields a batch of pyramids (facies, wells, seismic)
                 self.facies, self.wells, self.seismic = batch
 
@@ -710,7 +671,16 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 self._total_batches = total_batches
                 self._current_batch_id = batch_id
 
-                # Train all scales in this group using the current batch
+                # Enforce that prepared_batch is present
+                if prepared_batch is None:
+                    raise RuntimeError(
+                        f"{self.__class__.__name__}.create_batch_iterator returned None "
+                        "for prepared_batch. Data preparation must be handled by the iterator."
+                    )
+
+                real_facies_dict, masks_dict, wells_dict, seismic_dict = prepared_batch
+
+                # Pass prepared dictionaries directly to train_scales
                 self.train_scales(
                     scales_to_train,
                     writers,
@@ -718,6 +688,10 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     results_paths,
                     batch_id,
                     progress,
+                    real_facies_dict=real_facies_dict,
+                    masks_dict=masks_dict,
+                    wells_dict=wells_dict,
+                    seismic_dict=seismic_dict,
                 )
 
             progress.close()

@@ -1,5 +1,6 @@
 import os
-from typing import Any
+from typing import Any, Iterator
+
 import mlx.core as mx
 import mlx.nn as nn  # type: ignore
 import mlx.optimizers as optim  # type: ignore
@@ -8,6 +9,7 @@ from torch.utils.data import DataLoader
 import background_workers as bw
 from config import D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, SCH_D_FILE, SCH_G_FILE
 from datasets import PyramidsDataset
+from datasets.mlx.data_prefetcher import MLXDataPrefetcher
 from datasets.mlx.dataset import MLXPyramidsDataset
 from models import FaciesGAN
 from options import TrainningOptions
@@ -39,6 +41,7 @@ class MLXTrainer(
         checkpoint_path: str = ".checkpoints",
     ) -> None:
         super().__init__(options, fine_tuning, checkpoint_path)
+        self.gpu_stream: mx.Stream = mx.default_stream(mx.gpu)  # type: ignore
 
     def create_dataloader(self) -> DataLoader[Batch[mx.array]]:
         """Create and return a :class:`torch.utils.data.DataLoader` for the
@@ -142,10 +145,12 @@ class MLXTrainer(
         """
         generated_samples: dict[int, mx.array] = {}
 
-        for scale in scales:
-            generated_samples[scale] = self.model.generate_fake(
-                self.model.get_noise(indexes, scale), scale
-            )
+        # Ensure generation happens on GPU
+        with mx.stream(self.gpu_stream):
+            for scale in scales:
+                generated_samples[scale] = self.model.generate_fake(
+                    self.model.get_noise(indexes, scale), scale
+                )
         return generated_samples
 
     def initialize_noise(
@@ -183,96 +188,85 @@ class MLXTrainer(
           ``self.model.rec_noise``.
         - Updates or appends the noise amplitude entry in ``self.model.noise_amp``.
         """
-        if scale == 0:
-            prev_rec = mx.zeros_like(real_facies, stream=mx.cpu)  # type: ignore
-            z_rec = mlx_utils.generate_noise(
-                (*real_facies.shape[1:3], self.noise_channels),
-                num_samp=self.batch_size,
-            )
-            p = self.model.zero_padding
-            z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
-            self.model.rec_noise.append(z_rec)
+        # Ensure heavy ops use default stream
+        with mx.stream(self.gpu_stream):
+            if scale == 0:
+                prev_rec = mx.zeros_like(real_facies, stream=mx.cpu)  # type: ignore
+                z_rec = mlx_utils.generate_noise(
+                    (*real_facies.shape[1:3], self.noise_channels),
+                    num_samp=self.batch_size,
+                )
+                p = self.model.zero_padding
+                z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+                self.model.rec_noise.append(z_rec)
 
-            # Calculate noise amplitude for scale 0
-            fake = self.model.generator(
-                self.model.get_noise(indexes, scale),
-                [1.0] * (scale + 1),
-                stop_scale=scale,
-            )
+                # Calculate noise amplitude for scale 0
+                fake = self.model.generator(
+                    self.model.get_noise(indexes, scale),
+                    [1.0] * (scale + 1),
+                    stop_scale=scale,
+                )
 
-            rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
-            amp = self.options.scale0_noise_amp * rmse.item()
-            self.model.noise_amp.append(amp)
-        else:
-            # Interpolate previous scale facies
-            prev_rec = mlx_utils.interpolate(
-                self.facies[scale - 1][indexes],
-                real_facies.shape[1:3],
-            )
-
-            if wells is None:
-                if seismic is None:
-                    z_rec = mlx_utils.generate_noise(
-                        (
-                            *real_facies.shape[1:3],
-                            self.noise_channels,
-                        ),
-                        num_samp=self.batch_size,
-                    )
-                else:
-                    z_rec = mlx_utils.generate_noise(
-                        (
-                            *real_facies.shape[1:3],
-                            self.noise_channels - self.num_img_channels,
-                        ),
-                        num_samp=self.batch_size,
-                    )
-                    z_rec = mx.concatenate([z_rec, seismic], axis=1)
-            else:
-                if seismic is None:
-                    z_rec = mlx_utils.generate_noise(
-                        (
-                            *real_facies.shape[1:3],
-                            self.noise_channels - self.num_img_channels,
-                        ),
-                        num_samp=self.batch_size,
-                    )
-                    z_rec = mx.concatenate([z_rec, wells], axis=-1)
-                else:
-                    z_rec = mlx_utils.generate_noise(
-                        (
-                            *real_facies.shape[1:3],
-                            self.noise_channels - 2 * self.num_img_channels,
-                        ),
-                        num_samp=self.batch_size,
-                    )
-                    z_rec = mx.concatenate([z_rec, wells, seismic], axis=-1)
-
-            p = self.model.zero_padding
-            z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
-            self.model.rec_noise.append(z_rec)
-
-            # Calculate noise amplitude based on reconstruction error
-            fake = self.model.generator(
-                self.model.get_noise(indexes, scale),
-                self.model.noise_amp + [1.0],
-                stop_scale=scale,
-            )
-
-            rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
-            amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
-            self.model.noise_amp.append(amp)
-
-            if scale < len(self.model.noise_amp):
-                self.model.noise_amp[scale] = (amp + self.model.noise_amp[scale]) / 2
-            else:
+                rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
+                amp = self.options.scale0_noise_amp * rmse.item()
                 self.model.noise_amp.append(amp)
-        # Use mx.eval to log and avoid uncontrolled OOM during evaluation
-        mx.eval(  # type: ignore
-            self.model.rec_noise[-1],
-            prev_rec,
-            self.model.noise_amp[-1],
-        )
+            else:
+                # Interpolate previous scale facies
+                prev_rec = mlx_utils.interpolate(
+                    self.facies[scale - 1][indexes],
+                    real_facies.shape[1:3],
+                )
+
+                # Logic for noise generation based on conditioning
+                shape = (*real_facies.shape[1:3], self.noise_channels)
+                if wells is not None:
+                    shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
+                if seismic is not None:
+                    shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
+
+                z_rec = mlx_utils.generate_noise(shape, num_samp=self.batch_size)
+
+                to_concat = [z_rec]
+                if wells is not None:
+                    to_concat.append(wells)
+                if seismic is not None:
+                    to_concat.append(seismic)
+
+                if len(to_concat) > 1:
+                    z_rec = mx.concat(to_concat, axis=-1)  # type: ignore
+
+                p = self.model.zero_padding
+                z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+                self.model.rec_noise.append(z_rec)
+
+                # Calculate noise amplitude based on reconstruction error
+                fake = self.model.generator(
+                    self.model.get_noise(indexes, scale),
+                    self.model.noise_amp + [1.0],
+                    stop_scale=scale,
+                )
+
+                rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
+                amp = (
+                    max(self.model.noise_amp[-1] * rmse.item(), self.min_noise_amp)
+                    if self.model.noise_amp
+                    else self.min_noise_amp
+                )
+                self.model.noise_amp.append(amp)
+
+                if scale < len(self.model.noise_amp):
+                    self.model.noise_amp[scale] = (
+                        amp + self.model.noise_amp[scale]
+                    ) / 2
+                else:
+                    self.model.noise_amp.append(amp)
+
+            # Critical: eval here forces synchronization before returning
+            mx.eval(  # type: ignore
+                self.model.rec_noise[-1],
+                prev_rec,
+                mx.array(self.model.noise_amp[-1]),
+            )
         return prev_rec
 
     def init_dataset(
@@ -364,59 +358,15 @@ class MLXTrainer(
         except Exception as e:
             print(f"Warning: Could not load optimizers for scale {scale}: {e}")
 
-    def prepare_scale_batch(self, scales: list[int], indexes: list[int]) -> tuple[
-        dict[int, mx.array],
-        dict[int, mx.array],
-        dict[int, mx.array],
-        dict[int, mx.array],
-    ]:
-        """Prepare and move to device the batch tensors for given scales.
-
-        Parameters
-        ----------
-        scales : list[int]
-            List of scale indices to prepare batches for.
-        indexes : list[int]
-            List of batch sample indices.
-
-        Returns
-        -------
-        tuple containing:
-        - real_facies_dict: dict[int, mx.array]
-            Real facies tensors per scale moved to ``self.device`` (channels-last).
-        - masks_dict: dict[int, mx.array]
-            Well masks per scale moved to device (present when wells are used).
-        - wells_dict: dict[int, mx.array]
-            Well conditioning tensors per scale moved to device (channels-last).
-        - seismic_dict: dict[int, mx.array]
-            Seismic conditioning tensors per scale moved to device (channels-last).
-        """
-        real_facies_dict: dict[int, mx.array] = {}
-        masks_dict: dict[int, mx.array] = {}
-        wells_dict: dict[int, mx.array] = {}
-        seismic_dict: dict[int, mx.array] = {}
-
-        for scale in scales:
-            # Real facies
-            real_facies_dict[scale] = self.facies[scale][indexes]
-
-            # Wells (optional)
-            if len(self.wells) > 0:
-                wells_dev = self.wells[scale][indexes]
-                # wells_dev is MLX array in channel-last format (N, H, W, C).
-                # Compute mask where any channel is non-zero using MLX ops.
-                masks_dev = mx.sum(mx.abs(wells_dev), axis=3, keepdims=True)
-                masks_dev = mx.greater(masks_dev, 0)
-                masks_dev = masks_dev.astype(mx.int32)
-                wells_dict[scale] = wells_dev
-                masks_dict[scale] = masks_dev
-
-            # Seismic (optional)
-            if len(self.seismic) > 0:
-                seismic_dev = self.seismic[scale][indexes]
-                seismic_dict[scale] = seismic_dev
-
-        return real_facies_dict, masks_dict, wells_dict, seismic_dict
+    def create_batch_iterator(
+        self, loader: DataLoader[mx.array], scales: list[int]
+    ) -> Iterator[tuple[Batch[mx.array], Any]]:
+        """Override to use MLXDataPrefetcher."""
+        prefetcher = MLXDataPrefetcher(loader, scales)
+        batch, prepared = prefetcher.next()
+        while batch is not None:
+            yield batch, prepared
+            batch, prepared = prefetcher.next()
 
     def save_generated_facies(
         self,
@@ -439,14 +389,14 @@ class MLXTrainer(
         )
         real_facies = self.facies[scale][indexes]
 
+        # Generate on GPU (lazy)
         noises = [
             self.model.get_noise(
                 [int(index.item())] * self.num_generated_per_real, scale
             )
             for index in indexes
         ]
-
-        generated_facies: list[mx.array] = [
+        generated_facies = [
             self.model.generator(
                 noise, self.model.noise_amp[: scale + 1], stop_scale=scale
             )
@@ -455,17 +405,16 @@ class MLXTrainer(
         generated_facies = [utils.clamp(gen, -1, 1) for gen in generated_facies]
 
         if self.enable_plot_facies:
-            # Convert MLX arrays to NumPy (host) objects before pickling.
-            # MLX tensors are in [-1, 1], so request denormalization to [0, 1]
-            # to match the Torch branch behavior and avoid clipping negatives
-            # to zero later in the plotting code.
+            # We want to minimize blocking here.
+            # Convert to numpy (this blocks until generation is done)
+            # We can't easily avoid this block without changing background_workers to accept MLX.
+            # However, since this runs only once per epoch, blocking here is acceptable.
             generated_facies_cpu = [
                 utils.tensor2np(g, denormalize=True) for g in generated_facies
             ]
             real_facies_cpu = utils.tensor2np(real_facies, denormalize=True)
             masks_cpu = utils.tensor2np(masks[indexes]) if masks is not None else None
 
-            # Submit background job to save the plot (non-blocking)
             bw.submit_plot_generated_facies(
                 generated_facies_cpu,
                 real_facies_cpu,

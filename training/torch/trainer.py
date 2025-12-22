@@ -19,7 +19,7 @@ Notes
 from __future__ import annotations
 
 import os
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from typing import Any
 
 import torch
@@ -29,7 +29,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 
 import background_workers as bw
-import utils
+from datasets.torch.data_prefetcher import TorchDataPrefetcher
 from config import D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, SCH_D_FILE, SCH_G_FILE
 from datasets import PyramidsDataset
 from datasets.torch.dataset import TorchPyramidsDataset
@@ -80,7 +80,7 @@ class TorchTrainer(
     - The trainer updates ``self.model.rec_noise`` and ``self.model.noise_amp``
       as part of noise initialization (see :meth:`initialize_noise`).
     - Conditioning tensors (wells/seismic) are expected channels-last when
-      prepared and returned by :meth:`prepare_scale_batch`.
+      prepared and returned by :meth:`TorchDataPrefetcher`.
     """
 
     def __init__(
@@ -442,66 +442,19 @@ class TorchTrainer(
         except Exception as e:
             print(f"Warning: Could not load optimizers for scale {scale}: {e}")
 
-    def prepare_scale_batch(self, scales: list[int], indexes: list[int]) -> tuple[
-        dict[int, torch.Tensor],
-        dict[int, torch.Tensor],
-        dict[int, torch.Tensor],
-        dict[int, torch.Tensor],
-    ]:
-        """Prepare and move to device the batch tensors for given scales.
+    def create_batch_iterator(
+        self, loader: DataLoader[torch.Tensor], scales: list[int]
+    ) -> Iterator[tuple[Batch[torch.Tensor], Any | None]]:
+        """Create a prefetching iterator for the DataLoader.
 
-        Parameters
-        ----------
-        scales : list[int]
-            List of scale indices to prepare batches for.
-        indexes : list[int]
-            List of batch sample indices.
-
-        Returns
-        -------
-        tuple containing:
-        - real_facies_dict: dict[int, torch.Tensor]
-            Real facies tensors per scale moved to ``self.device`` (channels-last).
-        - masks_dict: dict[int, torch.Tensor]
-            Well masks per scale moved to device (present when wells are used).
-        - wells_dict: dict[int, torch.Tensor]
-            Well conditioning tensors per scale moved to device (channels-last).
-        - seismic_dict: dict[int, torch.Tensor]
-            Seismic conditioning tensors per scale moved to device (channels-last).
+        Overrides the base implementation to use :class:`TorchDataPrefetcher`,
+        which moves tensors to the GPU asynchronously.
         """
-        real_facies_dict: dict[int, torch.Tensor] = {}
-        masks_dict: dict[int, torch.Tensor] = {}
-        wells_dict: dict[int, torch.Tensor] = {}
-        seismic_dict: dict[int, torch.Tensor] = {}
-
-        for scale in scales:
-            facies_batch = self.facies[scale][indexes]
-
-            # Wells (optional)
-            if len(self.wells) > 0:
-                wells_batch = self.wells[scale][indexes]
-                wells_dev = utils.to_device(
-                    wells_batch, self.device, channels_last=True
-                )
-                masks_dev = (wells_dev.abs().sum(dim=1, keepdim=True) > 0).int()
-                masks_dev = utils.to_device(masks_dev, self.device, channels_last=True)
-                wells_dict[scale] = wells_dev
-                masks_dict[scale] = masks_dev
-
-            # Seismic (optional)
-            if len(self.seismic) > 0:
-                seismic_batch = self.seismic[scale][indexes]
-                seismic_dev = utils.to_device(
-                    seismic_batch, self.device, channels_last=True
-                )
-                seismic_dict[scale] = seismic_dev
-
-            # Real facies
-            real_facies_dict[scale] = utils.to_device(
-                facies_batch, self.device, channels_last=True
-            )
-
-        return real_facies_dict, masks_dict, wells_dict, seismic_dict
+        prefetcher = TorchDataPrefetcher(loader, scales, self.device)
+        batch, prepared = prefetcher.next()
+        while batch is not None:
+            yield batch, prepared
+            batch, prepared = prefetcher.next()
 
     def save_generated_facies(
         self,

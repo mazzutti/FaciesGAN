@@ -24,7 +24,7 @@
         "--num-iter",
         "4000",
         "--num-parallel-scales",
-        "3",
+        "7",
         "--alpha",
         "10",
         "--scale0-noise-amp",

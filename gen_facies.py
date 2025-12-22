@@ -312,7 +312,9 @@ if __name__ == "__main__":
                 dim=0,
             )
         )
-    faciesGAN = TorchFaciesGAN(options=args, wells=masked_facies, device=args.device)
+    faciesGAN = TorchFaciesGAN(
+        options=args, wells=tuple(masked_facies), device=args.device
+    )
 
     if arguments.comparison_plots:
         # Generate comparison plots instead of individual facies

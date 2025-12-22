@@ -582,7 +582,6 @@ def np2torch(np_array: NDArray[np.float32], normalize: bool = False) -> torch.Te
     tensor = torch.from_numpy(arr).float()  # type: ignore
     if normalize:
         tensor = norm(tensor)
-    mx.eval(tensor)  # type: ignore
     return tensor
 
 
@@ -612,7 +611,6 @@ def clamp(x: mx.array, min_val: float = -1.0, max_val: float = 1.0) -> mx.array:
     min_arr = mx.zeros_like(x) + float(min_val)
     max_arr = mx.zeros_like(x) + float(max_val)
     tensor = mx.minimum(mx.maximum(x, min_arr), max_arr)
-    mx.eval(tensor)  # type: ignore
     return tensor
 
 

@@ -55,7 +55,6 @@ def calc_gradient_penalty(
 
     # Calculate gradients of the output w.r.t. the interpolates
     gradients = cast(mx.array, grad_fn(interpolates))  # type: ignore
-    # mx.eval(gradients)  # type: ignore
 
     # Compute L2 norm of gradients along the (H, W, C) dimensions
     # In MLX, we flatten the non-batch dimensions to calculate the norm per sample
@@ -79,7 +78,6 @@ def calc_gradient_penalty(
         )
         * LAMBDA
     )  # type: ignore
-    mx.eval(gradient_penalty)  # type: ignore
     return gradient_penalty
 
 
@@ -109,8 +107,6 @@ def generate_noise(
 
     if scale != 1.0:
         noise = interpolate(noise, (h, w))
-
-    mx.eval(noise)  # type: ignore
     return noise
 
 
@@ -138,7 +134,6 @@ def interpolate(tensor: mx.array, size: tuple[float, ...]) -> mx.array:
             align_corners=True,
         ),
     )
-    mx.eval(resized_tensor)  # type: ignore
     return resized_tensor
 
 

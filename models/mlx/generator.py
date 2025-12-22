@@ -195,11 +195,9 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                     z_in = z_in + padded_facie
 
                 out_facie = cast(mx.array, self.gens[index](z_in)) + out_facie
-            mx.eval(out_facie)  # type: ignore
 
         # Apply color quantization to enforce pure colors
         out_facie = self.color_quantizer(out_facie)
-        mx.eval(out_facie)  # type: ignore
         return out_facie
 
     def create_scale(
