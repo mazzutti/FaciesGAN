@@ -36,11 +36,12 @@ def to_facies_pyramids(
     torch_pyramids = torch_utils.to_facies_pyramids(
         scale_list, channels_last=channels_last
     )
-    mlx_pyramids: list[mx.array] = []
-    for pyramid in torch_pyramids:
-        pyramid_mx = mx.array(pyramid.numpy())
-        mlx_pyramids.append(pyramid_mx)
-    return tuple(mlx_pyramids)
+    # Vectorized: stack and convert in one go if possible
+    if len(torch_pyramids) > 0:
+        mlx_pyramids = tuple(mx.array(p.numpy()) for p in torch_pyramids)
+        return mlx_pyramids
+    else:
+        return tuple()
 
 
 def to_seismic_pyramids(
@@ -66,11 +67,11 @@ def to_seismic_pyramids(
     torch_pyramids = torch_utils.to_seismic_pyramids(
         scale_list, channels_last=channels_last
     )
-    mlx_pyramids: list[mx.array] = []
-    for pyramid in torch_pyramids:
-        pyramid_mx = mx.array(pyramid.numpy())
-        mlx_pyramids.append(pyramid_mx)
-    return tuple(mlx_pyramids)
+    if len(torch_pyramids) > 0:
+        mlx_pyramids = tuple(mx.array(p.numpy()) for p in torch_pyramids)
+        return mlx_pyramids
+    else:
+        return tuple()
 
 
 def to_wells_pyramids(
@@ -98,11 +99,11 @@ def to_wells_pyramids(
     torch_pyramids = torch_utils.to_wells_pyramids(
         scale_list, channels_last=channels_last
     )
-    mlx_pyramids: list[mx.array] = []
-    for pyramid in torch_pyramids:
-        pyramid_mx = mx.array(pyramid.numpy())
-        mlx_pyramids.append(pyramid_mx)
-    return tuple(mlx_pyramids)
+    if len(torch_pyramids) > 0:
+        mlx_pyramids = tuple(mx.array(p.numpy()) for p in torch_pyramids)
+        return mlx_pyramids
+    else:
+        return tuple()
 
 
 def norm(x: mx.array) -> mx.array:

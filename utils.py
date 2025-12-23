@@ -570,9 +570,12 @@ def np2torch(np_array: NDArray[np.float32], normalize: bool = False) -> torch.Te
     the normalize parameter value. The normalize parameter causes double
     normalization when True.
     """
-    # Support input layouts: (B, H, W, C), (H, W, C) or (H, W) grayscale.
+    # Support input layouts: (B, T, H, W, C), (B, H, W, C), (H, W, C), or (H, W) grayscale.
     arr = np_array
-    if arr.ndim == 4:
+    if arr.ndim == 5:
+        # (B, T, H, W, C) -> (B, T, C, H, W)
+        arr = np.transpose(arr, (0, 1, 4, 2, 3))
+    elif arr.ndim == 4:
         # (B, H, W, C) -> (B, C, H, W)
         arr = np.transpose(arr, (0, 3, 1, 2))
     elif arr.ndim == 3:
@@ -643,15 +646,19 @@ def denorm(
 def torch2np(
     tensor: torch.Tensor, denormalize: bool = False, ceiling: bool = False
 ) -> NDArray[np.float32]:
-    """Convert PyTorch tensor to NumPy array with optional denormalization.
+    """
+    Convert PyTorch tensor to NumPy array with optional denormalization.
 
-    Transforms tensor from (B, C, H, W) format to (B, H, W, C) NumPy array,
-    optionally denormalizing from [-1, 1] to [0, 1] range.
+    Supports 3D, 4D, and 5D tensors:
+      - (C, H, W)   -> (H, W, C)
+      - (B, C, H, W) -> (B, H, W, C)
+      - (B, T, C, H, W) -> (B, T, H, W, C)
+    Optionally denormalizes from [-1, 1] to [0, 1] range.
 
     Parameters
     ----------
     tensor : torch.Tensor
-        Input tensor in (B, C, H, W) format.
+        Input tensor of shape (C, H, W), (B, C, H, W), or (B, T, C, H, W).
     denormalize : bool, optional
         If True, denormalize from [-1, 1] to [0, 1]. Defaults to False.
     ceiling : bool, optional
@@ -660,13 +667,16 @@ def torch2np(
     Returns
     -------
     NDArray[np.float32]
-        NumPy array with shape (B, H, W, C) and values clipped to [0, 1].
+        NumPy array with shape (H, W, C), (B, H, W, C), or (B, T, H, W, C) and values clipped to [0, 1].
     """
     if denormalize:
         tensor = cast(torch.Tensor, denorm(tensor, ceiling))
     np_array = tensor.detach().cpu().numpy()
-    # Support both batch tensors (B, C, H, W) and single samples (C, H, W).
-    if np_array.ndim == 4:
+    # Support 5D, 4D, and 3D tensors
+    if np_array.ndim == 5:
+        # (B, T, C, H, W) -> (B, T, H, W, C)
+        np_array = np.transpose(np_array, (0, 1, 3, 4, 2))
+    elif np_array.ndim == 4:
         # (B, C, H, W) -> (B, H, W, C)
         np_array = np.transpose(np_array, (0, 2, 3, 1))
     elif np_array.ndim == 3:
@@ -684,15 +694,19 @@ def mlx2np(
     denormalize: bool = False,
     ceiling: bool = False,
 ) -> NDArray[np.float32]:
-    """Convert PyTorch tensor to NumPy array with optional denormalization.
+    """
+    Convert MLX array to NumPy array with optional denormalization.
 
-    Transforms MLX array to NumPy array, optionally denormalizing from [-1, 1]
-    to [0, 1] range.
+    Supports 3D, 4D, and 5D arrays:
+      - (C, H, W)   -> (H, W, C)
+      - (B, C, H, W) -> (B, H, W, C)
+      - (B, T, C, H, W) -> (B, T, H, W, C)
+    Optionally denormalizes from [-1, 1] to [0, 1] range.
 
     Parameters
     ----------
-    tensor : mx.array
-        Input tensor in (B, C, H, W) format.
+    tensor : mx.array or np.ndarray
+        Input MLX array or NumPy array of shape (C, H, W), (B, C, H, W), or (B, T, C, H, W).
     denormalize : bool, optional
         If True, denormalize from [-1, 1] to [0, 1]. Defaults to False.
     ceiling : bool, optional
@@ -701,7 +715,7 @@ def mlx2np(
     Returns
     -------
     NDArray[np.float32]
-        NumPy array with shape (B, H, W, C) and values clipped to [0, 1].
+        NumPy array with shape (H, W, C), (B, H, W, C), or (B, T, H, W, C) and values clipped to [0, 1].
     """
     # Support both MLX arrays and host NumPy arrays. If a NumPy ndarray is
     # provided we must avoid calling MLX helpers (like `clamp`) which expect
@@ -852,7 +866,12 @@ def draw_well_arrows(
 
 
 def plot_generated_facies(
-    fake_facies: Sequence[torch.Tensor | mx.array | NDArray[np.float32]],
+    fake_facies: (
+        Sequence[torch.Tensor | mx.array | NDArray[np.float32]]
+        | torch.Tensor
+        | mx.array
+        | NDArray[np.float32]
+    ),
     real_facies: torch.Tensor | mx.array | NDArray[np.float32],
     stage: int,
     index: int,
@@ -893,29 +912,47 @@ def plot_generated_facies(
     if not save:
         return
 
-    num_real_facies = int(real_facies.shape[0])
-    num_generated_per_real = int(fake_facies[0].shape[0])
-
-    # Convert inputs to NumPy. If callers already provided host-side NumPy
-    # arrays (common when using the background worker) treat them as already
-    # denormalized in [0, 1]. Otherwise convert/denormalize as needed.
-    fake_facies_arr: list[np.ndarray] = []
-    for ff in fake_facies:
-        if isinstance(ff, np.ndarray):
-            fake_facies_arr.append(ff.astype(np.float32))
-        else:
-            fake_facies_arr.append(tensor2np(ff, denormalize=True))
-
-    if isinstance(real_facies, np.ndarray):
-        np_real_facies = real_facies.astype(np.float32)
+    fake_facies_arr: list[list[np.ndarray]] = []
+    if (
+        isinstance(fake_facies, (torch.Tensor, mx.array, np.ndarray))
+        and hasattr(fake_facies, "ndim")
+        and fake_facies.ndim == 5
+    ):
+        arr = fake_facies
+        if not isinstance(arr, np.ndarray):
+            arr = tensor2np(arr, denormalize=True)
+        arr = np.asarray(arr, dtype=np.float32)
+        num_real_facies = arr.shape[0]
+        num_generated_per_real = arr.shape[1]
+        fake_facies_arr = [
+            [arr[i, j] for j in range(num_generated_per_real)]
+            for i in range(num_real_facies)
+        ]
     else:
-        np_real_facies = tensor2np(real_facies, denormalize=True, ceiling=True)
+        num_real_facies = int(real_facies.shape[0])
+        num_generated_per_real = int(fake_facies[0].shape[0])
+        fake_facies_arr: list[list[np.ndarray]] = []
+        for ff in fake_facies:
+            arr = ff
+            if not isinstance(ff, np.ndarray):
+                arr = tensor2np(ff, denormalize=True)
+            # arr shape: (T, H, W, C) or (H, W, C)
+            if arr.ndim == 4:
+                fake_facies_arr.append(
+                    cast(list[np.ndarray], [arr[j] for j in range(arr.shape[0])]),
+                )
+            else:
+                fake_facies_arr.append(cast(list[np.ndarray], [arr]))
 
-    np_masks = (
-        masks
-        if isinstance(masks, np.ndarray)
-        else (tensor2np(masks) if masks is not None else None)
-    )
+    if not isinstance(real_facies, np.ndarray):
+        np_real_facies = tensor2np(real_facies, denormalize=True, ceiling=True)
+    else:
+        np_real_facies = np.asarray(real_facies, dtype=np.float32)
+
+    if masks is not None and not isinstance(masks, np.ndarray):
+        np_masks = tensor2np(masks)
+    else:
+        np_masks = None
 
     # Calculate grid dimensions with spacing and margins
     spacing = 20  # pixels between subplots

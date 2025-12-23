@@ -465,23 +465,32 @@ class MLXColorQuantization(nn.Module):
             ]
         )
 
-    def __call__(self, x: mx.array) -> mx.array:
-
+    @staticmethod
+    @mx.compile  # type: ignore
+    def _quantize_impl(
+        x: mx.array, pure_colors: mx.array, temperature: float, training: bool
+    ) -> mx.array:
         b, h, w, c = x.shape
         x_flat = x.reshape(-1, c)  # (N, 3) # type: ignore
-
-        # Distances: ||x - c||^2 = ||x||^2 + ||c||^2 - 2 * (x @ c.T)
         x_norm = mx.sum(x_flat**2, axis=1, keepdims=True)
-        c_norm = mx.sum(self.pure_colors**2, axis=1, keepdims=True)
-        distances = x_norm + c_norm.T - 2 * (x_flat @ self.pure_colors.T)
-
-        if not self.training:
-            # Hard quantization
+        c_norm = mx.sum(pure_colors**2, axis=1, keepdims=True)
+        distances = x_norm + c_norm.T - 2 * (x_flat @ pure_colors.T)
+        if not training:
             indices = mx.argmin(distances, axis=-1)
-            quantized = self.pure_colors[indices]
+            quantized = pure_colors[indices]
             return quantized.reshape(b, h, w, c)  # type: ignore
         else:
-            # Soft quantization (differentiable)
-            weights = mx.softmax(-distances / self.temperature, axis=1)
-            quantized = weights @ self.pure_colors
+            weights = mx.softmax(-distances / temperature, axis=-1)
+            quantized = weights @ pure_colors
             return quantized.reshape(b, h, w, c)  # type: ignore
+
+    def __call__(self, x: mx.array) -> mx.array:
+        return cast(
+            mx.array,
+            self._quantize_impl(  # type: ignore
+                x,
+                self.pure_colors,
+                self.temperature,
+                self.training,
+            ),
+        )

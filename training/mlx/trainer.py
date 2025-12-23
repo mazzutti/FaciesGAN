@@ -125,8 +125,11 @@ class MLXTrainer(
             discriminator_schedulers,
         )
 
+    def gen_indexes(self, size: int) -> mx.array:
+        return mx.arange(self.batch_size)
+
     def generate_visualization_samples(
-        self, scales: list[int], indexes: list[int]
+        self, scales: list[int], indexes: mx.array
     ) -> dict[int, mx.array]:
         """Generate fixed samples for visualization at specified scales.
 
@@ -134,7 +137,7 @@ class MLXTrainer(
         ----------
         scales : list[int]
             List of scale indices to generate samples for.
-        indexes : list[int]
+        indexes : mx.array
             List of batch sample indices.
 
         Returns
@@ -157,7 +160,7 @@ class MLXTrainer(
         self,
         scale: int,
         real_facies: mx.array,
-        indexes: list[int],
+        indexes: mx.array,
         wells: mx.array | None = None,
         seismic: mx.array | None = None,
     ) -> mx.array:
@@ -373,46 +376,47 @@ class MLXTrainer(
         """Save generated facies visualizations to disk asynchronously.
 
         This method samples noises, generates multiple facies images per real
-        sample, clips them to [-1, 1], moves them to CPU and submits a
-        background worker job to save the visualization images. Masks are
-        passed through for overlay if provided.
+        sample, clips them to [-1, 1], and submits a background worker job to save
+        the visualization images. Masks are passed through for overlay if provided.
+        All data is kept as tensors/arrays until the worker process.
         """
         indexes = mx.random.randint(
             0,
             self.batch_size,
             shape=(self.num_real_facies,),
+            dtype=mx.int32,
         )
         real_facies = self.facies[scale][indexes]
 
-        # Generate on GPU (lazy)
-        noises = [
-            self.model.get_noise(
-                [int(index.item())] * self.num_generated_per_real, scale
-            )
-            for index in indexes
-        ]
-        generated_facies = [
+        # Efficiently repeat indexes for noise generation
+        repeated_indexes = mx.repeat(indexes, self.num_generated_per_real)
+        noises = self.model.get_noise(repeated_indexes, scale)
+
+        generated_facies = utils.clamp(
             self.model.generator(
-                noise, self.model.noise_amps[: scale + 1], stop_scale=scale
-            )
-            for noise in noises
-        ]
-        generated_facies = [utils.clamp(gen, -1, 1) for gen in generated_facies]
+                noises,
+                self.model.noise_amps[: scale + 1],
+                stop_scale=scale,
+            ),
+            min_val=-1,
+            max_val=1,
+        )
+        facies_tensor = generated_facies.reshape(  # type: ignore
+            self.num_real_facies,
+            self.num_generated_per_real,
+            *generated_facies.shape[1:],
+        )
+
+        masks_tensor = masks[indexes] if masks is not None else None
 
         if self.enable_plot_facies:
-            generated_facies_cpu = [
-                utils.tensor2np(g, denormalize=True) for g in generated_facies
-            ]
-            real_facies_cpu = utils.tensor2np(real_facies, denormalize=True)
-            masks_cpu = utils.tensor2np(masks[indexes]) if masks is not None else None
-
             bw.submit_plot_generated_facies(
-                generated_facies_cpu,
-                real_facies_cpu,
+                utils.mlx2np(facies_tensor, denormalize=True),
+                utils.mlx2np(real_facies, denormalize=True),
                 scale,
                 epoch,
                 results_path,
-                masks_cpu,
+                utils.mlx2np(masks_tensor) if masks_tensor is not None else None,
             )
 
     def save_optimizers(

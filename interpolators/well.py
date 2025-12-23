@@ -96,11 +96,10 @@ class WellInterpolator(BaseInterpolator):
             # Create output image (black background)
             downsampled = np.zeros((new_h, new_w, 3), dtype=np.float32)
 
-            # Downsample the vertical trace using nearest neighbor
+            # Downsample the vertical trace using nearest neighbor (vectorized)
             step = height // new_h
-            for i in range(new_h):
-                src_row = min(i * step, height - 1)
-                downsampled[i, scaled_column, :] = well_trace[src_row, :]
+            indices = np.minimum(np.arange(new_h) * step, height - 1)
+            downsampled[:, scaled_column, :] = well_trace[indices, :]
 
             smooth_imgs.append(torch.from_numpy(downsampled))  # type: ignore
 

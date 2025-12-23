@@ -38,6 +38,7 @@ from models.torch import utils as torch_utils
 from options import TrainningOptions
 from training.base import Trainer
 from typedefs import Batch
+from utils import torch2np
 
 
 class TorchTrainer(
@@ -185,8 +186,11 @@ class TorchTrainer(
             discriminator_schedulers,
         )
 
+    def gen_indexes(self, size: int) -> torch.Tensor:
+        return torch.arange(self.batch_size)
+
     def generate_visualization_samples(
-        self, scales: list[int], indexes: list[int]
+        self, scales: list[int], indexes: torch.Tensor
     ) -> dict[int, torch.Tensor]:
         """Generate fixed samples for visualization at specified scales.
 
@@ -194,7 +198,7 @@ class TorchTrainer(
         ----------
         scales : list[int]
             List of scale indices to generate samples for.
-        indexes : list[int]
+        indexes : torch.Tensor
             List of batch sample indices.
 
         Returns
@@ -215,7 +219,7 @@ class TorchTrainer(
         self,
         scale: int,
         real_facies: torch.Tensor,
-        indexes: list[int],
+        indexes: torch.Tensor,
         wells: torch.Tensor | None = None,
         seismic: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -233,7 +237,7 @@ class TorchTrainer(
             Current pyramid scale index.
         real_facies : torch.Tensor
             Real facies data at the current scale (channels-last expected).
-        indexes : list[int]
+        indexes : torch.Tensor
             Batch sample indices used to generate noise with deterministic
             indexing.
         wells : torch.Tensor | None
@@ -470,39 +474,45 @@ class TorchTrainer(
         background worker job to save the visualization images. Masks are
         passed through for overlay if provided.
         """
-        indexes = torch.randint(self.batch_size, (self.num_real_facies,))
-        real_facies = self.facies[scale][indexes]
-
-        noises = [
-            self.model.get_noise(
-                [int(index.item())] * self.num_generated_per_real, scale
-            )
-            for index in indexes
-        ]
-
-        with torch.no_grad():
-            generated_facies = [
-                self.model.generator(
-                    noise, self.model.noise_amps[: scale + 1], stop_scale=scale
-                )
-                for noise in noises
-            ]
-            generated_facies = [gen.clip(-1, 1) for gen in generated_facies]
-
         if self.enable_plot_facies:
+            indexes = torch.randint(self.batch_size, (self.num_real_facies,))
+            real_facies = self.facies[scale][indexes]
 
-            generated_facies_cpu = [g.detach().cpu() for g in generated_facies]
-            real_facies_cpu = real_facies.detach().cpu()
-            masks_cpu = masks[indexes].detach().cpu() if masks is not None else None
+            # Repeat each index num_generated_per_real times
+            tiled_indexes = indexes.repeat(self.num_generated_per_real)
+            noises = self.model.get_noise(tiled_indexes, scale)
 
-            # Submit background job to save the plot (non-blocking)
+            with torch.no_grad():
+                generated_facies = self.model.generator(
+                    noises,
+                    self.model.noise_amps[: scale + 1],
+                    stop_scale=scale,
+                ).clamp(-1, 1)
+
+            # Reshape and permute to (num_real_facies, num_generated_per_real, H, W, C), channels last
+            # _, c, h, w = (
+            #     generated_facies.shape
+            # )  # _ = num_real_facies * num_generated_per_real
+            # generated_facies = generated_facies.view(
+            #     self.num_real_facies, self.num_generated_per_real, c, h, w
+            # )
+            # generated_facies = generated_facies.permute(
+            #     0, 1, 3, 4, 2
+            # )  # (num_real_facies, num_generated_per_real, H, W, C)
+
+            facies_tensor = generated_facies.reshape(  # type: ignore
+                self.num_real_facies,
+                self.num_generated_per_real,
+                *generated_facies.shape[1:],
+            )
+
             bw.submit_plot_generated_facies(
-                generated_facies_cpu,
-                real_facies_cpu,
+                torch2np(facies_tensor.detach().cpu(), denormalize=True),
+                torch2np(real_facies.detach().cpu(), denormalize=True),
                 scale,
                 epoch,
                 results_path,
-                masks_cpu,
+                torch2np(masks[indexes].detach().cpu()) if masks is not None else None,
             )
 
     def save_optimizers(

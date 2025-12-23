@@ -31,13 +31,26 @@ logger = logging.getLogger(__name__)
 
 
 def _save_plot_task(
-    fake_list: Sequence[torch.Tensor | mx.array | NDArray[np.float32]],
+    fake_list: (
+        Sequence[torch.Tensor | mx.array | NDArray[np.float32]]
+        | torch.Tensor
+        | mx.array
+        | NDArray[np.float32]
+    ),
     real_arr: torch.Tensor | mx.array | NDArray[np.float32],
     stage: int,
     index: int,
     out_dir: str,
     masks_arr: torch.Tensor | mx.array | NDArray[np.float32] | None = None,
 ) -> bool:
+    """
+    Internal task to save a plot in a background process.
+
+    Supports 3D, 4D, and 5D tensors/arrays for fake_list, real_arr, and masks_arr:
+      - fake_list can be a sequence of tensors/arrays or a single tensor/array
+      - (C, H, W), (B, C, H, W), (B, T, C, H, W) for torch/mx/np
+      - (B, H, W, C), (B, T, H, W, C) for np arrays (after conversion)
+    """
     # Import locally so the worker process has its own module imports
     from utils import plot_generated_facies
 
@@ -117,7 +130,12 @@ class BackgroundWorker:
 
     def submit_plot_generated_facies(
         self,
-        fake_list: Sequence[torch.Tensor | mx.array | NDArray[np.float32]],
+        fake_list: (
+            Sequence[torch.Tensor | mx.array | NDArray[np.float32]]
+            | torch.Tensor
+            | mx.array
+            | NDArray[np.float32]
+        ),
         real: torch.Tensor | mx.array | NDArray[np.float32],
         stage: int,
         index: int,
@@ -126,7 +144,13 @@ class BackgroundWorker:
         wait_if_full: bool = True,
         timeout: Optional[float] = None,
     ) -> Future[bool]:
-        """Submit a plot job to the process pool (non-blocking by default).
+        """
+        Submit a plot job to the process pool (non-blocking by default).
+
+        Supports 3D, 4D, and 5D tensors/arrays for fake_list, real, and masks:
+          - fake_list can be a sequence of tensors/arrays or a single tensor/array
+          - (C, H, W), (B, C, H, W), (B, T, C, H, W) for torch/mx/np
+          - (B, H, W, C), (B, T, H, W, C) for np arrays (after conversion)
 
         If the number of pending jobs reaches ``max_pending``, the call will
         block until space is available when ``wait_if_full=True``. If
@@ -215,14 +239,25 @@ class BackgroundWorker:
 
 
 def submit_plot_generated_facies(
-    fake_list: Sequence[torch.Tensor | mx.array | NDArray[np.float32]],
+    fake_list: (
+        Sequence[torch.Tensor | mx.array | NDArray[np.float32]]
+        | torch.Tensor
+        | mx.array
+        | NDArray[np.float32]
+    ),
     real: torch.Tensor | mx.array | NDArray[np.float32],
     stage: int,
     index: int,
     out_dir: str,
     masks: torch.Tensor | mx.array | NDArray[np.float32] | None = None,
 ) -> Future[bool]:
-    """Submit a plot job using the module-level BackgroundWorker.
+    """
+    Submit a plot job using the module-level BackgroundWorker.
+
+        Supports 3D, 4D, and 5D tensors/arrays for fake_list, real, and masks:
+            - fake_list can be a sequence of tensors/arrays or a single tensor/array
+            - (C, H, W), (B, C, H, W), (B, T, C, H, W) for torch/mx/np
+            - (B, H, W, C), (B, T, H, W, C) for np arrays (after conversion)
 
     This wrapper provides backward compatibility for callers that expect a
     module-level function rather than instantiating the singleton class.

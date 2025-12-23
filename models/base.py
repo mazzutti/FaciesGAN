@@ -367,13 +367,13 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
     @abstractmethod
     def compute_recovery_loss(
-        self, indexes: list[int], scale: int, rec_in: TTensor | None, real: TTensor
+        self, indexes: TTensor, scale: int, rec_in: TTensor | None, real: TTensor
     ) -> TTensor:
         """Return reconstruction loss tensor for the provided inputs.
 
         Parameters
         ----------
-        indexes : list[int]
+        indexes : TTensor
             List of batch/sample indices used to generate noise.
         scale : int
             Scale index for which to compute the recovery loss.
@@ -442,28 +442,28 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         """
         raise NotImplementedError("Subclasses must implement generate_fake")
 
-    @abstractmethod
-    def generate_noise(self, shape: tuple[int, ...], num_samp: int) -> TTensor:
-        """Generate a noise tensor of the requested shape and batch size.
+    # @abstractmethod
+    # def generate_noise(self, shape: tuple[int, ...], num_samp: int) -> TTensor:
+    #     """Generate a noise tensor of the requested shape and batch size.
 
-        Parameters
-        ----------
-        shape : tuple[int, ...]
-            Channel/height/width shape of the tensor to generate.
-        num_samp : int
-            Number of samples (batch size) to generate.
+    #     Parameters
+    #     ----------
+    #     shape : tuple[int, ...]
+    #         Channel/height/width shape of the tensor to generate.
+    #     num_samp : int
+    #         Number of samples (batch size) to generate.
 
-        Returns
-        -------
-        TTensor
-            Noise tensor with shape `(num_samp, *shape)` or framework-equivalent.
+    #     Returns
+    #     -------
+    #     TTensor
+    #         Noise tensor with shape `(num_samp, *shape)` or framework-equivalent.
 
-        Raises
-        ------
-        NotImplementedError
-            If the subclass does not override this method.
-        """
-        raise NotImplementedError("Subclasses must implement generate_noise")
+    #     Raises
+    #     ------
+    #     NotImplementedError
+    #         If the subclass does not override this method.
+    #     """
+    #     raise NotImplementedError("Subclasses must implement generate_noise")
 
     @abstractmethod
     def generate_padding(self, z: TTensor, value: int = 0) -> TTensor:
@@ -690,7 +690,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
     @abstractmethod
     def compute_discriminator_metrics(
         self,
-        indexes: list[int],
+        indexes: TTensor,
         scale: int,
         real_facies: TTensor,
     ) -> tuple[DiscriminatorMetrics[TTensor], dict[str, Any] | None]:
@@ -698,7 +698,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
         Parameters
         ----------
-        indexes (list[int]):
+        indexes (TTensor):
             Batch/sample indices used to generate fake inputs.
         scale (int):
             Pyramid scale index for which to compute the metrics.
@@ -722,7 +722,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
     @abstractmethod
     def compute_generator_metrics(
         self,
-        indexes: list[int],
+        indexes: TTensor,
         scale: int,
         real_facies: TTensor,
         masks_dict: dict[int, TTensor],
@@ -732,7 +732,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
         Parameters
         ----------
-        indexes (list[int]):
+        indexes (TTensor):
             Batch/sample indices used to generate noise.
         scale (int):
             Pyramid scale index for which to compute the metrics.
@@ -815,7 +815,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         """
         raise NotImplementedError("Subclasses must implement update_generator_weights")
 
-    def generate_diverse_samples(self, indexes: list[int], scale: int) -> list[TTensor]:
+    def generate_diverse_samples(self, indexes: TTensor, scale: int) -> list[TTensor]:
         """Generate multiple candidate outputs for `scale` using current generator.
 
         This centralizes the pattern of sampling multiple noise realizations
@@ -824,7 +824,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
         Parameters
         ----------
-        indexes : list[int]
+        indexes : TTensor
             Batch/sample indices used to generate noise.
         scale : int
             Pyramid scale index for which to generate samples.
@@ -843,7 +843,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
     def get_noise(
         self,
-        indexes: list[int],
+        indexes: TTensor,
         scale: int,
         rec: bool = False,
     ) -> list[TTensor]:
@@ -855,7 +855,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
         Parameters
         ----------
-        indexes : list[int]
+        indexes : TTensor
             Batch/sample indices used to generate noise.
         scale : int
             Pyramid scale index up to which to generate noise tensors.
@@ -870,7 +870,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         """
         if rec:
             return self.get_rec_noise(scale)
-        return [self._generate_noise(i, indexes) for i in range(scale + 1)]
+        return [self.generate_noise(i, indexes) for i in range(scale + 1)]
 
     def get_noise_aplitude(self, scale: int) -> list[float]:
         """Return noise amplitude for a given scale.
@@ -1182,7 +1182,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
     def optimize_discriminator(
         self,
-        indexes: list[int],
+        indexes: TTensor,
         real_facies_dict: dict[int, TTensor],
         discriminator_optimizers: dict[int, Any],
     ) -> dict[int, DiscriminatorMetrics[TTensor]]:
@@ -1196,7 +1196,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
         Parameters
         ----------
-        indexes : list[int]
+        indexes : TTensor
             Batch/sample indices used to generate noise.
         real_facies_dict : dict[int, TTensor]
             Dictionary mapping scale indices to real tensor samples.
@@ -1258,7 +1258,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
     def optimize_generator(
         self,
-        indexes: list[int],
+        indexes: TTensor,
         real_facies_dict: dict[int, TTensor],
         masks_dict: dict[int, TTensor],
         rec_in_dict: dict[int, TTensor],
@@ -1274,7 +1274,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
 
         Parameters
         ----------
-        indexes : list[int]
+        indexes : TTensor
             Batch/sample indices used to generate noise.
         real_facies_dict : dict[int, TTensor]
             Dictionary mapping scale indices to real tensor samples.
@@ -1421,47 +1421,25 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         """
         return self.has_well and index < len(self.wells)
 
-    def _generate_noise(self, index: int, indexes: list[int]) -> TTensor:
-        """Create a noise tensor for a single pyramid level, optionally
-        concatenating conditioning channels and applying padding.
+    @abstractmethod
+    def generate_noise(self, index: int, indexes: TTensor) -> TTensor:
+        """Generate a noise tensor of given shape and batch size.
 
         Parameters
         ----------
         index : int
-            Pyramid level index used to select shapes and conditioning tensors.
-        indexes : list[int]
-            Batch/sample indices to select conditioning slices from stored per-scale tensors.
+            Shape index used to select the noise shape.
+        indexes : TTensor
+            Tensor of batch/sample indices to determine number of samples.
 
         Returns
         -------
         TTensor
-            Padded noise tensor for the requested level, possibly concatenated with well
-            and/or seismic conditioning.
+            Generated noise tensor of shape (num_samp, *shape).
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
         """
-
-        batch = len(indexes)
-
-        if self.use_wells(index) and self.use_seismic(index):
-            shape = self.get_noise_shape(index)
-            z = self.generate_noise(shape, num_samp=batch)
-            well = self.move_to_device(self._wells[index][indexes])
-            seismic = self.move_to_device(self._seismic[index][indexes])
-            z = self.concatenate_tensors([z, well, seismic])
-        elif self.use_wells(index):
-            shape = self.get_noise_shape(index)
-            z = self.generate_noise(shape, num_samp=batch)
-            well = self.move_to_device(self._wells[index][indexes])
-            z = self.concatenate_tensors([z, well])
-        elif self.use_seismic(index):
-            shape = self.get_noise_shape(index)
-            z = self.generate_noise(shape, num_samp=batch)
-            seismic = self.move_to_device(self._seismic[index][indexes])
-            z = self.concatenate_tensors([z, seismic])
-        else:
-            shape = self.get_noise_shape(index, use_base_channel=False)
-            z = self.generate_noise(
-                (*shape, self.gen_input_channels),
-                num_samp=batch,
-            )
-
-        return self.generate_padding(z, value=0)
+        raise NotImplementedError("Subclasses must implement generate_noise")

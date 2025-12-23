@@ -65,28 +65,31 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
         dict[int, mx.array],
         dict[int, mx.array],
     ]:
-        """Perform batch preparation logic asynchronously."""
+        """Perform batch preparation logic asynchronously (vectorized where possible)."""
         facies, wells, seismic = batch
 
-        real_facies_dict: dict[int, mx.array] = {}
-        masks_dict: dict[int, mx.array] = {}
-        wells_dict: dict[int, mx.array] = {}
-        seismic_dict: dict[int, mx.array] = {}
+        # Vectorized conversion for facies
+        real_facies_dict = {scale: mx.array(facies[scale]) for scale in self.scales}
 
-        for scale in self.scales:
-            real_facies_dict[scale] = mx.array(facies[scale])
+        # Vectorized wells and masks if wells are present
+        if len(wells) > 0:
+            wells_dict = {scale: mx.array(wells[scale]) for scale in self.scales}
+            # Compute masks for all scales at once
+            masks_dict = {
+                scale: mx.greater(
+                    mx.sum(mx.abs(wells_dict[scale]), axis=3, keepdims=True), 0
+                ).astype(mx.int32)
+                for scale in self.scales
+            }
+        else:
+            wells_dict = {}
+            masks_dict = {}
 
-            if len(wells) > 0:
-                wells_dev = mx.array(wells[scale])
-                masks_dev = mx.sum(mx.abs(wells_dev), axis=3, keepdims=True)
-                masks_dev = mx.greater(masks_dev, 0)
-                masks_dev = masks_dev.astype(mx.int32)
-                wells_dict[scale] = wells_dev
-                masks_dict[scale] = masks_dev
-
-            if len(seismic) > 0:
-                seismic_dev = mx.array(seismic[scale])
-                seismic_dict[scale] = seismic_dev
+        # Vectorized seismic if present
+        if len(seismic) > 0:
+            seismic_dict = {scale: mx.array(seismic[scale]) for scale in self.scales}
+        else:
+            seismic_dict = {}
 
         return (real_facies_dict, masks_dict, wells_dict, seismic_dict)
 

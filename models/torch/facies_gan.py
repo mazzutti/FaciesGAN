@@ -115,7 +115,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
     def compute_discriminator_metrics(
         self,
-        indexes: list[int],
+        indexes: torch.Tensor,
         scale: int,
         real_facies: torch.Tensor,
     ) -> tuple[DiscriminatorMetrics[torch.Tensor], dict[str, Any] | None]:
@@ -123,7 +123,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
         Parameters
         ----------
-        indexes (list[int]):
+        indexes (torch.Tensor):
             Batch/sample indices used to generate fake inputs.
         scale (int):
             Pyramid scale index for which to compute the metrics.
@@ -153,7 +153,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
     def compute_generator_metrics(
         self,
-        indexes: list[int],
+        indexes: torch.Tensor,
         scale: int,
         real_facies: torch.Tensor,
         masks_dict: dict[int, torch.Tensor],
@@ -163,15 +163,15 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
         Parameters
         ----------
-        indexes (list[int]):
+        indexes (torch.Tensor):
             Batch/sample indices used to generate noise.
         scale (int):
             Pyramid scale index for which to compute the metrics.
-        real_facies (TTensor):
+        real_facies (torch.Tensor):
             Ground-truth tensor for the current scale.
-        masks_dict (dict[int, TTensor]):
+        masks_dict (dict[int, torch.Tensor]):
             Dictionary mapping scale indices to well/mask tensors.
-        rec_in_dict (dict[int, TTensor]):
+        rec_in_dict (dict[int, torch.Tensor]):
             Dictionary mapping scale indices to reconstruction inputs.
 
         Returns
@@ -298,7 +298,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
     def compute_recovery_loss(
         self,
-        indexes: list[int],
+        indexes: torch.Tensor,
         scale: int,
         rec_in: torch.Tensor | None,
         real: torch.Tensor,
@@ -306,7 +306,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         """Compute reconstruction (recovery) loss for given inputs.
 
         Args:
-            indexes (list[int]): Indexes of noise samples to use for recovery.
+            indexes (torch.Tensor): Indexes of noise samples to use for recovery.
             scale (int): Scale index at which recovery is computed.
             rec_in (torch.Tensor | None): Optional conditioning input for the
                 recovery pass. If None, no recovery is performed.
@@ -376,17 +376,51 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
             fake = self.generator(noises, amps, stop_scale=scale)
         return fake
 
-    def generate_noise(self, shape: tuple[int, ...], num_samp: int) -> torch.Tensor:
-        """Generate noise tensor with the configured device.
+    def generate_noise(self, index: int, indexes: torch.Tensor) -> torch.Tensor:
+        """Create a noise tensor for a single pyramid level, optionally
+        concatenating conditioning channels and applying padding.
 
-        Args:
-            shape (tuple[int, ...]): Shape of the noise tensor to generate.
-            num_samp (int): Number of samples to generate.
+        Parameters
+        ----------
+        index : int
+            Pyramid level index used to select shapes and conditioning tensors.
+        indexes : torch.Tensor
+            Batch/sample indices to select conditioning slices from stored per-scale tensors.
 
-        Returns:
-            torch.Tensor: Noise tensor on `self.device`.
+        Returns
+        -------
+        torch.Tensor
+            Padded noise tensor for the requested level, possibly concatenated with well
+            and/or seismic conditioning.
         """
-        return utils.generate_noise(shape, num_samp=num_samp, device=self.device)
+
+        batch = len(indexes)
+
+        if self.use_wells(index) and self.use_seismic(index):
+            shape = self.get_noise_shape(index)
+            z = utils.generate_noise(shape, num_samp=batch, device=self.device)
+            well = self._wells[index][indexes].to(self.device)
+            seismic = self._seismic[index][indexes].to(self.device)
+            z = self.concatenate_tensors([z, well, seismic])
+        elif self.use_wells(index):
+            shape = self.get_noise_shape(index)
+            z = utils.generate_noise(shape, num_samp=batch, device=self.device)
+            well = self._wells[index][indexes].to(self.device)
+            z = self.concatenate_tensors([z, well])
+        elif self.use_seismic(index):
+            shape = self.get_noise_shape(index)
+            z = utils.generate_noise(shape, num_samp=batch, device=self.device)
+            seismic = self._seismic[index][indexes].to(self.device)
+            z = self.concatenate_tensors([z, seismic])
+        else:
+            shape = self.get_noise_shape(index, use_base_channel=False)
+            z = utils.generate_noise(
+                (*shape, self.gen_input_channels),
+                num_samp=batch,
+                device=self.device,
+            )
+
+        return self.generate_padding(z, value=0)
 
     def get_rec_noise(self, scale: int) -> list[torch.Tensor]:
         return [tensor.clone() for tensor in self.rec_noise[: scale + 1]]

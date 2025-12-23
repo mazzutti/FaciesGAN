@@ -106,7 +106,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
 
     def compute_discriminator_metrics(
         self,
-        indexes: list[int],
+        indexes: mx.array,
         scale: int,
         real_facies: mx.array,
     ) -> tuple[DiscriminatorMetrics[mx.array], dict[str, Any] | None]:
@@ -114,7 +114,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
 
         Parameters
         ----------
-        indexes : list[int]
+        indexes : mx.array
             Batch indices used for consistent noise generation.
         scale : int
             Current pyramid scale.
@@ -151,7 +151,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
 
     def compute_generator_metrics(
         self,
-        indexes: list[int],
+        indexes: mx.array,
         scale: int,
         real_facies: mx.array,
         masks_dict: dict[int, mx.array],
@@ -161,7 +161,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
 
         Parameters
         ----------
-        indexes : list[int]
+        indexes : mx.array
             Batch indices used for consistent noise generation.
         scale : int
             Current pyramid scale.
@@ -213,7 +213,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         ----------
         scale : int
             Current scale index.
-        optimizer : Any
+        optimizer :
             The MLX optimizer instance.
         loss : mx.array
             The total loss (evaluated lazily).
@@ -240,16 +240,16 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         ----------
         scale : int
             Current scale index.
-        optimizer : Any
+        optimizer : mx.Optimizer
             The MLX optimizer instance.
         loss : mx.array
             The total loss (evaluated lazily).
-        gradients : Any | None
+        gradients :  Any| None
             The gradients computed by `value_and_grad`.
 
         Returns
         -------
-        list[Any]
+        dict[str, Any]
             A list containing the optimizer state and updated parameters.
             These must be passed to `mx.eval` to trigger the update.
         """
@@ -358,7 +358,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
 
     def compute_recovery_loss(
         self,
-        indexes: list[int],
+        indexes: mx.array,
         scale: int,
         rec_in: mx.array | None,
         real: mx.array,
@@ -367,7 +367,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
 
         Parameters
         ----------
-        indexes : list[int]
+        indexes :  mx.array
             Batch indices.
         scale : int
             Current scale index.
@@ -444,22 +444,47 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         fake = self.generator(noises, amps, stop_scale=scale)
         return fake
 
-    def generate_noise(self, shape: tuple[int, ...], num_samp: int) -> mx.array:
-        """Generate a random noise tensor.
+    def generate_noise(self, index: int, indexes: mx.array) -> mx.array:
+        """Create a noise tensor for a single pyramid level, optionally
+        concatenating conditioning channels and applying padding.
 
         Parameters
         ----------
-        shape : tuple[int, ...]
-            Dimensions of the noise tensor (excluding batch).
-        num_samp : int
-            Batch size.
+        index : int
+            Pyramid level index used to select shapes and conditioning tensors.
+        indexes : mx.array
+            Batch/sample indices to select conditioning slices from stored per-scale tensors.
 
         Returns
         -------
         mx.array
-            Random Gaussian noise tensor.
+            Padded noise tensor for the requested level, possibly concatenated with well
+            and/or seismic conditioning.
         """
-        return utils.generate_noise(shape, num_samp=num_samp)
+
+        batch = len(indexes)
+
+        if self.use_wells(index) and self.use_seismic(index):
+            shape = self.get_noise_shape(index)
+            z = utils.generate_noise(shape, num_samp=batch)
+            well = self._wells[index][indexes]
+            seismic = self._seismic[index][indexes]
+            z = self.concatenate_tensors([z, well, seismic])
+        elif self.use_wells(index):
+            shape = self.get_noise_shape(index)
+            z = utils.generate_noise(shape, num_samp=batch)
+            well = self._wells[index][indexes]
+            z = self.concatenate_tensors([z, well])
+        elif self.use_seismic(index):
+            shape = self.get_noise_shape(index)
+            z = utils.generate_noise(shape, num_samp=batch)
+            seismic = self._seismic[index][indexes]
+            z = self.concatenate_tensors([z, seismic])
+        else:
+            shape = self.get_noise_shape(index, use_base_channel=False)
+            z = utils.generate_noise((*shape, self.gen_input_channels), num_samp=batch)
+
+        return self.generate_padding(z, value=0)
 
     def generate_padding(self, z: mx.array, value: int = 0) -> mx.array:
         """Pad the input tensor with zeros or a specified value.

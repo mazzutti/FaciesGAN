@@ -242,7 +242,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self,
         scale: int,
         real_facies: TTensor,
-        indexes: list[int],
+        indexes: TTensor,
         wells: TTensor | None = None,
         seismic: TTensor | None = None,
     ) -> TTensor:
@@ -256,7 +256,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             Well conditioning data.
         real_facies : torch.Tensor
             Real facies data at the current scale.
-        indexes : list[int]
+        indexes : TTensor
             Batch sample indices.
 
         Returns
@@ -274,8 +274,29 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         raise NotImplementedError("Subclasses must implement initialize_noise")
 
     @abstractmethod
+    def gen_indexes(self, size: int) -> TTensor:
+        """Generate batch sample indexes for noise generation.
+
+        Parameters
+        ----------
+        size : int
+            Number of indexes to generate.
+
+        Returns
+        -------
+        TTensor
+            A tensor containing batch sample indexes.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not implement this method.
+        """
+        raise NotImplementedError("Subclasses must implement gen_indexes")
+
+    @abstractmethod
     def generate_visualization_samples(
-        self, scales: list[int], indexes: list[int]
+        self, scales: list[int], indexes: TTensor
     ) -> dict[int, TTensor]:
         """Generate fixed samples for visualization at specified scales.
 
@@ -283,7 +304,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         ----------
         scales : list[int]
             List of scale indices to generate samples for.
-        indexes : list[int]
+        indexes : TTensor
             List of batch sample indices.
 
         Returns
@@ -340,7 +361,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         Accepts prepared data dictionaries directly.
         """
 
-        indexes = list(range(self.batch_size))
+        indexes = self.gen_indexes(self.batch_size)
 
         # Create optimizers for all scales
         (
