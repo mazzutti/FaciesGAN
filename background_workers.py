@@ -20,28 +20,18 @@ import logging
 import multiprocessing as mp
 import threading
 from concurrent.futures import Future, ProcessPoolExecutor
-from typing import Optional, Sequence
-import numpy as np
-from numpy.typing import NDArray
-
-import torch
-import mlx.core as mx
+from typedefs import TTensor
 
 logger = logging.getLogger(__name__)
 
 
 def _save_plot_task(
-    fake_list: (
-        Sequence[torch.Tensor | mx.array | NDArray[np.float32]]
-        | torch.Tensor
-        | mx.array
-        | NDArray[np.float32]
-    ),
-    real_arr: torch.Tensor | mx.array | NDArray[np.float32],
+    fake_list: TTensor,
+    real_arr: TTensor,
     stage: int,
     index: int,
     out_dir: str,
-    masks_arr: torch.Tensor | mx.array | NDArray[np.float32] | None = None,
+    masks_arr: TTensor | None = None,
 ) -> bool:
     """
     Internal task to save a plot in a background process.
@@ -72,7 +62,7 @@ class BackgroundWorker:
     - Logs exceptions raised by background tasks.
     """
 
-    _instance: Optional["BackgroundWorker"] = None
+    _instance: BackgroundWorker | None = None
     _instance_lock = threading.Lock()
 
     def __new__(cls, max_workers: int = 2, max_pending: int = 32) -> "BackgroundWorker":
@@ -130,19 +120,14 @@ class BackgroundWorker:
 
     def submit_plot_generated_facies(
         self,
-        fake_list: (
-            Sequence[torch.Tensor | mx.array | NDArray[np.float32]]
-            | torch.Tensor
-            | mx.array
-            | NDArray[np.float32]
-        ),
-        real: torch.Tensor | mx.array | NDArray[np.float32],
+        fake_list: TTensor,
+        real: TTensor,
         stage: int,
         index: int,
         out_dir: str,
-        masks: torch.Tensor | mx.array | NDArray[np.float32] | None = None,
+        masks: TTensor | None = None,
         wait_if_full: bool = True,
-        timeout: Optional[float] = None,
+        timeout: float | None = None,
     ) -> Future[bool]:
         """
         Submit a plot job to the process pool (non-blocking by default).
@@ -207,7 +192,7 @@ class BackgroundWorker:
         with self._pending_cond:
             return len(self._pending)
 
-    def wait_pending(self, timeout: Optional[float] = None) -> None:
+    def wait_pending(self, timeout: float | None = None) -> None:
         """Block until all pending tasks complete or timeout elapses."""
         with self._pending_cond:
             if timeout is None:
@@ -239,17 +224,12 @@ class BackgroundWorker:
 
 
 def submit_plot_generated_facies(
-    fake_list: (
-        Sequence[torch.Tensor | mx.array | NDArray[np.float32]]
-        | torch.Tensor
-        | mx.array
-        | NDArray[np.float32]
-    ),
-    real: torch.Tensor | mx.array | NDArray[np.float32],
+    fake_list: TTensor,
+    real: TTensor,
     stage: int,
     index: int,
     out_dir: str,
-    masks: torch.Tensor | mx.array | NDArray[np.float32] | None = None,
+    masks: TTensor | None = None,
 ) -> Future[bool]:
     """
     Submit a plot job using the module-level BackgroundWorker.

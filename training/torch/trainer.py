@@ -489,17 +489,6 @@ class TorchTrainer(
                     stop_scale=scale,
                 ).clamp(-1, 1)
 
-            # Reshape and permute to (num_real_facies, num_generated_per_real, H, W, C), channels last
-            # _, c, h, w = (
-            #     generated_facies.shape
-            # )  # _ = num_real_facies * num_generated_per_real
-            # generated_facies = generated_facies.view(
-            #     self.num_real_facies, self.num_generated_per_real, c, h, w
-            # )
-            # generated_facies = generated_facies.permute(
-            #     0, 1, 3, 4, 2
-            # )  # (num_real_facies, num_generated_per_real, H, W, C)
-
             facies_tensor = generated_facies.reshape(  # type: ignore
                 self.num_real_facies,
                 self.num_generated_per_real,

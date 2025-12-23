@@ -11,7 +11,7 @@ import hashlib
 import random
 import os
 from collections import OrderedDict
-from typing import Any, Self, cast, Sequence
+from typing import Any, Self, cast
 
 import numpy as np
 from numpy.typing import NDArray
@@ -22,6 +22,7 @@ from PIL import Image, ImageDraw, ImageFont
 import mlx.core as mx
 
 from config import RESULTS_DIR
+from typedefs import TTensor
 
 
 class ExtractUniqueColors:
@@ -734,7 +735,7 @@ def mlx2np(
 
 
 def tensor2np(
-    tensor: torch.Tensor | mx.array | NDArray[np.float32],
+    tensor: TTensor,
     denormalize: bool = False,
     ceiling: bool = False,
 ) -> NDArray[np.float32]:
@@ -866,16 +867,11 @@ def draw_well_arrows(
 
 
 def plot_generated_facies(
-    fake_facies: (
-        Sequence[torch.Tensor | mx.array | NDArray[np.float32]]
-        | torch.Tensor
-        | mx.array
-        | NDArray[np.float32]
-    ),
-    real_facies: torch.Tensor | mx.array | NDArray[np.float32],
+    fake_facies: TTensor,
+    real_facies: TTensor,
     stage: int,
     index: int,
-    masks: torch.Tensor | mx.array | NDArray[np.float32] | None = None,
+    masks: TTensor | None = None,
     out_dir: str = RESULTS_DIR,
     save: bool = False,
     cell_size: int = 256,
@@ -913,11 +909,7 @@ def plot_generated_facies(
         return
 
     fake_facies_arr: list[list[np.ndarray]] = []
-    if (
-        isinstance(fake_facies, (torch.Tensor, mx.array, np.ndarray))
-        and hasattr(fake_facies, "ndim")
-        and fake_facies.ndim == 5
-    ):
+    if fake_facies.ndim == 5:
         arr = fake_facies
         if not isinstance(arr, np.ndarray):
             arr = tensor2np(arr, denormalize=True)
@@ -935,7 +927,7 @@ def plot_generated_facies(
         for ff in fake_facies:
             arr = ff
             if not isinstance(ff, np.ndarray):
-                arr = tensor2np(ff, denormalize=True)
+                arr = tensor2np(cast(TTensor, ff), denormalize=True)
             # arr shape: (T, H, W, C) or (H, W, C)
             if arr.ndim == 4:
                 fake_facies_arr.append(

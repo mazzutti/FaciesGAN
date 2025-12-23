@@ -6,6 +6,7 @@ import mlx.core as mlx_core
 import mlx.nn as mlx_nn  # type: ignore
 import mlx.optimizers as mlx_optim  # type: ignore
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
@@ -15,7 +16,7 @@ from training.mlx.schedulers import MultiStepLR
 T = TypeVar("T")
 
 # Tensor type variable (e.g., torch.Tensor or mx.array)
-TTensor = TypeVar("TTensor", torch.Tensor, mlx_core.array)
+TTensor = TypeVar("TTensor", torch.Tensor, mlx_core.array, np.ndarray)
 
 # Module type variable (e.g., torch.nn.Module or mlx.nn.Module)
 TDiscriminator = TypeVar("TDiscriminator")
