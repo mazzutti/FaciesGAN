@@ -75,8 +75,6 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
     ]:
         """Perform batch preparation logic identical to the old prepare_scale_batch."""
         facies, wells, seismic = batch
-        # Assuming batch size is consistent across pyramids
-        indexes = list(range(len(facies[0])))
 
         real_facies_dict: dict[int, torch.Tensor] = {}
         masks_dict: dict[int, torch.Tensor] = {}
@@ -85,7 +83,7 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
 
         for scale in self.scales:
             # Real facies
-            facies_batch = facies[scale][indexes]
+            facies_batch = facies[scale]
             # When inside a stream context, to() calls are asynchronous
             real_facies_dict[scale] = utils.to_device(
                 facies_batch, self.device, channels_last=True
@@ -93,7 +91,7 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
 
             # Wells
             if len(wells) > 0:
-                wells_batch = wells[scale][indexes]
+                wells_batch = wells[scale]
                 wells_dev = utils.to_device(
                     wells_batch, self.device, channels_last=True
                 )
@@ -105,7 +103,7 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
 
             # Seismic
             if len(seismic) > 0:
-                seismic_batch = seismic[scale][indexes]
+                seismic_batch = seismic[scale]
                 seismic_dev = utils.to_device(
                     seismic_batch, self.device, channels_last=True
                 )

@@ -127,7 +127,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             height, width = tuple(
                 dim - self.full_zero_padding for dim in z[start_scale].shape[1:3]
             )
-            out_facie = mx.zeros((batch_size, height, width, channels), stream=mx.cpu)  # type: ignore
+            out_facie = mx.zeros((batch_size, height, width, channels))  # type: ignore
         else:
             out_facie = in_noise
 
@@ -148,22 +148,22 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
 
                 z_in = cast(mx.array, z[index])  # type: ignore
                 if self.has_cond_channels:
-                    z_in[..., : self.output_channels] = (
-                        amp[index] * z_in[..., : self.output_channels]
-                    )
+                    noise = z_in[..., : self.output_channels]
+                    cond = z_in[..., self.output_channels :]
+                    noise = amp[index] * noise
+                    z_in = mx.concat([noise, cond], axis=-1)
                 else:
                     z_in = amp[index] * z_in
 
                 p = self.zero_padding
-                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)], stream=mx.cpu)  # type: ignore
+                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
 
                 if self.has_cond_channels:
                     num_repeats = self.cond_channels // self.output_channels
-                    padded_facie = mx.repeat(padded_facie, num_repeats, axis=-1, stream=mx.cpu)  # type: ignore
-                    # Add padded output facie to well conditioning channels
-                    z_in[..., self.output_channels :] = (
-                        z_in[..., self.output_channels :] + padded_facie
-                    )
+                    padded_facie = mx.tile(padded_facie, (1, 1, 1, num_repeats))
+                    noise = z_in[..., : self.output_channels]
+                    cond = z_in[..., self.output_channels :] + padded_facie
+                    z_in = mx.concat([noise, cond], axis=-1)
                 else:
                     z_in = z_in + padded_facie
 
@@ -174,23 +174,25 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                 # Apply amplitude scaling to noise channels (first N channels)
                 z_in = cast(mx.array, z[index])  # type: ignore
                 if self.has_cond_channels:
-                    z_in[..., : self.output_channels] = (
-                        amp[index] * z[index][..., : self.output_channels]
-                    )
+                    noise = z_in[..., : self.output_channels]
+                    cond = z_in[..., self.output_channels :]
+                    noise = amp[index] * noise
+                    z_in = mx.concat([noise, cond], axis=-1)
                 else:
                     z_in = amp[index] * z_in
 
                 # Add padded output facie ONLY to conditioning channels (not noise)
                 # This ensures random noise always has direct impact on generation
                 p = self.zero_padding
-                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)], stream=mx.cpu)  # type: ignore
+                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
 
                 if self.has_cond_channels:
                     num_repeats = self.cond_channels // self.output_channels
-                    padded_facie = mx.repeat(padded_facie, num_repeats, axis=-1, stream=mx.cpu)  # type: ignore
-                    z_in[..., self.output_channels :] = (
-                        z_in[..., self.output_channels :] + padded_facie
-                    )
+                    padded_facie = mx.tile(padded_facie, (1, 1, 1, num_repeats))
+                    noise = z_in[..., : self.output_channels]
+                    cond = z_in[..., self.output_channels :]
+                    cond = cond + padded_facie
+                    z_in = mx.concat([noise, cond], axis=-1)
                 else:
                     z_in = z_in + padded_facie
 

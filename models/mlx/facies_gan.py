@@ -131,10 +131,11 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
             mx.array(0.0), mx.array(0.0), mx.array(0.0), mx.array(0.0)
         )
 
+        noises = self.get_noise(indexes, scale)
+        fake = self.generate_fake(noises, scale)
+
         def compute_metrics(params: dict[str, Any]) -> mx.array:
             cast(MLXDiscriminator, self.discriminator.discs[scale]).update(params)  # type: ignore
-            noises = self.get_noise(indexes, scale)
-            fake = self.generate_fake(noises, scale)
             metrics.real = -self.discriminator(scale, real_facies).mean()
             metrics.fake = self.discriminator(scale, fake).mean()
             metrics.gp = self.compute_gradient_penalty(scale, real_facies, fake)
@@ -226,7 +227,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
             These must be passed to `mx.eval` to trigger the update.
         """
         if gradients:
-            optimizer.update(self.discriminator.discs[scale], gradients[0])
+            optimizer.update(self.discriminator.discs[scale], gradients)
             # Return updated state elements for lazy evaluation
             return cast(dict[str, Any], self.discriminator.discs[scale].parameters())
 
@@ -253,11 +254,11 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
             These must be passed to `mx.eval` to trigger the update.
         """
         if gradients:
-            optimizer.update(self.generator.gens[scale], gradients[0])
+            optimizer.update(self.generator.gens[scale], gradients)
             # Return updated state elements for lazy evaluation
             return cast(dict[str, Any], self.generator.gens[scale].parameters())
 
-    def concatenate_tensors(self, tensors: list[mx.array], dim: int) -> mx.array:
+    def concatenate_tensors(self, tensors: list[mx.array]) -> mx.array:
         """Concatenate a list of MLX arrays along the channel axis (last dimension).
 
         Parameters
@@ -385,7 +386,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         rec_noise = self.get_noise(indexes, scale, rec=True)
         rec = self.generator(
             rec_noise,
-            self.noise_amp[: scale + 1],
+            self.noise_amps[: scale + 1],
             in_noise=rec_in,
             start_scale=scale,
             stop_scale=scale,
@@ -436,7 +437,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
             Generated image tensor.
         """
         amps = (
-            self.noise_amp[: scale + 1]
+            self.noise_amps[: scale + 1]
             if hasattr(self, "noise_amp")
             else [1.0] * (scale + 1)
         )
@@ -530,7 +531,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module]):
         amp_path = os.path.join(scale_path, "amp.txt")
         if os.path.exists(amp_path):
             with open(amp_path, "r") as f:
-                self.noise_amp.append(float(f.read().strip()))
+                self.noise_amps.append(float(f.read().strip()))
 
     def load_discriminator_state(self, scale_path: str, scale: int) -> None:
         """Load discriminator weights from a checkpoint.

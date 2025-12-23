@@ -465,7 +465,8 @@ class MLXColorQuantization(nn.Module):
             ]
         )
 
-    def __call__(self, x: mx.array, training: bool = True) -> mx.array:
+    def __call__(self, x: mx.array) -> mx.array:
+
         b, h, w, c = x.shape
         x_flat = x.reshape(-1, c)  # (N, 3) # type: ignore
 
@@ -474,9 +475,9 @@ class MLXColorQuantization(nn.Module):
         c_norm = mx.sum(self.pure_colors**2, axis=1, keepdims=True)
         distances = x_norm + c_norm.T - 2 * (x_flat @ self.pure_colors.T)
 
-        if not training:
+        if not self.training:
             # Hard quantization
-            indices = mx.argmin(distances, axis=1)
+            indices = mx.argmin(distances, axis=-1)
             quantized = self.pure_colors[indices]
             return quantized.reshape(b, h, w, c)  # type: ignore
         else:

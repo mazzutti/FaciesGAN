@@ -44,40 +44,22 @@ def calc_gradient_penalty(
     """
     # Random interpolation factor
     batch_size = real_data.shape[0]
-    alpha = mx.random.uniform(shape=(batch_size, 1, 1, 1), stream=mx.cpu)  # type: ignore
+    alpha = mx.random.uniform(shape=(batch_size, 1, 1, 1))
 
     interpolates = alpha * real_data + (1 - alpha) * fake_data
 
     def grad_fn(x: mx.array) -> mx.array:
         # Discriminator output for interpolates
         out: mx.array = cast(mx.array, discriminator(x))
-        return mx.sum(out, stream=mx.cpu)  # type: ignore
+        return mx.sum(out)  # type: ignore
 
     # Calculate gradients of the output w.r.t. the interpolates
-    gradients = cast(mx.array, grad_fn(interpolates))  # type: ignore
+    gradients = cast(mx.array, mx.grad(grad_fn)(interpolates))  # type: ignore
 
-    # Compute L2 norm of gradients along the (H, W, C) dimensions
-    # In MLX, we flatten the non-batch dimensions to calculate the norm per sample
-    gradients_flat = gradients.reshape(batch_size, -1)  # type: ignore
-    grad_norm = mx.sqrt(
-        mx.sum(
-            mx.square(gradients_flat, stream=mx.cpu),  # type: ignore
-            axis=1,
-            stream=mx.cpu,  # type: ignore
-        )
-        + 1e-12,
-    )
+    # gradients_flat = gradients.reshape(batch_size, -1)  # type: ignore
+    grad_norm = mx.sqrt(mx.sum(mx.square(gradients), axis=-1) + 1e-12)
 
-    gradient_penalty = (
-        mx.mean(
-            mx.square(
-                grad_norm - 1.0,
-                stream=mx.cpu,  # type: ignore
-            ),
-            stream=mx.cpu,  # type: ignore
-        )
-        * LAMBDA
-    )  # type: ignore
+    gradient_penalty = mx.mean(mx.square(grad_norm - 1.0)) * LAMBDA
     return gradient_penalty
 
 
@@ -103,7 +85,7 @@ def generate_noise(
     h, w, c = size
     noise_shape = (num_samp, round(h / scale), round(w / scale), c)
     # Prefer float32 for noise arrays to reduce memory on device backends.
-    noise = mx.random.normal(shape=noise_shape, dtype=mx.float32, stream=mx.cpu)  # type: ignore
+    noise = mx.random.normal(shape=noise_shape, dtype=mx.float32)
 
     if scale != 1.0:
         noise = interpolate(noise, (h, w))
@@ -125,7 +107,7 @@ def interpolate(tensor: mx.array, size: tuple[float, ...]) -> mx.array:
     mx.array
         Resized array.
     """
-    scale_factor = (tensor.shape[1] / size[0], tensor.shape[2] / size[1])
+    scale_factor = (size[0] / tensor.shape[1], size[1] / tensor.shape[2])
     resized_tensor = cast(
         mx.array,
         upsample.upsample_linear(  # type: ignore
@@ -165,9 +147,8 @@ def init_weights(model: nn.Module | Callable[[mx.array], mx.array]) -> None:
                 shape=m.weight.shape,
                 scale=0.02,
                 dtype=m.weight.dtype,
-                stream=mx.cpu,  # type: ignore
             )
-            m.bias = mx.zeros_like(m.bias, stream=mx.cpu)  # type: ignore
+            m.bias = mx.zeros_like(m.bias)
         elif isinstance(m, (nn.BatchNorm, nn.InstanceNorm)):
             if getattr(m, "weight", None) is not None:
                 m.weight = mx.random.normal(
@@ -175,10 +156,9 @@ def init_weights(model: nn.Module | Callable[[mx.array], mx.array]) -> None:
                     loc=1.0,
                     scale=0.02,
                     dtype=m.weight.dtype,
-                    stream=mx.cpu,  # type: ignore
                 )
             if getattr(m, "bias", None) is not None:
-                m.bias = mx.zeros_like(m.bias, stream=mx.cpu)  # type: ignore
+                m.bias = mx.zeros_like(m.bias)
 
     # Walk through modules and initialize
     for _, module in cast(
@@ -213,7 +193,7 @@ def load(
     T
         The loaded object, cast to the requested generic return type.
     """
-    obj = mx.load(path, stream=mx.cpu)  # type: ignore
+    obj = mx.load(path)  # type: ignore
     if as_type is not None:
         # `as_type` should be a concrete runtime class (e.g., `dict` or `list`).
         # For typing constructs like `Mapping[str, Any]` you should annotate the

@@ -321,7 +321,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         rec_noise = self.get_noise(indexes, scale, rec=True)
         rec = self.generator(
             rec_noise,
-            self.noise_amp[: scale + 1],
+            self.noise_amps[: scale + 1],
             in_noise=rec_in,
             start_scale=scale,
             stop_scale=scale,
@@ -413,7 +413,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         amp_path = os.path.join(scale_path, AMP_FILE)
         if os.path.exists(amp_path):
             with open(amp_path, "r") as f:
-                self.noise_amp.append(float(f.read().strip()))
+                self.noise_amps.append(float(f.read().strip()))
 
     def get_noise_shape(
         self, scale: int, use_base_channel: bool = True

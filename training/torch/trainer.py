@@ -274,7 +274,7 @@ class TorchTrainer(
 
             rmse = torch.sqrt(F.mse_loss(fake, real_facies))
             amp = self.scale0_noise_amp * rmse.item()
-            self.model.noise_amp.append(amp)
+            self.model.noise_amps.append(amp)
 
         else:
             # For higher scales, upsample previous facies to current resolution
@@ -331,17 +331,17 @@ class TorchTrainer(
             with torch.no_grad():
                 fake = self.model.generator(
                     self.model.get_noise(indexes, scale),
-                    self.model.noise_amp + [1.0],
+                    self.model.noise_amps + [1.0],
                     stop_scale=scale,
                 )
 
             rmse = torch.sqrt(F.mse_loss(fake, real_facies))
             amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
 
-            if scale < len(self.model.noise_amp):
-                self.model.noise_amp[scale] = (amp + self.model.noise_amp[scale]) / 2
+            if scale < len(self.model.noise_amps):
+                self.model.noise_amps[scale] = (amp + self.model.noise_amps[scale]) / 2
             else:
-                self.model.noise_amp.append(amp)
+                self.model.noise_amps.append(amp)
 
         return prev_rec
 
@@ -483,7 +483,7 @@ class TorchTrainer(
         with torch.no_grad():
             generated_facies = [
                 self.model.generator(
-                    noise, self.model.noise_amp[: scale + 1], stop_scale=scale
+                    noise, self.model.noise_amps[: scale + 1], stop_scale=scale
                 )
                 for noise in noises
             ]

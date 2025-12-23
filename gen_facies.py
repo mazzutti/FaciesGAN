@@ -65,7 +65,7 @@ def generate_facies(
     mask_indexes = [random.choice(options.wells) for _ in range(how_many)]
 
     # Get the highest scale (finest resolution)
-    max_scale = len(model.noise_amp) - 1
+    max_scale = len(model.noise_amps) - 1
 
     # Generate noise for the maximum scale
     if options.rec:
@@ -76,7 +76,7 @@ def generate_facies(
     with torch.no_grad():
         generated_facies: list[NDArray[np.float32]] = [
             utils.torch2np(gen_facie.unsqueeze(0), denormalize=True)
-            for gen_facie in model.generator(noises, model.noise_amp)
+            for gen_facie in model.generator(noises, model.noise_amps)
         ]
     return generated_facies, mask_indexes
 
@@ -117,7 +117,7 @@ def generate_comparison_plots(
 
     # Use finest scale if not specified
     if scale is None:
-        scale = len(model.noise_amp) - 1
+        scale = len(model.noise_amps) - 1
 
     facies_scale, wells_scale, _ = dataset.get_scale_data(scale)
     num_images = facies_scale.shape[0]
@@ -148,7 +148,7 @@ def generate_comparison_plots(
             )
             with torch.no_grad():
                 fake = model.generator(
-                    noises, model.noise_amp[: scale + 1], stop_scale=scale
+                    noises, model.noise_amps[: scale + 1], stop_scale=scale
                 )
                 fake_list.append(fake.detach().cpu())
 

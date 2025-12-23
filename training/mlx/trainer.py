@@ -16,7 +16,7 @@ from options import TrainningOptions
 
 from models.mlx.facies_gan import MLXFaciesGAN
 from training.base import Trainer
-from training.mlx.collate import mlx_collate
+from training.mlx.collate import collate
 from training.mlx.schedulers import MultiStepLR
 from typedefs import Batch
 from models.mlx import utils as mlx_utils
@@ -53,7 +53,7 @@ class MLXTrainer(
             shuffle=False,
             num_workers=self.options.num_workers,
             persistent_workers=(self.options.num_workers > 0),
-            collate_fn=mlx_collate,
+            collate_fn=collate,
         )
 
     def create_model(self) -> FaciesGAN[mx.array, nn.Module]:
@@ -191,7 +191,7 @@ class MLXTrainer(
         # Ensure heavy ops use default stream
         with mx.stream(self.gpu_stream):
             if scale == 0:
-                prev_rec = mx.zeros_like(real_facies, stream=mx.cpu)  # type: ignore
+                prev_rec = mx.zeros_like(real_facies)
                 z_rec = mlx_utils.generate_noise(
                     (*real_facies.shape[1:3], self.noise_channels),
                     num_samp=self.batch_size,
@@ -209,7 +209,7 @@ class MLXTrainer(
 
                 rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
                 amp = self.options.scale0_noise_amp * rmse.item()
-                self.model.noise_amp.append(amp)
+                self.model.noise_amps.append(amp)
             else:
                 # Interpolate previous scale facies
                 prev_rec = mlx_utils.interpolate(
@@ -242,30 +242,25 @@ class MLXTrainer(
                 # Calculate noise amplitude based on reconstruction error
                 fake = self.model.generator(
                     self.model.get_noise(indexes, scale),
-                    self.model.noise_amp + [1.0],
+                    self.model.noise_amps + [1.0],
                     stop_scale=scale,
                 )
 
                 rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
-                amp = (
-                    max(self.model.noise_amp[-1] * rmse.item(), self.min_noise_amp)
-                    if self.model.noise_amp
-                    else self.min_noise_amp
-                )
-                self.model.noise_amp.append(amp)
+                amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
 
-                if scale < len(self.model.noise_amp):
-                    self.model.noise_amp[scale] = (
-                        amp + self.model.noise_amp[scale]
+                if scale < len(self.model.noise_amps):
+                    self.model.noise_amps[scale] = (
+                        amp + self.model.noise_amps[scale]
                     ) / 2
                 else:
-                    self.model.noise_amp.append(amp)
+                    self.model.noise_amps.append(amp)
 
             # Critical: eval here forces synchronization before returning
             mx.eval(  # type: ignore
                 self.model.rec_noise[-1],
                 prev_rec,
-                mx.array(self.model.noise_amp[-1]),
+                mx.array(self.model.noise_amps[-1]),
             )
         return prev_rec
 
@@ -398,17 +393,13 @@ class MLXTrainer(
         ]
         generated_facies = [
             self.model.generator(
-                noise, self.model.noise_amp[: scale + 1], stop_scale=scale
+                noise, self.model.noise_amps[: scale + 1], stop_scale=scale
             )
             for noise in noises
         ]
         generated_facies = [utils.clamp(gen, -1, 1) for gen in generated_facies]
 
         if self.enable_plot_facies:
-            # We want to minimize blocking here.
-            # Convert to numpy (this blocks until generation is done)
-            # We can't easily avoid this block without changing background_workers to accept MLX.
-            # However, since this runs only once per epoch, blocking here is acceptable.
             generated_facies_cpu = [
                 utils.tensor2np(g, denormalize=True) for g in generated_facies
             ]

@@ -20,7 +20,7 @@
         "--num-train-pyramids",
         "1",
         "--num-workers",
-        "0",
+        "1",
         "--num-iter",
         "4000",
         "--num-parallel-scales",

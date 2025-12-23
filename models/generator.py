@@ -166,19 +166,3 @@ class Generator(ABC, Generic[TTensor, TModule]):
             If the subclass does not implement this method.
         """
         raise NotImplementedError("Subclasses must implement the __call__ method.")
-
-    # @abstractmethod
-    # def eval(self) -> Self:
-    #     """Set the module in evaluation mode.
-
-    #     Returns
-    #     -------
-    #     Generator[torch.Tensor, nn.ModuleList]
-    #         The generator instance in evaluation mode.
-
-    #     Raises
-    #     ------
-    #     NotImplementedError
-    #         If the subclass does not implement this method.
-    #     """
-    #     raise NotImplementedError("Subclasses must implement eval method.")

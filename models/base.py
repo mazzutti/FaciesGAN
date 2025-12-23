@@ -134,7 +134,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         self.rec_noise: list[TTensor] = []
 
         # noise amplitudes
-        self.noise_amp: list[float] = []
+        self.noise_amps: list[float] = []
 
         # active scales set
         self.active_scales: set[int] = set()
@@ -269,15 +269,13 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         raise NotImplementedError("Subclasses must implement build_generator")
 
     @abstractmethod
-    def concatenate_tensors(self, tensors: list[TTensor], dim: int) -> TTensor:
+    def concatenate_tensors(self, tensors: list[TTensor]) -> TTensor:
         """Concatenate a list of tensors along a specified dimension.
 
         Parameters
         ----------
         tensors : list[TTensor]
             List of tensors to concatenate.
-        dim : int
-            Dimension along which to concatenate the tensors.
         Returns
         -------
         TTensor
@@ -297,7 +295,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         Parameters
         ----------
         fake_samples : list[TTensor]
-            List of generated tensors for diversity computation.
+            Generated tensor samples used to compute diversity loss.
 
         Returns
         -------
@@ -888,8 +886,8 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
             List of noise amplitudes up to the requested scale.
         """
         return (
-            self.noise_amp[: scale + 1]
-            if len(self.noise_amp) >= scale + 1
+            self.noise_amps[: scale + 1]
+            if len(self.noise_amps) >= scale + 1
             else [1.0] * (scale + 1)
         )
 
@@ -1309,7 +1307,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
                 # Ensure noise amplitudes have been initialized for this scale.
                 # In normal training `noise_amp` is populated during noise
                 # initialization; missing values indicate setup wasn't run.
-                if len(self.noise_amp) < scale + 1:
+                if len(self.noise_amps) < scale + 1:
                     raise RuntimeError(
                         f"noise_amp not initialized for scale {scale}. "
                         "Call the project's noise initialization before training."
@@ -1362,10 +1360,10 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
         scale : int
             Pyramid scale index being saved.
         """
-        if scale < len(self.noise_amp):
+        if scale < len(self.noise_amps):
             amp_path = os.path.join(scale_path, AMP_FILE)
             with open(amp_path, "w") as f:
-                f.write(str(self.noise_amp[scale]))
+                f.write(str(self.noise_amps[scale]))
 
     def save_scale(self, scale: int, path: str) -> None:
         """Save generator/discriminator and auxiliary files for a scale.
@@ -1448,17 +1446,17 @@ class FaciesGAN(ABC, Generic[TTensor, TModule]):
             z = self.generate_noise(shape, num_samp=batch)
             well = self.move_to_device(self._wells[index][indexes])
             seismic = self.move_to_device(self._seismic[index][indexes])
-            z = self.concatenate_tensors([z, well, seismic], dim=1)
+            z = self.concatenate_tensors([z, well, seismic])
         elif self.use_wells(index):
             shape = self.get_noise_shape(index)
             z = self.generate_noise(shape, num_samp=batch)
             well = self.move_to_device(self._wells[index][indexes])
-            z = self.concatenate_tensors([z, well], dim=1)
+            z = self.concatenate_tensors([z, well])
         elif self.use_seismic(index):
             shape = self.get_noise_shape(index)
             z = self.generate_noise(shape, num_samp=batch)
             seismic = self.move_to_device(self._seismic[index][indexes])
-            z = self.concatenate_tensors([z, seismic], dim=1)
+            z = self.concatenate_tensors([z, seismic])
         else:
             shape = self.get_noise_shape(index, use_base_channel=False)
             z = self.generate_noise(

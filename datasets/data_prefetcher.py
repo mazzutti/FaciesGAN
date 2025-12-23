@@ -10,8 +10,9 @@ torch-specific trainers and other code that needs async batch preparation.
 
 from __future__ import annotations
 
-from typing import Any, Iterator
-from typing_extensions import Generic
+
+from typing import Any, Iterator, Generic
+
 from abc import ABC, abstractmethod
 from torch.utils.data import DataLoader
 

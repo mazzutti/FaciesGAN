@@ -5,6 +5,7 @@ from typing import Any, Generic, NamedTuple, TypeVar
 import mlx.core as mlx_core
 import mlx.nn as mlx_nn  # type: ignore
 import mlx.optimizers as mlx_optim  # type: ignore
+
 import torch
 from torch.utils.data import DataLoader
 
@@ -64,6 +65,4 @@ class Batch(NamedTuple, Generic[TTensor]):
 
 
 # Type variable for a data loader that yields batches of tensors
-IDataLoader = TypeVar(
-    "IDataLoader", DataLoader[Batch[torch.Tensor]], Any
-)  # mlx_core.data.DataLoader)
+IDataLoader = TypeVar("IDataLoader", DataLoader[Batch[torch.Tensor]], Any)

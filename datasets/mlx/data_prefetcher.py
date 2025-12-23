@@ -52,7 +52,6 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
             return
 
         # Queue the MLX data preparation on the CPU stream.
-
         assert self.stream is not None
         with mx.stream(self.stream):
             if self.next_batch is not None:
@@ -68,8 +67,6 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
     ]:
         """Perform batch preparation logic asynchronously."""
         facies, wells, seismic = batch
-        # Assuming batch size is consistent across pyramids
-        indexes = list(range(len(facies[0])))
 
         real_facies_dict: dict[int, mx.array] = {}
         masks_dict: dict[int, mx.array] = {}
@@ -77,10 +74,10 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
         seismic_dict: dict[int, mx.array] = {}
 
         for scale in self.scales:
-            real_facies_dict[scale] = facies[scale][indexes]
+            real_facies_dict[scale] = mx.array(facies[scale])
 
             if len(wells) > 0:
-                wells_dev = wells[scale][indexes]
+                wells_dev = mx.array(wells[scale])
                 masks_dev = mx.sum(mx.abs(wells_dev), axis=3, keepdims=True)
                 masks_dev = mx.greater(masks_dev, 0)
                 masks_dev = masks_dev.astype(mx.int32)
@@ -88,7 +85,7 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
                 masks_dict[scale] = masks_dev
 
             if len(seismic) > 0:
-                seismic_dev = seismic[scale][indexes]
+                seismic_dev = mx.array(seismic[scale])
                 seismic_dict[scale] = seismic_dev
 
         return (real_facies_dict, masks_dict, wells_dict, seismic_dict)
