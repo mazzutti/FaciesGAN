@@ -1,6 +1,8 @@
 from typing import Literal, cast
 import mlx.core as mx
 import mlx.nn as nn  # type: ignore
+import mlx.nn.layers.upsample as upsample  # type: ignore
+from numpy import dtype  # type: ignore
 
 
 class MLXLeakyReLU(nn.LeakyReLU):
@@ -11,8 +13,11 @@ class MLXLeakyReLU(nn.LeakyReLU):
     expected to implement the module interface.
     """
 
-    def __init__(self, negative_slope: float = 0.2) -> None:
+    def __init__(
+        self, negative_slope: float = 0.2, dtype: mx.Dtype = mx.float32
+    ) -> None:
         super().__init__(negative_slope=negative_slope)
+        self.set_dtype(dtype)
 
 
 class MLXConvBlock(nn.Module):
@@ -44,8 +49,12 @@ class MLXConvBlock(nn.Module):
         kernel_size: int,
         padding: int,
         stride: int,
+        use_norm: bool = True,
+        dtype: mx.Dtype = mx.float32,
     ) -> None:
         super().__init__()
+        self.set_dtype(dtype)
+        self.use_norm = use_norm
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
@@ -53,12 +62,20 @@ class MLXConvBlock(nn.Module):
             stride=stride,
             padding=padding,
         )
-        self.norm = nn.BatchNorm(num_features=out_channels)
-        self.activation = MLXLeakyReLU(negative_slope=0.2)
+        self.conv.set_dtype(dtype)
+
+        # Only initialize norm if requested
+        if self.use_norm:
+            self.norm = nn.InstanceNorm(dims=out_channels, affine=True)
+            self.norm.set_dtype(dtype)
+        # self.norm = nn.BatchNorm(num_features=out_channels)
+        # self.norm.set_dtype(dtype)
+        self.activation = MLXLeakyReLU(negative_slope=0.2, dtype=dtype)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.conv(x)
-        x = self.norm(x)
+        if self.use_norm:
+            x = self.norm(x)
         x = cast(mx.array, self.activation(x))
         return x
 
@@ -76,10 +93,12 @@ class MLXUpsample(nn.Module):
         size: tuple[int, ...],
         mode: Literal["nearest", "linear", "cubic"] = "linear",
         align_corners: bool = True,
+        dtype: mx.Dtype = mx.float32,
     ) -> None:
         self.height, self.width = (int(size[0]), int(size[1]))
         self.mode = mode
         self.align_corners = align_corners
+        self.set_dtype(dtype)
 
     def __call__(self, x: mx.array) -> mx.array:
         in_height, in_width = x.shape[1:3]
@@ -88,11 +107,11 @@ class MLXUpsample(nn.Module):
 
         scale_factor = (self.height / in_height, self.width / in_width)
         if self.mode == "nearest":
-            return nn.layers.upsample.upsample_nearest(x, scale_factor)  # type: ignore
+            return upsample.upsample_nearest(x, scale_factor).astype(self.dtype)  # type: ignore
         elif self.mode == "linear":
             return cast(
                 mx.array,
-                nn.layers.upsample.upsample_linear(  # type: ignore
+                upsample.upsample_linear(  # type: ignore
                     x,
                     scale_factor,
                     self.align_corners,
@@ -101,7 +120,7 @@ class MLXUpsample(nn.Module):
         elif self.mode == "cubic":
             return cast(
                 mx.array,
-                nn.layers.upsample.upsample_cubic(  # type: ignore
+                upsample.upsample_cubic(  # type: ignore
                     x,
                     scale_factor,
                     self.align_corners,
@@ -132,7 +151,7 @@ class MLXSPADE(nn.Module):
     Notes
     -----
     - Input tensors are expected in NHWC layout (B, H, W, C).
-    - The internal InstanceNorm does not use affine parameters.
+    - The internal InstanceNorm uses affine parameters.
     """
 
     def __init__(
@@ -141,30 +160,38 @@ class MLXSPADE(nn.Module):
         cond_nc: int,
         hidden_nc: int = 64,
         kernel_size: int = 3,
+        dtype: mx.Dtype = mx.float32,
     ) -> None:
         super().__init__()
 
         # MLX InstanceNorm works on (B, H, W, C)
-        self.norm = nn.InstanceNorm(dims=norm_nc, affine=False)
+        self.dtype = dtype
+        self.set_dtype(dtype)
+        self.norm = nn.InstanceNorm(dims=norm_nc, affine=True)
+        self.norm.set_dtype(dtype)
 
         padding = kernel_size // 2
 
-        self.mlp_shared: list[nn.Module] = [
+        self.mlp_shared: nn.Sequential = nn.Sequential(
             nn.Conv2d(
                 cond_nc,
                 hidden_nc,
                 kernel_size=kernel_size,
                 padding=padding,
             ),
-            MLXLeakyReLU(0.2),
-        ]
+            MLXLeakyReLU(0.2, dtype),
+        )
+
+        _ = [layer.set_dtype(dtype) for layer in self.mlp_shared.layers]  # type: ignore
 
         self.mlp_gamma = nn.Conv2d(
             hidden_nc, norm_nc, kernel_size=kernel_size, padding=padding
         )
+        self.mlp_gamma.set_dtype(dtype)
         self.mlp_beta = nn.Conv2d(
             hidden_nc, norm_nc, kernel_size=kernel_size, padding=padding
         )
+        self.mlp_beta.set_dtype(dtype)
         # Cache of upsample layers keyed by target (height, width).
         # We create them lazily on first use to avoid re-allocating
         # Upsample modules on every forward call. Optionally the caller
@@ -189,6 +216,7 @@ class MLXSPADE(nn.Module):
                 size=target,
                 mode=mode,
                 align_corners=align_corners,
+                dtype=self.dtype,
             )
             self._upsample_cache[target] = up
         return up
@@ -208,8 +236,7 @@ class MLXSPADE(nn.Module):
                 align_corners=align_corners,
             )(conditioning_input),
         )
-        for layer in self.mlp_shared:
-            activated_input = cast(mx.array, layer(activated_input))
+        activated_input = cast(mx.array, self.mlp_shared(activated_input))
         gamma = self.mlp_gamma(activated_input)
         beta = self.mlp_beta(activated_input)
         normalized = self.norm(x)
@@ -246,10 +273,13 @@ class MLXSPADEConvBlock(nn.Module):
         padding: int,
         stride: int,
         spade_hidden: int = 64,
+        dtype: mx.Dtype = mx.float32,
     ) -> None:
         super().__init__()
 
-        self.spade = MLXSPADE(in_channels, cond_channels, spade_hidden, kernel_size)
+        self.spade = MLXSPADE(
+            in_channels, cond_channels, spade_hidden, kernel_size, dtype=dtype
+        )
         self.conv = nn.Conv2d(
             in_channels,
             out_channels,
@@ -257,8 +287,8 @@ class MLXSPADEConvBlock(nn.Module):
             stride=stride,
             padding=padding,
         )
-
-        self.activation = MLXLeakyReLU(negative_slope=0.2)
+        self.conv.set_dtype(dtype)
+        self.activation = MLXLeakyReLU(negative_slope=0.2, dtype=dtype)
 
     def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
         x = self.spade(x, cond)
@@ -303,8 +333,11 @@ class MLXSPADEGenerator(nn.Module):
         min_num_features: int,
         output_channels: int,
         input_channels: int,
+        dtype: mx.Dtype = mx.float32,
     ) -> None:
         super().__init__()
+
+        self.set_dtype(dtype)
 
         self.init_conv = nn.Conv2d(
             input_channels,
@@ -312,21 +345,28 @@ class MLXSPADEGenerator(nn.Module):
             kernel_size=kernel_size,
             padding=padding_size,
         )
-
-        self.spade_blocks: list[MLXSPADEConvBlock] = []
+        self.init_conv.set_dtype(dtype)
 
         current_features = num_features
+        spade_blocks: list[MLXSPADEConvBlock] = []
         for i in range(num_layer - 2):
             block_features = int(num_features / pow(2, (i + 1)))
             out_ch = max(block_features, min_num_features)
             in_ch = current_features
 
-            self.spade_blocks.append(
+            spade_blocks.append(
                 MLXSPADEConvBlock(
-                    in_ch, out_ch, input_channels, kernel_size, padding_size, 1
+                    in_ch,
+                    out_ch,
+                    input_channels,
+                    kernel_size,
+                    padding_size,
+                    1,
+                    dtype=dtype,
                 )
             )
             current_features = out_ch
+        self.spade_blocks: nn.Sequential = nn.Sequential(*spade_blocks)
 
         self.tail_conv = nn.Conv2d(
             current_features,
@@ -335,18 +375,18 @@ class MLXSPADEGenerator(nn.Module):
             stride=1,
             padding=padding_size,
         )
-
-        self.leaky_relu = MLXLeakyReLU(negative_slope=0.2)
+        self.tail_conv.set_dtype(dtype)
+        self.leaky_relu = MLXLeakyReLU(negative_slope=0.2, dtype=dtype)
         self.activation = nn.Tanh()
+        self.activation.set_dtype(dtype)
 
     def __call__(self, cond: mx.array) -> mx.array:
         # Initial feature extraction
         x = self.init_conv(cond)
         x = cast(mx.array, self.leaky_relu(x))
 
-        # Apply SPADE blocks
-        for block in self.spade_blocks:
-            x = block(x, cond)
+        for block in self.spade_blocks.layers:  # type: ignore
+            x = cast(mx.array, block(x, cond))
 
         # Final output layer
         out = cast(mx.array, self.activation(self.tail_conv(x)))
@@ -365,11 +405,13 @@ class MLXScaleModule(nn.Module):
         head: MLXSPADEGenerator | MLXConvBlock,
         body: nn.Sequential,
         tail: nn.Sequential,
+        dtype: mx.Dtype = mx.float32,
     ) -> None:
         super().__init__()
         self.head = head
         self.body = body
         self.tail = tail
+        self.set_dtype(dtype)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.head(x)
@@ -405,28 +447,47 @@ class MLXSPADEDiscriminator(nn.Module):
         kernel_size: int,
         padding_size: int,
         input_channels: int,
+        dtype: mx.Dtype = mx.float32,
     ) -> None:
         super().__init__()
 
         self.head = MLXConvBlock(
-            input_channels, num_features, kernel_size, padding_size, 1
+            input_channels,
+            num_features,
+            kernel_size,
+            padding_size,
+            1,
+            use_norm=True,
+            dtype=dtype,
         )
 
-        self.body: list[MLXConvBlock] = []
+        body: list[MLXConvBlock] = []
         for i in range(num_layer - 2):
             in_ch = max(num_features // (2**i), min_num_features)
             out_ch = max(num_features // (2 ** (i + 1)), min_num_features)
-            self.body.append(MLXConvBlock(in_ch, out_ch, kernel_size, padding_size, 1))
+            body.append(
+                MLXConvBlock(
+                    in_ch,
+                    out_ch,
+                    kernel_size,
+                    padding_size,
+                    1,
+                    use_norm=True,
+                    dtype=dtype,
+                )
+            )
+
+        self.body = nn.Sequential(*body)
 
         output_channels = max(num_features // (2 ** (num_layer - 2)), min_num_features)
         self.tail = nn.Conv2d(
             output_channels, 1, kernel_size=kernel_size, stride=1, padding=padding_size
         )
+        self.tail.set_dtype(dtype)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.head(x)
-        for block in self.body:
-            x = block(x)
+        x = cast(mx.array, self.body(x))
         return self.tail(x)
 
 
@@ -451,9 +512,14 @@ class MLXColorQuantization(nn.Module):
         (NHWC).
     """
 
-    def __init__(self, temperature: float = 0.1) -> None:
+    def __init__(
+        self,
+        temperature: float = 0.1,
+        dtype: mx.Dtype = mx.float32,
+    ) -> None:
         super().__init__()
         self.temperature = temperature
+        self.dtype = dtype
 
         # Pure colors: (4, 3)
         self.pure_colors = mx.array(
@@ -462,7 +528,8 @@ class MLXColorQuantization(nn.Module):
                 [1.0, -1.0, -1.0],
                 [-1.0, 1.0, -1.0],
                 [-1.0, -1.0, 1.0],
-            ]
+            ],
+            dtype=self.dtype,
         )
 
     @staticmethod

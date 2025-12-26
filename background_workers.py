@@ -224,7 +224,7 @@ class BackgroundWorker:
 
 
 def submit_plot_generated_facies(
-    fake_list: TTensor,
+    fake: TTensor,
     real: TTensor,
     stage: int,
     index: int,
@@ -245,6 +245,4 @@ def submit_plot_generated_facies(
     # BackgroundWorker is a singleton — calling the constructor returns the
     # shared instance. Use it to submit the job.
     worker = BackgroundWorker()
-    return worker.submit_plot_generated_facies(
-        fake_list, real, stage, index, out_dir, masks
-    )
+    return worker.submit_plot_generated_facies(fake, real, stage, index, out_dir, masks)

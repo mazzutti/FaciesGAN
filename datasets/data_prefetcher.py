@@ -14,9 +14,10 @@ from __future__ import annotations
 from typing import Any, Iterator, Generic
 
 from abc import ABC, abstractmethod
+
 from torch.utils.data import DataLoader
 
-from typedefs import Batch, TTensor
+from typedefs import Batch, PyramidsBatch, TTensor
 
 
 class DataPrefetcher(Generic[TTensor], ABC):
@@ -27,13 +28,8 @@ class DataPrefetcher(Generic[TTensor], ABC):
     ----------
     loader:
         A PyTorch ``DataLoader`` instance to iterate over.
-    prepare_fn:
-        Optional callable that accepts a raw batch and returns a prepared
-        batch (for example, moving tensors to a device). If ``None`` the
-        raw batch is returned as the prepared value.
-    device:
-        Optional ``torch.device`` used to decide whether to use a CUDA
-        stream. If not provided, defaults to ``torch.device('cpu')``.
+    scales : tuple[int, ...]
+        Tuple of scales to prepare data for.
 
     Behavior
     --------
@@ -42,11 +38,11 @@ class DataPrefetcher(Generic[TTensor], ABC):
     overlap with host/GPU work on the current stream.
     """
 
-    def __init__(self, loader: DataLoader[TTensor], scales: list[int]) -> None:
+    def __init__(self, loader: DataLoader[TTensor], scales: tuple[int, ...]) -> None:
         self.loader = iter(loader)
         self.scales = scales
-        self.next_batch: Any | None = None
-        self.next_prepared: Any | None = None
+        self.next_batch: Batch[TTensor] | None = None
+        self.next_prepared: PyramidsBatch[TTensor] | None = None
 
     @abstractmethod
     def preload(self) -> None:
@@ -62,12 +58,7 @@ class DataPrefetcher(Generic[TTensor], ABC):
         raise NotImplementedError("Subclasses must implement preload method")
 
     @abstractmethod
-    def prepare_batch_async(self, batch: Batch[TTensor]) -> tuple[
-        dict[int, TTensor],
-        dict[int, TTensor],
-        dict[int, TTensor],
-        dict[int, TTensor],
-    ]:
+    def prepare_batch_async(self, batch: Batch[TTensor]) -> PyramidsBatch[TTensor]:
         """Perform batch preparation logic asynchronously.
 
         Parameters
@@ -76,7 +67,8 @@ class DataPrefetcher(Generic[TTensor], ABC):
             The raw batch to prepare.
         Returns
         -------
-        A tuple of prepared batch components.
+        DictBatch[TTensor]
+            The prepared batch as a tuple of dictionaries.
 
         Raises
         ------
@@ -88,15 +80,13 @@ class DataPrefetcher(Generic[TTensor], ABC):
         )
 
     @abstractmethod
-    def next(self) -> tuple[Batch[TTensor] | None, Any | None]:
+    def next(self) -> PyramidsBatch[TTensor] | None:
         """Return the next batch and trigger loading of the subsequent one.
 
         Returns
         -------
-        A tuple ``(raw_batch, prepared_batch)`` where ``raw_batch`` is the
-        next raw batch from the loader (or ``None`` if no more batches are
-        available), and ``prepared_batch`` is the corresponding prepared batch
-        (or ``None`` if no more batches are available).
+        DictBatch[TTensor] | None
+            The prepared batch, or ``None`` if no more batches are available.
 
         Raises
         ------
@@ -106,7 +96,7 @@ class DataPrefetcher(Generic[TTensor], ABC):
         raise NotImplementedError("Subclasses must implement next method")
 
     @abstractmethod
-    def __iter__(self) -> Iterator[tuple[Batch[TTensor] | None, Any | None]]:
+    def __iter__(self) -> Iterator[PyramidsBatch[TTensor] | None]:
         """Iterator over ``(raw_batch, prepared_batch)`` pairs.
         Subclasses should provide a concrete iteration strategy, typically
         by repeatedly calling ``self.next()`` until no batch remains.

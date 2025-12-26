@@ -60,13 +60,19 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
         padding_size: int,
         input_channels: int,
         output_channels: int = 3,
+        dtype: mx.Dtype = mx.float32,
     ) -> None:
         super(MLXGenerator, self).__init__(
             num_layer, kernel_size, padding_size, input_channels, output_channels
         )
         nn.Module.__init__(self)
         self.gens: list[nn.Module] = list()
-        self.color_quantizer = MLXColorQuantization(temperature=0.1)
+        self.dtype = dtype
+        self.color_quantizer = MLXColorQuantization(
+            temperature=0.1,
+            dtype=self.dtype,
+        )
+        self.set_dtype(self.dtype)
 
     def __call__(
         self,
@@ -127,7 +133,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             height, width = tuple(
                 dim - self.full_zero_padding for dim in z[start_scale].shape[1:3]
             )
-            out_facie = mx.zeros((batch_size, height, width, channels))  # type: ignore
+            out_facie = mx.zeros((batch_size, height, width, channels), dtype=self.dtype)  # type: ignore
         else:
             out_facie = in_noise
 
@@ -233,6 +239,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                 min_num_features,
                 self.output_channels,
                 self.input_channels,
+                dtype=self.dtype,
             )
             self.gens.append(spade_gen)
             self.spade_scales.add(scale)
@@ -244,6 +251,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                 self.kernel_size,
                 self.padding_size,
                 1,
+                dtype=self.dtype,
             )
 
             def build_body() -> tuple[list[MLXConvBlock], int]:
@@ -260,6 +268,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                             self.kernel_size,
                             self.padding_size,
                             1,
+                            dtype=self.dtype,
                         )
                     )
                 return blocks, block_features
@@ -276,5 +285,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                 ),
                 nn.Tanh(),
             )
+
+            _ = [layer.set_dtype(self.dtype) for layer in tail.layers]  # type: ignore
 
             self.gens.append(MLXScaleModule(head, body, tail))

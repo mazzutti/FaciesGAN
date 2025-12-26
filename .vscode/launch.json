@@ -19,6 +19,8 @@
         "results/",
         "--num-train-pyramids",
         "1",
+        "--batch-size",
+        "1",
         "--num-workers",
         "1",
         "--num-iter",
@@ -34,9 +36,10 @@
         "--lambda-diversity",
         "1.0",
         "--no-tensorboard",
+        // "--use-mixed-precision",
         "--use-wells",
         "--use-seismic",
-        // "--use-mlx"
+        "--use-mlx"
         // "--use-profiler"
       ]
     }

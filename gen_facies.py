@@ -62,16 +62,16 @@ def generate_facies(
     model.load(model_path, load_discriminator=False, load_wells=False)
     # model.generator.eval()
 
-    mask_indexes = [random.choice(options.wells) for _ in range(how_many)]
+    mask_indexes = list(random.choice(options.wells) for _ in range(how_many))
 
     # Get the highest scale (finest resolution)
     max_scale = len(model.noise_amps) - 1
 
     # Generate noise for the maximum scale
     if options.rec:
-        noises = model.get_noise(mask_indexes, scale=max_scale, rec=True)
+        noises = model.get_pyramid_noise(max_scale, mask_indexes, rec=True)
     else:
-        noises = model.get_noise(mask_indexes, scale=max_scale, rec=False)
+        noises = model.get_pyramid_noise(max_scale, mask_indexes, rec=False)
 
     with torch.no_grad():
         generated_facies: list[NDArray[np.float32]] = [
@@ -143,16 +143,16 @@ def generate_comparison_plots(
         # Generate fake samples using the trained model
         fake_list: list[torch.Tensor] = []
         for i_idx in range(start, end):
-            noises = model.get_noise(
-                [int(i_idx)] * num_generated, scale=scale, rec=False
-            )
+            noises = model.get_pyramid_noise(scale, [i_idx] * num_generated, rec=False)
             with torch.no_grad():
                 fake = model.generator(
                     noises, model.noise_amps[: scale + 1], stop_scale=scale
                 )
                 fake_list.append(fake.detach().cpu())
 
-        submit_plot_generated_facies(fake_list, real, scale, start, out_path, masks)
+        submit_plot_generated_facies(
+            torch.stack(fake_list), real, scale, start, out_path, masks
+        )
 
         print(
             f"Submitted async plot job for indices {start}..{end-1} -> {out_path}/gen_{scale}_{start}.png"
@@ -312,9 +312,7 @@ if __name__ == "__main__":
                 dim=0,
             )
         )
-    faciesGAN = TorchFaciesGAN(
-        options=args, wells=tuple(masked_facies), device=args.device
-    )
+    faciesGAN = TorchFaciesGAN(options=args, device=args.device)
 
     if arguments.comparison_plots:
         # Generate comparison plots instead of individual facies

@@ -1,4 +1,4 @@
-from typing import TypeVar, cast
+from typing import Any, TypeVar, cast
 import mlx.core as mx
 import mlx.nn.layers.upsample as upsample  # type: ignore
 import mlx.nn as nn  # type: ignore
@@ -55,16 +55,30 @@ def calc_gradient_penalty(
 
     # Calculate gradients of the output w.r.t. the interpolates
     gradients = cast(mx.array, mx.grad(grad_fn)(interpolates))  # type: ignore
-
-    # gradients_flat = gradients.reshape(batch_size, -1)  # type: ignore
     grad_norm = mx.sqrt(mx.sum(mx.square(gradients), axis=-1) + 1e-12)
-
     gradient_penalty = mx.mean(mx.square(grad_norm - 1.0)) * LAMBDA
     return gradient_penalty
 
 
+def flatten_to_list(obj: Any) -> list[mx.array]:
+    """Recursively flatten dictionaries and lists to extract mlx arrays."""
+    flat: list[mx.array] = []
+    if isinstance(obj, dict):
+        for v in obj.values():  # type: ignore
+            flat.extend(flatten_to_list(v))
+    elif isinstance(obj, list) or isinstance(obj, tuple):
+        for v in obj:  # type: ignore
+            flat.extend(flatten_to_list(v))
+    elif isinstance(obj, mx.array):
+        flat.append(obj)
+    return flat
+
+
 def generate_noise(
-    size: tuple[int, ...], num_samp: int = 1, scale: float = 1.0
+    size: tuple[int, ...],
+    num_samp: int = 1,
+    scale: float = 1.0,
+    use_mixed_precision: bool = False,
 ) -> mx.array:
     """Generate random noise in NHWC format.
 
@@ -84,8 +98,8 @@ def generate_noise(
     """
     h, w, c = size
     noise_shape = (num_samp, round(h / scale), round(w / scale), c)
-    # Prefer float32 for noise arrays to reduce memory on device backends.
-    noise = mx.random.normal(shape=noise_shape, dtype=mx.float32)
+    dtype = mx.bfloat16 if use_mixed_precision else mx.float32
+    noise = mx.random.normal(shape=noise_shape, dtype=dtype)
 
     if scale != 1.0:
         noise = interpolate(noise, (h, w))

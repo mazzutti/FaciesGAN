@@ -1,8 +1,8 @@
-from typing import Any, Iterator
+from typing import Iterator
 import torch
 from torch.utils.data import DataLoader
 
-from datasets.data_prefetcher import DataPrefetcher
+from datasets.data_prefetcher import DataPrefetcher, PyramidsBatch
 from typedefs import Batch
 import utils
 
@@ -19,14 +19,14 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
     ----------
     loader : DataLoader
         The underlying data loader.
-    scales : list[int]
-        List of scales to prepare data for.
+    scales : tuple[int, ...]
+        Tuple of scales to prepare data for.
     """
 
     def __init__(
         self,
         loader: DataLoader[torch.Tensor],
-        scales: list[int],
+        scales: tuple[int, ...],
         device: torch.device = torch.device("cpu"),
     ) -> None:
         super().__init__(loader, scales)
@@ -67,51 +67,43 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
         else:
             self.next_prepared = None
 
-    def prepare_batch_async(self, batch: Batch[torch.Tensor]) -> tuple[
-        dict[int, torch.Tensor],
-        dict[int, torch.Tensor],
-        dict[int, torch.Tensor],
-        dict[int, torch.Tensor],
-    ]:
+    def prepare_batch_async(
+        self, batch: Batch[torch.Tensor]
+    ) -> PyramidsBatch[torch.Tensor]:
         """Perform batch preparation logic identical to the old prepare_scale_batch."""
         facies, wells, seismic = batch
 
-        real_facies_dict: dict[int, torch.Tensor] = {}
-        masks_dict: dict[int, torch.Tensor] = {}
-        wells_dict: dict[int, torch.Tensor] = {}
-        seismic_dict: dict[int, torch.Tensor] = {}
+        # Build per-scale pyramids using tuple comprehensions. This avoids
+        # creating intermediate dicts or mutating empty tuples by index.
+        facies_pyramid: tuple[torch.Tensor, ...] = tuple(
+            utils.to_device(facies[scale], self.device, channels_last=True)
+            for scale in self.scales
+        )
 
-        for scale in self.scales:
-            # Real facies
-            facies_batch = facies[scale]
-            # When inside a stream context, to() calls are asynchronous
-            real_facies_dict[scale] = utils.to_device(
-                facies_batch, self.device, channels_last=True
+        if len(wells) > 0:
+            wells_pyramid: tuple[torch.Tensor, ...] = tuple(
+                utils.to_device(wells[scale], self.device, channels_last=True)
+                for scale in self.scales
             )
+            # Masks are computed from the device-resident well tensors
+            masks_pyramid: tuple[torch.Tensor, ...] = tuple(
+                (w.abs().sum(dim=1, keepdim=True) > 0).int() for w in wells_pyramid
+            )
+        else:
+            wells_pyramid = ()
+            masks_pyramid = ()
 
-            # Wells
-            if len(wells) > 0:
-                wells_batch = wells[scale]
-                wells_dev = utils.to_device(
-                    wells_batch, self.device, channels_last=True
-                )
-                # Compute mask on device
-                masks_dev = (wells_dev.abs().sum(dim=1, keepdim=True) > 0).int()
-                masks_dev = utils.to_device(masks_dev, self.device, channels_last=True)
-                wells_dict[scale] = wells_dev
-                masks_dict[scale] = masks_dev
+        if len(seismic) > 0:
+            seismic_pyramid: tuple[torch.Tensor, ...] = tuple(
+                utils.to_device(seismic[scale], self.device, channels_last=True)
+                for scale in self.scales
+            )
+        else:
+            seismic_pyramid = ()
 
-            # Seismic
-            if len(seismic) > 0:
-                seismic_batch = seismic[scale]
-                seismic_dev = utils.to_device(
-                    seismic_batch, self.device, channels_last=True
-                )
-                seismic_dict[scale] = seismic_dev
+        return (facies_pyramid, wells_pyramid, masks_pyramid, seismic_pyramid)
 
-        return (real_facies_dict, masks_dict, wells_dict, seismic_dict)
-
-    def next(self) -> tuple[Batch[torch.Tensor] | None, Any | None]:
+    def next(self) -> PyramidsBatch[torch.Tensor] | None:
         """Return the next batch and trigger loading of the subsequent one.
 
         Waits for the stream to finish before returning if CUDA is enabled.
@@ -125,17 +117,18 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
         if batch is not None:
             self.preload()
 
-        return batch, prepared
+        return prepared
 
-    def __iter__(self) -> Iterator[tuple[Batch[torch.Tensor] | None, Any | None]]:
+    def __iter__(self) -> Iterator[PyramidsBatch[torch.Tensor] | None]:
         """Iterate over (raw_batch, prepared_batch) pairs until the loader
         is exhausted.
 
         Returns
         -------
-        An iterator over tuples of raw and prepared batches.
+        Iterator[DictBatch[torch.Tensor] | None]
+            An iterator over prepared batches.
         """
-        batch, prepared = self.next()
-        while batch is not None:
-            yield batch, prepared
-            batch, prepared = self.next()
+        prepared = self.next()
+        while prepared is not None:
+            yield prepared
+            prepared = self.next()

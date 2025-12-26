@@ -70,6 +70,7 @@ class TrainningOptions(argparse.Namespace):
         wells_mask_columns: tuple[int, ...] = (),
         enable_tensorboard: bool = True,
         enable_plot_facies: bool = True,
+        use_mixed_precision: bool = False,
     ) -> None:
         """Create a TrainningOptions namespace with defaults for training.
 
@@ -229,6 +230,7 @@ class TrainningOptions(argparse.Namespace):
         self.wells_mask_columns = wells_mask_columns
         self.enable_tensorboard = enable_tensorboard
         self.enable_plot_facies = enable_plot_facies
+        self.use_mixed_precision = use_mixed_precision
 
 
 class ResumeOptions(argparse.Namespace):

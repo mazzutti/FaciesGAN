@@ -42,6 +42,7 @@ class PyramidsDataset(Dataset[Batch[TTensor]]):
     ) -> None:
         self.data_dir = options.input_path
         self.batches: list[Batch[TTensor]] = []
+        self.use_mixed_precision = options.use_mixed_precision
         self.scales = self.generate_scales(options, channels_last)
         if regenerate:
             self.clean_cache()
@@ -54,17 +55,15 @@ class PyramidsDataset(Dataset[Batch[TTensor]]):
 
         if n_samples:
             has_wells = bool(wp and wp[0].shape[0] > 0)
-            has_seismic = bool(wp and wp[0].shape[0] > 0)
+            has_seismic = bool(sp and sp[0].shape[0] > 0)
             facies_iter = zip(*fp)
             wells_iter = zip(*wp) if has_wells else repeat(())
             seismic_iter = zip(*sp) if has_seismic else repeat(())
 
             for facies, wells, seismic in zip(facies_iter, wells_iter, seismic_iter):
-                wells = tuple(wells) if has_wells else ()
-                seismic = tuple(seismic) if has_seismic else ()
-                self.batches.append(
-                    Batch(facies=tuple(facies), wells=wells, seismic=seismic)
-                )
+                wells = wells if has_wells else ()
+                seismic = seismic if has_seismic else ()
+                self.batches.append(Batch(facies=facies, wells=wells, seismic=seismic))
 
         if shuffle:
             self.shuffle()
@@ -81,7 +80,7 @@ class PyramidsDataset(Dataset[Batch[TTensor]]):
 
         Returns
         -------
-        tuple[tuple[int, ...], ...]
+        tuple[tuple[TTensor, ...], ...]
             Tuple of scale descriptors as produced by ``self.generate_scales``.
 
         Raises

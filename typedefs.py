@@ -18,6 +18,14 @@ T = TypeVar("T")
 # Tensor type variable (e.g., torch.Tensor or mx.array)
 TTensor = TypeVar("TTensor", torch.Tensor, mlx_core.array, np.ndarray)
 
+PyramidsBatch = tuple[
+    tuple[TTensor, ...],
+    tuple[TTensor, ...],
+    tuple[TTensor, ...],
+    tuple[TTensor, ...],
+]
+
+
 # Module type variable (e.g., torch.nn.Module or mlx.nn.Module)
 TDiscriminator = TypeVar("TDiscriminator")
 
@@ -52,17 +60,17 @@ class Batch(NamedTuple, Generic[TTensor]):
 
     Parameters
     ----------
-    facies : Tuple[TTensor, ...]
+    facies : tuple[TTensor]
         Per-scale facies tensors.
-    wells : Tuple[TTensor, ...] | tuple[()]
+    wells : tuple[TTensor]
         Per-scale well-conditioning tensors (may be empty when unused).
-    seismic : Tuple[TTensor, ...] | tuple[()]
+    seismic : tuple[TTensor]
         Per-scale seismic-conditioning tensors (may be empty when unused).
     """
 
     facies: tuple[TTensor, ...]
-    wells: tuple[TTensor, ...] | tuple[()]
-    seismic: tuple[TTensor, ...] | tuple[()]
+    wells: tuple[TTensor, ...]
+    seismic: tuple[TTensor, ...]
 
 
 # Type variable for a data loader that yields batches of tensors

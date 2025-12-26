@@ -1,6 +1,6 @@
-from typing import Any, Iterator
+from typing import Iterator
 from torch.utils.data import DataLoader
-from datasets.data_prefetcher import DataPrefetcher
+from datasets.data_prefetcher import DataPrefetcher, PyramidsBatch
 
 import mlx.core as mx
 from typedefs import Batch
@@ -24,7 +24,7 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
     def __init__(
         self,
         loader: DataLoader[mx.array],
-        scales: list[int],
+        scales: tuple[int, ...],
         device: mx.Device = mx.cpu,  # type: ignore
     ) -> None:
         super().__init__(loader, scales)
@@ -59,49 +59,42 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
             else:
                 self.next_prepared = None
 
-    def prepare_batch_async(self, batch: Batch[mx.array]) -> tuple[
-        dict[int, mx.array],
-        dict[int, mx.array],
-        dict[int, mx.array],
-        dict[int, mx.array],
-    ]:
+    def prepare_batch_async(self, batch: Batch[mx.array]) -> PyramidsBatch[mx.array]:
         """Perform batch preparation logic asynchronously (vectorized where possible)."""
         facies, wells, seismic = batch
 
         # Vectorized conversion for facies
-        real_facies_dict = {scale: mx.array(facies[scale]) for scale in self.scales}
+        facies_pyramid = tuple(mx.array(facies[scale]) for scale in self.scales)
 
         # Vectorized wells and masks if wells are present
         if len(wells) > 0:
-            wells_dict = {scale: mx.array(wells[scale]) for scale in self.scales}
-            # Compute masks for all scales at once
-            masks_dict = {
-                scale: mx.greater(
-                    mx.sum(mx.abs(wells_dict[scale]), axis=3, keepdims=True), 0
+            wells_pyramid = tuple(mx.array(wells[scale]) for scale in self.scales)
+            # Compute masks for all scales at once (vectorized)
+            masks_pyramid = tuple(
+                mx.greater(
+                    mx.sum(mx.abs(wells_pyramid[scale]), axis=3, keepdims=True), 0
                 ).astype(mx.int32)
                 for scale in self.scales
-            }
+            )
         else:
-            wells_dict = {}
-            masks_dict = {}
+            wells_pyramid = ()
+            masks_pyramid = ()
 
         # Vectorized seismic if present
         if len(seismic) > 0:
-            seismic_dict = {scale: mx.array(seismic[scale]) for scale in self.scales}
+            seismic_pyramid = tuple(mx.array(seismic[scale]) for scale in self.scales)
         else:
-            seismic_dict = {}
+            seismic_pyramid = ()
 
-        return (real_facies_dict, masks_dict, wells_dict, seismic_dict)
+        return (facies_pyramid, wells_pyramid, masks_pyramid, seismic_pyramid)
 
-    def next(self) -> tuple[Batch[mx.array] | None, Any | None]:
+    def next(self) -> PyramidsBatch[mx.array] | None:
         """Return the next batch and trigger loading of the subsequent one.
 
         Returns
         -------
-        A tuple ``(raw_batch, prepared_batch)`` where ``raw_batch`` is the
-        next raw batch from the loader (or ``None`` if no more batches are
-        available), and ``prepared_batch`` is the corresponding prepared batch
-        (or ``None`` if no more batches are available).
+        DictBatch[mx.array] | None
+            The prepared batch, or ``None`` if no more batches are available.
         """
         batch = self.next_batch
         prepared = self.next_prepared
@@ -109,9 +102,9 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
         if batch is not None:
             self.preload()
 
-        return batch, prepared
+        return prepared
 
-    def __iter__(self) -> Iterator[tuple[Batch[mx.array] | None, Any | None]]:
+    def __iter__(self) -> Iterator[PyramidsBatch[mx.array] | None]:
         """Iterator over ``(raw_batch, prepared_batch)`` pairs.
         Subclasses should provide a concrete iteration strategy, typically
         by repeatedly calling ``self.next()`` until no batch remains.
@@ -120,7 +113,7 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
         -------
         An iterator over tuples of raw and prepared batches.
         """
-        batch, prepared = self.next()
-        while batch is not None:
-            yield batch, prepared
-            batch, prepared = self.next()
+        prepared = self.next()
+        while prepared is not None:
+            yield prepared
+            prepared = self.next()

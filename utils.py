@@ -913,7 +913,7 @@ def plot_generated_facies(
         arr = fake_facies
         if not isinstance(arr, np.ndarray):
             arr = tensor2np(arr, denormalize=True)
-        arr = np.asarray(arr, dtype=np.float32)
+        # arr = np.asarray(arr, dtype=np.float32)
         num_real_facies = arr.shape[0]
         num_generated_per_real = arr.shape[1]
         fake_facies_arr = [
@@ -941,8 +941,8 @@ def plot_generated_facies(
     else:
         np_real_facies = np.asarray(real_facies, dtype=np.float32)
 
-    if masks is not None and not isinstance(masks, np.ndarray):
-        np_masks = tensor2np(masks)
+    if masks is not None:
+        np_masks = masks if isinstance(masks, np.ndarray) else tensor2np(masks)
     else:
         np_masks = None
 

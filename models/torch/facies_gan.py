@@ -20,10 +20,18 @@ from models.torch import utils
 from models.torch.discriminator import TorchDiscriminator
 from models.torch.generator import TorchGenerator
 from options import TrainningOptions
-from training.metrics import DiscriminatorMetrics, GeneratorMetrics
+from training.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
 
 
-class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
+class TorchFaciesGAN(
+    FaciesGAN[
+        torch.Tensor,
+        nn.Module,
+        torch.optim.Optimizer,
+        torch.optim.lr_scheduler.LRScheduler,
+    ],
+    nn.Module,
+):
     """PyTorch adapter for the framework-agnostic FaciesGAN base.
 
     This class manages the lifecycle of Generators and Discriminators,
@@ -35,8 +43,6 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
     def __init__(
         self,
         options: TrainningOptions,
-        wells: tuple[torch.Tensor, ...] = (),
-        seismic: tuple[torch.Tensor, ...] = (),
         device: torch.device = torch.device("cpu"),
         noise_channels: int = 3,
         *args: tuple[Any, ...],
@@ -57,6 +63,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         noise_channels : int, optional
             Number of input noise channels, by default 3.
         """
+        nn.Module.__init__(self)
         # Initialize framework-agnostic attributes in the base class
         super().__init__(options, noise_channels, *args, **kwargs)
 
@@ -67,7 +74,9 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
         # Create framework objects via the base class helper (calls build_* hooks)
         self.setup_framework()
-        self.wells, self.seismic = wells, seismic
+
+    def __call__(self, *args: Any, **kwds: Any) -> ScaleMetrics[torch.Tensor]:
+        return nn.Module.__call__(self, *args, **kwds)
 
     def backward_grads(
         self,
@@ -115,20 +124,26 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
     def compute_discriminator_metrics(
         self,
-        indexes: torch.Tensor,
+        indexes: list[int],
         scale: int,
-        real_facies: torch.Tensor,
+        real: torch.Tensor,
+        wells_pyramid: tuple[torch.Tensor, ...] = (),
+        seismic_pyramid: tuple[torch.Tensor, ...] = (),
     ) -> tuple[DiscriminatorMetrics[torch.Tensor], dict[str, Any] | None]:
         """Compute discriminator losses and gradient penalty for a scale.
 
         Parameters
         ----------
-        indexes (torch.Tensor):
+        indexes (tuple[int, ...]):
             Batch/sample indices used to generate fake inputs.
         scale (int):
             Pyramid scale index for which to compute the metrics.
         real_facies (torch.Tensor):
             Ground-truth tensor for the current scale.
+        wells_pyramid (tuple[torch.Tensor, ...], optional):
+            Wells tensors dict for conditioning, keyed by scale.
+        seismic_pyramid (tuple[torch.Tensor, ...], optional):
+            Seismic  tensors dict for conditioning, keyed by scale.
 
         Returns
         -------
@@ -136,11 +151,11 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
             Container with total, real, fake and gp losses, and optional gradients dict.
         """
 
-        real_loss = -self.discriminator(scale, real_facies).mean()
-        noises = self.get_noise(indexes, scale)
+        real_loss = -self.discriminator(scale, real).mean()
+        noises = self.get_pyramid_noise(scale, indexes, wells_pyramid, seismic_pyramid)
         fake = self.generate_fake(noises, scale)
         fake_loss = self.discriminator(scale, fake.detach()).mean()  # type: ignore
-        gp_loss = self.compute_gradient_penalty(scale, real_facies, fake)
+        gp_loss = self.compute_gradient_penalty(scale, real, fake)
         return (
             DiscriminatorMetrics(
                 total=(real_loss + fake_loss + gp_loss),
@@ -153,27 +168,32 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
     def compute_generator_metrics(
         self,
-        indexes: torch.Tensor,
+        indexes: list[int],
         scale: int,
-        real_facies: torch.Tensor,
-        masks_dict: dict[int, torch.Tensor],
-        rec_in_dict: dict[int, torch.Tensor],
+        real: torch.Tensor,
+        rec_in: torch.Tensor,
+        wells_pyramid: tuple[torch.Tensor, ...] = (),
+        seismic_pyramid: tuple[torch.Tensor, ...] = (),
+        mask: torch.Tensor | None = None,
     ) -> tuple[GeneratorMetrics[torch.Tensor], dict[str, Any] | None]:
         """Common generator-metrics flow shared by frameworks.
 
         Parameters
         ----------
-        indexes (torch.Tensor):
+        indexes (list[int]):
             Batch/sample indices used to generate noise.
         scale (int):
             Pyramid scale index for which to compute the metrics.
-        real_facies (torch.Tensor):
+        real (torch.Tensor):
             Ground-truth tensor for the current scale.
-        masks_dict (dict[int, torch.Tensor]):
-            Dictionary mapping scale indices to well/mask tensors.
-        rec_in_dict (dict[int, torch.Tensor]):
-            Dictionary mapping scale indices to reconstruction inputs.
-
+        rec_in (torch.Tensor):
+            Reconstruction input tensor for the current scale.
+        wells_pyramid (tuple[torch.Tensor, ...], optional):
+            Wells tensors dict for conditioning, keyed by scale.
+        seismic_pyramid (tuple[torch.Tensor, ...], optional):
+            Seismic tensors dict for conditioning, keyed by scale.
+        mask (torch.Tensor | None, optional):
+            Well mask tensor for the current scale, by default None.
         Returns
         -------
         tuple[
@@ -186,17 +206,33 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         NotImplementedError
             If the subclass does not override this method.
         """
-        rec_in = rec_in_dict.get(scale)
 
         # Generate diversity candidates (framework-agnostic forward)
-        fake_samples = self.generate_diverse_samples(indexes, scale)
+        fake_samples = self.generate_diverse_samples(
+            indexes,
+            scale,
+            wells_pyramid,
+            seismic_pyramid,
+        )
         fake = fake_samples[0]
 
         # Delegate component computations to subclass hooks
         adv = self.compute_adversarial_loss(scale, fake)
-        well = self.compute_masked_loss(scale, fake, real_facies, masks_dict)
+        well = self.compute_masked_loss(
+            fake,
+            real,
+            wells_pyramid[scale] if wells_pyramid else None,
+            mask,
+        )
         div = self.compute_diversity_loss(fake_samples)
-        rec_loss = self.compute_recovery_loss(indexes, scale, rec_in, real_facies)
+        rec_loss = self.compute_recovery_loss(
+            indexes,
+            scale,
+            real,
+            rec_in,
+            wells_pyramid,
+            seismic_pyramid,
+        )
 
         total = adv + well + rec_loss + div
 
@@ -216,6 +252,14 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         """Concatenate a list of tensors along dimension `dim`.
 
         Uses PyTorch `torch.cat` and preserves device placement.
+
+        Parameters
+        ----------
+        tensors (list[torch.Tensor]):
+            List of tensors to concatenate.
+        dim (int, optional):
+
+            Dimension along which to concatenate, by default 1.
         """
         return torch.cat(tensors, dim=dim)
 
@@ -225,7 +269,7 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
         Encourages different noise inputs to produce diverse outputs by
         penalizing small pairwise distances between flattened samples.
 
-        Args:
+        Parameters:
             fake_samples (list[torch.Tensor]): List of generated samples to
                 compare for diversity.
 
@@ -271,54 +315,73 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
     def compute_masked_loss(
         self,
-        scale: int,
         fake: torch.Tensor,
         real: torch.Tensor,
-        masks_dict: dict[int, torch.Tensor],
+        well: torch.Tensor | None = None,
+        mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Compute mask-weighted MSE between `fake` and `real` at `scale`.
 
-        Args:
-            scale (int): Scale index for which the loss is computed.
-            fake (torch.Tensor): Generated tensor.
-            real (torch.Tensor): Ground truth tensor.
-            masks_dict (dict[int, torch.Tensor]): Mapping from scale index to
-                well-conditioning mask tensor.
+        parameters
+        ----------
+        fake (torch.Tensor):
+            Generated tensor samples for the current scale.
+        real (torch.Tensor):
+            Ground-truth tensor samples for the current scale.
+        wells (torch.Tensor):
+            Well-conditioning tensor for the current scale.
+        masks (torch.Tensor):
+            Well mask tensor for the current scale.
 
         Returns:
             torch.Tensor: Scalar masked MSE loss scaled by
                 `self.well_loss_penalty`, or zero if no wells are used.
         """
-        if len(self.wells) == 0:
+        if well is None or mask is None:
             return torch.zeros(1, device=self.device)
-        masks = masks_dict[scale]
         return self.well_loss_penalty * nn.MSELoss(reduction="mean")(
-            fake * masks, real * masks
+            fake * mask, real * mask
         )
 
     def compute_recovery_loss(
         self,
-        indexes: torch.Tensor,
+        indexes: list[int],
         scale: int,
-        rec_in: torch.Tensor | None,
         real: torch.Tensor,
+        rec_in: torch.Tensor,
+        wells_pyramid: tuple[torch.Tensor, ...] = (),
+        seismic_pyramid: tuple[torch.Tensor, ...] = (),
     ) -> torch.Tensor:
         """Compute reconstruction (recovery) loss for given inputs.
 
-        Args:
-            indexes (torch.Tensor): Indexes of noise samples to use for recovery.
-            scale (int): Scale index at which recovery is computed.
-            rec_in (torch.Tensor | None): Optional conditioning input for the
-                recovery pass. If None, no recovery is performed.
-            real (torch.Tensor): Ground truth tensor used to compute MSE.
+        parameters
+        ----------
+        indexes (tuple[int, ...]):
+            Batch/sample indices used to generate reconstruction noise.
+        scale (int):
+            Pyramid scale index for which to compute the loss.
+        real (torch.Tensor):
+            Ground-truth tensor for the current scale.
+        rec_in (torch.Tensor):
+            Reconstruction input tensor for the current scale.
+        wells_pyramid (tuple[torch.Tensor, ...]), optional):
+            Wells tensors tuple for conditioning, keyed by scale.
+        seismic_pyramid (tuple[torch.Tensor, ...]), optional):
+            Seismic tensors tuple for conditioning, keyed by scale.
 
         Returns:
             torch.Tensor: Scalar reconstruction loss weighted by `self.alpha`,
                 or zero when recovery is disabled.
         """
-        if self.alpha == 0 or rec_in is None:
+        if self.alpha == 0:
             return torch.zeros(1, device=self.device)
-        rec_noise = self.get_noise(indexes, scale, rec=True)
+        rec_noise = self.get_pyramid_noise(
+            scale,
+            indexes,
+            wells_pyramid,
+            seismic_pyramid,
+            rec=True,
+        )
         rec = self.generator(
             rec_noise,
             self.noise_amps[: scale + 1],
@@ -343,6 +406,17 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
             self.device
         )
 
+        self.discriminator_optimizers[scale] = torch.optim.Adam(
+            self.discriminator.discs[scale].parameters(),
+            lr=self.lr_d,
+            betas=(self.beta1, 0.999),
+        )
+        self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
+            self.discriminator_optimizers[scale],
+            milestones=[self.lr_decay],
+            gamma=self.gamma,
+        )
+
     def finalize_generator_scale(self, scale: int, reinit: bool) -> None:
         """Finalize generator block after creation.
 
@@ -361,6 +435,67 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
             )
         self.generator.gens[scale] = self.generator.gens[scale].to(self.device)
 
+        self.generator_optimizers[scale] = torch.optim.Adam(
+            self.generator.gens[scale].parameters(),
+            lr=self.lr_g,
+            betas=(self.beta1, 0.999),
+        )
+
+        self.generator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
+            self.generator_optimizers[scale],
+            milestones=[self.lr_decay],
+            gamma=self.gamma,
+        )
+
+    def forward(
+        self,
+        indexes: list[int],
+        facies_pyramid: tuple[torch.Tensor, ...],
+        rec_in_pyramid: tuple[torch.Tensor, ...],
+        wells_pyramid: tuple[torch.Tensor, ...] = (),
+        masks_pyramid: tuple[torch.Tensor, ...] = (),
+        seismic_pyramid: tuple[torch.Tensor, ...] = (),
+    ) -> ScaleMetrics[torch.Tensor]:
+        """Perform a forward pass and compute scale metrics.
+
+        Parameters
+        ----------
+        indexes (list[int]):
+            List of batch/sample indices used to generate noise.
+        facies_pyramid (tuple[torch.Tensor, ...]):
+            Tuple mapping scale indices to real tensor samples.
+        rec_in_pyramid (tuple[torch.Tensor, ...]):
+            Tuple mapping scale indices to reconstruction input tensors.
+        wells_pyramid (tuple[torch.Tensor, ...], optional):
+            Wells tensors tuple for conditioning, keyed by scale.
+        masks_pyramid (tuple[torch.Tensor, ...], optional):
+            Well masks tuple for conditioning, keyed by scale.
+        seismic_pyramid (tuple[torch.Tensor, ...], optional):
+            Seismic tensors tuple for conditioning, keyed by scale.
+
+        Returns
+        -------
+        ScaleMetrics[torch.Tensor]:
+            Container with discriminator and generator metrics for the scale.
+        """
+
+        return ScaleMetrics(
+            discriminator=self.optimize_discriminator(
+                indexes,
+                facies_pyramid,
+                wells_pyramid,
+                seismic_pyramid,
+            ),
+            generator=self.optimize_generator(
+                indexes,
+                facies_pyramid,
+                rec_in_pyramid,
+                wells_pyramid,
+                masks_pyramid,
+                seismic_pyramid,
+            ),
+        )
+
     def generate_fake(self, noises: list[torch.Tensor], scale: int) -> torch.Tensor:
         """Generate a fake sample at the requested `scale` using `noises`.
 
@@ -376,16 +511,26 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
             fake = self.generator(noises, amps, stop_scale=scale)
         return fake
 
-    def generate_noise(self, index: int, indexes: torch.Tensor) -> torch.Tensor:
+    def generate_noise(
+        self,
+        scale: int,
+        indexes: list[int],
+        well: torch.Tensor | None = None,
+        seismic: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Create a noise tensor for a single pyramid level, optionally
         concatenating conditioning channels and applying padding.
 
         Parameters
         ----------
-        index : int
+        scale : int
             Pyramid level index used to select shapes and conditioning tensors.
-        indexes : torch.Tensor
-            Batch/sample indices to select conditioning slices from stored per-scale tensors.
+        indexes : list[int]
+            Batch/sample indices to select conditioning slices from stored per-scale tensors
+        wells : torch.Tensor, optional
+            Well-conditioning tensor for the current scale, by default torch.Tensor().
+        seismic : torch.Tensor, optional
+            Seismic-conditioning tensor for the current scale, by default torch.Tensor().
 
         Returns
         -------
@@ -396,26 +541,26 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
 
         batch = len(indexes)
 
-        if self.use_wells(index) and self.use_seismic(index):
-            shape = self.get_noise_shape(index)
+        if well is not None and seismic is not None:
+            shape = self.get_noise_shape(scale)
             z = utils.generate_noise(shape, num_samp=batch, device=self.device)
-            well = self._wells[index][indexes].to(self.device)
-            seismic = self._seismic[index][indexes].to(self.device)
+            well = well[indexes].to(self.device)
+            seismic = seismic[indexes].to(self.device)
             z = self.concatenate_tensors([z, well, seismic])
-        elif self.use_wells(index):
-            shape = self.get_noise_shape(index)
+        elif well is not None:
+            shape = self.get_noise_shape(scale)
             z = utils.generate_noise(shape, num_samp=batch, device=self.device)
-            well = self._wells[index][indexes].to(self.device)
+            well = well[indexes].to(self.device)
             z = self.concatenate_tensors([z, well])
-        elif self.use_seismic(index):
-            shape = self.get_noise_shape(index)
+        elif seismic is not None:
+            shape = self.get_noise_shape(scale)
             z = utils.generate_noise(shape, num_samp=batch, device=self.device)
-            seismic = self._seismic[index][indexes].to(self.device)
+            seismic = seismic[indexes].to(self.device)
             z = self.concatenate_tensors([z, seismic])
         else:
-            shape = self.get_noise_shape(index, use_base_channel=False)
+            shape = self.get_noise_shape(scale, use_base_channel=False)
             z = utils.generate_noise(
-                (*shape, self.gen_input_channels),
+                (self.gen_input_channels, *shape),
                 num_samp=batch,
                 device=self.device,
             )
@@ -567,23 +712,21 @@ class TorchFaciesGAN(FaciesGAN[torch.Tensor, torch.nn.Module]):
     def update_discriminator_weights(
         self,
         scale: int,
-        optimizer: torch.optim.Optimizer,
         loss: torch.Tensor,
         gradients: Any | None,
     ) -> dict[str, Any] | None:
         """Perform standard PyTorch optimization step."""
-        optimizer.zero_grad()
+        self.discriminator_optimizers[scale].zero_grad()
         torch.autograd.backward(loss)
-        optimizer.step()
+        self.discriminator_optimizers[scale].step()
 
     def update_generator_weights(
         self,
         scale: int,
-        optimizer: torch.optim.Optimizer,
         loss: torch.Tensor,
         gradients: Any | None,
     ) -> dict[str, Any] | None:
         """Perform standard PyTorch optimization step."""
-        optimizer.zero_grad()
+        self.generator_optimizers[scale].zero_grad()
         torch.autograd.backward(loss)
-        optimizer.step()
+        self.generator_optimizers[scale].step()

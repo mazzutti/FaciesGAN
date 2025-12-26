@@ -49,13 +49,16 @@ class MLXDiscriminator(Discriminator[mx.array, nn.Module], nn.Module):
         kernel_size: int,
         padding_size: int,
         input_channels: int,
+        dtype: mx.Dtype = mx.float32,
     ) -> None:
         Discriminator.__init__(  # type: ignore
             self, num_layer, kernel_size, padding_size, input_channels
         )
         nn.Module.__init__(self)
 
+        self.dtype = dtype
         self.discs: list[nn.Module] = list()
+        self.set_dtype(self.dtype)
 
     def __call__(self, scale: int, input_tensor: mx.array) -> mx.array:
         return super().__call__(scale, input_tensor)
@@ -73,5 +76,6 @@ class MLXDiscriminator(Discriminator[mx.array, nn.Module], nn.Module):
             num_features=num_features,
             min_num_features=min_num_features,
             input_channels=self.input_channels,
+            dtype=self.dtype,
         )
         self.discs.append(spade_gen)

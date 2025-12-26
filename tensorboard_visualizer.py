@@ -92,8 +92,8 @@ class TensorBoardVisualizer:
     def update(
         self,
         epoch: int,
-        scale_metrics: ScaleMetrics[TTensor] | dict[int, dict[str, float]],
-        generated_samples: dict[int, TTensor] | None = None,
+        scale_metrics: ScaleMetrics[TTensor] | tuple[dict[str, float], ...],
+        generated_samples: tuple[TTensor, ...] | None = None,
         samples_processed: int = 0,
     ) -> None:
         """Update TensorBoard with per-scale metrics and optional images.
@@ -102,13 +102,13 @@ class TensorBoardVisualizer:
         ----------
         epoch : int
             Current epoch number (used as the global step in TensorBoard).
-        scale_metrics : ScaleMetrics or dict[int, dict[str, float]]
+        scale_metrics : ScaleMetrics or tuple[dict[str, float], ...]
             Either a `ScaleMetrics` dataclass (with tensor fields) or a
-            pre-flattened mapping from scale index to metric-name->float.
+            pre-flattened tuple of metric-name->float dictionaries, one per scale.
             When a `ScaleMetrics` is provided the method will extract scalar
             values via `tensor.item()` before logging.
-        generated_samples : dict[int, torch.Tensor] | None, optional
-            Mapping from scale index to a generated sample tensor. Expected
+        generated_samples : tuple[TTensor, ...] | None, optional
+            Tuple of generated sample tensors, one per scale. Expected
             tensor shapes: (B, C, H, W) or (C, H, W). The first sample in the
             batch is used for logging. Tensors are detached and moved to CPU
             before conversion to numpy arrays.
@@ -125,32 +125,19 @@ class TensorBoardVisualizer:
         if epoch % self.update_interval != 0 and epoch != 1:
             return
 
-        # If we received a ScaleMetrics object, flatten it to the dict format
-        # expected by the rest of this method.
         if isinstance(scale_metrics, ScaleMetrics):
-            flat_metrics: dict[int, dict[str, float]] = {}
-            for s, g in scale_metrics.generator.items():
-                d = scale_metrics.discriminator[s]
-
-                flat_metrics[s] = {
-                    "d_total": d.total.item(),
-                    "d_real": d.real.item(),
-                    "d_fake": d.fake.item(),
-                    "d_gp": d.gp.item(),
-                    "g_total": g.total.item(),
-                    "g_adv": g.fake.item(),
-                    "g_rec": g.rec.item(),
-                    "g_well": g.well.item(),
-                    "g_div": g.div.item(),
-                }
-            scale_metrics = flat_metrics
+            flat_metrics: tuple[dict[str, float], ...] = (
+                scale_metrics.as_tuple_of_dicts()
+            )
+        else:
+            flat_metrics: tuple[dict[str, float], ...] = scale_metrics
 
         # Calculate timing info
         current_time = time.time()
         elapsed = current_time - self.start_time
 
         # Log individual scale metrics
-        for scale, metrics in scale_metrics.items():
+        for scale, metrics in enumerate(flat_metrics):
             # Discriminator losses
             self.writer.add_scalar(
                 f"Scale_{scale}/D_Total", metrics.get("d_total", 0), epoch
@@ -175,21 +162,21 @@ class TensorBoardVisualizer:
 
         # Compute and log mean losses across all scales
         if scale_metrics:
-            scales = list(scale_metrics.keys())
+            scales = list(range(len(flat_metrics)))
 
             # Mean discriminator losses
-            mean_d_total = np.mean([scale_metrics[s].get("d_total", 0) for s in scales])
-            mean_d_real = np.mean([scale_metrics[s].get("d_real", 0) for s in scales])
-            mean_d_fake = np.mean([scale_metrics[s].get("d_fake", 0) for s in scales])
+            mean_d_total = np.mean([flat_metrics[s].get("d_total", 0) for s in scales])
+            mean_d_real = np.mean([flat_metrics[s].get("d_real", 0) for s in scales])
+            mean_d_fake = np.mean([flat_metrics[s].get("d_fake", 0) for s in scales])
 
             self.writer.add_scalar("Mean/D_Total", mean_d_total, epoch)
             self.writer.add_scalar("Mean/D_Real", mean_d_real, epoch)
             self.writer.add_scalar("Mean/D_Fake", mean_d_fake, epoch)
 
             # Mean generator losses
-            mean_g_total = np.mean([scale_metrics[s].get("g_total", 0) for s in scales])
-            mean_g_adv = np.mean([scale_metrics[s].get("g_adv", 0) for s in scales])
-            mean_g_rec = np.mean([scale_metrics[s].get("g_rec", 0) for s in scales])
+            mean_g_total = np.mean([flat_metrics[s].get("g_total", 0) for s in scales])
+            mean_g_adv = np.mean([flat_metrics[s].get("g_adv", 0) for s in scales])
+            mean_g_rec = np.mean([flat_metrics[s].get("g_rec", 0) for s in scales])
 
             self.writer.add_scalar("Mean/G_Total", mean_g_total, epoch)
             self.writer.add_scalar("Mean/G_Adversarial", mean_g_adv, epoch)
@@ -202,7 +189,7 @@ class TensorBoardVisualizer:
         # Log generated samples as images with color mapping
         if generated_samples:
             print(f"   Logging {len(generated_samples)} sample images...")
-            for scale, sample in generated_samples.items():
+            for scale, sample in enumerate(generated_samples):
                 # Convert to numpy
                 if isinstance(sample, torch.Tensor):
                     img = np.array(sample.detach().cpu())

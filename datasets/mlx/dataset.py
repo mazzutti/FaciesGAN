@@ -102,7 +102,7 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
 
         Returns
         -------
-        tuple[tuple[int, ...], ...]
+        tuple[tuple[mx.array], ...]
             Tuple of scale descriptors as produced by ``self.generate_scales``.
 
         Raises
@@ -162,19 +162,22 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
 
         # Stack per-sample tensors for the requested scale
         facies_list = [batch.facies[scale] for batch in self.batches]
-        facies_scale = mx.stack(facies_list, axis=0)
+
+        # Try to get the current options if available
+        dtype = mx.bfloat16 if self.use_mixed_precision else mx.float32
+        facies_scale = mx.stack(facies_list, axis=0).astype(dtype)
 
         # Wells may be an empty tuple on each batch; handle gracefully
         if len(self.batches[0].wells) == 0:
             wells_scale = mx.array([], dtype=facies_scale.dtype)
         else:
             wells_list = [batch.wells[scale] for batch in self.batches]
-            wells_scale = mx.stack(wells_list, axis=0)
+            wells_scale = mx.stack(wells_list, axis=0).astype(dtype)
 
         if len(self.batches[0].seismic) == 0:
             seismic_scale = mx.array([], dtype=facies_scale.dtype)
         else:
             seismic_list = [batch.seismic[scale] for batch in self.batches]
-            seismic_scale = mx.stack(seismic_list, axis=0)
+            seismic_scale = mx.stack(seismic_list, axis=0).astype(dtype)
 
         return facies_scale, wells_scale, seismic_scale

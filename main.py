@@ -224,6 +224,12 @@ def get_arguments() -> ArgumentParser:
         help="disable plot_generated_facies visualizations during training",
     )
 
+    parser.add_argument(
+        "--use-mixed-precision",
+        action="store_true",
+        help="enable mixed precision (bfloat16) for MLX training",
+    )
+
     return parser
 
 

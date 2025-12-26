@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator, Mapping
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn.functional as F
@@ -29,6 +29,7 @@ from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
 
 import background_workers as bw
+from datasets.data_prefetcher import PyramidsBatch
 from datasets.torch.data_prefetcher import TorchDataPrefetcher
 from config import D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, SCH_D_FILE, SCH_G_FILE
 from datasets import PyramidsDataset
@@ -120,108 +121,66 @@ class TorchTrainer(
             persistent_workers=(self.options.num_workers > 0),
         )
 
-    def create_model(self) -> FaciesGAN[torch.Tensor, torch.nn.Module]:
+    def create_model(
+        self,
+    ) -> FaciesGAN[
+        torch.Tensor, torch.nn.Module, optim.Optimizer, optim.lr_scheduler.LRScheduler
+    ]:
         """Instantiate and return the :class:`TorchFaciesGAN` configured
         with the trainer options and device.
         """
         return TorchFaciesGAN(
             self.options,
-            self.wells,
-            self.seismic,
             self.device,
             noise_channels=self.noise_channels,
         )
 
-    def create_optimizers_and_schedulers(self, scales: list[int]) -> tuple[
-        dict[int, optim.Optimizer],
-        dict[int, optim.Optimizer],
-        dict[int, optim.lr_scheduler.LRScheduler],
-        dict[int, optim.lr_scheduler.LRScheduler],
-    ]:
-        """Create per-scale optimizers and learning-rate schedulers.
-
-        Parameters
-        ----------
-        scales : list[int]
-            List of scale indices to create optimizers/schedulers for.
-
-        Returns
-        -------
-        tuple
-            Four dictionaries mapping scale index -> optimizer/scheduler in the
-            order: ``(generator_optimizers, discriminator_optimizers,
-            generator_schedulers, discriminator_schedulers)``.
-        """
-        generator_optimizers: dict[int, optim.Optimizer] = {}
-        discriminator_optimizers: dict[int, optim.Optimizer] = {}
-        generator_schedulers: dict[int, optim.lr_scheduler.LRScheduler] = {}
-        discriminator_schedulers: dict[int, optim.lr_scheduler.LRScheduler] = {}
-
-        for scale in scales:
-            generator_optimizers[scale] = optim.Adam(
-                self.model.generator.gens[scale].parameters(),
-                lr=self.lr_g,
-                betas=(self.beta1, 0.999),
-            )
-            discriminator_optimizers[scale] = optim.Adam(
-                self.model.discriminator.discs[scale].parameters(),
-                lr=self.lr_d,
-                betas=(self.beta1, 0.999),
-            )
-            generator_schedulers[scale] = optim.lr_scheduler.MultiStepLR(
-                generator_optimizers[scale],
-                milestones=[self.lr_decay],
-                gamma=self.gamma,
-            )
-            discriminator_schedulers[scale] = optim.lr_scheduler.MultiStepLR(
-                discriminator_optimizers[scale],
-                milestones=[self.lr_decay],
-                gamma=self.gamma,
-            )
-
-        return (
-            generator_optimizers,
-            discriminator_optimizers,
-            generator_schedulers,
-            discriminator_schedulers,
-        )
-
-    def gen_indexes(self, size: int) -> torch.Tensor:
-        return torch.arange(self.batch_size)
-
     def generate_visualization_samples(
-        self, scales: list[int], indexes: torch.Tensor
-    ) -> dict[int, torch.Tensor]:
+        self,
+        scales: tuple[int, ...],
+        indexes: list[int],
+        wells_pyramid: tuple[torch.Tensor, ...],
+        seismic_pyramid: tuple[torch.Tensor, ...],
+    ) -> tuple[torch.Tensor, ...]:
         """Generate fixed samples for visualization at specified scales.
 
         Parameters
         ----------
-        scales : list[int]
-            List of scale indices to generate samples for.
-        indexes : torch.Tensor
-            List of batch sample indices.
+        scales : tuple[int, ...]
+            Tuple of scale indices to generate samples for.
+        indexes : tuple[int, ...]
+            Tuple of batch sample indices.
+        wells_pyramid : tuple[torch.Tensor, ...]
+            Tuple of well-conditioning tensors per scale.
+        seismic_pyramid : tuple[torch.Tensor, ...]
+            Tuple of seismic-conditioning tensors per scale.
 
         Returns
         -------
-        dict[int, torch.Tensor]
-            A dictionary mapping scale indices to generated facies tensors
-            for visualization.
+        tuple[torch.Tensor, ...]
+            A tuple of generated facies tensors for visualization, one per scale.
         """
-        generated_samples: dict[int, torch.Tensor] = {}
         with torch.no_grad():
-            for scale in scales:
-                generated_samples[scale] = self.model.generate_fake(
-                    self.model.get_noise(indexes, scale), scale
+            return tuple(
+                self.model.generate_fake(
+                    self.model.get_pyramid_noise(
+                        scale,
+                        indexes,
+                        wells_pyramid,
+                        seismic_pyramid,
+                    ),
+                    scale,
                 )
-        return generated_samples
+                for scale in scales
+            )
 
     def initialize_noise(
         self,
         scale: int,
-        real_facies: torch.Tensor,
-        indexes: torch.Tensor,
-        wells: torch.Tensor | None = None,
-        seismic: torch.Tensor | None = None,
+        indexes: list[int],
+        facies_pyramid: tuple[torch.Tensor, ...],
+        wells_pyramid: tuple[torch.Tensor, ...] = (),
+        seismic_pyramid: tuple[torch.Tensor, ...] = (),
     ) -> torch.Tensor:
         """Initialize and append reconstruction noise for a specific scale.
 
@@ -235,15 +194,14 @@ class TorchTrainer(
         ----------
         scale : int
             Current pyramid scale index.
-        real_facies : torch.Tensor
-            Real facies data at the current scale (channels-last expected).
-        indexes : torch.Tensor
-            Batch sample indices used to generate noise with deterministic
-            indexing.
-        wells : torch.Tensor | None
-            Optional wells conditioning tensor for this batch (channels-last).
-        seismic : torch.Tensor | None
-            Optional seismic conditioning tensor for this batch (channels-last).
+        indexes : list[int]
+            List of batch sample indices.
+        facies_pyramid : tuple[torch.Tensor, ...]
+            Tuple of real facies data for all scales.
+        wells_pyramid : tuple[torch.Tensor, ...] | None, optional
+            Tuple of well-conditioning tensors per scale.
+        seismic_pyramid : tuple[torch.Tensor, ...] | None, optional
+            Tuple of seismic-conditioning tensors per scale.
 
         Returns
         -------
@@ -258,10 +216,11 @@ class TorchTrainer(
         - Updates or appends the noise amplitude entry in ``self.model.noise_amp``.
         """
         # Prepare previous reconstruction
+        real = facies_pyramid[scale]
         if scale == 0:
-            prev_rec = torch.zeros_like(real_facies)
+            prev_rec = torch.zeros_like(real)
             z_rec = torch_utils.generate_noise(
-                (self.noise_channels, *real_facies.shape[2:]),
+                (self.noise_channels, *real.shape[2:]),
                 device=self.device,
                 num_samp=self.batch_size,
             )
@@ -271,28 +230,28 @@ class TorchTrainer(
             # Calculate noise amplitude for scale 0
             with torch.no_grad():
                 fake = self.model.generator(
-                    self.model.get_noise(indexes, scale),
+                    self.model.get_pyramid_noise(scale, indexes),
                     [1.0] * (scale + 1),
                     stop_scale=scale,
                 )
 
-            rmse = torch.sqrt(F.mse_loss(fake, real_facies))
+            rmse = torch.sqrt(F.mse_loss(fake, real))
             amp = self.scale0_noise_amp * rmse.item()
             self.model.noise_amps.append(amp)
 
         else:
             # For higher scales, upsample previous facies to current resolution
             prev_rec = torch_utils.interpolate(
-                self.facies[scale - 1][indexes], real_facies.shape[2:]
+                facies_pyramid[scale - 1][indexes], real.shape[2:]
             ).to(self.device)
 
             # noise channel sizing for higher scales (empirical split)
-            if wells is None:
-                if seismic is None:
+            if len(wells_pyramid) == 0 and len(seismic_pyramid) == 0:
+                if len(seismic_pyramid) == 0:
                     z_rec = torch_utils.generate_noise(
                         (
                             self.noise_channels,
-                            *real_facies.shape[2:],
+                            *real.shape[2:],
                         ),
                         device=self.device,
                         num_samp=self.batch_size,
@@ -301,45 +260,52 @@ class TorchTrainer(
                     z_rec = torch_utils.generate_noise(
                         (
                             self.noise_channels - self.num_img_channels,
-                            *real_facies.shape[2:],
+                            *real.shape[2:],
                         ),
                         device=self.device,
                         num_samp=self.batch_size,
                     )
-                    z_rec = torch.cat([z_rec, seismic], dim=1)
+                    z_rec = torch.cat([z_rec, seismic_pyramid[scale]], dim=1)
             else:
-                if seismic is None:
+                if wells_pyramid == ():
                     z_rec = torch_utils.generate_noise(
                         (
                             self.noise_channels - self.num_img_channels,
-                            *real_facies.shape[2:],
+                            *real.shape[2:],
                         ),
                         device=self.device,
                         num_samp=self.batch_size,
                     )
-                    z_rec = torch.cat([z_rec, wells], dim=1)
+                    z_rec = torch.cat([z_rec, wells_pyramid[scale]], dim=1)
                 else:
                     z_rec = torch_utils.generate_noise(
                         (
                             self.noise_channels - 2 * self.num_img_channels,
-                            *real_facies.shape[2:],
+                            *real.shape[2:],
                         ),
                         device=self.device,
                         num_samp=self.batch_size,
                     )
-                    z_rec = torch.cat([z_rec, wells, seismic], dim=1)
+                    z_rec = torch.cat(
+                        [z_rec, wells_pyramid[scale], seismic_pyramid[scale]], dim=1
+                    )
             z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
             self.model.rec_noise.append(z_rec)
 
             # Calculate noise amplitude based on reconstruction error
             with torch.no_grad():
                 fake = self.model.generator(
-                    self.model.get_noise(indexes, scale),
+                    self.model.get_pyramid_noise(
+                        scale,
+                        indexes,
+                        wells_pyramid,
+                        seismic_pyramid,
+                    ),
                     self.model.noise_amps + [1.0],
                     stop_scale=scale,
                 )
 
-            rmse = torch.sqrt(F.mse_loss(fake, real_facies))
+            rmse = torch.sqrt(F.mse_loss(fake, real))
             amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
 
             if scale < len(self.model.noise_amps):
@@ -447,25 +413,30 @@ class TorchTrainer(
             print(f"Warning: Could not load optimizers for scale {scale}: {e}")
 
     def create_batch_iterator(
-        self, loader: DataLoader[torch.Tensor], scales: list[int]
-    ) -> Iterator[tuple[Batch[torch.Tensor], Any | None]]:
+        self,
+        loader: DataLoader[torch.Tensor],
+        scales: tuple[int, ...],
+    ) -> Iterator[PyramidsBatch[torch.Tensor] | None]:
         """Create a prefetching iterator for the DataLoader.
 
         Overrides the base implementation to use :class:`TorchDataPrefetcher`,
         which moves tensors to the GPU asynchronously.
         """
         prefetcher = TorchDataPrefetcher(loader, scales, self.device)
-        batch, prepared = prefetcher.next()
+        batch = prefetcher.next()
         while batch is not None:
-            yield batch, prepared
-            batch, prepared = prefetcher.next()
+            yield batch
+            batch = prefetcher.next()
 
     def save_generated_facies(
         self,
         scale: int,
         epoch: int,
         results_path: str,
-        masks: torch.Tensor | None = None,
+        real_facies: torch.Tensor,
+        wells_pyramid: tuple[torch.Tensor, ...] = (),
+        masks_pyramid: tuple[torch.Tensor, ...] = (),
+        seismic_pyramid: tuple[torch.Tensor, ...] = (),
     ) -> None:
         """Save generated facies visualizations to disk asynchronously.
 
@@ -473,14 +444,37 @@ class TorchTrainer(
         sample, clips them to [-1, 1], moves them to CPU and submits a
         background worker job to save the visualization images. Masks are
         passed through for overlay if provided.
+
+        Parameters
+        ----------
+        scale : int
+            Current pyramid scale index.
+        epoch : int
+            Current epoch number (used for logging).
+        results_path : str
+            Base path where results are saved.
+        real_facies : torch.Tensor
+            Tensor of real facies samples at the current scale.
+        wells_pyramid : tuple[torch.Tensor, ...]
+            Tuple of well-conditioning tensors per scale.
+        masks_pyramid : tuple[torch.Tensor, ...]
+            Tuple of mask tensors per scale.
+        seismic_pyramid : tuple[torch.Tensor, ...]
+            Tuple of seismic-conditioning tensors per scale.
         """
         if self.enable_plot_facies:
             indexes = torch.randint(self.batch_size, (self.num_real_facies,))
-            real_facies = self.facies[scale][indexes]
 
             # Repeat each index num_generated_per_real times
-            tiled_indexes = indexes.repeat(self.num_generated_per_real)
-            noises = self.model.get_noise(tiled_indexes, scale)
+            tiled_indexes: list[int] = cast(
+                list[int], indexes.repeat(self.num_generated_per_real).tolist()  # type: ignore
+            )
+            noises = self.model.get_pyramid_noise(
+                scale,
+                tiled_indexes,
+                wells_pyramid,
+                seismic_pyramid,
+            )
 
             with torch.no_grad():
                 generated_facies = self.model.generator(
@@ -495,13 +489,19 @@ class TorchTrainer(
                 *generated_facies.shape[1:],
             )
 
+            real_facies_tensor = real_facies[indexes]
+
             bw.submit_plot_generated_facies(
                 torch2np(facies_tensor.detach().cpu(), denormalize=True),
-                torch2np(real_facies.detach().cpu(), denormalize=True),
+                torch2np(real_facies_tensor.detach().cpu(), denormalize=True),
                 scale,
                 epoch,
                 results_path,
-                torch2np(masks[indexes].detach().cpu()) if masks is not None else None,
+                (
+                    torch2np(masks_pyramid[scale][indexes].detach().cpu())
+                    if len(masks_pyramid) > 0
+                    else None
+                ),
             )
 
     def save_optimizers(
@@ -528,24 +528,3 @@ class TorchTrainer(
         torch.save(
             discriminator_scheduler.state_dict(), os.path.join(scale_path, SCH_D_FILE)
         )
-
-    def schedulers_step(
-        self,
-        generator_schedulers: dict[int, LRScheduler],
-        discriminator_schedulers: dict[int, LRScheduler],
-        scales: list[int],
-    ) -> None:
-        """Step the learning-rate schedulers for the provided scales.
-
-        Parameters
-        ----------
-        generator_schedulers : dict[int, LRScheduler]
-            Generator learning-rate schedulers per scale.
-        discriminator_schedulers : dict[int, LRScheduler]
-            Discriminator learning-rate schedulers per scale.
-        scales : list[int]
-            Scale indices to step the schedulers for.
-        """
-        for scale in scales:
-            generator_schedulers[scale].step()
-            discriminator_schedulers[scale].step()

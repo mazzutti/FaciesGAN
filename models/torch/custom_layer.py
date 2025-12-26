@@ -106,8 +106,10 @@ class TorchSPADE(nn.Module):
 
         # Shared convolution for processing conditioning input
         self.mlp_shared = nn.Sequential(
-            nn.Conv2d(cond_nc, hidden_nc, kernel_size=kernel_size, padding=padding),
-            nn.LeakyReLU(0.2, inplace=True),
+            *(
+                nn.Conv2d(cond_nc, hidden_nc, kernel_size=kernel_size, padding=padding),
+                nn.LeakyReLU(0.2, inplace=True),
+            )
         )
 
         # Separate convolutions for gamma (scale) and beta (bias)
