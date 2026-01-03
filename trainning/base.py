@@ -24,7 +24,7 @@ import utils
 from config import RESULT_FACIES_PATH
 from datasets import PyramidsDataset
 import log
-from training.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
 from models.base import FaciesGAN
 from options import TrainningOptions
 from tensorboard_visualizer import TensorBoardVisualizer
@@ -381,7 +381,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
             generated_samples: tuple[TTensor, ...] = ()
 
-            scale_metrics = self.model(
+            scale_metrics = self.optimization_step(
                 indexes,
                 facies_pyramid,
                 rec_in_pyramid,
@@ -420,6 +420,46 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         #         generator_schedulers[scale],
         #         discriminator_schedulers[scale],
         #     )
+
+    def optimization_step(
+        self,
+        indexes: list[int],
+        facies_pyramid: tuple[TTensor, ...],
+        rec_in_pyramid: tuple[TTensor, ...],
+        wells_pyramid: tuple[TTensor, ...] = (),
+        masks_pyramid: tuple[TTensor, ...] = (),
+        seismic_pyramid: tuple[TTensor, ...] = (),
+    ) -> ScaleMetrics[TTensor]:
+        """Perform a single optimization step for the model.
+
+        Parameters
+        ----------
+        indexes : list[int]
+            Batch sample indices.
+        facies_pyramid : tuple[TTensor, ...]
+            Tuple of real facies data for all scales.
+        rec_in_pyramid : tuple[TTensor, ...]
+            Tuple of reconstruction input tensors for all scales.
+        wells_pyramid : tuple[TTensor, ...]
+            Tuple of well-conditioning tensors for all scales.
+        masks_pyramid : tuple[TTensor, ...]
+            Tuple of masks tensors for all scales.
+        seismic_pyramid : tuple[TTensor, ...]
+            Tuple of seismic-conditioning tensors for all scales.
+
+        Returns
+        -------
+        ScaleMetrics[TTensor]
+            Collected metrics for all scales after the optimization step.
+        """
+        return self.model(
+            indexes,
+            facies_pyramid,
+            rec_in_pyramid,
+            wells_pyramid,
+            masks_pyramid,
+            seismic_pyramid,
+        )
 
     @abstractmethod
     def save_optimizers(

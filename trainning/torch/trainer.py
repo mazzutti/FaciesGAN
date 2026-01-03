@@ -37,7 +37,7 @@ from datasets.torch.dataset import TorchPyramidsDataset
 from models import FaciesGAN, TorchFaciesGAN
 from models.torch import utils as torch_utils
 from options import TrainningOptions
-from training.base import Trainer
+from trainning.base import Trainer
 from typedefs import Batch
 from utils import torch2np
 
@@ -414,7 +414,7 @@ class TorchTrainer(
 
     def create_batch_iterator(
         self,
-        loader: DataLoader[torch.Tensor],
+        loader: DataLoader[Batch[torch.Tensor]],
         scales: tuple[int, ...],
     ) -> Iterator[PyramidsBatch[torch.Tensor] | None]:
         """Create a prefetching iterator for the DataLoader.

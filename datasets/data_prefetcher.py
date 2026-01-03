@@ -38,7 +38,9 @@ class DataPrefetcher(Generic[TTensor], ABC):
     overlap with host/GPU work on the current stream.
     """
 
-    def __init__(self, loader: DataLoader[TTensor], scales: tuple[int, ...]) -> None:
+    def __init__(
+        self, loader: DataLoader[Batch[TTensor]], scales: tuple[int, ...]
+    ) -> None:
         self.loader = iter(loader)
         self.scales = scales
         self.next_batch: Batch[TTensor] | None = None

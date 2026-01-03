@@ -23,7 +23,7 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
 
     def __init__(
         self,
-        loader: DataLoader[mx.array],
+        loader: DataLoader[Batch[mx.array]],
         scales: tuple[int, ...],
         device: mx.Device = mx.cpu,  # type: ignore
     ) -> None:

@@ -14,8 +14,8 @@ from models.mlx.discriminator import MLXDiscriminator
 from models.mlx.generator import MLXGenerator
 from options import TrainningOptions
 import models.mlx.utils as utils
-from training.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
-from training.mlx.schedulers import MultiStepLR
+from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from trainning.mlx.schedulers import MultiStepLR
 
 
 class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Module):

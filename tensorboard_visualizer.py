@@ -12,7 +12,7 @@ import numpy as np
 import torch
 from tensorboardX import SummaryWriter  # pyright: ignore
 
-from training.metrics import ScaleMetrics
+from trainning.metrics import ScaleMetrics
 from typedefs import TTensor
 
 

@@ -107,8 +107,8 @@ class ScaleMetrics[TTensor]:
 
     @staticmethod
     def from_dicts(
-        gen_dict: dict[int, list[TTensor]],
-        disc_dict: dict[int, list[TTensor]],
+        gen_dict: dict[str, list[TTensor]],
+        disc_dict: dict[str, list[TTensor]],
     ) -> ScaleMetrics[TTensor]:
         """Construct a ``ScaleMetrics`` instance from per-scale metric dicts.
 

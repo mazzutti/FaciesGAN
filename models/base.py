@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Generic
 
 from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
-from training.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
 from models.discriminator import Discriminator
 from models.generator import Generator
 from options import TrainningOptions

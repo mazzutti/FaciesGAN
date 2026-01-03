@@ -14,12 +14,13 @@ from datasets.data_prefetcher import PyramidsBatch
 from datasets.mlx.data_prefetcher import MLXDataPrefetcher
 from datasets.mlx.dataset import MLXPyramidsDataset
 from models import FaciesGAN
+from models.mlx.facies_gan import MLXFaciesGAN
 from options import TrainningOptions
 
-from models.mlx.facies_gan import MLXFaciesGAN
-from training.base import Trainer
-from training.mlx.collate import collate
-from training.mlx.schedulers import MultiStepLR
+from trainning.base import Trainer
+from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from trainning.mlx.collate import collate
+from trainning.mlx.schedulers import MultiStepLR
 from typedefs import Batch
 from models.mlx import utils as mlx_utils
 import utils
@@ -41,29 +42,27 @@ class MLXTrainer(
         options: TrainningOptions,
         fine_tuning: bool = False,
         checkpoint_path: str = ".checkpoints",
-        compile_backend: bool = False,
+        compile_backend: bool = True,
     ) -> None:
         self.compile_backend = compile_backend
         super().__init__(options, fine_tuning, checkpoint_path)
         self.gpu_stream: mx.Stream = mx.default_stream(mx.gpu)  # type: ignore
 
         # Initialize cache for the compiled step function
-        self._compiled_step: (
-            Callable[
-                [
-                    mx.array,
-                    dict[int, mx.array],
-                    dict[int, mx.array],
-                    dict[int, mx.array],
-                ],
-                tuple[
-                    dict[int, list[mx.array]],
-                    dict[int, list[mx.array]],
-                    list[dict[str, Any]],
-                ],
-            ]
-            | None
-        ) = None
+        self._compiled_optimization_step: Callable[
+            [
+                mx.array,
+                tuple[mx.array, ...],
+                tuple[mx.array, ...],
+                tuple[mx.array, ...],
+                tuple[mx.array, ...],
+                tuple[mx.array, ...],
+            ],
+            tuple[
+                tuple[tuple[mx.array, ...], ...],
+                tuple[tuple[mx.array, ...], ...],
+            ],
+        ]
         self._compiled_step_key: tuple[int, ...] | None = None
 
     # def optimization_step(
@@ -132,20 +131,14 @@ class MLXTrainer(
     #         metrics = self.model(indexes, real_facies_dict, masks_dict, rec_in_dict)
     #     return metrics
 
-    @staticmethod
-    def evaluate_step(gradients: dict[str, Any], metrics: list[mx.array]) -> None:
-        """Evaluate and return the scalar values of the metrics.
-
-        Parameters
-        ----------
-        metrics : ScaleMetrics[mx.array]
-            The scale metrics containing MX arrays to evaluate.
-        """
-        mx.eval(*metrics, *gradients)  # type: ignore
-
     def create_dataloader(self) -> DataLoader[Batch[mx.array]]:
         """Create and return a :class:`torch.utils.data.DataLoader` for the
         trainer's dataset using configured batch size and worker settings.
+
+        Returns
+        -------
+        DataLoader[Batch[mx.array]]
+            The data loader for the trainer's dataset.
         """
         return DataLoader(
             self.dataset,
@@ -161,6 +154,11 @@ class MLXTrainer(
     ) -> FaciesGAN[mx.array, nn.Module, optim.Optimizer, MultiStepLR]:
         """Instantiate and return the :class:`TorchFaciesGAN` configured
         with the trainer options and device.
+
+        Returns
+        -------
+        TorchFaciesGAN
+            The instantiated FaciesGAN model for MLX.
         """
         return MLXFaciesGAN(
             self.options,
@@ -315,11 +313,11 @@ class MLXTrainer(
                     self.model.noise_amps.append(amp)
 
             # Critical: eval here forces synchronization before returning
-            mx.eval(  # type: ignore
-                self.model.rec_noise[-1],
-                prev_rec,
-                mx.array(self.model.noise_amps[-1]),
-            )
+            # mx.eval(  # type: ignore
+            #     self.model.rec_noise[-1],
+            #     prev_rec,
+            #     mx.array(self.model.noise_amps[-1]),
+            # )
         return prev_rec
 
     def init_dataset(
@@ -386,6 +384,21 @@ class MLXTrainer(
 
         If any checkpoint files are missing or incompatible a warning is
         printed and the trainer continues without restoring those states.
+
+        Parameters
+        ----------
+        scale : int
+            Scale index to load optimizers for.
+        scale_path : str
+            Filesystem path to the scale checkpoint directory.
+        generator_optimizer : optim.Optimizer
+            The generator optimizer instance to load state into.
+        discriminator_optimizer : optim.Optimizer
+            The discriminator optimizer instance to load state into.
+        generator_scheduler : MultiStepLR
+            The generator learning rate scheduler to load state into.
+        discriminator_scheduler : MultiStepLR
+            The discriminator learning rate scheduler to load state into.
         """
         try:
             generator_optimizer.state = mlx_utils.load(
@@ -412,7 +425,7 @@ class MLXTrainer(
             print(f"Warning: Could not load optimizers for scale {scale}: {e}")
 
     def create_batch_iterator(
-        self, loader: DataLoader[mx.array], scales: tuple[int, ...]
+        self, loader: DataLoader[Batch[mx.array]], scales: tuple[int, ...]
     ) -> Iterator[PyramidsBatch[mx.array] | None]:
         """Override to use MLXDataPrefetcher."""
         prefetcher = MLXDataPrefetcher(loader, scales)
@@ -420,6 +433,116 @@ class MLXTrainer(
         while batch is not None:
             yield batch
             batch = prefetcher.next()
+
+    def optimization_step(
+        self,
+        indexes: list[int],
+        facies_pyramid: tuple[mx.array, ...],
+        rec_in_pyramid: tuple[mx.array, ...],
+        wells_pyramid: tuple[mx.array, ...] = (),
+        masks_pyramid: tuple[mx.array, ...] = (),
+        seismic_pyramid: tuple[mx.array, ...] = (),
+    ) -> ScaleMetrics[mx.array]:
+        """Run a single optimization step using a compiled forward if available.
+
+        This method prefers a compiled forward cached on the model (via
+        `MLXFaciesGAN.compile_forward`). If compilation is disabled or fails
+        it falls back to the Python-callable `self.model(...)`.
+
+        Parameters
+        ----------
+        indexes : list[int]
+            List of batch sample indices.
+        facies_pyramid : tuple[mx.array, ...]
+            Tuple of real facies tensors for all scales.
+        rec_in_pyramid : tuple[mx.array, ...]
+            Tuple of reconstruction input tensors for all scales.
+        wells_pyramid : tuple[mx.array, ...], optional
+            Tuple of well-conditioning tensors for all scales.
+        masks_pyramid : tuple[mx.array, ...], optional
+            Tuple of mask tensors for all scales.
+        seismic_pyramid : tuple[mx.array, ...], optional
+            Tuple of seismic-conditioning tensors for all scales.
+
+        Returns
+        -------
+        ScaleMetrics[mx.array]
+            The scale metrics resulting from the optimization step.
+        """
+        # If compilation requested, ensure model has compiled forward
+        if self.compile_backend:
+            if getattr(self, "_compiled_optimization_step", None) is None:
+                self._compile_optimization_step()
+
+            idx_mx = mx.array(indexes, dtype=mx.int32)
+
+            # Call the compiled optimization step and annotate its return type so the
+            # type checker can understand the structure of the returned tuples.
+            metrics_tuples: tuple[
+                tuple[tuple[mx.array, ...], ...],
+                tuple[tuple[mx.array, ...], ...],
+            ] = self._compiled_optimization_step(
+                idx_mx,
+                facies_pyramid,
+                rec_in_pyramid,
+                wells_pyramid,
+                masks_pyramid,
+                seismic_pyramid,
+            )
+            gen_tuples, disc_tuples = metrics_tuples
+
+            mx.eval(*self.model.pending_evals, *gen_tuples, *disc_tuples)  # type: ignore
+            return ScaleMetrics(
+                generator=tuple(GeneratorMetrics(*t) for t in gen_tuples),
+                discriminator=tuple(DiscriminatorMetrics(*t) for t in disc_tuples),
+            )
+
+        # Fallback: Python call
+        return self.model(
+            indexes,
+            facies_pyramid,
+            rec_in_pyramid,
+            wells_pyramid,
+            masks_pyramid,
+            seismic_pyramid,
+        )
+
+    def _compile_optimization_step(self) -> None:
+        """Compile the forward call with MLX `mx.compile` for faster execution.
+
+        This compiles a thin wrapper around `forward` that accepts MLX arrays
+        (including an integer `indexes` array) and the pyramids. Compilation is
+        performed lazily and cached on the instance as `_compiled_forward`.
+        """
+        from functools import partial
+
+        @partial(mx.compile, inputs=self.model, outputs=self.model)  # type: ignore
+        def _optimization_step(
+            indexes: list[int],
+            facies_pyramid: tuple[mx.array, ...],
+            rec_in_pyramid: tuple[mx.array, ...],
+            wells_pyramid: tuple[mx.array, ...] = (),
+            masks_pyramid: tuple[mx.array, ...] = (),
+            seismic_pyramid: tuple[mx.array, ...] = (),
+        ) -> tuple[tuple[tuple[mx.array, ...], ...], tuple[tuple[mx.array, ...], ...]]:
+
+            scale_metrics: ScaleMetrics[mx.array] = self.model(  # type: ignore
+                indexes,
+                facies_pyramid,
+                rec_in_pyramid,
+                wells_pyramid,
+                masks_pyramid,
+                seismic_pyramid,
+            )
+            generator_metrics = scale_metrics.generator
+            discriminator_metrics = scale_metrics.discriminator
+
+            gen_tuples = tuple(m.as_tuple() for m in generator_metrics)
+            disc_tuples = tuple(m.as_tuple() for m in discriminator_metrics)
+            return gen_tuples, disc_tuples
+
+        # Compile and cache the function that returns metric tuples (MLX arrays)
+        self._compiled_optimization_step = _optimization_step  # type: ignore
 
     def save_generated_facies(
         self,

@@ -20,7 +20,7 @@ from models.torch import utils
 from models.torch.discriminator import TorchDiscriminator
 from models.torch.generator import TorchGenerator
 from options import TrainningOptions
-from training.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
 
 
 class TorchFaciesGAN(

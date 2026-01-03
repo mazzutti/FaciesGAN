@@ -17,7 +17,7 @@ from dateutil import tz
 from config import CHECKPOINT_PATH, OPT_FILE
 from log import init_output_logging
 from options import TrainningOptions
-from training import TorchTrainer, MLXTrainer
+from trainning import TorchTrainer, MLXTrainer
 
 
 def get_arguments() -> ArgumentParser:
