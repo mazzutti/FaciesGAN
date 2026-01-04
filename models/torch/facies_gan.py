@@ -8,7 +8,7 @@ and discriminators for each scale.
 
 import math
 import os
-from typing import Any
+from typing import Any, cast
 
 import torch
 import torch.nn as nn
@@ -480,19 +480,29 @@ class TorchFaciesGAN(
         """
 
         return ScaleMetrics(
-            discriminator=self.optimize_discriminator(
-                indexes,
-                facies_pyramid,
-                wells_pyramid,
-                seismic_pyramid,
+            discriminator=(
+                cast(
+                    DiscriminatorMetrics[torch.Tensor],
+                    self.optimize_discriminator(
+                        indexes,
+                        facies_pyramid,
+                        wells_pyramid,
+                        seismic_pyramid,
+                    ),
+                ),
             ),
-            generator=self.optimize_generator(
-                indexes,
-                facies_pyramid,
-                rec_in_pyramid,
-                wells_pyramid,
-                masks_pyramid,
-                seismic_pyramid,
+            generator=(
+                cast(
+                    GeneratorMetrics[torch.Tensor],
+                    self.optimize_generator(
+                        indexes,
+                        facies_pyramid,
+                        rec_in_pyramid,
+                        wells_pyramid,
+                        masks_pyramid,
+                        seismic_pyramid,
+                    ),
+                ),
             ),
         )
 

@@ -42,7 +42,6 @@ class PyramidsDataset(Dataset[Batch[TTensor]]):
     ) -> None:
         self.data_dir = options.input_path
         self.batches: list[Batch[TTensor]] = []
-        self.use_mixed_precision = options.use_mixed_precision
         self.scales = self.generate_scales(options, channels_last)
         if regenerate:
             self.clean_cache()

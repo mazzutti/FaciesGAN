@@ -36,10 +36,10 @@
         "--lambda-diversity",
         "1.0",
         "--no-tensorboard",
-        // "--use-mixed-precision",
         "--use-wells",
         "--use-seismic",
-        "--use-mlx"
+        "--use-mlx",
+        "--compile-backend"
         // "--use-profiler"
       ]
     }

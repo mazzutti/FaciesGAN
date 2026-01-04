@@ -225,9 +225,9 @@ def get_arguments() -> ArgumentParser:
     )
 
     parser.add_argument(
-        "--use-mixed-precision",
+        "--compile-backend",
         action="store_true",
-        help="enable mixed precision (bfloat16) for MLX training",
+        help="enable JIT compilation for MLX training (can significantly speed up training)",
     )
 
     return parser

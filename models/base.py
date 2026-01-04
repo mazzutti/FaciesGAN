@@ -4,7 +4,12 @@ from abc import ABC, abstractmethod
 from typing import Any, Generic
 
 from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
-from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from trainning.metrics import (
+    DiscriminatorMetrics,
+    GeneratorMetrics,
+    IterableMetrics,
+    ScaleMetrics,
+)
 from models.discriminator import Discriminator
 from models.generator import Generator
 from options import TrainningOptions
@@ -198,7 +203,9 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         raise NotImplementedError("Subclasses must implement backward_grads")
 
     @abstractmethod
-    def __call__(self, *args: Any, **kwds: Any) -> ScaleMetrics[TTensor]:
+    def __call__(
+        self, *args: Any, **kwds: Any
+    ) -> ScaleMetrics[TTensor] | tuple[IterableMetrics[TTensor], ...]:
         """Framework-specific forward method for training step.
 
         Parameters
@@ -805,7 +812,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         wells_pyramid: tuple[TTensor, ...] = (),
         masks_pyramid: tuple[TTensor, ...] = (),
         seismic_pyramid: tuple[TTensor, ...] = (),
-    ) -> ScaleMetrics[TTensor]:
+    ) -> ScaleMetrics[TTensor] | tuple[IterableMetrics[TTensor], ...]:
         """Perform a forward pass for both discriminator and generator.
 
         Parameters
@@ -1229,7 +1236,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         facies_pyramid: tuple[TTensor, ...],
         wells_pyramid: tuple[TTensor, ...] = (),
         seismic_pyramid: tuple[TTensor, ...] = (),
-    ) -> tuple[DiscriminatorMetrics[TTensor], ...]:
+    ) -> tuple[DiscriminatorMetrics[TTensor], ...] | IterableMetrics[TTensor]:
         """Framework-agnostic discriminator optimization orchestration.
 
         This method zeroes gradients, delegates framework-specific forward
@@ -1250,7 +1257,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             Tuple mapping scale indices to seismic-conditioning tensors.
         Returns
         -------
-        tuple[DiscriminatorMetrics[TTensor], ...]
+        tuple[DiscriminatorMetrics[TTensor], ...] | IterableMetrics[TTensor]
             Tuple of computed discriminator metrics for each scale.
         """
         step_metrics: list[DiscriminatorMetrics[TTensor]] = []
@@ -1283,10 +1290,6 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
                 step_metrics.append(metrics)
                 losses.extend(metrics.as_tuple())
 
-            # Cleanup / Lazy Evaluation
-            if len(step_gradients) > 0:
-                self.backward_grads(losses, gradients=step_gradients)
-
         return tuple(step_metrics)
 
     def optimize_generator(
@@ -1297,7 +1300,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         wells_pyramid: tuple[TTensor, ...] = (),
         masks_pyramid: tuple[TTensor, ...] = (),
         seismic_pyramid: tuple[TTensor, ...] = (),
-    ) -> tuple[GeneratorMetrics[TTensor], ...]:
+    ) -> tuple[GeneratorMetrics[TTensor], ...] | IterableMetrics[TTensor]:
         """Framework-agnostic generator optimization orchestration.
 
         This method handles zeroing grads, calling the per-scale
@@ -1323,10 +1326,9 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
 
         Returns
         -------
-        dict[int, GeneratorMetrics[TTensor]]
-            Dictionary mapping scale indices to computed generator metrics.
+        tuple[GeneratorMetrics[TTensor], ...] | IterableMetrics[TTensor]
+            Tuple of computed generator metrics for each scale.
         """
-        # final_metrics: dict[int, GeneratorMetrics[TTensor]] = {}
 
         step_metrics: list[GeneratorMetrics[TTensor]] = []
 
@@ -1370,10 +1372,6 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
 
                 step_metrics.append(metrics)
                 losses.extend(metrics.as_tuple())
-
-            # Cleanup / Lazy Evaluation
-            if len(step_gradients) > 0:
-                self.backward_grads(losses, gradients=step_gradients)
 
         return tuple(step_metrics)
 

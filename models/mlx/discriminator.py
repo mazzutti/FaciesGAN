@@ -76,6 +76,5 @@ class MLXDiscriminator(Discriminator[mx.array, nn.Module], nn.Module):
             num_features=num_features,
             min_num_features=min_num_features,
             input_channels=self.input_channels,
-            dtype=self.dtype,
         )
         self.discs.append(spade_gen)

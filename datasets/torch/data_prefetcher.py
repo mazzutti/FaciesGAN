@@ -17,7 +17,7 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
 
     Parameters
     ----------
-    loader : DataLoader
+    loader : DataLoader[Batch[torch.Tensor]]
         The underlying data loader.
     scales : tuple[int, ...]
         Tuple of scales to prepare data for.
@@ -25,7 +25,7 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
 
     def __init__(
         self,
-        loader: DataLoader[torch.Tensor],
+        loader: DataLoader[Batch[torch.Tensor]],
         scales: tuple[int, ...],
         device: torch.device = torch.device("cpu"),
     ) -> None:

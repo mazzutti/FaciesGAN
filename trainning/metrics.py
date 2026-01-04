@@ -10,6 +10,9 @@ or writing to external sinks.
 from __future__ import annotations
 from dataclasses import dataclass
 
+from log import Any
+from typedefs import TTensor
+
 
 @dataclass
 class DiscriminatorMetrics[TTensor]:
@@ -174,3 +177,10 @@ class ScaleMetrics[TTensor]:
                 *self.discriminator[scale].as_tuple(),
             )
         )
+
+
+IterableMetrics = tuple[
+    dict[int, list[tuple[TTensor, ...]]],
+    dict[int, list[dict[str, Any]]],
+    dict[int, list[dict[str, Any]]],
+]

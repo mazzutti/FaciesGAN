@@ -73,7 +73,7 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
             masks_pyramid = tuple(
                 mx.greater(
                     mx.sum(mx.abs(wells_pyramid[scale]), axis=3, keepdims=True), 0
-                ).astype(mx.int32)
+                )
                 for scale in self.scales
             )
         else:

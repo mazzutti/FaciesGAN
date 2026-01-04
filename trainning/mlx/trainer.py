@@ -1,11 +1,12 @@
+from collections.abc import Callable
 import os
 from typing import Any, Iterator, cast
-from typing_extensions import Callable
 
 import mlx.core as mx
 import mlx.nn as nn  # type: ignore
 import mlx.optimizers as optim  # type: ignore
 from torch.utils.data import DataLoader
+
 
 import background_workers as bw
 from config import D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, SCH_D_FILE, SCH_G_FILE
@@ -18,12 +19,29 @@ from models.mlx.facies_gan import MLXFaciesGAN
 from options import TrainningOptions
 
 from trainning.base import Trainer
-from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from trainning.metrics import (
+    DiscriminatorMetrics,
+    GeneratorMetrics,
+    IterableMetrics,
+    ScaleMetrics,
+)
 from trainning.mlx.collate import collate
 from trainning.mlx.schedulers import MultiStepLR
 from typedefs import Batch
 from models.mlx import utils as mlx_utils
 import utils
+
+OptimzationStep = Callable[
+    [
+        mx.array | list[int],
+        tuple[mx.array, ...],
+        tuple[mx.array, ...],
+        tuple[mx.array, ...],
+        tuple[mx.array, ...],
+        tuple[mx.array, ...],
+    ],
+    tuple[IterableMetrics[mx.array], ...],
+]
 
 
 class MLXTrainer(
@@ -37,6 +55,8 @@ class MLXTrainer(
 ):
     """Parallel trainer for multi-scale progressive FaciesGAN training in MLX."""
 
+    _compiled_optimization_step: OptimzationStep | None
+
     def __init__(
         self,
         options: TrainningOptions,
@@ -45,91 +65,21 @@ class MLXTrainer(
         compile_backend: bool = True,
     ) -> None:
         self.compile_backend = compile_backend
+        self._compiled_optimization_step = None
         super().__init__(options, fine_tuning, checkpoint_path)
-        self.gpu_stream: mx.Stream = mx.default_stream(mx.gpu)  # type: ignore
 
-        # Initialize cache for the compiled step function
-        self._compiled_optimization_step: Callable[
-            [
-                mx.array,
-                tuple[mx.array, ...],
-                tuple[mx.array, ...],
-                tuple[mx.array, ...],
-                tuple[mx.array, ...],
-                tuple[mx.array, ...],
-            ],
-            tuple[
-                tuple[tuple[mx.array, ...], ...],
-                tuple[tuple[mx.array, ...], ...],
-            ],
-        ]
-        self._compiled_step_key: tuple[int, ...] | None = None
+        try:
+            # Set memory limit for better memory management
+            mx.set_memory_limit(48 * 1024**3)  # 48GB limit
+            mx.set_default_device(mx.gpu)  # type: ignore
 
-    # def optimization_step(
-    #     self,
-    #     scales: tuple[int, ...],
-    #     indexes: mx.array,
-    #     real_facies_dict: dict[int, mx.array],
-    #     masks_dict: dict[int, mx.array],
-    #     rec_in_dict: dict[int, mx.array],
-    # ) -> ScaleMetrics[mx.array]:
-    #     """
-    #     Execute a compiled optimization step using mx.compile.
-    #     This overrides the default loop-based optimization in the BaseTrainer.
-    #     """
-
-    #     def step_fn(
-    #         model: MLXFaciesGAN,
-    #         idxs: mx.array,
-    #         rf_dict: dict[int, mx.array],
-    #         m_dict: dict[int, mx.array],
-    #         ri_dict: dict[int, mx.array],
-    #     ) -> tuple[
-    #         dict[int, list[mx.array]],
-    #         dict[int, list[mx.array]],
-    #         dict[str, Any],
-    #     ]:
-    #         metrics: ScaleMetrics[mx.array] = self.model(idxs, rf_dict, m_dict, ri_dict)
-    #         return (
-    #             {k: v.as_list() for k, v in metrics.discriminator.items()},
-    #             {k: v.as_list() for k, v in metrics.generator.items()},
-    #             cast(dict[str, Any], model.trainable_parameters()),
-    #         )
-
-    #     if self.compile_backend:
-    #         # Create a stable key for caching the compiled function based on active scales
-    #         key = tuple(sorted(scales))
-
-    #         # Check if we need to (re)compile. This happens when the set of active scales changes.
-    #         if self._compiled_step_key != key:
-    #             self._compiled_step = mx.compile(  # type: ignore
-    #                 partial(
-    #                     step_fn,
-    #                     cast(MLXFaciesGAN, self.model),
-    #                 )
-    #             )  # type: ignore
-    #             self._compiled_step_key = key
-
-    #         # Execute the compiled step
-    #         if self._compiled_step is not None:
-    #             d_metrics, g_metrics, gradients = self._compiled_step(
-    #                 indexes,
-    #                 real_facies_dict,
-    #                 wells_dict,
-    #                 masks_dict,
-    #                 rec_in_dict,
-    #             )
-    #             mx.eval(*d_metrics, *g_metrics, *gradients)  # type: ignore
-    #             metrics = cast(
-    #                 ScaleMetrics[mx.array],
-    #                 ScaleMetrics.from_dicts(g_metrics, d_metrics),  # type: ignore
-    #             )
-    #         else:
-    #             raise RuntimeError("Compiled step is None. Compilation failed.")
-
-    #     else:
-    #         metrics = self.model(indexes, real_facies_dict, masks_dict, rec_in_dict)
-    #     return metrics
+            print(f"MLX Metal Configuration:")
+            print(f"  Device: {mx.default_device()}")
+            print(f"  Active memory: {mx.metal.get_active_memory() / 1024**3:.3f} GB")
+            print(f"  Peak memory: {mx.get_peak_memory() / 1024**3:.3f} GB")
+            print(f"  Compilation: {'Enabled' if self.compile_backend else 'Disabled'}")
+        except Exception as e:
+            print(f"Warning: Could not configure Metal backend: {e}")
 
     def create_dataloader(self) -> DataLoader[Batch[mx.array]]:
         """Create and return a :class:`torch.utils.data.DataLoader` for the
@@ -193,17 +143,16 @@ class MLXTrainer(
         """
 
         # Ensure generation happens on GPU
-        with mx.stream(self.gpu_stream):
-            return tuple(
-                self.model.generate_fake(
-                    self.model.get_pyramid_noise(
-                        scale, indexes, wells_pyramid, seismic_pyramid
-                    ),
-                    scale,
-                )
-                for scale in scales
+        # with mx.stream(self.gpu_stream):
+        return tuple(
+            self.model.generate_fake(
+                self.model.get_pyramid_noise(
+                    scale, indexes, wells_pyramid, seismic_pyramid
+                ),
+                scale,
             )
-        return generated_samples
+            for scale in scales
+        )
 
     def initialize_noise(
         self,
@@ -241,83 +190,81 @@ class MLXTrainer(
         - Updates or appends the noise amplitude entry in ``self.model.noise_amp``.
         """
         # Ensure heavy ops use default stream
-        with mx.stream(self.gpu_stream):
-            real_facies = facies_pyramid[scale]
-            if scale == 0:
-                prev_rec = mx.zeros_like(real_facies)
-                z_rec = mlx_utils.generate_noise(
-                    (*real_facies.shape[1:3], self.noise_channels),
-                    num_samp=self.batch_size,
-                )
-                p = self.model.zero_padding
-                z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
-                self.model.rec_noise.append(z_rec)
+        # with mx.stream(self.gpu_stream):
+        real_facies = facies_pyramid[scale]
+        if scale == 0:
+            prev_rec = mx.zeros_like(real_facies)
+            z_rec = mlx_utils.generate_noise(
+                (*real_facies.shape[1:3], self.noise_channels),
+                num_samp=self.batch_size,
+            )
+            p = self.model.zero_padding
+            z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+            self.model.rec_noise.append(z_rec)
 
-                # Calculate noise amplitude for scale 0
-                fake = self.model.generator(
-                    self.model.get_pyramid_noise(scale, indexes),
-                    [1.0] * (scale + 1),
-                    stop_scale=scale,
-                )
+            # Calculate noise amplitude for scale 0
+            fake = self.model.generator(
+                self.model.get_pyramid_noise(scale, indexes),
+                [1.0] * (scale + 1),
+                stop_scale=scale,
+            )
 
-                rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
-                amp = self.options.scale0_noise_amp * rmse.item()
-                self.model.noise_amps.append(amp)
+            rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
+            amp = self.options.scale0_noise_amp * rmse.item()
+            self.model.noise_amps.append(amp)
+        else:
+            # Interpolate previous scale facies
+            tensor = facies_pyramid[scale - 1][indexes]
+            prev_rec = mlx_utils.interpolate(
+                tensor,
+                real_facies.shape[1:3],
+            )
+
+            # Logic for noise generation based on conditioning
+            shape = (*real_facies.shape[1:3], self.noise_channels)
+            if len(wells_pyramid) > 0:
+                shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
+            if len(seismic_pyramid) > 0:
+                shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
+
+            z_rec = mlx_utils.generate_noise(shape, num_samp=self.batch_size)
+
+            to_concat = [z_rec]
+            if len(wells_pyramid) > 0:
+                to_concat.append(wells_pyramid[scale])
+            if len(seismic_pyramid) > 0:
+                to_concat.append(seismic_pyramid[scale])
+
+            if len(to_concat) > 1:
+                z_rec = mx.concat(to_concat, axis=-1)  # type: ignore
+
+            p = self.model.zero_padding
+            z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+            self.model.rec_noise.append(z_rec)
+
+            # Calculate noise amplitude based on reconstruction error
+            fake = self.model.generator(
+                self.model.get_pyramid_noise(
+                    scale, indexes, wells_pyramid, seismic_pyramid
+                ),
+                self.model.noise_amps + [1.0],
+                stop_scale=scale,
+            )
+
+            rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
+            amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
+
+            if scale < len(self.model.noise_amps):
+                self.model.noise_amps[scale] = (amp + self.model.noise_amps[scale]) / 2
             else:
-                # Interpolate previous scale facies
-                tensor = facies_pyramid[scale - 1][indexes]
-                prev_rec = mlx_utils.interpolate(
-                    tensor,
-                    real_facies.shape[1:3],
-                )
+                self.model.noise_amps.append(amp)
 
-                # Logic for noise generation based on conditioning
-                shape = (*real_facies.shape[1:3], self.noise_channels)
-                if len(wells_pyramid) > 0:
-                    shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
-                if len(seismic_pyramid) > 0:
-                    shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
-
-                z_rec = mlx_utils.generate_noise(shape, num_samp=self.batch_size)
-
-                to_concat = [z_rec]
-                if len(wells_pyramid) > 0:
-                    to_concat.append(wells_pyramid[scale])
-                if len(seismic_pyramid) > 0:
-                    to_concat.append(seismic_pyramid[scale])
-
-                if len(to_concat) > 1:
-                    z_rec = mx.concat(to_concat, axis=-1)  # type: ignore
-
-                p = self.model.zero_padding
-                z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
-                self.model.rec_noise.append(z_rec)
-
-                # Calculate noise amplitude based on reconstruction error
-                fake = self.model.generator(
-                    self.model.get_pyramid_noise(
-                        scale, indexes, wells_pyramid, seismic_pyramid
-                    ),
-                    self.model.noise_amps + [1.0],
-                    stop_scale=scale,
-                )
-
-                rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
-                amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
-
-                if scale < len(self.model.noise_amps):
-                    self.model.noise_amps[scale] = (
-                        amp + self.model.noise_amps[scale]
-                    ) / 2
-                else:
-                    self.model.noise_amps.append(amp)
-
-            # Critical: eval here forces synchronization before returning
-            # mx.eval(  # type: ignore
-            #     self.model.rec_noise[-1],
-            #     prev_rec,
-            #     mx.array(self.model.noise_amps[-1]),
-            # )
+        # Critical: eval here forces synchronization before returning
+        # mx.eval(  # type: ignore
+        #     self.model.rec_noise[-1],
+        #     prev_rec,
+        #     mx.array(self.model.noise_amps[-1]),
+        # )
         return prev_rec
 
     def init_dataset(
@@ -341,10 +288,10 @@ class MLXTrainer(
             sel = [int(i) for i in self.options.wells_mask_columns]
             dataset.batches = [dataset.batches[i] for i in sel]
         elif self.options.num_train_pyramids < len(dataset):
-            idxs = mx.random.permutation(mx.arange(len(dataset)))[
+            idxs = mx.random.permutation(mx.arange(len(dataset)))[  # type: ignore
                 : self.options.num_train_pyramids
             ]
-            dataset.batches = [dataset.batches[int(i)] for i in idxs]
+            dataset.batches = [dataset.batches[int(i)] for i in idxs]  # type: ignore
         return dataset, dataset.scales
 
     def load_model(self, scale: int) -> None:
@@ -442,7 +389,7 @@ class MLXTrainer(
         wells_pyramid: tuple[mx.array, ...] = (),
         masks_pyramid: tuple[mx.array, ...] = (),
         seismic_pyramid: tuple[mx.array, ...] = (),
-    ) -> ScaleMetrics[mx.array]:
+    ) -> ScaleMetrics[mx.array] | tuple[IterableMetrics[mx.array], ...]:
         """Run a single optimization step using a compiled forward if available.
 
         This method prefers a compiled forward cached on the model (via
@@ -469,80 +416,99 @@ class MLXTrainer(
         ScaleMetrics[mx.array]
             The scale metrics resulting from the optimization step.
         """
-        # If compilation requested, ensure model has compiled forward
         if self.compile_backend:
             if getattr(self, "_compiled_optimization_step", None) is None:
                 self._compile_optimization_step()
 
-            idx_mx = mx.array(indexes, dtype=mx.int32)
-
-            # Call the compiled optimization step and annotate its return type so the
-            # type checker can understand the structure of the returned tuples.
-            metrics_tuples: tuple[
-                tuple[tuple[mx.array, ...], ...],
-                tuple[tuple[mx.array, ...], ...],
-            ] = self._compiled_optimization_step(
-                idx_mx,
+            to_eval: tuple[IterableMetrics[mx.array], ...] = cast(
+                OptimzationStep, self._compiled_optimization_step
+            )(
+                mx.array(indexes, dtype=mx.int32),
                 facies_pyramid,
                 rec_in_pyramid,
                 wells_pyramid,
                 masks_pyramid,
                 seismic_pyramid,
             )
-            gen_tuples, disc_tuples = metrics_tuples
 
-            mx.eval(*self.model.pending_evals, *gen_tuples, *disc_tuples)  # type: ignore
-            return ScaleMetrics(
-                generator=tuple(GeneratorMetrics(*t) for t in gen_tuples),
-                discriminator=tuple(DiscriminatorMetrics(*t) for t in disc_tuples),
+        else:
+            to_eval = cast(
+                tuple[IterableMetrics[mx.array], ...],
+                self.model(
+                    indexes,
+                    facies_pyramid,
+                    rec_in_pyramid,
+                    wells_pyramid,
+                    masks_pyramid,
+                    seismic_pyramid,
+                ),
             )
 
-        # Fallback: Python call
-        return self.model(
-            indexes,
-            facies_pyramid,
-            rec_in_pyramid,
-            wells_pyramid,
-            masks_pyramid,
-            seismic_pyramid,
+        # Evaluate all lazy computations
+        mx.eval(*to_eval)  # type: ignore
+
+        disc_results, gen_results = to_eval
+
+        # Vectorized metric aggregation using vmap-like stacking
+        def aggregate_metrics_vectorized(
+            results_dict: dict[int, list[tuple[mx.array, ...]]],
+        ) -> tuple[tuple[mx.array, ...], ...]:
+            aggregated: list[tuple[mx.array, ...]] = []
+            for scale in sorted(results_dict.keys()):
+                # Stack all metric tuples for this scale
+                stacked = mx.stack([mx.stack(list(m)) for m in results_dict[scale]])
+                # Compute mean across batch dimension
+                means = mx.mean(stacked, axis=0)
+                aggregated.append(tuple(means))
+            return tuple(aggregated)
+
+        discriminator_metrics = tuple(
+            DiscriminatorMetrics(*metrics)
+            for metrics in aggregate_metrics_vectorized(disc_results[0])
+        )
+        generator_metrics = tuple(
+            GeneratorMetrics(*metrics)
+            for metrics in aggregate_metrics_vectorized(gen_results[0])
+        )
+
+        return ScaleMetrics[mx.array](
+            generator=generator_metrics,
+            discriminator=discriminator_metrics,
         )
 
     def _compile_optimization_step(self) -> None:
         """Compile the forward call with MLX `mx.compile` for faster execution.
 
-        This compiles a thin wrapper around `forward` that accepts MLX arrays
-        (including an integer `indexes` array) and the pyramids. Compilation is
-        performed lazily and cached on the instance as `_compiled_forward`.
+        Uses partial to specify `inputs=self.model` and `outputs=self.model`,
+        ensuring parameter updates are tracked and avoiding uncaptured inputs.
+        The compiled function accepts the model instance explicitly as its first
+        argument and is called with `self.model`.
         """
+
         from functools import partial
 
-        @partial(mx.compile, inputs=self.model, outputs=self.model)  # type: ignore
+        @partial(mx.compile, inputs=[self.model], outputs=[self.model])  # type: ignore
         def _optimization_step(
             indexes: list[int],
             facies_pyramid: tuple[mx.array, ...],
             rec_in_pyramid: tuple[mx.array, ...],
-            wells_pyramid: tuple[mx.array, ...] = (),
-            masks_pyramid: tuple[mx.array, ...] = (),
-            seismic_pyramid: tuple[mx.array, ...] = (),
-        ) -> tuple[tuple[tuple[mx.array, ...], ...], tuple[tuple[mx.array, ...], ...]]:
-
-            scale_metrics: ScaleMetrics[mx.array] = self.model(  # type: ignore
-                indexes,
-                facies_pyramid,
-                rec_in_pyramid,
-                wells_pyramid,
-                masks_pyramid,
-                seismic_pyramid,
+            wells_pyramid: tuple[mx.array, ...],
+            masks_pyramid: tuple[mx.array, ...],
+            seismic_pyramid: tuple[mx.array, ...],
+        ) -> tuple[IterableMetrics[mx.array], ...]:
+            return cast(
+                tuple[IterableMetrics[mx.array], ...],
+                self.model(
+                    indexes,
+                    facies_pyramid,
+                    rec_in_pyramid,
+                    wells_pyramid,
+                    masks_pyramid,
+                    seismic_pyramid,
+                ),
             )
-            generator_metrics = scale_metrics.generator
-            discriminator_metrics = scale_metrics.discriminator
 
-            gen_tuples = tuple(m.as_tuple() for m in generator_metrics)
-            disc_tuples = tuple(m.as_tuple() for m in discriminator_metrics)
-            return gen_tuples, disc_tuples
-
-        # Compile and cache the function that returns metric tuples (MLX arrays)
-        self._compiled_optimization_step = _optimization_step  # type: ignore
+        self._compiled_optimization_step = cast(OptimzationStep, _optimization_step)
 
     def save_generated_facies(
         self,
@@ -578,15 +544,15 @@ class MLXTrainer(
         seismic_pyramid : tuple[mx.array, ...], optional
             Tuple of seismic-conditioning tensors for all scales.
         """
-        indexes = mx.random.randint(
+        indexes = mx.random.randint(  # type: ignore
             0,
             self.batch_size,
             shape=(self.num_real_facies,),
             dtype=mx.int32,
         )
 
-        idx_list = cast(list[int], indexes.tolist())
-        repeated_mx = mx.repeat(indexes, repeats=self.num_generated_per_real)
+        idx_list = cast(list[int], indexes.tolist())  # type: ignore
+        repeated_mx = mx.repeat(indexes, repeats=self.num_generated_per_real)  # type: ignore
         repeated_indexes = cast(list[int], repeated_mx.tolist())
         noises = self.model.get_pyramid_noise(
             scale,

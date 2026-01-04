@@ -14,7 +14,7 @@ import math
 import os
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Iterator
+from typing import Any, Iterator, cast
 
 from tensorboardX import SummaryWriter  # type: ignore
 from tqdm import tqdm
@@ -24,7 +24,12 @@ import utils
 from config import RESULT_FACIES_PATH
 from datasets import PyramidsDataset
 import log
-from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from trainning.metrics import (
+    DiscriminatorMetrics,
+    GeneratorMetrics,
+    IterableMetrics,
+    ScaleMetrics,
+)
 from models.base import FaciesGAN
 from options import TrainningOptions
 from tensorboard_visualizer import TensorBoardVisualizer
@@ -401,7 +406,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             self.handle_epoch_end(
                 scales=scales,
                 epoch=epoch,
-                scale_metrics=scale_metrics,
+                scale_metrics=cast(ScaleMetrics[TTensor], scale_metrics),
                 generated_samples=generated_samples,
                 writers=writers,
                 results_paths=results_paths,
@@ -429,7 +434,13 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         wells_pyramid: tuple[TTensor, ...] = (),
         masks_pyramid: tuple[TTensor, ...] = (),
         seismic_pyramid: tuple[TTensor, ...] = (),
-    ) -> ScaleMetrics[TTensor]:
+    ) -> (
+        ScaleMetrics[TTensor]
+        | tuple[
+            IterableMetrics[TTensor],
+            ...,
+        ]
+    ):
         """Perform a single optimization step for the model.
 
         Parameters
@@ -452,13 +463,16 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         ScaleMetrics[TTensor]
             Collected metrics for all scales after the optimization step.
         """
-        return self.model(
-            indexes,
-            facies_pyramid,
-            rec_in_pyramid,
-            wells_pyramid,
-            masks_pyramid,
-            seismic_pyramid,
+        return cast(
+            ScaleMetrics[TTensor],
+            self.model(
+                indexes,
+                facies_pyramid,
+                rec_in_pyramid,
+                wells_pyramid,
+                masks_pyramid,
+                seismic_pyramid,
+            ),
         )
 
     @abstractmethod

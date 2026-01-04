@@ -14,7 +14,7 @@ from models.mlx.discriminator import MLXDiscriminator
 from models.mlx.generator import MLXGenerator
 from options import TrainningOptions
 import models.mlx.utils as utils
-from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, IterableMetrics
 from trainning.mlx.schedulers import MultiStepLR
 
 
@@ -52,13 +52,16 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         super().__init__(options, noise_channels, *args, **kwargs)
         nn.Module.__init__(self)
 
-        # Keep reference to options so setup can access flags like mixed precision
-        self.dtype = mx.bfloat16 if options.use_mixed_precision else mx.float32
+        self.dtype = mx.float32
         self.zero_padding = int(options.num_layer * math.floor(options.kernel_size / 2))
         self.compile_backend = compile_backend
         self.setup_framework()
 
-    def __call__(self, *args: Any, **kwds: Any) -> ScaleMetrics[mx.array]:
+        self.compute_gradient_penalty_ = []
+
+    def __call__(
+        self, *args: Any, **kwds: Any
+    ) -> tuple[IterableMetrics[mx.array], ...]:
         return self.forward(*args, **kwds)
 
     def forward(
@@ -69,7 +72,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         wells_pyramid: tuple[mx.array, ...] = (),
         masks_pyramid: tuple[mx.array, ...] = (),
         seismic_pyramid: tuple[mx.array, ...] = (),
-    ) -> ScaleMetrics[mx.array]:
+    ) -> tuple[IterableMetrics[mx.array], ...]:
         """Execute a forward pass for both discriminator and generator.
 
         Parameters
@@ -93,11 +96,11 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             The computed metrics for discriminator and generator.
         """
 
-        return ScaleMetrics(
-            discriminator=self.optimize_discriminator(
+        return (
+            self.optimize_discriminator(
                 indexes, facies_pyramid, wells_pyramid, seismic_pyramid
             ),
-            generator=self.optimize_generator(
+            self.optimize_generator(
                 indexes,
                 facies_pyramid,
                 rec_in_pyramid,
@@ -125,12 +128,13 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         gradients : list[Any] | None, optional
             List of gradients or optimizer states to evaluate/update, by default None.
         """
+
         if not self.compile_backend:
-            # FIX: flattening gradients dict to ensure values are evaluated
             eval_items = list(losses)
             if gradients:
                 eval_items.extend(utils.flatten_to_list(gradients))
-            mx.eval(*eval_items)  # type: ignore
+            if eval_items:
+                mx.eval(*eval_items)  # type: ignore
 
     def build_discriminator(self) -> MLXDiscriminator:
         """Build the MLX Discriminator model.
@@ -145,7 +149,6 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             self.kernel_size,
             self.padding_size,
             self.disc_input_channels,
-            dtype=self.dtype,
         )
 
     def build_generator(self) -> MLXGenerator:
@@ -162,7 +165,6 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             self.padding_size,
             self.gen_input_channels,
             self.gen_output_channels,
-            dtype=self.dtype,
         )
 
     def compute_discriminator_metrics(
@@ -195,7 +197,10 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             (to be passed to the update method).
         """
         metrics: DiscriminatorMetrics[mx.array] = DiscriminatorMetrics(
-            mx.array(0.0), mx.array(0.0), mx.array(0.0), mx.array(0.0)
+            mx.array(0.0),
+            mx.array(0.0),
+            mx.array(0.0),
+            mx.array(0.0),
         )
 
         noises = self.get_pyramid_noise(
@@ -289,6 +294,188 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
 
         return metrics, cast(dict[str, Any] | None, gradients)
 
+    def optimize_discriminator(
+        self,
+        indexes: list[int],
+        facies_pyramid: tuple[mx.array, ...],
+        wells_pyramid: tuple[mx.array, ...] = (),
+        seismic_pyramid: tuple[mx.array, ...] = (),
+    ) -> IterableMetrics[mx.array]:
+        """Framework-agnostic discriminator optimization orchestration.
+
+        This method zeroes gradients, delegates framework-specific forward
+        computations to small abstract hooks implemented by subclasses,
+        aggregates tensor losses for a single backward call, and steps the
+        provided optimizers. It intentionally avoids importing heavy
+        frameworks.
+
+        Parameters
+        ----------
+        indexes : list[int]
+            List of batch/sample indices used to generate noise.
+        facies_pyramid : tuple[mx.array, ...]
+            Tuple mapping scale indices to real tensor samples.
+        wells_pyramid : tuple[mx.array, ...]
+            Tuple mapping scale indices to well-conditioning tensors.
+        seismic_pyramid : tuple[mx.array, ...]
+            Tuple mapping scale indices to seismic-conditioning tensors.
+        Returns
+        -------
+        tuple[
+            dict[int, list[tuple[mx.array, ...]]],
+            dict[int, list[dict[str, Any]]],
+            dict[int, list[dict[str, Any]]],
+            dict[int, list[dict[str, Any]]],
+        ]
+            Tuple containing:
+            - metrics: dict[int, list[tuple[mx.array, ...]]]
+                Dictionary mapping scale indices to lists of discriminator metrics tuples.
+            - gradients: dict[int, list[dict[str, Any]]]
+                Dictionary mapping scale indices to lists of gradients dicts.
+            - parameters: dict[int, list[dict[str, Any]]]
+                Dictionary mapping scale indices to lists of updated parameters dicts.
+            - states: dict[int, list[dict[str, Any]]]
+                Dictionary mapping scale indices to lists of updated optimizer states dicts.
+        """
+        metrics: dict[int, list[tuple[mx.array, ...]]] = {
+            scale: [] for scale in self.active_scales
+        }
+        gradients: dict[int, list[dict[str, Any]]] = {
+            scale: [] for scale in self.active_scales
+        }
+        parameters: dict[int, list[dict[str, Any]]] = {
+            scale: [] for scale in self.active_scales
+        }
+
+        for _ in range(self.discriminator_steps):
+
+            for scale in self.active_scales:
+
+                met, grad = self.compute_discriminator_metrics(
+                    indexes,
+                    scale,
+                    facies_pyramid[scale],
+                    wells_pyramid,
+                    seismic_pyramid,
+                )
+
+                metrics[scale].append(met.as_tuple())
+                gradients[scale].append(cast(dict[str, Any], grad))
+
+                updates = cast(
+                    dict[str, Any],
+                    self.update_discriminator_weights(
+                        scale,
+                        met.total,
+                        grad,
+                    ),
+                )
+
+                parameters[scale].append(updates["disc_parameters"])
+
+        # return metrics, gradients, parameters, states
+        return metrics, gradients, parameters
+
+    def optimize_generator(
+        self,
+        indexes: list[int],
+        facies_pyramid: tuple[mx.array, ...],
+        rec_in_pyramid: tuple[mx.array, ...],
+        wells_pyramid: tuple[mx.array, ...] = (),
+        masks_pyramid: tuple[mx.array, ...] = (),
+        seismic_pyramid: tuple[mx.array, ...] = (),
+    ) -> IterableMetrics[mx.array]:
+        """Framework-agnostic generator optimization orchestration.
+
+        This method handles zeroing grads, calling the per-scale
+        computation hook, aggregating totals for backward, and stepping
+        optimizers. Subclasses must implement
+        `compute_generator_metrics` to return scale-level
+        metrics and produced tensors.
+
+        Parameters
+        ----------
+        indexes : list[int]
+            List of batch/sample indices used to generate noise.
+        facies_pyramid : tuple[mx.array, ...]
+            Tuple mapping scale indices to real tensor samples.
+        rec_in_pyramid : tuple[mx.array, ...]
+            Tuple mapping scale indices to reconstruction inputs.
+        wells_pyramid : tuple[mx.array, ...]
+            Tuple mapping scale indices to well-conditioning tensors.
+        masks_pyramid : tuple[mx.array, ...]
+            Tuple mapping scale indices to well/mask tensors.
+        seismic_pyramid : tuple[mx.array, ...]
+            Tuple mapping scale indices to seismic-conditioning tensors.
+
+        Returns
+        -------
+        tuple[
+            dict[int, list[tuple[mx.array, ...]]],
+            dict[int, list[dict[str, Any]]],
+            dict[int, list[dict[str, Any]]],
+            dict[int, list[dict[str, Any]]],
+        ]
+            Tuple containing:
+            - metrics: dict[int, list[tuple[mx.array, ...]]]
+                Dictionary mapping scale indices to lists of generator metrics tuples.
+            - gradients: dict[int, list[dict[str, Any]]]
+                Dictionary mapping scale indices to lists of gradients dicts.
+            - parameters: dict[int, list[dict[str, Any]]]
+                Dictionary mapping scale indices to lists of updated parameters dicts.
+            - states: dict[int, list[dict[str, Any]]]
+                Dictionary mapping scale indices to lists of updated optimizer states dicts.
+        """
+        metrics: dict[int, list[tuple[mx.array, ...]]] = {
+            scale: [] for scale in self.active_scales
+        }
+        gradients: dict[int, list[dict[str, Any]]] = {
+            scale: [] for scale in self.active_scales
+        }
+        parameters: dict[int, list[dict[str, Any]]] = {
+            scale: [] for scale in self.active_scales
+        }
+
+        for _ in range(self.generator_steps):
+
+            for scale in self.active_scales:
+                if scale >= len(facies_pyramid):
+                    continue
+
+                real = facies_pyramid[scale]
+                rec_in = rec_in_pyramid[scale]
+                mask = masks_pyramid[scale]
+
+                if len(self.noise_amps) < scale + 1:
+                    raise RuntimeError(
+                        f"noise_amp not initialized for scale {scale}. "
+                        "Call the project's noise initialization before training."
+                    )
+
+                met, grad = self.compute_generator_metrics(
+                    indexes,
+                    scale,
+                    real,
+                    rec_in,
+                    wells_pyramid,
+                    seismic_pyramid,
+                    mask,
+                )
+
+                metrics[scale].append(met.as_tuple())
+                gradients[scale].append(cast(dict[str, Any], grad))
+
+                # Delegate the optimization step to subclass
+                updates = cast(
+                    dict[str, Any],
+                    self.update_generator_weights(scale, met.total, grad),
+                )
+
+                parameters[scale].append(updates["gen_parameters"])
+
+        # return metrics, gradients, parameters, states
+        return metrics, gradients, parameters
+
     def update_discriminator_weights(
         self, scale: int, loss: mx.array, gradients: Any | None
     ) -> dict[str, Any] | None:
@@ -317,8 +504,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             optimizer.update(discriminator, gradients)  # type: ignore
             # Return updated state elements for lazy evaluation
             return {
-                "discriminator": discriminator.parameters(),
-                "discriminator_optimizer": optimizer.state,  # type: ignore
+                "disc_parameters": discriminator.parameters(),
+                "disc_opt_state": optimizer.state,  # type: ignore
             }
 
     def update_generator_weights(
@@ -349,8 +536,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             optimizer.update(generator, gradients)  # type: ignore
             # Return updated state elements for lazy evaluation
             return {
-                "generator": generator.parameters(),
-                "generator_optimizer": optimizer.state,  # type: ignore
+                "gen_parameters": generator.parameters(),
+                "gen_opt_state": optimizer.state,  # type: ignore
             }
 
     def concatenate_tensors(self, tensors: list[mx.array]) -> mx.array:
@@ -374,6 +561,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
 
         Encourages different noise inputs to produce diverse outputs by
         penalizing small pairwise distances between flattened samples.
+        Uses vmap for efficient vectorization.
 
         Parameters
         ----------
@@ -387,6 +575,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         """
         if self.lambda_diversity <= 0 or len(fake_samples) < 2:
             return mx.array(0.0)
+
         stacked = mx.stack([f.flatten() for f in fake_samples])
         n = stacked.shape[0]
         diffs = stacked[:, None] - stacked[None, :]
@@ -531,6 +720,14 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             gamma=self.gamma,
             optimizer=self.discriminator_optimizers[scale],
         )
+        # discriminator = self.discriminator.discs[scale]
+        # self.compute_gradient_penalty_.append(
+        #     mx.compile(
+        #         partial(utils.calc_gradient_penalty, discriminator),
+        #         inputs=[discriminator],
+        #         outputs=[discriminator],  # type: ignore
+        #     )
+        # )
 
     def finalize_generator_scale(self, scale: int, reinit: bool) -> None:
         """Initialize weights for the new generator scale.
