@@ -110,32 +110,6 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             ),
         )
 
-    def backward_grads(
-        self,
-        losses: list[mx.array],
-        gradients: list[Any] | None = None,
-    ) -> None:
-        """Execute the backward pass and evaluate the computation graph.
-
-        In MLX, operations are lazy. This method forces the evaluation of
-        losses and gradient updates, ensuring the computation graph is executed
-        and memory is freed.
-
-        Parameters
-        ----------
-        losses : list[mx.array]
-            List of loss tensors to evaluate.
-        gradients : list[Any] | None, optional
-            List of gradients or optimizer states to evaluate/update, by default None.
-        """
-
-        if not self.compile_backend:
-            eval_items = list(losses)
-            if gradients:
-                eval_items.extend(utils.flatten_to_list(gradients))
-            if eval_items:
-                mx.eval(*eval_items)  # type: ignore
-
     def build_discriminator(self) -> MLXDiscriminator:
         """Build the MLX Discriminator model.
 
@@ -608,12 +582,21 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         mx.array
             Scalar gradient penalty term.
         """
-        return utils.calc_gradient_penalty(
-            self.discriminator.discs[scale],
-            real,
-            fake,
-            self.lambda_grad,
-        )
+        # Random interpolation factor
+        batch_size = real.shape[0]
+        alpha = mx.random.uniform(shape=(batch_size, 1, 1, 1))  # type: ignore
+        interpolates = alpha * real + (1 - alpha) * fake  # type: ignore
+
+        def grad_fn(x: mx.array) -> mx.array:
+            # Discriminator output for interpolates
+            out: mx.array = self.discriminator(scale, x)
+            return mx.sum(out)  # type: ignore
+
+        # Calculate gradients of the output w.r.t. the interpolates
+        gradients = cast(mx.array, mx.grad(grad_fn)(interpolates))  # type: ignore
+        grad_norm = mx.sqrt(mx.sum(mx.square(gradients), axis=-1) + 1e-12)
+        gradient_penalty = mx.mean(mx.square(grad_norm - 1.0)) * self.lambda_grad
+        return gradient_penalty
 
     def compute_masked_loss(
         self,

@@ -1,5 +1,6 @@
-from typing import Any, TypeVar, cast
+from typing import TypeVar, cast
 import mlx.core as mx
+import mlx.core.random as random  # type: ignore
 import mlx.nn.layers.upsample as upsample  # type: ignore
 import mlx.nn as nn  # type: ignore
 
@@ -13,64 +14,6 @@ gradient penalty computation for WGAN-GP, parameter initialization and
 weight loading. Functions are written to operate on MLX arrays in the
 project's NHWC tensor layout (B, H, W, C) unless otherwise noted.
 """
-
-
-def calc_gradient_penalty(
-    discriminator: nn.Module | Callable[[mx.array], mx.array],
-    real_data: mx.array,
-    fake_data: mx.array,
-    LAMBDA: float,
-) -> mx.array:
-    """Calculate gradient penalty for WGAN-GP training in MLX.
-
-    Implements the gradient penalty term to enforce the 1-Lipschitz constraint.
-    Uses vmap for efficient per-sample gradient computation.
-
-    Parameters
-    ----------
-    discriminator : nn.Module
-        The discriminator model.
-    real_data : mx.array
-        Real data samples (B, H, W, C).
-    fake_data : mx.array
-        Generated fake data samples (B, H, W, C).
-    LAMBDA : float
-        Gradient penalty coefficient.
-
-    Returns
-    -------
-    mx.array
-        Calculated gradient penalty scalar.
-    """
-    # Random interpolation factor
-    batch_size = real_data.shape[0]
-    alpha = mx.random.uniform(shape=(batch_size, 1, 1, 1))  # type: ignore
-    interpolates = alpha * real_data + (1 - alpha) * fake_data  # type: ignore
-
-    def grad_fn(x: mx.array) -> mx.array:
-        # Discriminator output for interpolates
-        out: mx.array = cast(mx.array, discriminator(x))
-        return mx.sum(out)  # type: ignore
-
-    # Calculate gradients of the output w.r.t. the interpolates
-    gradients = cast(mx.array, mx.grad(grad_fn)(interpolates))  # type: ignore
-    grad_norm = mx.sqrt(mx.sum(mx.square(gradients), axis=-1) + 1e-12)
-    gradient_penalty = mx.mean(mx.square(grad_norm - 1.0)) * LAMBDA
-    return gradient_penalty
-
-
-def flatten_to_list(obj: Any) -> list[mx.array]:
-    """Recursively flatten dictionaries and lists to extract mlx arrays."""
-    flat: list[mx.array] = []
-    if isinstance(obj, dict):
-        for v in obj.values():  # type: ignore
-            flat.extend(flatten_to_list(v))
-    elif isinstance(obj, list) or isinstance(obj, tuple):
-        for v in obj:  # type: ignore
-            flat.extend(flatten_to_list(v))
-    elif isinstance(obj, mx.array):
-        flat.append(obj)
-    return flat
 
 
 def generate_noise(
@@ -96,11 +39,11 @@ def generate_noise(
     """
     h, w, c = size
     noise_shape = (num_samp, round(h / scale), round(w / scale), c)
-    noise = mx.random.normal(shape=noise_shape)  # type: ignore
+    noise = cast(mx.array, random.normal(shape=noise_shape))  # type: ignore
 
     if scale != 1.0:
-        noise = interpolate(noise, (h, w))  # type: ignore
-    return noise  # type: ignore
+        noise = interpolate(noise, (h, w))
+    return noise
 
 
 def interpolate(tensor: mx.array, size: tuple[float, ...]) -> mx.array:
@@ -154,7 +97,7 @@ def init_weights(model: nn.Module | Callable[[mx.array], mx.array]) -> None:
     def initialize(m: nn.Module) -> None:
         if isinstance(m, nn.Conv2d):
             # Normal distribution N(0, 0.02)
-            m.weight = mx.random.normal(  # type: ignore
+            m.weight = random.normal(  # type: ignore
                 shape=m.weight.shape,  # type: ignore
                 scale=0.02,
                 dtype=m.weight.dtype,  # type: ignore
@@ -162,7 +105,7 @@ def init_weights(model: nn.Module | Callable[[mx.array], mx.array]) -> None:
             m.bias = mx.zeros_like(m.bias)
         elif isinstance(m, (nn.BatchNorm, nn.InstanceNorm)):
             if getattr(m, "weight", None) is not None:
-                m.weight = mx.random.normal(  # type: ignore
+                m.weight = random.normal(  # type: ignore
                     shape=m.weight.shape,
                     loc=1.0,
                     scale=0.02,

@@ -171,37 +171,6 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         # discriminator schedulers
         self.discriminator_schedulers: dict[int, TScheduler] = {}
 
-    def backward_grads(
-        self,
-        losses: list[TTensor],
-        gradients: list[Any] | None = None,
-    ) -> TTensor | None:
-        """Framework-specific backward operation for aggregated losses.
-
-        Subclasses should implement this to call their framework's backward
-        API (e.g., `torch.autograd.backward(losses)`, `mx.eval(losses)`). Keeping this
-        abstract prevents importing heavy frameworks into the base module.
-
-        Parameters
-        ----------
-        losses : list[Any]
-            List of tensors from multiple scales to backpropagate.
-        gradients : list[Any] | None, optional
-            Optional list of parameter gradients/states to populate during the backward call (default is None).
-
-        Returns
-        -------
-        TTensor | None
-            Optional aggregated tensor returned by the backward call.
-
-
-        Raises
-        ------
-        NotImplementedError
-            If the subclass does not override this method.
-        """
-        raise NotImplementedError("Subclasses must implement backward_grads")
-
     @abstractmethod
     def __call__(
         self, *args: Any, **kwds: Any

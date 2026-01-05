@@ -78,23 +78,6 @@ class TorchFaciesGAN(
     def __call__(self, *args: Any, **kwds: Any) -> ScaleMetrics[torch.Tensor]:
         return nn.Module.__call__(self, *args, **kwds)
 
-    def backward_grads(
-        self,
-        losses: list[torch.Tensor],
-        gradients: list[dict[str, Any]] | None = None,
-    ) -> None:
-        """Call PyTorch backward on aggregated losses.
-
-        Parameters:
-        ----------
-        losses  (list[torch.Tensor]): List of gradient tensors to backpropagate
-            through the graph via `torch.autograd.backward`.
-        gradients (list[dict[str, Any]] | None, optional):
-            Optional list of dictionaries mapping parameter names to gradients
-            to populate during the backward call (default is None).
-        """
-        torch.autograd.backward(losses)
-
     def build_discriminator(self) -> TorchDiscriminator:
         """Build and return the PyTorch `Discriminator` instance (not moved).
 

@@ -493,7 +493,7 @@ class MLXColorQuantization(nn.Module):
         )
 
     @staticmethod
-    @mx.compile  # type: ignore
+    # @mx.compile  # type: ignore
     def _quantize_impl(
         x: mx.array, pure_colors: mx.array, temperature: float, training: bool
     ) -> mx.array:

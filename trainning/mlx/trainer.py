@@ -75,7 +75,7 @@ class MLXTrainer(
 
             print(f"MLX Metal Configuration:")
             print(f"  Device: {mx.default_device()}")
-            print(f"  Active memory: {mx.metal.get_active_memory() / 1024**3:.3f} GB")
+            print(f"  Active memory: {mx.get_active_memory() / 1024**3:.3f} GB")
             print(f"  Peak memory: {mx.get_peak_memory() / 1024**3:.3f} GB")
             print(f"  Compilation: {'Enabled' if self.compile_backend else 'Disabled'}")
         except Exception as e:
@@ -198,6 +198,7 @@ class MLXTrainer(
                 (*real_facies.shape[1:3], self.noise_channels),
                 num_samp=self.batch_size,
             )
+
             p = self.model.zero_padding
             z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
             self.model.rec_noise.append(z_rec)
@@ -423,7 +424,7 @@ class MLXTrainer(
             to_eval: tuple[IterableMetrics[mx.array], ...] = cast(
                 OptimzationStep, self._compiled_optimization_step
             )(
-                mx.array(indexes, dtype=mx.int32),
+                mx.array(indexes),
                 facies_pyramid,
                 rec_in_pyramid,
                 wells_pyramid,
