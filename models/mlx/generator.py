@@ -146,60 +146,28 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                 align_corners=True,
             )
 
-            if index in self.spade_scales:
-
-                z_in = cast(mx.array, z[index])  # type: ignore
-                if self.has_cond_channels:
-                    noise = z_in[..., : self.output_channels]
-                    cond = z_in[..., self.output_channels :]
-                    noise = amp[index] * noise
-                    z_in = mx.concat([noise, cond], axis=-1)
-                else:
-                    z_in = amp[index] * z_in
-
-                p = self.zero_padding
-                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
-
-                if self.has_cond_channels:
-                    num_repeats = self.cond_channels // self.output_channels
-                    padded_facie = mx.tile(padded_facie, (1, 1, 1, num_repeats))
-                    noise = z_in[..., : self.output_channels]
-                    cond = z_in[..., self.output_channels :] + padded_facie
-                    z_in = mx.concat([noise, cond], axis=-1)
-                else:
-                    z_in = z_in + padded_facie
-
-                # Forward through scale module
-                out_facie = cast(mx.array, self.gens[index](z_in)) + out_facie
+            z_in = cast(mx.array, z[index])  # type: ignore
+            if self.has_cond_channels:
+                noise = z_in[..., : self.output_channels]
+                cond = z_in[..., self.output_channels :]
+                noise = amp[index] * noise
+                z_in = mx.concat([noise, cond], axis=-1)
             else:
-                # Standard concatenation-based generation at finer scales
-                # Apply amplitude scaling to noise channels (first N channels)
-                z_in = cast(mx.array, z[index])  # type: ignore
-                if self.has_cond_channels:
-                    noise = z_in[..., : self.output_channels]
-                    cond = z_in[..., self.output_channels :]
-                    noise = amp[index] * noise
-                    z_in = mx.concat([noise, cond], axis=-1)
-                else:
-                    z_in = amp[index] * z_in
+                z_in = amp[index] * z_in
 
-                # Add padded output facie ONLY to conditioning channels (not noise)
-                # This ensures random noise always has direct impact on generation
-                p = self.zero_padding
-                padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+            p = self.zero_padding
+            padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
 
-                if self.has_cond_channels:
-                    num_repeats = self.cond_channels // self.output_channels
-                    padded_facie = mx.tile(padded_facie, (1, 1, 1, num_repeats))
-                    noise = z_in[..., : self.output_channels]
-                    cond = z_in[..., self.output_channels :]
-                    cond = cond + padded_facie
-                    z_in = mx.concat([noise, cond], axis=-1)
-                else:
-                    z_in = z_in + padded_facie
+            if self.has_cond_channels:
+                num_repeats = self.cond_channels // self.output_channels
+                padded_facie = mx.tile(padded_facie, (1, 1, 1, num_repeats))
+                noise = z_in[..., : self.output_channels]
+                cond = z_in[..., self.output_channels :] + padded_facie
+                z_in = mx.concat([noise, cond], axis=-1)
+            else:
+                z_in = z_in + padded_facie
 
-                out_facie = cast(mx.array, self.gens[index](z_in)) + out_facie
-
+            out_facie = cast(mx.array, self.gens[index](z_in)) + out_facie
         # Apply color quantization to enforce pure colors
         out_facie = self.color_quantizer(out_facie)
         return out_facie

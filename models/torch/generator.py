@@ -184,54 +184,27 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
                 ),
             )
 
-            if index in self.spade_scales:
-                # SPADE-based generation at coarse scale
-                # Apply amplitude scaling to noise channels
-                z_in = z[index].clone()
-                if self.has_cond_channels:
-                    z_in[:, : self.output_channels, :, :] = (
-                        amp[index] * z[index][:, : self.output_channels, :, :]
-                    )
-                else:
-                    z_in = amp[index] * z_in
-
-                padded_facie = F.pad(out_facie, [self.zero_padding] * 4, value=0)
-                if self.has_cond_channels:
-                    num_repeats = self.cond_channels // self.output_channels
-                    padded_facie = padded_facie.repeat(1, num_repeats, 1, 1)
-                    # Add padded output facie to well conditioning channels
-                    z_in[:, self.output_channels :, :, :] = (
-                        z_in[:, self.output_channels :, :, :] + padded_facie
-                    )
-                else:
-                    z_in = z_in + padded_facie
-
-                # SPADE generator takes full conditioning and outputs directly
-                out_facie = self.gens[index](z_in) + out_facie
+            z_in = z[index].clone()
+            if self.has_cond_channels:
+                z_in[:, : self.output_channels, :, :] = (
+                    amp[index] * z[index][:, : self.output_channels, :, :]
+                )
             else:
-                # Standard concatenation-based generation at finer scales
-                # Apply amplitude scaling to noise channels (first N channels)
-                z_in = z[index].clone()
-                if self.has_cond_channels:
-                    z_in[:, : self.output_channels, :, :] = (
-                        amp[index] * z[index][:, : self.output_channels, :, :]
-                    )
-                else:
-                    z_in = amp[index] * z_in
+                z_in = amp[index] * z_in
 
-                # Add padded output facie ONLY to conditioning channels (not noise)
-                # This ensures random noise always has direct impact on generation
-                padded_facie = F.pad(out_facie, [self.zero_padding] * 4, value=0)
-                if self.has_cond_channels:
-                    num_repeats = self.cond_channels // self.output_channels
-                    padded_facie = padded_facie.repeat(1, num_repeats, 1, 1)
-                    z_in[:, self.output_channels :, :, :] = (
-                        z_in[:, self.output_channels :, :, :] + padded_facie
-                    )
-                else:
-                    z_in = z_in + padded_facie
+            padded_facie = F.pad(out_facie, [self.zero_padding] * 4, value=0)
+            if self.has_cond_channels:
+                num_repeats = self.cond_channels // self.output_channels
+                padded_facie = padded_facie.repeat(1, num_repeats, 1, 1)
+                # Add padded output facie to well conditioning channels
+                z_in[:, self.output_channels :, :, :] = (
+                    z_in[:, self.output_channels :, :, :] + padded_facie
+                )
+            else:
+                z_in = z_in + padded_facie
 
-                out_facie = self.gens[index](z_in) + out_facie
+            # SPADE generator takes full conditioning and outputs directly
+            out_facie = self.gens[index](z_in) + out_facie
 
         # Apply color quantization to enforce pure colors
         out_facie = self.color_quantizer(out_facie)

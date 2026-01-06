@@ -697,7 +697,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         reinit : bool
             If True, reinitialize weights. If False, copy from previous scale.
         """
-        if reinit:
+        if scale == 0 or reinit:
             utils.init_weights(self.generator.gens[scale])
         else:
             self.generator.gens[scale].update(  # type: ignore

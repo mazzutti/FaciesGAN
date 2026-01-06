@@ -1064,18 +1064,10 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             Pyramid scale index to initialize.
         """
         num_feature, min_num_feature = self.get_num_features(scale)
-
-        # Create the framework-specific generator scale block (subclass).
         self.generator.create_scale(scale, num_feature, min_num_feature)
-
-        # Determine whether the new scale should be reinitialized or copied
-        # from previous scale; delegate SPADE/scale logic to subclass.
         prev_is_spade = self.is_spade_scale(scale - 1) if scale > 0 else False
         curr_is_spade = self.is_spade_scale(scale)
-        reinit = (scale % 4 == 0) or prev_is_spade or curr_is_spade
-
-        # Let the subclass finalize the new generator block (apply weights or
-        # copy previous weights) according to the `reinit` decision.
+        reinit = prev_is_spade or curr_is_spade
         self.finalize_generator_scale(scale, reinit)
 
     def init_scales(self, start_scale: int, num_scales: int) -> None:
