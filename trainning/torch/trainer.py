@@ -248,49 +248,34 @@ class TorchTrainer(
 
             if len(self.model.rec_noise) < scale + 1:
                 # noise channel sizing for higher scales (empirical split)
-                if len(wells_pyramid) == 0 and len(seismic_pyramid) == 0:
-                    if len(seismic_pyramid) == 0:
-                        z_rec = torch_utils.generate_noise(
-                            (
-                                self.noise_channels,
-                                *real.shape[2:],
-                            ),
-                            device=self.device,
-                            num_samp=self.batch_size,
-                        )
-                    else:
-                        z_rec = torch_utils.generate_noise(
-                            (
-                                self.noise_channels - self.num_img_channels,
-                                *real.shape[2:],
-                            ),
-                            device=self.device,
-                            num_samp=self.batch_size,
-                        )
-                        z_rec = torch.cat([z_rec, seismic_pyramid[scale]], dim=1)
-                else:
-                    if len(wells_pyramid) == 0:
-                        z_rec = torch_utils.generate_noise(
-                            (
-                                self.noise_channels - self.num_img_channels,
-                                *real.shape[2:],
-                            ),
-                            device=self.device,
-                            num_samp=self.batch_size,
-                        )
-                        z_rec = torch.cat([z_rec, wells_pyramid[scale]], dim=1)
-                    else:
-                        z_rec = torch_utils.generate_noise(
-                            (
-                                self.noise_channels - 2 * self.num_img_channels,
-                                *real.shape[2:],
-                            ),
-                            device=self.device,
-                            num_samp=self.batch_size,
-                        )
-                        z_rec = torch.cat(
-                            [z_rec, wells_pyramid[scale], seismic_pyramid[scale]], dim=1
-                        )
+
+                # Determine how many noise channels we need after conditioning
+                num_cond_channels = 0
+                if len(wells_pyramid) > 0:
+                    num_cond_channels += self.num_img_channels
+                if len(seismic_pyramid) > 0:
+                    num_cond_channels += self.num_img_channels
+
+                noise_ch = self.noise_channels - num_cond_channels
+
+                z_rec = torch_utils.generate_noise(
+                    (
+                        noise_ch,
+                        *real.shape[2:],
+                    ),
+                    device=self.device,
+                    num_samp=self.batch_size,
+                )
+
+                to_concat = [z_rec]
+                if len(wells_pyramid) > 0:
+                    to_concat.append(wells_pyramid[scale])
+                if len(seismic_pyramid) > 0:
+                    to_concat.append(seismic_pyramid[scale])
+
+                if len(to_concat) > 1:
+                    z_rec = torch.cat(to_concat, dim=1)
+
                 z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
                 self.model.rec_noise.append(z_rec)
 
@@ -506,6 +491,31 @@ class TorchTrainer(
                     if len(masks_pyramid) > 0
                     else None
                 ),
+            )
+
+    def setup_optimizers(self, scales: tuple[int, ...]) -> None:
+        for scale in scales:
+            self.discriminator_optimizers[scale] = torch.optim.Adam(
+                self.model.discriminator.discs[scale].parameters(),
+                lr=self.lr_d,
+                betas=(self.beta1, 0.999),
+            )
+            self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
+                self.discriminator_optimizers[scale],
+                milestones=[self.lr_decay],
+                gamma=self.gamma,
+            )
+
+            self.generator_optimizers[scale] = torch.optim.Adam(
+                self.model.generator.gens[scale].parameters(),
+                lr=self.lr_g,
+                betas=(self.beta1, 0.999),
+            )
+
+            self.generator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
+                self.generator_optimizers[scale],
+                milestones=[self.lr_decay],
+                gamma=self.gamma,
             )
 
     def save_optimizers(

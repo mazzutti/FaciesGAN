@@ -5,7 +5,7 @@ import math
 
 import mlx.core as mx
 import mlx.nn as nn  # type: ignore
-from mlx.optimizers import Adam, Optimizer  # type: ignore
+from mlx.optimizers import Optimizer  # type: ignore
 
 
 from config import D_FILE, G_FILE, M_FILE, SHAPE_FILE
@@ -69,6 +69,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
 
     def forward(
         self,
+        generator_optimizers: dict[int, Optimizer],
+        discriminator_optimizers: dict[int, Optimizer],
         indexes: list[int],
         facies_pyramid: dict[int, mx.array],
         rec_in_pyramid: dict[int, mx.array],
@@ -80,6 +82,10 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
 
         Parameters
         ----------
+        generator_optimizers : dict[int, Optimizer]
+            Dictionary mapping scale indices to optimizers for generator.
+        discriminator_optimizers : dict[int, Optimizer]
+            Dictionary mapping scale indices to optimizers for discriminator.
         indexes : list[int]
             Batch/sample indices used for consistent noise generation.
         facies_pyramid : dict[int, mx.array]
@@ -102,6 +108,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             IterableMetrics[mx.array],
             self.optimize_discriminator(
                 indexes,
+                discriminator_optimizers,
                 facies_pyramid,
                 wells_pyramid,
                 seismic_pyramid,
@@ -112,6 +119,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             IterableMetrics[mx.array],
             self.optimize_generator(
                 indexes,
+                generator_optimizers,
                 facies_pyramid,
                 rec_in_pyramid,
                 wells_pyramid,
@@ -291,6 +299,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
     def optimize_discriminator(
         self,
         indexes: list[int],
+        optimizers: dict[int, Optimizer],
         facies_pyramid: dict[int, mx.array],
         wells_pyramid: dict[int, mx.array] = {},
         seismic_pyramid: dict[int, mx.array] = {},
@@ -325,16 +334,11 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 Dictionary mapping scale indices to lists of discriminator metrics tuples.
             - gradients: dict[int, list[dict[str, Any]]]
                 Dictionary mapping scale indices to lists of gradients dicts.
-            - parameters: dict[int, list[dict[str, Any]]]
-                Dictionary mapping scale indices to lists of updated parameters dicts.
         """
         metrics: dict[int, list[tuple[mx.array, ...]]] = {
             scale: [] for scale in self.active_scales
         }
         gradients: dict[int, list[dict[str, Any]]] = {
-            scale: [] for scale in self.active_scales
-        }
-        parameters: dict[int, list[dict[str, Any]]] = {
             scale: [] for scale in self.active_scales
         }
 
@@ -354,23 +358,20 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 metrics[scale].append(met.as_tuple())
                 gradients[scale].append(grad)
 
-                updates = cast(
-                    dict[str, Any],
-                    self.update_discriminator_weights(
-                        scale,
-                        met.total,
-                        grad,
-                    ),
+                self.update_discriminator_weights(
+                    scale,
+                    optimizers[scale],
+                    met.total,
+                    grad,
                 )
 
-                parameters[scale].append(updates)
-
         # return metrics, gradients, parameters, states
-        return metrics, gradients, parameters
+        return metrics, gradients
 
     def optimize_generator(
         self,
         indexes: list[int],
+        optimizers: dict[int, Optimizer],
         facies_pyramid: dict[int, mx.array],
         rec_in_pyramid: dict[int, mx.array],
         wells_pyramid: dict[int, mx.array] = {},
@@ -389,6 +390,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         ----------
         indexes : list[int]
             List of batch/sample indices used to generate noise.
+        optimizers : dict[int, Optimizer]
+            Dictionary mapping scale indices to generator optimizers.
         facies_pyramid : dict[int, mx.array]
             Dictionary mapping scale indices to real tensor samples.
         rec_in_pyramid : dict[int, mx.array]
@@ -413,18 +416,11 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 Dictionary mapping scale indices to lists of generator metrics tuples.
             - gradients: dict[int, list[dict[str, Any]]]
                 Dictionary mapping scale indices to lists of gradients dicts.
-            - parameters: dict[int, list[dict[str, Any]]]
-                Dictionary mapping scale indices to lists of updated parameters dicts.
-            - states: dict[int, list[dict[str, Any]]]
-                Dictionary mapping scale indices to lists of updated optimizer states dicts.
         """
         metrics: dict[int, list[tuple[mx.array, ...]]] = {
             scale: [] for scale in self.active_scales
         }
         gradients: dict[int, list[dict[str, Any]]] = {
-            scale: [] for scale in self.active_scales
-        }
-        parameters: dict[int, list[dict[str, Any]]] = {
             scale: [] for scale in self.active_scales
         }
 
@@ -456,19 +452,19 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 gradients[scale].append(grad)
 
                 # Delegate the optimization step to subclass
-                updates = cast(
-                    dict[str, Any],
-                    self.update_generator_weights(scale, met.total, grad),
+                self.update_generator_weights(
+                    scale,
+                    optimizers[scale],
+                    met.total,
+                    grad,
                 )
 
-                parameters[scale].append(updates)
-
-        # return metrics, gradients, parameters
-        return metrics, gradients, parameters
+        # return metrics, gradients
+        return metrics, gradients
 
     def update_discriminator_weights(
-        self, scale: int, loss: mx.array, gradients: Any | None
-    ) -> dict[str, Any] | None:
+        self, scale: int, optimizer: Optimizer, loss: mx.array, gradients: Any | None
+    ) -> None:
         """Update discriminator weights using MLX optimizer.
 
         Parameters
@@ -481,23 +477,14 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             The total loss (evaluated lazily).
         gradients : Any | None
             The gradients computed by `value_and_grad`.
-
-        Returns
-        -------
-        list[Any]
-            A list containing the optimizer state and updated parameters.
-            These must be passed to `mx.eval` to trigger the update.
         """
         if gradients:
-            optimizer = self.discriminator_optimizers[scale]
             discriminator = self.discriminator.discs[scale]
             optimizer.update(discriminator, gradients)  # type: ignore
-            # Return updated state elements for lazy evaluation
-            return cast(dict[str, Any], discriminator.parameters())
 
     def update_generator_weights(
-        self, scale: int, loss: mx.array, gradients: Any | None
-    ) -> dict[str, Any] | None:
+        self, scale: int, optimizer: Optimizer, loss: mx.array, gradients: Any | None
+    ) -> None:
         """Update generator weights using MLX optimizer.
 
         Parameters
@@ -510,19 +497,10 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             The total loss (evaluated lazily).
         gradients :  Any| None
             The gradients computed by `value_and_grad`.
-
-        Returns
-        -------
-        dict[str, Any]
-            A list containing the optimizer state and updated parameters.
-            These must be passed to `mx.eval` to trigger the update.
         """
         if gradients:
-            optimizer = self.generator_optimizers[scale]
             generator = self.generator.gens[scale]
             optimizer.update(generator, gradients)  # type: ignore
-            # Return updated state elements for lazy evaluation
-            return cast(dict[str, Any], generator.parameters())
 
     def concatenate_tensors(self, tensors: list[mx.array]) -> mx.array:
         """Concatenate a list of MLX arrays along the channel axis (last dimension).
@@ -700,19 +678,6 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         """
         utils.init_weights(self.discriminator.discs[scale])
 
-        self.discriminator_optimizers[scale] = Adam(
-            learning_rate=self.lr_d,
-            betas=[self.beta1, 0.999],
-        )
-        self.discriminator_optimizers[scale].init(  # type: ignore
-            self.discriminator.discs[scale].parameters()
-        )
-        self.discriminator_schedulers[scale] = MultiStepLR(
-            init_lr=self.lr_d,
-            milestones=[self.lr_decay],
-            gamma=self.gamma,
-            optimizer=self.discriminator_optimizers[scale],
-        )
         # discriminator = self.discriminator.discs[scale]
         # self.compute_gradient_penalty_.append(
         #     mx.compile(
@@ -738,21 +703,6 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             self.generator.gens[scale].update(  # type: ignore
                 self.generator.gens[scale - 1].parameters(),
             )
-
-        self.generator_optimizers[scale] = Adam(
-            learning_rate=self.lr_g,
-            betas=[self.beta1, 0.999],
-        )
-        self.generator_optimizers[scale].init(  # type: ignore
-            self.generator.gens[scale].parameters()
-        )
-
-        self.generator_schedulers[scale] = MultiStepLR(
-            init_lr=self.lr_g,
-            milestones=[self.lr_decay],
-            gamma=self.gamma,
-            optimizer=self.generator_optimizers[scale],
-        )
 
     def generate_fake(self, noises: list[mx.array], scale: int) -> mx.array:
         """Generate fake images using the provided noise inputs.

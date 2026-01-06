@@ -397,17 +397,6 @@ class TorchFaciesGAN(
             self.device
         )
 
-        self.discriminator_optimizers[scale] = torch.optim.Adam(
-            self.discriminator.discs[scale].parameters(),
-            lr=self.lr_d,
-            betas=(self.beta1, 0.999),
-        )
-        self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
-            self.discriminator_optimizers[scale],
-            milestones=[self.lr_decay],
-            gamma=self.gamma,
-        )
-
     def finalize_generator_scale(self, scale: int, reinit: bool) -> None:
         """Finalize generator block after creation.
 
@@ -426,20 +415,10 @@ class TorchFaciesGAN(
             )
         self.generator.gens[scale] = self.generator.gens[scale].to(self.device)
 
-        self.generator_optimizers[scale] = torch.optim.Adam(
-            self.generator.gens[scale].parameters(),
-            lr=self.lr_g,
-            betas=(self.beta1, 0.999),
-        )
-
-        self.generator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
-            self.generator_optimizers[scale],
-            milestones=[self.lr_decay],
-            gamma=self.gamma,
-        )
-
     def forward(
         self,
+        generator_optimizers: dict[int, torch.optim.Optimizer],
+        discriminator_optimizers: dict[int, torch.optim.Optimizer],
         indexes: list[int],
         facies_pyramid: dict[int, torch.Tensor],
         rec_in_pyramid: dict[int, torch.Tensor],
@@ -472,6 +451,7 @@ class TorchFaciesGAN(
             tuple[DiscriminatorMetrics[torch.Tensor], ...],
             self.optimize_discriminator(
                 indexes,
+                discriminator_optimizers,
                 facies_pyramid,
                 wells_pyramid,
                 seismic_pyramid,
@@ -481,6 +461,7 @@ class TorchFaciesGAN(
             tuple[GeneratorMetrics[torch.Tensor], ...],
             self.optimize_generator(
                 indexes,
+                generator_optimizers,
                 facies_pyramid,
                 rec_in_pyramid,
                 wells_pyramid,
@@ -549,29 +530,43 @@ class TorchFaciesGAN(
 
         batch = len(indexes)
 
-        if well is not None and seismic is not None:
-            shape = self.get_noise_shape(scale)
-            z = utils.generate_noise(shape, num_samp=batch, device=self.device)
-            well = well[indexes].to(self.device)
-            seismic = seismic[indexes].to(self.device)
-            z = self.concatenate_tensors([z, well, seismic])
-        elif well is not None:
-            shape = self.get_noise_shape(scale)
-            z = utils.generate_noise(shape, num_samp=batch, device=self.device)
-            well = well[indexes].to(self.device)
-            z = self.concatenate_tensors([z, well])
-        elif seismic is not None:
-            shape = self.get_noise_shape(scale)
-            z = utils.generate_noise(shape, num_samp=batch, device=self.device)
-            seismic = seismic[indexes].to(self.device)
-            z = self.concatenate_tensors([z, seismic])
-        else:
-            shape = self.get_noise_shape(scale, use_base_channel=False)
-            z = utils.generate_noise(
-                (self.gen_input_channels, *shape),
-                num_samp=batch,
-                device=self.device,
-            )
+        # Get spatial shape (H, W)
+        spatial_shape = self.get_noise_shape(scale, use_base_channel=False)
+
+        # Determine number of random noise channels needed
+        noise_channels = self.gen_input_channels
+
+        # Use helper lists to manage tensors for concatenation
+        tensors_to_concat: list[torch.Tensor] = []
+
+        if well is not None:
+            # Assume well is (Batch, C, H, W) or (Total, C, H, W)
+            # If (Total...), indexing [indexes] gives (Batch, C, H, W)
+            # channels is dim 1
+            w = well[indexes].to(self.device)
+            noise_channels -= w.shape[1]
+            # Will append later, but we need order: z, well, seismic
+
+        if seismic is not None:
+            s = seismic[indexes].to(self.device)
+            noise_channels -= s.shape[1]
+
+        # Generate random noise part
+        z = utils.generate_noise(
+            (noise_channels, *spatial_shape),
+            num_samp=batch,
+            device=self.device,
+        )
+        tensors_to_concat.append(z)
+
+        if well is not None:
+            tensors_to_concat.append(well[indexes].to(self.device))
+
+        if seismic is not None:
+            tensors_to_concat.append(seismic[indexes].to(self.device))
+
+        if len(tensors_to_concat) > 1:
+            z = self.concatenate_tensors(tensors_to_concat)
 
         return self.generate_padding(z, value=0)
 
@@ -684,6 +679,30 @@ class TorchFaciesGAN(
         """
         return obj.to(device or self.device)
 
+    def update_discriminator_weights(
+        self,
+        scale: int,
+        optimizer: torch.optim.Optimizer,
+        loss: torch.Tensor,
+        gradients: Any | None,
+    ) -> None:
+        """Perform standard PyTorch optimization step."""
+        optimizer.zero_grad()
+        torch.autograd.backward(loss)
+        optimizer.step()
+
+    def update_generator_weights(
+        self,
+        scale: int,
+        optimizer: torch.optim.Optimizer,
+        loss: torch.Tensor,
+        gradients: Any | None,
+    ) -> None:
+        """Perform standard PyTorch optimization step."""
+        optimizer.zero_grad()
+        torch.autograd.backward(loss)
+        optimizer.step()
+
     def save_discriminator_state(self, scale_path: str, scale: int) -> None:
         """Save discriminator state dict for `scale` to `scale_path` if present.
 
@@ -716,25 +735,3 @@ class TorchFaciesGAN(
         if scale < len(self.shapes):
             shape_path = os.path.join(scale_path, SHAPE_FILE)
             torch.save(self.shapes[scale], shape_path)
-
-    def update_discriminator_weights(
-        self,
-        scale: int,
-        loss: torch.Tensor,
-        gradients: Any | None,
-    ) -> dict[str, Any] | None:
-        """Perform standard PyTorch optimization step."""
-        self.discriminator_optimizers[scale].zero_grad()
-        torch.autograd.backward(loss)
-        self.discriminator_optimizers[scale].step()
-
-    def update_generator_weights(
-        self,
-        scale: int,
-        loss: torch.Tensor,
-        gradients: Any | None,
-    ) -> dict[str, Any] | None:
-        """Perform standard PyTorch optimization step."""
-        self.generator_optimizers[scale].zero_grad()
-        torch.autograd.backward(loss)
-        self.generator_optimizers[scale].step()

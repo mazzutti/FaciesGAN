@@ -132,6 +132,33 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self.model = self.create_model()
         self.model.shapes = list(self.scales)
 
+        # generator learning rate
+        self.lr_g = options.lr_g
+
+        # discriminator learning rate
+        self.lr_d = options.lr_d
+
+        # discriminator learning rate
+        self.beta1 = options.beta1
+
+        # learning rate decay milestone
+        self.lr_decay = options.lr_decay
+
+        # learning rate gamma
+        self.gamma = options.gamma
+
+        # generator optimizers
+        self.generator_optimizers: dict[int, TOptimizer] = {}
+
+        # discriminator optimizers
+        self.discriminator_optimizers: dict[int, TOptimizer] = {}
+
+        # generator schedulers
+        self.generator_schedulers: dict[int, TScheduler] = {}
+
+        # discriminator schedulers
+        self.discriminator_schedulers: dict[int, TScheduler] = {}
+
         print("Generated facie shapes:")
         print("╔══════════╦══════════╦══════════╦══════════╗")
         print(
@@ -311,6 +338,22 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         """
         raise NotImplementedError("Subclasses must implement create_batch_iterator")
 
+    @abstractmethod
+    def setup_optimizers(self, scales: tuple[int, ...]) -> None:
+        """Setup optimizers and schedulers for all scales.
+
+        Parameters
+        ----------
+        scales : tuple[int, ...]
+            Tuple of scale indices to setup optimizers for.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not implement this method.
+        """
+        raise NotImplementedError("Subclasses must implement setup_optimizers")
+
     def train_scales(
         self,
         scales: tuple[int, ...],
@@ -468,6 +511,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         return cast(
             ScaleMetrics[TTensor],
             self.model(
+                self.generator_optimizers,
+                self.discriminator_optimizers,
                 indexes,
                 facies_pyramid,
                 rec_in_pyramid,
@@ -699,8 +744,27 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 )
 
         # Step schedulers
-        self.model.schedulers_step(scales)
+        self.schedulers_step(scales)
         progress.update(1)
+
+    def schedulers_step(
+        self,
+        scales: tuple[int, ...],
+    ) -> None:
+        """Step the learning-rate schedulers for the provided scales.
+
+        Parameters
+        ----------
+        generator_schedulers : dict[int, LRScheduler]
+            Generator learning-rate schedulers per scale.
+        discriminator_schedulers : dict[int, LRScheduler]
+            Discriminator learning-rate schedulers per scale.
+        scales : tuple[int, ...]
+            Tuple of scale indices to step the schedulers for.
+        """
+        for scale in scales:
+            self.generator_schedulers[scale].step()
+            self.discriminator_schedulers[scale].step()
 
     def train(self) -> None:
         """Train the FaciesGAN model with parallel scale training.
@@ -728,9 +792,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             # Initialize all scales in the group
             self.model.init_scales(scale, num_scales_in_group)
 
-            # Invalidate compiled optimization step for MLX when active scales change
-            if hasattr(self, "invalidate_compiled_optimization_step"):
-                self.invalidate_compiled_optimization_step()  # type: ignore
+            # Setup optimizers for active scales
+            self.setup_optimizers(scales_to_train)
 
             # Create directories for all scales (use dict to map scale -> path)
             scale_paths: dict[int, str] = {

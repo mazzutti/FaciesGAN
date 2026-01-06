@@ -184,5 +184,4 @@ class ScaleMetrics[TTensor]:
 IterableMetrics = tuple[
     dict[int, list[tuple[TTensor, ...]]],
     dict[int, list[dict[str, Any]]],
-    dict[int, list[dict[str, Any]]],
 ]

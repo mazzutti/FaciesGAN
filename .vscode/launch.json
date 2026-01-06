@@ -24,9 +24,9 @@
         "--num-workers",
         "0",
         "--num-iter",
-        "100",
+        "1000",
         "--num-parallel-scales",
-        "3",
+        "7",
         "--discriminator-steps",
         "3",
         "--generator-steps",
@@ -42,8 +42,8 @@
         "--no-tensorboard",
         "--use-wells",
         "--use-seismic",
-        "--use-mlx",
-        "--compile-backend"
+        // "--use-mlx",
+        // "--compile-backend"
         // "--use-profiler"
       ]
     }

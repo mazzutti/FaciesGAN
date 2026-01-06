@@ -178,7 +178,7 @@ class MLXTrainer(
         Returns
         -------
         mx.array
-            The upsampled previous reconstruction (``prev_rec``) matching
+            The upsampled previous reconstruction (``rec_input``) matching
             ``real_facies`` spatial shape.
 
         Side effects
@@ -191,7 +191,7 @@ class MLXTrainer(
         # with mx.stream(self.gpu_stream):
         real_facies = facies_pyramid[scale]
         if scale == 0:
-            prev_rec = mx.zeros_like(real_facies)
+            rec_input = mx.zeros_like(real_facies)
             if len(self.model.rec_noise) <= scale:
                 z_rec = mlx_utils.generate_noise(
                     (*real_facies.shape[1:3], self.noise_channels),
@@ -215,7 +215,7 @@ class MLXTrainer(
         else:
             # Interpolate previous scale facies
             tensor = facies_pyramid[scale - 1][indexes]
-            prev_rec = mlx_utils.interpolate(
+            rec_input = mlx_utils.interpolate(
                 tensor,
                 real_facies.shape[1:3],
             )
@@ -262,7 +262,7 @@ class MLXTrainer(
                 else:
                     self.model.noise_amps.append(amp)
 
-        return prev_rec
+        return rec_input
 
     def init_dataset(
         self,
@@ -434,6 +434,8 @@ class MLXTrainer(
             to_eval = cast(
                 tuple[IterableMetrics[mx.array], ...],
                 self.model(
+                    self.generator_optimizers,
+                    self.discriminator_optimizers,
                     indexes,
                     facies_pyramid,
                     rec_in_pyramid,
@@ -445,7 +447,7 @@ class MLXTrainer(
         disc_results, gen_results = to_eval
 
         # Evaluate all lazy computations
-        mx.eval(*to_eval)  # type: ignore
+        mx.eval(*disc_results, *gen_results)  # type: ignore
 
         # Vectorized metric aggregation using vmap-like stacking
         def aggregate_metrics_vectorized(
@@ -485,7 +487,21 @@ class MLXTrainer(
 
         from functools import partial
 
-        @partial(mx.compile, inputs=[self.model], outputs=[self.model])  # type: ignore
+        state: list[
+            FaciesGAN[
+                mx.array,
+                nn.Module,
+                optim.Optimizer,
+                MultiStepLR,
+            ]
+            | dict[int, optim.Optimizer]
+        ] = [
+            self.model,
+            self.generator_optimizers,
+            self.discriminator_optimizers,
+        ]
+
+        @partial(mx.compile, inputs=state, outputs=state)  # type: ignore
         def _optimization_step(
             indexes: list[int],
             facies_pyramid: dict[int, mx.array],
@@ -497,6 +513,8 @@ class MLXTrainer(
             return cast(
                 tuple[IterableMetrics[mx.array], ...],
                 self.model(
+                    self.generator_optimizers,
+                    self.discriminator_optimizers,
                     indexes,
                     facies_pyramid,
                     rec_in_pyramid,
@@ -507,6 +525,52 @@ class MLXTrainer(
             )
 
         self._compiled_optimization_step = cast(OptimzationStep, _optimization_step)
+
+    def setup_optimizers(self, scales: tuple[int, ...]) -> None:
+        """Setup optimizers and schedulers on the model.
+
+        Parameters
+        ----------
+        scales : tuple[int, ...]
+            Tuple of scale indices to setup optimizers for.
+        """
+
+        generators = self.model.generator.gens
+        discriminators = self.model.discriminator.discs
+
+        for scale in scales:
+
+            self.generator_optimizers[scale] = optim.Adam(
+                learning_rate=self.lr_g,
+                betas=[self.beta1, 0.999],
+            )
+            self.generator_optimizers[scale].init(  # type: ignore
+                generators[scale].parameters()
+            )
+
+            self.generator_schedulers[scale] = MultiStepLR(
+                init_lr=self.lr_g,
+                milestones=[self.lr_decay],
+                gamma=self.gamma,
+                optimizer=self.generator_optimizers[scale],
+            )
+
+            self.discriminator_optimizers[scale] = optim.Adam(
+                learning_rate=self.lr_d,
+                betas=[self.beta1, 0.999],
+            )
+            self.discriminator_optimizers[scale].init(  # type: ignore
+                discriminators[scale].parameters()
+            )
+            self.discriminator_schedulers[scale] = MultiStepLR(
+                init_lr=self.lr_d,
+                milestones=[self.lr_decay],
+                gamma=self.gamma,
+                optimizer=self.discriminator_optimizers[scale],
+            )
+
+            # Invalidate compiled step on optimizer change
+            self._compiled_optimization_step = None
 
     def save_generated_facies(
         self,

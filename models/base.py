@@ -144,33 +144,6 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         # active scales set
         self.active_scales: set[int] = set()
 
-        # generator learning rate
-        self.lr_g = options.lr_g
-
-        # discriminator learning rate
-        self.lr_d = options.lr_d
-
-        # discriminator learning rate
-        self.beta1 = options.beta1
-
-        # learning rate decay milestone
-        self.lr_decay = options.lr_decay
-
-        # learning rate gamma
-        self.gamma = options.gamma
-
-        # generator optimizers
-        self.generator_optimizers: dict[int, TOptimizer] = {}
-
-        # discriminator optimizers
-        self.discriminator_optimizers: dict[int, TOptimizer] = {}
-
-        # generator schedulers
-        self.generator_schedulers: dict[int, TScheduler] = {}
-
-        # discriminator schedulers
-        self.discriminator_schedulers: dict[int, TScheduler] = {}
-
     @abstractmethod
     def __call__(
         self, *args: Any, **kwds: Any
@@ -724,8 +697,8 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
 
     @abstractmethod
     def update_discriminator_weights(
-        self, scale: int, loss: TTensor, gradients: Any | None
-    ) -> dict[str, Any] | None:
+        self, scale: int, optimizer: TOptimizer, loss: TTensor, gradients: Any | None
+    ) -> None:
         """Update discriminator weights using the provided optimizer and loss/gradients.
 
         This method encapsulates framework-specific optimization steps (e.g.,
@@ -736,17 +709,17 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         ----------
         scale : int
             Scale index.
+        optimizer : TOptimizer
+            Optimizer instance for the discriminator at the given scale.
         loss : TTensor
             Total loss tensor.
         gradients : Any | None
             Computed gradients (if applicable, e.g. MLX).
 
-        Returns
-        -------
-        dict[str, Any] | None
-            Dictionary mapping scale indices to updated state elements for
-            lazy evaluation (for frameworks like MLX), or None (for eager
-            frameworks like PyTorch).
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
         """
         raise NotImplementedError(
             "Subclasses must implement update_discriminator_weights"
@@ -754,31 +727,33 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
 
     @abstractmethod
     def update_generator_weights(
-        self, scale: int, loss: TTensor, gradients: Any | None
-    ) -> dict[str, Any] | None:
+        self, scale: int, optimizer: TOptimizer, loss: TTensor, gradients: Any | None
+    ) -> None:
         """Update generator weights using the provided optimizer and loss/gradients.
 
         Parameters
         ----------
         scale : int
             Scale index.
+        optimizer : TOptimizer
+            Generator optimizer for the current scale.
         loss : TTensor
             Total loss tensor.
         gradients : Any | None
             Computed gradients (if applicable, e.g. MLX).
 
-        Returns
-        -------
-        dict[str, Any] | None
-            Dictionary mapping scale indices to updated state elements for
-            lazy evaluation (for frameworks like MLX), or None (for eager
-            frameworks like PyTorch).
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
         """
         raise NotImplementedError("Subclasses must implement update_generator_weights")
 
     @abstractmethod
     def forward(
         self,
+        generator_optimizers: dict[int, TOptimizer],
+        discriminator_optimizers: dict[int, TOptimizer],
         indexes: list[int],
         facies_pyramid: dict[int, TTensor],
         rec_in_pyramid: dict[int, TTensor],
@@ -792,6 +767,10 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         ----------
         indexes : tuple[int, ...]
             Tuple of batch/sample indices used to generate noise.
+        generator_optimizers : dict[int, TOptimizer]
+            Dictionary mapping scale indices to optimizers for generator.
+        discriminator_optimizers : dict[int, TOptimizer]
+            Dictionary mapping scale indices to optimizers for discriminator.
         facies_pyramid : dict[int, TTensor]
             Dictionary mapping scale indices to ground-truth tensors.
         rec_in_pyramid : dict[int, TTensor]
@@ -1224,6 +1203,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
     def optimize_discriminator(
         self,
         indexes: list[int],
+        optimizers: dict[int, TOptimizer],
         facies_pyramid: dict[int, TTensor],
         wells_pyramid: dict[int, TTensor] = {},
         seismic_pyramid: dict[int, TTensor] = {},
@@ -1240,6 +1220,8 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         ----------
         indexes : list[int]
             List of batch/sample indices used to generate noise.
+        optimizers : dict[int, TOptimizer]
+            Dictionary mapping scale indices to discriminator optimizers.
         facies_pyramid : dict[int, TTensor]
             Dictionary mapping scale indices to real tensor samples.
         wells_pyramid : dict[int, TTensor]
@@ -1274,6 +1256,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
                 # Delegate the optimization step to subclass
                 updates = self.update_discriminator_weights(
                     scale,
+                    optimizers[scale],
                     metrics.total,
                     gradients,
                 )
@@ -1288,6 +1271,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
     def optimize_generator(
         self,
         indexes: list[int],
+        optimizers: dict[int, TOptimizer],
         facies_pyramid: dict[int, TTensor],
         rec_in_pyramid: dict[int, TTensor],
         wells_pyramid: dict[int, TTensor] = {},
@@ -1306,6 +1290,8 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         ----------
         indexes : list[int]
             List of batch/sample indices used to generate noise.
+        optimizers : dict[int, TOptimizer]
+            Dictionary mapping scale indices to generator optimizers.
         facies_pyramid : dict[int, TTensor]
             Dictionary mapping scale indices to real tensor samples.
         rec_in_pyramid : dict[int, TTensor]
@@ -1361,6 +1347,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
                 # Delegate the optimization step to subclass
                 updates = self.update_generator_weights(
                     scale,
+                    optimizers[scale],
                     metrics.total,
                     gradients,
                 )
@@ -1415,25 +1402,6 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         # Save amplitude and shape via subclass hooks (formats chosen by subclass)
         self.save_amp(path, scale)
         self.save_shape(path, scale)
-
-    def schedulers_step(
-        self,
-        scales: tuple[int, ...],
-    ) -> None:
-        """Step the learning-rate schedulers for the provided scales.
-
-        Parameters
-        ----------
-        generator_schedulers : dict[int, LRScheduler]
-            Generator learning-rate schedulers per scale.
-        discriminator_schedulers : dict[int, LRScheduler]
-            Discriminator learning-rate schedulers per scale.
-        scales : tuple[int, ...]
-            Tuple of scale indices to step the schedulers for.
-        """
-        for scale in scales:
-            self.generator_schedulers[scale].step()
-            self.discriminator_schedulers[scale].step()
 
     def setup_framework(self) -> None:
         """Create framework-specific objects and assign them to the instance.
