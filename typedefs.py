@@ -19,10 +19,10 @@ T = TypeVar("T")
 TTensor = TypeVar("TTensor", torch.Tensor, mlx_core.array, np.ndarray)
 
 PyramidsBatch = tuple[
-    tuple[TTensor, ...],
-    tuple[TTensor, ...],
-    tuple[TTensor, ...],
-    tuple[TTensor, ...],
+    dict[int, TTensor],
+    dict[int, TTensor],
+    dict[int, TTensor],
+    dict[int, TTensor],
 ]
 
 

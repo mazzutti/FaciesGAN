@@ -73,33 +73,33 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
         """Perform batch preparation logic identical to the old prepare_scale_batch."""
         facies, wells, seismic = batch
 
-        # Build per-scale pyramids using tuple comprehensions. This avoids
-        # creating intermediate dicts or mutating empty tuples by index.
-        facies_pyramid: tuple[torch.Tensor, ...] = tuple(
-            utils.to_device(facies[scale], self.device, channels_last=True)
+        # Build per-scale pyramids as dictionaries indexed by scale number
+        facies_pyramid: dict[int, torch.Tensor] = {
+            scale: utils.to_device(facies[scale], self.device, channels_last=True)
             for scale in self.scales
-        )
+        }
 
         if len(wells) > 0:
-            wells_pyramid: tuple[torch.Tensor, ...] = tuple(
-                utils.to_device(wells[scale], self.device, channels_last=True)
+            wells_pyramid: dict[int, torch.Tensor] = {
+                scale: utils.to_device(wells[scale], self.device, channels_last=True)
                 for scale in self.scales
-            )
+            }
             # Masks are computed from the device-resident well tensors
-            masks_pyramid: tuple[torch.Tensor, ...] = tuple(
-                (w.abs().sum(dim=1, keepdim=True) > 0).int() for w in wells_pyramid
-            )
+            masks_pyramid: dict[int, torch.Tensor] = {
+                scale: (w.abs().sum(dim=1, keepdim=True) > 0).int()
+                for scale, w in wells_pyramid.items()
+            }
         else:
-            wells_pyramid = ()
-            masks_pyramid = ()
+            wells_pyramid = {}
+            masks_pyramid = {}
 
         if len(seismic) > 0:
-            seismic_pyramid: tuple[torch.Tensor, ...] = tuple(
-                utils.to_device(seismic[scale], self.device, channels_last=True)
+            seismic_pyramid: dict[int, torch.Tensor] = {
+                scale: utils.to_device(seismic[scale], self.device, channels_last=True)
                 for scale in self.scales
-            )
+            }
         else:
-            seismic_pyramid = ()
+            seismic_pyramid = {}
 
         return (facies_pyramid, wells_pyramid, masks_pyramid, seismic_pyramid)
 

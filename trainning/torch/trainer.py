@@ -139,8 +139,8 @@ class TorchTrainer(
         self,
         scales: tuple[int, ...],
         indexes: list[int],
-        wells_pyramid: tuple[torch.Tensor, ...],
-        seismic_pyramid: tuple[torch.Tensor, ...],
+        wells_pyramid: dict[int, torch.Tensor] = {},
+        seismic_pyramid: dict[int, torch.Tensor] = {},
     ) -> tuple[torch.Tensor, ...]:
         """Generate fixed samples for visualization at specified scales.
 
@@ -150,10 +150,10 @@ class TorchTrainer(
             Tuple of scale indices to generate samples for.
         indexes : tuple[int, ...]
             Tuple of batch sample indices.
-        wells_pyramid : tuple[torch.Tensor, ...]
-            Tuple of well-conditioning tensors per scale.
-        seismic_pyramid : tuple[torch.Tensor, ...]
-            Tuple of seismic-conditioning tensors per scale.
+        wells_pyramid : dict[int, torch.Tensor], optional
+            Dictionary of well-conditioning tensors per scale.
+        seismic_pyramid : dict[int, torch.Tensor], optional
+            Dictionary of seismic-conditioning tensors per scale.
 
         Returns
         -------
@@ -178,9 +178,9 @@ class TorchTrainer(
         self,
         scale: int,
         indexes: list[int],
-        facies_pyramid: tuple[torch.Tensor, ...],
-        wells_pyramid: tuple[torch.Tensor, ...] = (),
-        seismic_pyramid: tuple[torch.Tensor, ...] = (),
+        facies_pyramid: dict[int, torch.Tensor],
+        wells_pyramid: dict[int, torch.Tensor] = {},
+        seismic_pyramid: dict[int, torch.Tensor] = {},
     ) -> torch.Tensor:
         """Initialize and append reconstruction noise for a specific scale.
 
@@ -196,12 +196,12 @@ class TorchTrainer(
             Current pyramid scale index.
         indexes : list[int]
             List of batch sample indices.
-        facies_pyramid : tuple[torch.Tensor, ...]
-            Tuple of real facies data for all scales.
-        wells_pyramid : tuple[torch.Tensor, ...] | None, optional
-            Tuple of well-conditioning tensors per scale.
-        seismic_pyramid : tuple[torch.Tensor, ...] | None, optional
-            Tuple of seismic-conditioning tensors per scale.
+        facies_pyramid : dict[int, torch.Tensor]
+            Dictionary of real facies data for all scales.
+        wells_pyramid : dict[int, torch.Tensor], optional
+            Dictionary of well-conditioning tensors per scale.
+        seismic_pyramid : dict[int, torch.Tensor], optional
+            Dictionary of seismic-conditioning tensors per scale.
 
         Returns
         -------
@@ -219,25 +219,26 @@ class TorchTrainer(
         real = facies_pyramid[scale]
         if scale == 0:
             prev_rec = torch.zeros_like(real)
-            z_rec = torch_utils.generate_noise(
-                (self.noise_channels, *real.shape[2:]),
-                device=self.device,
-                num_samp=self.batch_size,
-            )
-            z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
-            self.model.rec_noise.append(z_rec)
-
-            # Calculate noise amplitude for scale 0
-            with torch.no_grad():
-                fake = self.model.generator(
-                    self.model.get_pyramid_noise(scale, indexes),
-                    [1.0] * (scale + 1),
-                    stop_scale=scale,
+            if len(self.model.rec_noise) < scale + 1:
+                z_rec = torch_utils.generate_noise(
+                    (self.noise_channels, *real.shape[2:]),
+                    device=self.device,
+                    num_samp=self.batch_size,
                 )
+                z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
+                self.model.rec_noise.append(z_rec)
 
-            rmse = torch.sqrt(F.mse_loss(fake, real))
-            amp = self.scale0_noise_amp * rmse.item()
-            self.model.noise_amps.append(amp)
+                # Calculate noise amplitude for scale 0
+                with torch.no_grad():
+                    fake = self.model.generator(
+                        self.model.get_pyramid_noise(scale, indexes),
+                        [1.0] * (scale + 1),
+                        stop_scale=scale,
+                    )
+
+                rmse = torch.sqrt(F.mse_loss(fake, real))
+                amp = self.scale0_noise_amp * rmse.item()
+                self.model.noise_amps.append(amp)
 
         else:
             # For higher scales, upsample previous facies to current resolution
@@ -245,73 +246,76 @@ class TorchTrainer(
                 facies_pyramid[scale - 1][indexes], real.shape[2:]
             ).to(self.device)
 
-            # noise channel sizing for higher scales (empirical split)
-            if len(wells_pyramid) == 0 and len(seismic_pyramid) == 0:
-                if len(seismic_pyramid) == 0:
-                    z_rec = torch_utils.generate_noise(
-                        (
-                            self.noise_channels,
-                            *real.shape[2:],
-                        ),
-                        device=self.device,
-                        num_samp=self.batch_size,
-                    )
+            if len(self.model.rec_noise) < scale + 1:
+                # noise channel sizing for higher scales (empirical split)
+                if len(wells_pyramid) == 0 and len(seismic_pyramid) == 0:
+                    if len(seismic_pyramid) == 0:
+                        z_rec = torch_utils.generate_noise(
+                            (
+                                self.noise_channels,
+                                *real.shape[2:],
+                            ),
+                            device=self.device,
+                            num_samp=self.batch_size,
+                        )
+                    else:
+                        z_rec = torch_utils.generate_noise(
+                            (
+                                self.noise_channels - self.num_img_channels,
+                                *real.shape[2:],
+                            ),
+                            device=self.device,
+                            num_samp=self.batch_size,
+                        )
+                        z_rec = torch.cat([z_rec, seismic_pyramid[scale]], dim=1)
                 else:
-                    z_rec = torch_utils.generate_noise(
-                        (
-                            self.noise_channels - self.num_img_channels,
-                            *real.shape[2:],
+                    if len(wells_pyramid) == 0:
+                        z_rec = torch_utils.generate_noise(
+                            (
+                                self.noise_channels - self.num_img_channels,
+                                *real.shape[2:],
+                            ),
+                            device=self.device,
+                            num_samp=self.batch_size,
+                        )
+                        z_rec = torch.cat([z_rec, wells_pyramid[scale]], dim=1)
+                    else:
+                        z_rec = torch_utils.generate_noise(
+                            (
+                                self.noise_channels - 2 * self.num_img_channels,
+                                *real.shape[2:],
+                            ),
+                            device=self.device,
+                            num_samp=self.batch_size,
+                        )
+                        z_rec = torch.cat(
+                            [z_rec, wells_pyramid[scale], seismic_pyramid[scale]], dim=1
+                        )
+                z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
+                self.model.rec_noise.append(z_rec)
+
+                # Calculate noise amplitude based on reconstruction error
+                with torch.no_grad():
+                    fake = self.model.generator(
+                        self.model.get_pyramid_noise(
+                            scale,
+                            indexes,
+                            wells_pyramid,
+                            seismic_pyramid,
                         ),
-                        device=self.device,
-                        num_samp=self.batch_size,
+                        self.model.noise_amps + [1.0],
+                        stop_scale=scale,
                     )
-                    z_rec = torch.cat([z_rec, seismic_pyramid[scale]], dim=1)
-            else:
-                if wells_pyramid == ():
-                    z_rec = torch_utils.generate_noise(
-                        (
-                            self.noise_channels - self.num_img_channels,
-                            *real.shape[2:],
-                        ),
-                        device=self.device,
-                        num_samp=self.batch_size,
-                    )
-                    z_rec = torch.cat([z_rec, wells_pyramid[scale]], dim=1)
+
+                rmse = torch.sqrt(F.mse_loss(fake, real))
+                amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
+
+                if scale < len(self.model.noise_amps):
+                    self.model.noise_amps[scale] = (
+                        amp + self.model.noise_amps[scale]
+                    ) / 2
                 else:
-                    z_rec = torch_utils.generate_noise(
-                        (
-                            self.noise_channels - 2 * self.num_img_channels,
-                            *real.shape[2:],
-                        ),
-                        device=self.device,
-                        num_samp=self.batch_size,
-                    )
-                    z_rec = torch.cat(
-                        [z_rec, wells_pyramid[scale], seismic_pyramid[scale]], dim=1
-                    )
-            z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
-            self.model.rec_noise.append(z_rec)
-
-            # Calculate noise amplitude based on reconstruction error
-            with torch.no_grad():
-                fake = self.model.generator(
-                    self.model.get_pyramid_noise(
-                        scale,
-                        indexes,
-                        wells_pyramid,
-                        seismic_pyramid,
-                    ),
-                    self.model.noise_amps + [1.0],
-                    stop_scale=scale,
-                )
-
-            rmse = torch.sqrt(F.mse_loss(fake, real))
-            amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
-
-            if scale < len(self.model.noise_amps):
-                self.model.noise_amps[scale] = (amp + self.model.noise_amps[scale]) / 2
-            else:
-                self.model.noise_amps.append(amp)
+                    self.model.noise_amps.append(amp)
 
         return prev_rec
 
@@ -434,9 +438,9 @@ class TorchTrainer(
         epoch: int,
         results_path: str,
         real_facies: torch.Tensor,
-        wells_pyramid: tuple[torch.Tensor, ...] = (),
-        masks_pyramid: tuple[torch.Tensor, ...] = (),
-        seismic_pyramid: tuple[torch.Tensor, ...] = (),
+        wells_pyramid: dict[int, torch.Tensor] = {},
+        masks_pyramid: dict[int, torch.Tensor] = {},
+        seismic_pyramid: dict[int, torch.Tensor] = {},
     ) -> None:
         """Save generated facies visualizations to disk asynchronously.
 
@@ -455,12 +459,12 @@ class TorchTrainer(
             Base path where results are saved.
         real_facies : torch.Tensor
             Tensor of real facies samples at the current scale.
-        wells_pyramid : tuple[torch.Tensor, ...]
-            Tuple of well-conditioning tensors per scale.
+        wells_pyramid : dict[int, torch.Tensor]
+            Dictionary of well-conditioning tensors per scale.
         masks_pyramid : tuple[torch.Tensor, ...]
             Tuple of mask tensors per scale.
-        seismic_pyramid : tuple[torch.Tensor, ...]
-            Tuple of seismic-conditioning tensors per scale.
+        seismic_pyramid : dict[int, torch.Tensor]
+            Dictionary of seismic-conditioning tensors per scale.
         """
         if self.enable_plot_facies:
             indexes = torch.randint(self.batch_size, (self.num_real_facies,))

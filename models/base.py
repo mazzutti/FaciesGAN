@@ -1,7 +1,7 @@
 import math
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Generic
+from typing import Any, Generic, cast
 
 from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
 from trainning.metrics import (
@@ -336,8 +336,8 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         scale: int,
         real: TTensor,
         rec_in: TTensor,
-        wells_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
+        wells_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> TTensor:
         """Return reconstruction loss tensor for the provided inputs.
 
@@ -351,10 +351,10 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             Real tensor samples for the current scale.
         rec_in : TTensor
             Input tensor for reconstruction at the current scale.
-        wells_pyramid : tuple[TTensor, ...], optional
-            Well-conditioning tensor tuple for the current scale.
-        seismic_pyramid : tuple[TTensor, ...], optional
-            Seismic-conditioning tensor tuple for the current scale.
+        wells_pyramid : dict[int, TTensor], optional
+            Well-conditioning tensor dictionary for the current scale.
+        seismic_pyramid : dict[int, TTensor], optional
+            Seismic-conditioning tensor dictionary for the current scale.
         Returns
         -------
         TTensor
@@ -643,9 +643,12 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         indexes: list[int],
         scale: int,
         real: TTensor,
-        wells_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
-    ) -> tuple[DiscriminatorMetrics[TTensor], dict[str, Any] | None]:
+        wells_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
+    ) -> tuple[
+        DiscriminatorMetrics[TTensor] | IterableMetrics[TTensor],
+        dict[str, Any] | None,
+    ]:
         """Compute discriminator losses and gradient penalty for a scale.
 
         Parameters
@@ -656,13 +659,13 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             Pyramid scale index for which to compute the metrics.
         real (TTensor):
             Ground-truth tensor for the current scale.
-        wells_pyramid (tuple[TTensor, ...]):
-            Wells tensors tuple for conditioning, keyed by scale.
-        seismic_pyramid (tuple[TTensor, ...]):
-            Seismic tensors tuple for conditioning, keyed by scale.
+        wells_pyramid (dict[int, TTensor]):
+            Wells tensors dictionary for conditioning, keyed by scale.
+        seismic_pyramid (dict[int, TTensor]):
+            Seismic tensors dictionary for conditioning, keyed by scale.
         Returns
         -------
-        tuple[DiscriminatorMetrics[TTensor], dict[str, Any] | None]:
+        tuple[DiscriminatorMetrics[TTensor] | IterableMetrics[TTensor], dict[str, Any] | None]:
             Container with total, real, fake and gp losses, and optional gradients dict.
 
         Raises
@@ -680,11 +683,14 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         indexes: list[int],
         scale: int,
         real: TTensor,
-        rec_in: TTensor,
-        wells_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
-        mask: TTensor | None = None,
-    ) -> tuple[GeneratorMetrics[TTensor], dict[str, Any] | None]:
+        rec_in_pyramid: dict[int, TTensor],
+        wells_pyramid: dict[int, TTensor] = {},
+        masks_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
+    ) -> tuple[
+        GeneratorMetrics[TTensor] | IterableMetrics[TTensor],
+        dict[str, Any] | None,
+    ]:
         """Common generator-metrics flow shared by frameworks.
 
         Parameters
@@ -695,20 +701,18 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             Pyramid scale index for which to compute the metrics.
         real (TTensor):
             Ground-truth tensor for the current scale.
-        rec_in (TTensor):
-            Reconstruction input tensor for the current scale.
-        wells_pyramid (tuple[TTensor, ...]):
+        rec_in_pyramid (dict[int, TTensor]):
+            Reconstruction input tensors for the current scale.
+        wells_pyramid (dict[int, TTensor]):
             Well log tensors for conditioning, keyed by scale.
-        seismic_pyramid (tuple[TTensor, ...]):
+        masks_pyramid (dict[int, TTensor]):
+            Well/mask tensors for conditioning, keyed by scale.
+        seismic_pyramid (dict[int, TTensor]):
             Seismic volume tensors for conditioning, keyed by scale.
-        mask (TTensor | None):
-            Well/mask tensor for conditioning.
 
         Returns
         -------
-        tuple[
-            GeneratorMetrics[TTensor], dict[str, Any] | None
-        ]:
+        GeneratorMetrics[TTensor] | IterableMetrics[TTensor]:
             Container with total, fake, rec, well and div losses, and optional gradients list.
 
         Raises
@@ -776,11 +780,11 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
     def forward(
         self,
         indexes: list[int],
-        facies_pyramid: tuple[TTensor, ...],
-        rec_in_pyramid: tuple[TTensor, ...],
-        wells_pyramid: tuple[TTensor, ...] = (),
-        masks_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
+        facies_pyramid: dict[int, TTensor],
+        rec_in_pyramid: dict[int, TTensor],
+        wells_pyramid: dict[int, TTensor] = {},
+        masks_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> ScaleMetrics[TTensor] | tuple[IterableMetrics[TTensor], ...]:
         """Perform a forward pass for both discriminator and generator.
 
@@ -788,16 +792,16 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         ----------
         indexes : tuple[int, ...]
             Tuple of batch/sample indices used to generate noise.
-        facies_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to ground-truth tensors.
-        rec_in_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to reconstruction inputs.
-        wells_pyramid : tuple[TTensor, ...], optional
-            Tuple mapping scale indices to well-conditioning tensors.
-        masks_pyramid : tuple[TTensor, ...], optional
-            Tuple mapping scale indices to well/mask tensors.
-        seismic_pyramid : tuple[TTensor, ...], optional
-            Tuple mapping scale indices to seismic-conditioning tensors.
+        facies_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to ground-truth tensors.
+        rec_in_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to reconstruction inputs.
+        wells_pyramid : dict[int, TTensor], optional
+            Dictionary mapping scale indices to well-conditioning tensors.
+        masks_pyramid : dict[int, TTensor], optional
+            Dictionary mapping scale indices to well/mask tensors.
+        seismic_pyramid : dict[int, TTensor], optional
+            Dictionary mapping scale indices to seismic-conditioning tensors.
         Returns
         -------
         ScaleMetrics[TTensor]
@@ -814,8 +818,8 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         self,
         indexes: list[int],
         scale: int,
-        wells_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
+        wells_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> list[TTensor]:
         """Generate multiple candidate outputs for `scale` using current generator.
 
@@ -829,10 +833,10 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             Tuple of batch/sample indices used to generate noise.
         scale : int
             Pyramid scale index for which to generate samples.
-        wells_pyramid : tuple[TTensor, ...], optional
-            Tuple mapping scale indices to well-conditioning tensors for the current scale.
-        seismic_pyramid : tuple[TTensor, ...], optional
-            Tuple mapping scale indices to seismic-conditioning tensors for the current scale.
+        wells_pyramid : dict[int, TTensor], optional
+            Dictionary mapping scale indices to well-conditioning tensors for the current scale.
+        seismic_pyramid : dict[int, TTensor], optional
+            Dictionary mapping scale indices to seismic-conditioning tensors for the current scale.
 
         Returns
         -------
@@ -852,8 +856,8 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         self,
         scale: int,
         indexes: list[int],
-        wells_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
+        wells_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
         rec: bool = False,
     ) -> list[TTensor]:
         """Generate noise tensors up to a specific pyramid scale (generic).
@@ -868,10 +872,10 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             Batch/sample indices used to generate noise.
         scale : int
             Pyramid scale index up to which to generate noise tensors.
-        wells_pyramid : tuple[TTensor, ...], optional
-            Tuple mapping scale indices to well-conditioning tensors for the current scale.
-        seismic_pyramid : tuple[TTensor, ...], optional
-            Tuple mapping scale indices to seismic-conditioning tensors for the current scale.
+        wells_pyramid : dict[int, TTensor], optional
+            Dictionary mapping scale indices to well-conditioning tensors for the current scale.
+        seismic_pyramid : dict[int, TTensor], optional
+            Dictionary mapping scale indices to seismic-conditioning tensors for the current scale.
         rec : bool, optional
             If True, return stored reconstruction noise instead of new noise.
             (default is False).
@@ -894,6 +898,24 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         ]
 
     def get_noise_aplitude(self, scale: int) -> list[float]:
+        """Return noise amplitude list up to a given scale (generic).
+        If noise amps have not been computed, return list of 1.0s.
+
+        Parameters
+        ----------
+        scale : int
+            Pyramid scale index up to which to return amplitudes.
+
+        Returns
+        -------
+        list[float]
+            List of noise amplitudes.
+        """
+        return (
+            self.noise_amps[: scale + 1]
+            if hasattr(self, "noise_amps") and len(self.noise_amps) > 0
+            else [1.0] * (scale + 1)
+        )
         """Return noise amplitude for a given scale.
 
         Parameters
@@ -1202,9 +1224,9 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
     def optimize_discriminator(
         self,
         indexes: list[int],
-        facies_pyramid: tuple[TTensor, ...],
-        wells_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
+        facies_pyramid: dict[int, TTensor],
+        wells_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> tuple[DiscriminatorMetrics[TTensor], ...] | IterableMetrics[TTensor]:
         """Framework-agnostic discriminator optimization orchestration.
 
@@ -1218,15 +1240,15 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         ----------
         indexes : list[int]
             List of batch/sample indices used to generate noise.
-        facies_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to real tensor samples.
-        wells_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to well-conditioning tensors.
-        seismic_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to seismic-conditioning tensors.
+        facies_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to real tensor samples.
+        wells_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to well-conditioning tensors.
+        seismic_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to seismic-conditioning tensors.
         Returns
         -------
-        tuple[DiscriminatorMetrics[TTensor], ...] | IterableMetrics[TTensor]
+        tuple[DiscriminatorMetrics[TTensor], ...] | IterableMetrics[TTensor]:
             Tuple of computed discriminator metrics for each scale.
         """
         step_metrics: list[DiscriminatorMetrics[TTensor]] = []
@@ -1234,7 +1256,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         for _ in range(self.discriminator_steps):
 
             # Compute metrics for this discriminator step only
-            step_metrics = []
+            step_metrics: list[DiscriminatorMetrics[TTensor]] = []
             step_gradients: list[dict[str, TTensor]] = []
             losses: list[TTensor] = []
             for scale in self.active_scales:
@@ -1246,6 +1268,8 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
                     wells_pyramid,
                     seismic_pyramid,
                 )
+
+                metrics = cast(DiscriminatorMetrics[TTensor], metrics)
 
                 # Delegate the optimization step to subclass
                 updates = self.update_discriminator_weights(
@@ -1264,11 +1288,11 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
     def optimize_generator(
         self,
         indexes: list[int],
-        facies_pyramid: tuple[TTensor, ...],
-        rec_in_pyramid: tuple[TTensor, ...],
-        wells_pyramid: tuple[TTensor, ...] = (),
-        masks_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
+        facies_pyramid: dict[int, TTensor],
+        rec_in_pyramid: dict[int, TTensor],
+        wells_pyramid: dict[int, TTensor] = {},
+        masks_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> tuple[GeneratorMetrics[TTensor], ...] | IterableMetrics[TTensor]:
         """Framework-agnostic generator optimization orchestration.
 
@@ -1282,20 +1306,20 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         ----------
         indexes : list[int]
             List of batch/sample indices used to generate noise.
-        facies_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to real tensor samples.
-        rec_in_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to reconstruction inputs.
-        wells_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to well-conditioning tensors.
-        masks_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to well/mask tensors.
-        seismic_pyramid : tuple[TTensor, ...]
-            Tuple mapping scale indices to seismic-conditioning tensors.
+        facies_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to real tensor samples.
+        rec_in_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to reconstruction inputs.
+        wells_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to well-conditioning tensors.
+        masks_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to well/mask tensors.
+        seismic_pyramid : dict[int, TTensor]
+            Dictionary mapping scale indices to seismic-conditioning tensors.
 
         Returns
         -------
-        tuple[GeneratorMetrics[TTensor], ...] | IterableMetrics[TTensor]
+        tuple[GeneratorMetrics[TTensor], ...] | IterableMetrics[TTensor]:
             Tuple of computed generator metrics for each scale.
         """
 
@@ -1312,8 +1336,6 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
                     continue
 
                 real = facies_pyramid[scale]
-                rec_in = rec_in_pyramid[scale]
-                mask = masks_pyramid[scale]
 
                 # Ensure noise amplitudes have been initialized for this scale.
                 # In normal training `noise_amp` is populated during noise
@@ -1328,14 +1350,20 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
                     indexes,
                     scale,
                     real,
-                    rec_in,
+                    rec_in_pyramid,
                     wells_pyramid,
+                    masks_pyramid,
                     seismic_pyramid,
-                    mask,
                 )
 
+                metrics = cast(GeneratorMetrics[TTensor], metrics)
+
                 # Delegate the optimization step to subclass
-                updates = self.update_generator_weights(scale, metrics.total, gradients)
+                updates = self.update_generator_weights(
+                    scale,
+                    metrics.total,
+                    gradients,
+                )
                 if updates:
                     step_gradients.append(updates)
 

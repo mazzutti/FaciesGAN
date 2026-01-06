@@ -63,28 +63,32 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
         """Perform batch preparation logic asynchronously (vectorized where possible)."""
         facies, wells, seismic = batch
 
-        # Vectorized conversion for facies
-        facies_pyramid = tuple(mx.array(facies[scale]) for scale in self.scales)
+        # Build per-scale pyramids as dictionaries indexed by scale number
+        facies_pyramid: dict[int, mx.array] = {
+            scale: mx.array(facies[i]) for i, scale in enumerate(self.scales)
+        }
 
         # Vectorized wells and masks if wells are present
         if len(wells) > 0:
-            wells_pyramid = tuple(mx.array(wells[scale]) for scale in self.scales)
+            wells_pyramid: dict[int, mx.array] = {
+                scale: mx.array(wells[i]) for i, scale in enumerate(self.scales)
+            }
             # Compute masks for all scales at once (vectorized)
-            masks_pyramid = tuple(
-                mx.greater(
-                    mx.sum(mx.abs(wells_pyramid[scale]), axis=3, keepdims=True), 0
-                )
-                for scale in self.scales
-            )
+            masks_pyramid: dict[int, mx.array] = {
+                scale: mx.greater(mx.sum(mx.abs(w), axis=3, keepdims=True), 0)
+                for scale, w in wells_pyramid.items()
+            }
         else:
-            wells_pyramid = ()
-            masks_pyramid = ()
+            wells_pyramid = {}
+            masks_pyramid = {}
 
         # Vectorized seismic if present
         if len(seismic) > 0:
-            seismic_pyramid = tuple(mx.array(seismic[scale]) for scale in self.scales)
+            seismic_pyramid: dict[int, mx.array] = {
+                scale: mx.array(seismic[i]) for i, scale in enumerate(self.scales)
+            }
         else:
-            seismic_pyramid = ()
+            seismic_pyramid = {}
 
         return (facies_pyramid, wells_pyramid, masks_pyramid, seismic_pyramid)
 

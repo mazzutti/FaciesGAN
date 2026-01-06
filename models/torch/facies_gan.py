@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
-from models.base import FaciesGAN
+from models.base import FaciesGAN, IterableMetrics
 from models.torch import utils
 from models.torch.discriminator import TorchDiscriminator
 from models.torch.generator import TorchGenerator
@@ -110,8 +110,8 @@ class TorchFaciesGAN(
         indexes: list[int],
         scale: int,
         real: torch.Tensor,
-        wells_pyramid: tuple[torch.Tensor, ...] = (),
-        seismic_pyramid: tuple[torch.Tensor, ...] = (),
+        wells_pyramid: dict[int, torch.Tensor] = {},
+        seismic_pyramid: dict[int, torch.Tensor] = {},
     ) -> tuple[DiscriminatorMetrics[torch.Tensor], dict[str, Any] | None]:
         """Compute discriminator losses and gradient penalty for a scale.
 
@@ -123,9 +123,9 @@ class TorchFaciesGAN(
             Pyramid scale index for which to compute the metrics.
         real_facies (torch.Tensor):
             Ground-truth tensor for the current scale.
-        wells_pyramid (tuple[torch.Tensor, ...], optional):
+        wells_pyramid (dict[int, torch.Tensor], optional):
             Wells tensors dict for conditioning, keyed by scale.
-        seismic_pyramid (tuple[torch.Tensor, ...], optional):
+        seismic_pyramid (dict[int, torch.Tensor], optional):
             Seismic  tensors dict for conditioning, keyed by scale.
 
         Returns
@@ -154,11 +154,14 @@ class TorchFaciesGAN(
         indexes: list[int],
         scale: int,
         real: torch.Tensor,
-        rec_in: torch.Tensor,
-        wells_pyramid: tuple[torch.Tensor, ...] = (),
-        seismic_pyramid: tuple[torch.Tensor, ...] = (),
-        mask: torch.Tensor | None = None,
-    ) -> tuple[GeneratorMetrics[torch.Tensor], dict[str, Any] | None]:
+        rec_in_pyramid: dict[int, torch.Tensor] = {},
+        wells_pyramid: dict[int, torch.Tensor] = {},
+        masks_pyramid: dict[int, torch.Tensor] = {},
+        seismic_pyramid: dict[int, torch.Tensor] = {},
+    ) -> tuple[
+        GeneratorMetrics[torch.Tensor] | IterableMetrics[torch.Tensor],
+        dict[str, Any] | None,
+    ]:
         """Common generator-metrics flow shared by frameworks.
 
         Parameters
@@ -171,12 +174,13 @@ class TorchFaciesGAN(
             Ground-truth tensor for the current scale.
         rec_in (torch.Tensor):
             Reconstruction input tensor for the current scale.
-        wells_pyramid (tuple[torch.Tensor, ...], optional):
+        wells_pyramid (dict[int, torch.Tensor], optional):
             Wells tensors dict for conditioning, keyed by scale.
-        seismic_pyramid (tuple[torch.Tensor, ...], optional):
+        masks_pyramid (dict[int, torch.Tensor], optional):
+            Well mask tensors dict for conditioning, keyed by scale.
+        seismic_pyramid (dict[int, torch.Tensor], optional):
             Seismic tensors dict for conditioning, keyed by scale.
-        mask (torch.Tensor | None, optional):
-            Well mask tensor for the current scale, by default None.
+
         Returns
         -------
         tuple[
@@ -201,13 +205,16 @@ class TorchFaciesGAN(
 
         # Delegate component computations to subclass hooks
         adv = self.compute_adversarial_loss(scale, fake)
+        mask = masks_pyramid.get(scale, None)
+        well = wells_pyramid.get(scale, None)
         well = self.compute_masked_loss(
             fake,
             real,
-            wells_pyramid[scale] if wells_pyramid else None,
+            well,
             mask,
         )
         div = self.compute_diversity_loss(fake_samples)
+        rec_in = rec_in_pyramid[scale]
         rec_loss = self.compute_recovery_loss(
             indexes,
             scale,
@@ -332,8 +339,8 @@ class TorchFaciesGAN(
         scale: int,
         real: torch.Tensor,
         rec_in: torch.Tensor,
-        wells_pyramid: tuple[torch.Tensor, ...] = (),
-        seismic_pyramid: tuple[torch.Tensor, ...] = (),
+        wells_pyramid: dict[int, torch.Tensor] = {},
+        seismic_pyramid: dict[int, torch.Tensor] = {},
     ) -> torch.Tensor:
         """Compute reconstruction (recovery) loss for given inputs.
 
@@ -347,10 +354,10 @@ class TorchFaciesGAN(
             Ground-truth tensor for the current scale.
         rec_in (torch.Tensor):
             Reconstruction input tensor for the current scale.
-        wells_pyramid (tuple[torch.Tensor, ...]), optional):
-            Wells tensors tuple for conditioning, keyed by scale.
-        seismic_pyramid (tuple[torch.Tensor, ...]), optional):
-            Seismic tensors tuple for conditioning, keyed by scale.
+        wells_pyramid (dict[int, torch.Tensor], optional):
+            Wells tensors dictionary for conditioning, keyed by scale.
+        seismic_pyramid (dict[int, torch.Tensor], optional):
+            Seismic tensors dictionary for conditioning, keyed by scale.
 
         Returns:
             torch.Tensor: Scalar reconstruction loss weighted by `self.alpha`,
@@ -365,6 +372,7 @@ class TorchFaciesGAN(
             seismic_pyramid,
             rec=True,
         )
+
         rec = self.generator(
             rec_noise,
             self.noise_amps[: scale + 1],
@@ -433,11 +441,11 @@ class TorchFaciesGAN(
     def forward(
         self,
         indexes: list[int],
-        facies_pyramid: tuple[torch.Tensor, ...],
-        rec_in_pyramid: tuple[torch.Tensor, ...],
-        wells_pyramid: tuple[torch.Tensor, ...] = (),
-        masks_pyramid: tuple[torch.Tensor, ...] = (),
-        seismic_pyramid: tuple[torch.Tensor, ...] = (),
+        facies_pyramid: dict[int, torch.Tensor],
+        rec_in_pyramid: dict[int, torch.Tensor],
+        wells_pyramid: dict[int, torch.Tensor] = {},
+        masks_pyramid: dict[int, torch.Tensor] = {},
+        seismic_pyramid: dict[int, torch.Tensor] = {},
     ) -> ScaleMetrics[torch.Tensor]:
         """Perform a forward pass and compute scale metrics.
 
@@ -445,48 +453,55 @@ class TorchFaciesGAN(
         ----------
         indexes (list[int]):
             List of batch/sample indices used to generate noise.
-        facies_pyramid (tuple[torch.Tensor, ...]):
-            Tuple mapping scale indices to real tensor samples.
-        rec_in_pyramid (tuple[torch.Tensor, ...]):
-            Tuple mapping scale indices to reconstruction input tensors.
-        wells_pyramid (tuple[torch.Tensor, ...], optional):
-            Wells tensors tuple for conditioning, keyed by scale.
-        masks_pyramid (tuple[torch.Tensor, ...], optional):
-            Well masks tuple for conditioning, keyed by scale.
-        seismic_pyramid (tuple[torch.Tensor, ...], optional):
-            Seismic tensors tuple for conditioning, keyed by scale.
-
+        facies_pyramid (dict[int, torch.Tensor]):
+            Dictionary mapping scale indices to real tensor samples.
+        rec_in_pyramid (dict[int, torch.Tensor]):
+            Dictionary mapping scale indices to reconstruction input tensors.
+        wells_pyramid (dict[int, torch.Tensor], optional):
+            Wells tensors dictionary for conditioning, keyed by scale.
+        masks_pyramid (dict[int, torch.Tensor], optional):
+            Well masks dictionary for conditioning, keyed by scale.
+        seismic_pyramid (dict[int, torch.Tensor], optional):
+            Seismic tensors dictionary for conditioning, keyed by scale.
         Returns
         -------
         ScaleMetrics[torch.Tensor]:
             Container with discriminator and generator metrics for the scale.
         """
+        disc_metrics_tuple = cast(
+            tuple[DiscriminatorMetrics[torch.Tensor], ...],
+            self.optimize_discriminator(
+                indexes,
+                facies_pyramid,
+                wells_pyramid,
+                seismic_pyramid,
+            ),
+        )
+        gen_metrics_tuple = cast(
+            tuple[GeneratorMetrics[torch.Tensor], ...],
+            self.optimize_generator(
+                indexes,
+                facies_pyramid,
+                rec_in_pyramid,
+                wells_pyramid,
+                masks_pyramid,
+                seismic_pyramid,
+            ),
+        )
+
+        # Convert tuples to dicts mapping scale index to metrics
+        discriminator_metrics = {
+            scale: disc_metrics_tuple[i]
+            for i, scale in enumerate(sorted(self.active_scales))
+        }
+        generator_metrics = {
+            scale: gen_metrics_tuple[i]
+            for i, scale in enumerate(sorted(self.active_scales))
+        }
 
         return ScaleMetrics(
-            discriminator=(
-                cast(
-                    DiscriminatorMetrics[torch.Tensor],
-                    self.optimize_discriminator(
-                        indexes,
-                        facies_pyramid,
-                        wells_pyramid,
-                        seismic_pyramid,
-                    ),
-                ),
-            ),
-            generator=(
-                cast(
-                    GeneratorMetrics[torch.Tensor],
-                    self.optimize_generator(
-                        indexes,
-                        facies_pyramid,
-                        rec_in_pyramid,
-                        wells_pyramid,
-                        masks_pyramid,
-                        seismic_pyramid,
-                    ),
-                ),
-            ),
+            discriminator=discriminator_metrics,
+            generator=generator_metrics,
         )
 
     def generate_fake(self, noises: list[torch.Tensor], scale: int) -> torch.Tensor:

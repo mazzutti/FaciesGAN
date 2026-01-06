@@ -105,8 +105,8 @@ class ScaleMetrics[TTensor]:
     corresponding metric dataclasses defined above.
     """
 
-    generator: tuple[GeneratorMetrics[TTensor], ...]
-    discriminator: tuple[DiscriminatorMetrics[TTensor], ...]
+    generator: dict[int, GeneratorMetrics[TTensor]]
+    discriminator: dict[int, DiscriminatorMetrics[TTensor]]
 
     @staticmethod
     def from_dicts(
@@ -128,12 +128,14 @@ class ScaleMetrics[TTensor]:
             Constructed ``ScaleMetrics`` instance.
         """
         return ScaleMetrics(
-            generator=tuple(
-                GeneratorMetrics(*metrics) for _, metrics in gen_dict.items()
-            ),
-            discriminator=tuple(
-                DiscriminatorMetrics(*metrics) for _, metrics in disc_dict.items()
-            ),
+            generator={
+                int(scale): GeneratorMetrics(*metrics)
+                for scale, metrics in gen_dict.items()
+            },
+            discriminator={
+                int(scale): DiscriminatorMetrics(*metrics)
+                for scale, metrics in disc_dict.items()
+            },
         )
 
     def as_tuple_of_dicts(self) -> tuple[dict[str, float], ...]:
@@ -150,7 +152,7 @@ class ScaleMetrics[TTensor]:
         """
         return tuple(
             x
-            for scale in range(len(self.generator))
+            for scale in sorted(self.generator.keys())
             for x in (
                 self.generator[scale].as_dict(),
                 self.discriminator[scale].as_dict(),
@@ -171,7 +173,7 @@ class ScaleMetrics[TTensor]:
         #"""
         return tuple(
             x
-            for scale in range(len(self.generator))
+            for scale in sorted(self.generator.keys())
             for x in (
                 *self.generator[scale].as_tuple(),
                 *self.discriminator[scale].as_tuple(),

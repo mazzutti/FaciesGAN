@@ -14,7 +14,11 @@ from models.mlx.discriminator import MLXDiscriminator
 from models.mlx.generator import MLXGenerator
 from options import TrainningOptions
 import models.mlx.utils as utils
-from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, IterableMetrics
+from trainning.metrics import (
+    DiscriminatorMetrics,
+    GeneratorMetrics,
+    IterableMetrics,
+)
 from trainning.mlx.schedulers import MultiStepLR
 
 
@@ -56,8 +60,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         self.zero_padding = int(options.num_layer * math.floor(options.kernel_size / 2))
         self.compile_backend = compile_backend
         self.setup_framework()
-
-        self.compute_gradient_penalty_ = []
+        self._gp_counter = 0
 
     def __call__(
         self, *args: Any, **kwds: Any
@@ -67,11 +70,11 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
     def forward(
         self,
         indexes: list[int],
-        facies_pyramid: tuple[mx.array, ...],
-        rec_in_pyramid: tuple[mx.array, ...],
-        wells_pyramid: tuple[mx.array, ...] = (),
-        masks_pyramid: tuple[mx.array, ...] = (),
-        seismic_pyramid: tuple[mx.array, ...] = (),
+        facies_pyramid: dict[int, mx.array],
+        rec_in_pyramid: dict[int, mx.array],
+        wells_pyramid: dict[int, mx.array] = {},
+        masks_pyramid: dict[int, mx.array] = {},
+        seismic_pyramid: dict[int, mx.array] = {},
     ) -> tuple[IterableMetrics[mx.array], ...]:
         """Execute a forward pass for both discriminator and generator.
 
@@ -79,27 +82,34 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         ----------
         indexes : list[int]
             Batch/sample indices used for consistent noise generation.
-        facies_pyramid : tuple[mx.array, ...]
-            Tuple of real facies tensors at each scale.
-        rec_in_pyramid : tuple[mx.array, ...]
-            Tuple of reconstruction input tensors at each scale.
-        wells_pyramid : tuple[mx.array, ...], optional
-            Tuple of well log tensors for conditioning, by default ().
-        masks_pyramid : tuple[mx.array, ...], optional
-            Tuple of well/mask tensors for conditioning, by default ().
-        seismic_pyramid : tuple[mx.array, ...], optional
-            Tuple of seismic volume tensors for conditioning, by default ().
-
+        facies_pyramid : dict[int, mx.array]
+            Dictionary of real facies tensors at each scale.
+        rec_in_pyramid : dict[int, mx.array]
+            Dictionary of reconstruction input tensors at each scale.
+        wells_pyramid : dict[int, mx.array], optional
+            Dictionary of well log tensors for conditioning, by default ().
+        masks_pyramid : dict[int, mx.array], optional
+            Dictionary of well/mask tensors for conditioning, by default ().
+        seismic_pyramid : dict[int, mx.array], optional
+            Dictionary of seismic volume tensors for conditioning, by default ().
         Returns
         -------
         ScaleMetrics[mx.array]
             The computed metrics for discriminator and generator.
         """
 
-        return (
+        discriminator_metrics: IterableMetrics[mx.array] = cast(
+            IterableMetrics[mx.array],
             self.optimize_discriminator(
-                indexes, facies_pyramid, wells_pyramid, seismic_pyramid
+                indexes,
+                facies_pyramid,
+                wells_pyramid,
+                seismic_pyramid,
             ),
+        )
+
+        generator_metrics: IterableMetrics[mx.array] = cast(
+            IterableMetrics[mx.array],
             self.optimize_generator(
                 indexes,
                 facies_pyramid,
@@ -109,6 +119,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 seismic_pyramid,
             ),
         )
+
+        return discriminator_metrics, generator_metrics
 
     def build_discriminator(self) -> MLXDiscriminator:
         """Build the MLX Discriminator model.
@@ -146,9 +158,12 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         indexes: list[int],
         scale: int,
         real: mx.array,
-        wells_pyramid: tuple[mx.array, ...] = (),
-        seismic_pyramid: tuple[mx.array, ...] = (),
-    ) -> tuple[DiscriminatorMetrics[mx.array], dict[str, Any] | None]:
+        wells_pyramid: dict[int, mx.array] = {},
+        seismic_pyramid: dict[int, mx.array] = {},
+    ) -> tuple[
+        DiscriminatorMetrics[mx.array] | IterableMetrics[mx.array],
+        dict[str, Any],
+    ]:
         """Compute discriminator losses and gradients for a specific scale.
 
         Parameters
@@ -159,11 +174,10 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             Current pyramid scale.
         real_facies : mx.array
             Real facies images for the current scale.
-        wells_pyramid : tuple[mx.array, ...]
-            Tuple of well log tensors for conditioning.
-        seismic_pyramid : tuple[mx.array, ...]
-            Tuple of seismic volume tensors for conditioning.
-
+        wells_pyramid : dict[int, mx.array]
+            Dictionary of well log tensors for conditioning.
+        seismic_pyramid : dict[int, mx.array]
+            Dictionary of seismic volume tensors for conditioning.
         Returns
         -------
         tuple[DiscriminatorMetrics[mx.array], dict[str, Any] | None]
@@ -196,18 +210,18 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         metrics.total, gradients = mx.value_and_grad(compute_metrics)(params)  # type: ignore
 
         # Return gradients so they can be passed to update_discriminator_weights
-        return metrics, cast(dict[str, Any] | None, gradients)
+        return metrics, cast(dict[str, Any], gradients)
 
     def compute_generator_metrics(
         self,
         indexes: list[int],
         scale: int,
         real: mx.array,
-        rec_in: mx.array,
-        wells_pyramid: tuple[mx.array, ...] = (),
-        seismic_pyramid: tuple[mx.array, ...] = (),
-        mask: mx.array | None = None,
-    ) -> tuple[GeneratorMetrics[mx.array], dict[str, Any] | None]:
+        rec_in_pyramid: dict[int, mx.array],
+        wells_pyramid: dict[int, mx.array] = {},
+        masks_pyramid: dict[int, mx.array] = {},
+        seismic_pyramid: dict[int, mx.array] = {},
+    ) -> tuple[GeneratorMetrics[mx.array], dict[str, Any]]:
         """Compute generator losses and gradients for a specific scale.
 
         Parameters
@@ -218,14 +232,14 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             Current pyramid scale.
         real_facies : mx.array
             Real facies images for the current scale.
-        rec_in : mx.array
-             Array of reconstruction input.
-        wells_pyramid : tuple[mx.array, ...]
-            Tuple of well log tensors for conditioning.
-        seismic_pyramid : tuple[mx.array, ...]
-            Tuple of seismic volume tensors for conditioning.
-        mask : mx.array | None
-            Well/mask tensor for conditioning.
+        rec_in_pyramid : dict[int, mx.array]
+            Reconstruction input tensors for the current scale (from previous scale).
+        wells_pyramid : dict[int, mx.array]
+            Dictionary of well log tensors for conditioning.
+        masks_pyramid : dict[int, mx.array]
+            Dictionary of well/mask tensors for conditioning.
+        seismic_pyramid : dict[int, mx.array]
+            Dictionary of seismic volume tensors for conditioning.
 
         Returns
         -------
@@ -237,6 +251,10 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             mx.array(0.0), mx.array(0.0), mx.array(0.0), mx.array(0.0), mx.array(0.0)
         )
 
+        rec_in = rec_in_pyramid[scale]
+        well = wells_pyramid.get(scale, None)
+        mask = masks_pyramid.get(scale, None)
+
         def compute_metrics(params: dict[str, Any]) -> mx.array:
             self.generator.gens[scale].update(params)  # type: ignore
             fake_samples = self.generate_diverse_samples(
@@ -245,12 +263,14 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             fake = fake_samples[0]
 
             metrics.fake = self.compute_adversarial_loss(scale, fake)
+
             metrics.well = self.compute_masked_loss(
                 fake,
                 real,
-                wells_pyramid[scale] if len(wells_pyramid) > 0 else None,
+                well,
                 mask,
             )
+
             metrics.div = self.compute_diversity_loss(fake_samples)
             metrics.rec = self.compute_recovery_loss(
                 indexes,
@@ -266,15 +286,15 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         params = cast(dict[str, Any], self.generator.gens[scale].parameters())
         metrics.total, gradients = mx.value_and_grad(compute_metrics)(params)  # type: ignore
 
-        return metrics, cast(dict[str, Any] | None, gradients)
+        return metrics, cast(dict[str, Any], gradients)
 
     def optimize_discriminator(
         self,
         indexes: list[int],
-        facies_pyramid: tuple[mx.array, ...],
-        wells_pyramid: tuple[mx.array, ...] = (),
-        seismic_pyramid: tuple[mx.array, ...] = (),
-    ) -> IterableMetrics[mx.array]:
+        facies_pyramid: dict[int, mx.array],
+        wells_pyramid: dict[int, mx.array] = {},
+        seismic_pyramid: dict[int, mx.array] = {},
+    ) -> tuple[DiscriminatorMetrics[mx.array], ...] | IterableMetrics[mx.array]:
         """Framework-agnostic discriminator optimization orchestration.
 
         This method zeroes gradients, delegates framework-specific forward
@@ -287,17 +307,16 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         ----------
         indexes : list[int]
             List of batch/sample indices used to generate noise.
-        facies_pyramid : tuple[mx.array, ...]
-            Tuple mapping scale indices to real tensor samples.
-        wells_pyramid : tuple[mx.array, ...]
-            Tuple mapping scale indices to well-conditioning tensors.
-        seismic_pyramid : tuple[mx.array, ...]
-            Tuple mapping scale indices to seismic-conditioning tensors.
+        facies_pyramid : dict[int, mx.array]
+            Dictionary mapping scale indices to real tensor samples.
+        wells_pyramid : dict[int, mx.array]
+            Dictionary mapping scale indices to well-conditioning tensors.
+        seismic_pyramid : dict[int, mx.array]
+            Dictionary mapping scale indices to seismic-conditioning tensors.
         Returns
         -------
         tuple[
             dict[int, list[tuple[mx.array, ...]]],
-            dict[int, list[dict[str, Any]]],
             dict[int, list[dict[str, Any]]],
             dict[int, list[dict[str, Any]]],
         ]
@@ -308,8 +327,6 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 Dictionary mapping scale indices to lists of gradients dicts.
             - parameters: dict[int, list[dict[str, Any]]]
                 Dictionary mapping scale indices to lists of updated parameters dicts.
-            - states: dict[int, list[dict[str, Any]]]
-                Dictionary mapping scale indices to lists of updated optimizer states dicts.
         """
         metrics: dict[int, list[tuple[mx.array, ...]]] = {
             scale: [] for scale in self.active_scales
@@ -333,8 +350,9 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                     seismic_pyramid,
                 )
 
+                met = cast(DiscriminatorMetrics[mx.array], met)
                 metrics[scale].append(met.as_tuple())
-                gradients[scale].append(cast(dict[str, Any], grad))
+                gradients[scale].append(grad)
 
                 updates = cast(
                     dict[str, Any],
@@ -345,7 +363,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                     ),
                 )
 
-                parameters[scale].append(updates["disc_parameters"])
+                parameters[scale].append(updates)
 
         # return metrics, gradients, parameters, states
         return metrics, gradients, parameters
@@ -353,12 +371,12 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
     def optimize_generator(
         self,
         indexes: list[int],
-        facies_pyramid: tuple[mx.array, ...],
-        rec_in_pyramid: tuple[mx.array, ...],
-        wells_pyramid: tuple[mx.array, ...] = (),
-        masks_pyramid: tuple[mx.array, ...] = (),
-        seismic_pyramid: tuple[mx.array, ...] = (),
-    ) -> IterableMetrics[mx.array]:
+        facies_pyramid: dict[int, mx.array],
+        rec_in_pyramid: dict[int, mx.array],
+        wells_pyramid: dict[int, mx.array] = {},
+        masks_pyramid: dict[int, mx.array] = {},
+        seismic_pyramid: dict[int, mx.array] = {},
+    ) -> tuple[GeneratorMetrics[mx.array], ...] | IterableMetrics[mx.array]:
         """Framework-agnostic generator optimization orchestration.
 
         This method handles zeroing grads, calling the per-scale
@@ -371,16 +389,16 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         ----------
         indexes : list[int]
             List of batch/sample indices used to generate noise.
-        facies_pyramid : tuple[mx.array, ...]
-            Tuple mapping scale indices to real tensor samples.
-        rec_in_pyramid : tuple[mx.array, ...]
-            Tuple mapping scale indices to reconstruction inputs.
-        wells_pyramid : tuple[mx.array, ...]
-            Tuple mapping scale indices to well-conditioning tensors.
-        masks_pyramid : tuple[mx.array, ...]
-            Tuple mapping scale indices to well/mask tensors.
-        seismic_pyramid : tuple[mx.array, ...]
-            Tuple mapping scale indices to seismic-conditioning tensors.
+        facies_pyramid : dict[int, mx.array]
+            Dictionary mapping scale indices to real tensor samples.
+        rec_in_pyramid : dict[int, mx.array]
+            Dictionary mapping scale indices to reconstruction inputs.
+        wells_pyramid : dict[int, mx.array]
+            Dictionary mapping scale indices to well-conditioning tensors.
+        masks_pyramid : dict[int, mx.array]
+            Dictionary mapping scale indices to well/mask tensors.
+        seismic_pyramid : dict[int, mx.array]
+            Dictionary mapping scale indices to seismic-conditioning tensors.
 
         Returns
         -------
@@ -413,12 +431,10 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         for _ in range(self.generator_steps):
 
             for scale in self.active_scales:
-                if scale >= len(facies_pyramid):
+                if scale not in facies_pyramid:
                     continue
 
                 real = facies_pyramid[scale]
-                rec_in = rec_in_pyramid[scale]
-                mask = masks_pyramid[scale]
 
                 if len(self.noise_amps) < scale + 1:
                     raise RuntimeError(
@@ -430,14 +446,14 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                     indexes,
                     scale,
                     real,
-                    rec_in,
+                    rec_in_pyramid,
                     wells_pyramid,
+                    masks_pyramid,
                     seismic_pyramid,
-                    mask,
                 )
 
                 metrics[scale].append(met.as_tuple())
-                gradients[scale].append(cast(dict[str, Any], grad))
+                gradients[scale].append(grad)
 
                 # Delegate the optimization step to subclass
                 updates = cast(
@@ -445,9 +461,9 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                     self.update_generator_weights(scale, met.total, grad),
                 )
 
-                parameters[scale].append(updates["gen_parameters"])
+                parameters[scale].append(updates)
 
-        # return metrics, gradients, parameters, states
+        # return metrics, gradients, parameters
         return metrics, gradients, parameters
 
     def update_discriminator_weights(
@@ -477,10 +493,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             discriminator = self.discriminator.discs[scale]
             optimizer.update(discriminator, gradients)  # type: ignore
             # Return updated state elements for lazy evaluation
-            return {
-                "disc_parameters": discriminator.parameters(),
-                "disc_opt_state": optimizer.state,  # type: ignore
-            }
+            return cast(dict[str, Any], discriminator.parameters())
 
     def update_generator_weights(
         self, scale: int, loss: mx.array, gradients: Any | None
@@ -509,10 +522,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             generator = self.generator.gens[scale]
             optimizer.update(generator, gradients)  # type: ignore
             # Return updated state elements for lazy evaluation
-            return {
-                "gen_parameters": generator.parameters(),
-                "gen_opt_state": optimizer.state,  # type: ignore
-            }
+            return cast(dict[str, Any], generator.parameters())
 
     def concatenate_tensors(self, tensors: list[mx.array]) -> mx.array:
         """Concatenate a list of MLX arrays along the channel axis (last dimension).
@@ -636,8 +646,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         scale: int,
         real: mx.array,
         rec_in: mx.array,
-        wells_pyramid: tuple[mx.array, ...] = (),
-        seismic_pyramid: tuple[mx.array, ...] = (),
+        wells_pyramid: dict[int, mx.array] = {},
+        seismic_pyramid: dict[int, mx.array] = {},
     ) -> mx.array:
         """Compute reconstruction loss for the image pyramid.
 
@@ -650,11 +660,11 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         real : mx.array
             Real images.
         rec_in : mx.array
-            Input for reconstruction from previous scale.
-        wells_pyramid : tuple[mx.array, ...], optional
-            Tuple of well log tensors for conditioning, by default ().
-        seismic_pyramid : tuple[mx.array, ...], optional
-            Tuple of seismic volume tensors for conditioning, by default ().
+            Reconstruction input tensor for the current scale (upsampled from previous scale).
+        wells_pyramid : dict[int, mx.array], optional
+            Dictionary of well log tensors for conditioning, by default {}.
+        seismic_pyramid : dict[int, mx.array], optional
+            Dictionary of seismic volume tensors for conditioning, by default {}.
 
         Returns
         -------
@@ -901,7 +911,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         scale : int
             Scale index.
         """
-        disc_path = os.path.join(scale_path, D_FILE)
+        # MLX uses .npz extension instead of .pth
+        disc_path = os.path.join(scale_path, D_FILE.replace(".pth", ".npz"))
         if os.path.exists(disc_path):
             self.discriminator.discs[scale] = utils.load(
                 disc_path, as_type=type(self.discriminator.discs[scale])
@@ -917,7 +928,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         scale : int
             Scale index.
         """
-        gen_path = os.path.join(scale_path, G_FILE)
+        # MLX uses .npz extension instead of .pth
+        gen_path = os.path.join(scale_path, G_FILE.replace(".pth", ".npz"))
         if os.path.exists(gen_path):
             self.generator.gens[scale] = utils.load(
                 gen_path, as_type=type(self.generator.gens[scale])
@@ -933,7 +945,14 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         """
         shape_path = os.path.join(scale_path, SHAPE_FILE)
         if os.path.exists(shape_path):
-            self.shapes.append(cast(tuple[int, ...], mx.load(shape_path)))  # type: ignore
+            # Load array and convert to tuple
+            loaded = mx.load(shape_path)  # type: ignore
+            # mx.load returns a dict, get the array from it
+            if isinstance(loaded, dict):
+                shape_array = list(loaded.values())[0]
+            else:
+                shape_array = loaded
+            self.shapes.append(tuple(int(x) for x in shape_array.tolist()))  # type: ignore
 
     def load_wells(self, scale_path: str) -> None:
         """Load well data from disk.
@@ -961,7 +980,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             Scale index.
         """
         if scale < len(self.discriminator.discs):
-            path = os.path.join(scale_path, D_FILE)
+            # MLX requires .npz or .safetensors extension
+            path = os.path.join(scale_path, D_FILE.replace(".pth", ".npz"))
             self.discriminator.discs[scale].save_weights(path)
 
     def save_generator_state(self, scale_path: str, scale: int) -> None:
@@ -975,7 +995,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             Scale index.
         """
         if scale < len(self.generator.gens):
-            path = os.path.join(scale_path, G_FILE)
+            # MLX requires .npz or .safetensors extension
+            path = os.path.join(scale_path, G_FILE.replace(".pth", ".npz"))
             self.generator.gens[scale].save_weights(path)
 
     def save_shape(self, scale_path: str, scale: int) -> None:
@@ -990,4 +1011,6 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         """
         if scale < len(self.shapes):
             path = os.path.join(scale_path, SHAPE_FILE)
-            mx.savez(path, self.shapes[scale])  # type: ignore
+            # Convert tuple to mx.array for saving
+            shape_array = mx.array(self.shapes[scale])
+            mx.savez(path, shape_array)  # type: ignore

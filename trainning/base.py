@@ -27,10 +27,9 @@ import log
 from trainning.metrics import (
     DiscriminatorMetrics,
     GeneratorMetrics,
-    IterableMetrics,
     ScaleMetrics,
 )
-from models.base import FaciesGAN
+from models.base import FaciesGAN, IterableMetrics
 from options import TrainningOptions
 from tensorboard_visualizer import TensorBoardVisualizer
 from typedefs import (
@@ -220,9 +219,9 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self,
         scale: int,
         indexes: list[int],
-        facies_pyramid: tuple[TTensor, ...],
-        wells_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
+        facies_pyramid: dict[int, TTensor],
+        wells_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> TTensor:
         """Initialize reconstruction noise for a specific scale.
 
@@ -234,10 +233,10 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             Batch sample indices.
         facies_pyramid : tuple[TTensor, ...]
             Tuple of real facies data for all scales.
-        wells_pyramid : tuple[TTensor, ...], optional
-            Tuple of well-conditioning tensors for all scales.
-        seismic_pyramid : tuple[TTensor, ...], optional
-            Tuple of seismic-conditioning tensors for all scales.
+        wells_pyramid : dict[int, TTensor], optional
+            Dictionary of well-conditioning tensors for all scales.
+        seismic_pyramid : dict[int, TTensor], optional
+            Dictionary of seismic-conditioning tensors for all scales.
 
         Returns
         -------
@@ -258,8 +257,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self,
         scales: tuple[int, ...],
         indexes: list[int],
-        wells_pyramid: tuple[TTensor, ...],
-        seismic_pyramid: tuple[TTensor, ...],
+        wells_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> tuple[TTensor, ...]:
         """Generate fixed samples for visualization at specified scales.
 
@@ -269,10 +268,10 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             Tuple of scale indices to generate samples for.
         indexes : list[int]
             List of batch sample indices.
-        wells_pyramid : tuple[TTensor, ...], optional
-            Tuple of well-conditioning tensors for all scales.
-        seismic_pyramid : tuple[TTensor, ...], optional
-            Tuple of seismic-conditioning tensors for all scales.
+        wells_pyramid : dict[int, TTensor], optional
+            Dictionary of well-conditioning tensors for all scales.
+        seismic_pyramid : dict[int, TTensor], optional
+            Dictionary of seismic-conditioning tensors for all scales.
 
         Returns
         -------
@@ -315,15 +314,15 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
     def train_scales(
         self,
         scales: tuple[int, ...],
-        writers: tuple[SummaryWriter, ...],
-        scale_paths: tuple[str, ...],
-        results_paths: tuple[str, ...],
+        writers: dict[int, SummaryWriter],
+        scale_paths: dict[int, str],
+        results_paths: dict[int, str],
         batch_id: int,
         progress: "tqdm[Any]",
-        facies_pyramid: tuple[TTensor, ...],
-        wells_pyramid: tuple[TTensor, ...],
-        masks_pyramid: tuple[TTensor, ...],
-        seismic_pyramid: tuple[TTensor, ...],
+        facies_pyramid: dict[int, TTensor],
+        wells_pyramid: dict[int, TTensor] = {},
+        masks_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> None:
         """Train multiple pyramid scales simultaneously.
 
@@ -333,8 +332,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         ----------
         scales : tuple[int, ...]
             Tuple of scale indices to train.
-        writers : tuple[SummaryWriter, ...]
-            Tuple of per-scale TensorBoard writers.
+        writers : dict[int, SummaryWriter]
+            Dictionary of per-scale TensorBoard writers.
         scale_paths : tuple[str, ...]
             Tuple of per-scale output directory paths.
         results_paths : tuple[str, ...]
@@ -345,12 +344,12 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             Progress bar instance to update description text.
         facies_pyramid : tuple[TTensor, ...]
             Tuple of real facies data for all scales.
-        wells_pyramid : tuple[TTensor, ...]
-            Tuple of well-conditioning tensors for all scales.
-        masks_pyramid : tuple[TTensor, ...]
-            Tuple of masks tensors for all scales.
-        seismic_pyramid : tuple[TTensor, ...]
-            Tuple of seismic-conditioning tensors for all scales.
+        wells_pyramid : dict[int, TTensor], optional
+            Dictionary of well-conditioning tensors for all scales.
+        masks_pyramid : dict[int, TTensor], optional
+            Dictionary of masks tensors for all scales.
+        seismic_pyramid : dict[int, TTensor], optional
+            Dictionary of seismic-conditioning tensors for all scales.
         """
 
         indexes = list(range(self.batch_size))
@@ -366,17 +365,20 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         #             discriminator_schedulers[scale],
         #         )
 
-        # Initialize noise for all scales
-        rec_in_pyramid: tuple[TTensor, ...] = tuple(
-            self.initialize_noise(
+        # Initialize noise for all scales from 0 to max(scales)
+        # We need all scales because the generator internally processes
+        # from scale 0 to the target scale
+        stop_scale = min(max(scales), self.stop_scale) + 1
+        rec_in_pyramid: dict[int, TTensor] = {
+            scale: self.initialize_noise(
                 scale,
                 indexes,
                 facies_pyramid,
                 wells_pyramid,
                 seismic_pyramid,
             )
-            for scale in scales
-        )
+            for scale in range(stop_scale)
+        }
 
         # Training loop - iterate epochs (0-based)
         for epoch in range(self.num_iter):
@@ -411,7 +413,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 writers=writers,
                 results_paths=results_paths,
                 progress=progress,
-                real_facies_pyramid=facies_pyramid,
+                facies_pyramid=facies_pyramid,
                 wells_pyramid=wells_pyramid,
                 masks_pyramid=masks_pyramid,
                 seismic_pyramid=seismic_pyramid,
@@ -429,11 +431,11 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
     def optimization_step(
         self,
         indexes: list[int],
-        facies_pyramid: tuple[TTensor, ...],
-        rec_in_pyramid: tuple[TTensor, ...],
-        wells_pyramid: tuple[TTensor, ...] = (),
-        masks_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
+        facies_pyramid: dict[int, TTensor],
+        rec_in_pyramid: dict[int, TTensor],
+        wells_pyramid: dict[int, TTensor] = {},
+        masks_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> (
         ScaleMetrics[TTensor]
         | tuple[
@@ -447,16 +449,16 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         ----------
         indexes : list[int]
             Batch sample indices.
-        facies_pyramid : tuple[TTensor, ...]
-            Tuple of real facies data for all scales.
-        rec_in_pyramid : tuple[TTensor, ...]
-            Tuple of reconstruction input tensors for all scales.
-        wells_pyramid : tuple[TTensor, ...]
-            Tuple of well-conditioning tensors for all scales.
-        masks_pyramid : tuple[TTensor, ...]
-            Tuple of masks tensors for all scales.
-        seismic_pyramid : tuple[TTensor, ...]
-            Tuple of seismic-conditioning tensors for all scales.
+        facies_pyramid : dict[int, TTensor]
+            Dictionary of real facies data for all scales.
+        rec_in_pyramid : dict[int, TTensor]
+            Dictionary mapping scale -> reconstruction input from previous scale.
+        wells_pyramid : dict[int, TTensor]
+            Dictionary of well-conditioning tensors for all scales.
+        masks_pyramid : dict[int, TTensor]
+            Dictionary of masks tensors for all scales.
+        seismic_pyramid : dict[int, TTensor]
+            Dictionary of seismic-conditioning tensors for all scales.
 
         Returns
         -------
@@ -557,9 +559,9 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         epoch: int,
         results_path: str,
         real_facies: TTensor,
-        wells_pyramid: tuple[TTensor, ...] = (),
-        masks_pyramid: tuple[TTensor, ...] = (),
-        seismic_pyramid: tuple[TTensor, ...] = (),
+        wells_pyramid: dict[int, TTensor] = {},
+        masks_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
     ) -> None:
         """Persist generated facies for a given scale.
 
@@ -577,13 +579,12 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             Path to the results directory for the current scale.
         real_facies : TTensor
             Real facies tensor for the current scale.
-        wells_pyramid : tuple[TTensor, ...]
-            Tuple of well-conditioning tensors for all scales.
-        masks_pyramid : tuple[TTensor, ...]
-            Tuple of masks tensors for all scales.
-        seismic_pyramid : tuple[TTensor, ...]
-            Tuple of seismic-conditioning tensors for all scales.
-
+        wells_pyramid : dict[int, TTensor], optional
+            Dictionary of well-conditioning tensors for all scales.
+        masks_pyramid : dict[int, TTensor], optional
+            Dictionary of masks tensors for all scales.
+        seismic_pyramid : dict[int, TTensor], optional
+            Dictionary of seismic-conditioning tensors for all scales.
         Raises
         ------
         NotImplementedError
@@ -597,13 +598,13 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         epoch: int,
         scale_metrics: ScaleMetrics[TTensor],
         generated_samples: tuple[TTensor, ...],
-        writers: tuple[SummaryWriter, ...],
-        results_paths: tuple[str, ...],
+        writers: dict[int, SummaryWriter],
+        results_paths: dict[int, str],
         progress: "tqdm[Any]",
-        real_facies_pyramid: tuple[TTensor, ...],
-        wells_pyramid: tuple[TTensor, ...],
-        masks_pyramid: tuple[TTensor, ...],
-        seismic_pyramid: tuple[TTensor, ...],
+        facies_pyramid: dict[int, TTensor],
+        wells_pyramid: dict[int, TTensor],
+        masks_pyramid: dict[int, TTensor],
+        seismic_pyramid: dict[int, TTensor],
     ) -> None:
         """Shared end-of-epoch bookkeeping for trainers.
 
@@ -620,20 +621,20 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             Collected metrics for the current epoch.
         generated_samples : tuple[TTensor, ...]
             Tuple of generated facies samples for visualization.
-        writers : tuple[SummaryWriter, ...]
-            Tuple of per-scale TensorBoard writers.
-        results_paths : tuple[str, ...]
-            Tuple of per-scale results directory paths.
+        writers : dict[int, SummaryWriter]
+            Dictionary of per-scale TensorBoard writers.
+        results_paths : dict[int, str]
+            Dictionary of per-scale results directory paths.
         progress : tqdm[Any]
             Progress bar instance to update.
-        real_facies_pyramid : tuple[TTensor, ...]
-            Tuple of real facies data for all scales.
-        wells_pyramid : tuple[TTensor, ...]
-            Tuple of well-conditioning tensors for all scales.
-        masks_pyramid : tuple[TTensor, ...]
-            Tuple of masks tensors for all scales.
-        seismic_pyramid : tuple[TTensor, ...]
-            Tuple of seismic-conditioning tensors for all scales.
+        facies_pyramid : dict[int, TTensor]
+            Dictionary of real facies data for all scales.
+        wells_pyramid : dict[int, TTensor]
+            Dictionary of well-conditioning tensors for all scales.
+        masks_pyramid : dict[int, TTensor]
+            Dictionary of masks tensors for all scales.
+        seismic_pyramid : dict[int, TTensor]
+            Dictionary of seismic-conditioning tensors for all scales.
         """
         samples_processed = self.batch_size * epoch
 
@@ -691,7 +692,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     scale,
                     epoch,
                     results_paths[scale],
-                    real_facies_pyramid[scale],
+                    facies_pyramid[scale],
                     wells_pyramid,
                     masks_pyramid,
                     seismic_pyramid,
@@ -727,17 +728,21 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             # Initialize all scales in the group
             self.model.init_scales(scale, num_scales_in_group)
 
-            # Create directories for all scales
-            scale_paths: tuple[str, ...] = tuple(
-                os.path.join(self.output_path, str(s)) for s in scales_to_train
-            )
-            results_paths: tuple[str, ...] = tuple(
-                os.path.join(scale_paths[s], RESULT_FACIES_PATH)
+            # Invalidate compiled optimization step for MLX when active scales change
+            if hasattr(self, "invalidate_compiled_optimization_step"):
+                self.invalidate_compiled_optimization_step()  # type: ignore
+
+            # Create directories for all scales (use dict to map scale -> path)
+            scale_paths: dict[int, str] = {
+                s: os.path.join(self.output_path, str(s)) for s in scales_to_train
+            }
+            results_paths: dict[int, str] = {
+                s: os.path.join(scale_paths[s], RESULT_FACIES_PATH)
                 for s in scales_to_train
-            )
-            writers: tuple[SummaryWriter, ...] = tuple(
-                SummaryWriter(log_dir=scale_paths[s]) for s in scales_to_train
-            )
+            }
+            writers: dict[int, SummaryWriter] = {
+                s: SummaryWriter(log_dir=scale_paths[s]) for s in scales_to_train
+            }
             for s in scales_to_train:
                 utils.create_dirs(scale_paths[s])
                 utils.create_dirs(results_paths[s])
@@ -752,9 +757,10 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             progress = tqdm(total=self.num_iter * total_batches, position=0)
 
             # Use create_batch_iterator to allow subclasses to inject prefetching logic
-            batch_iterator = self.create_batch_iterator(
-                self.data_loader, scales_to_train
-            )
+            # Need to load all scales from 0 to max(scales_to_train) for noise initialization
+            max_scale = max(scales_to_train)
+            all_scales = tuple(range(max_scale + 1))
+            batch_iterator = self.create_batch_iterator(self.data_loader, all_scales)
 
             for batch_id, batch in enumerate(batch_iterator):
 

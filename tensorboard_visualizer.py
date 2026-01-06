@@ -92,7 +92,7 @@ class TensorBoardVisualizer:
     def update(
         self,
         epoch: int,
-        scale_metrics: ScaleMetrics[TTensor] | tuple[dict[str, float], ...],
+        scale_metrics: ScaleMetrics[TTensor] | dict[int, dict[str, float]],
         generated_samples: tuple[TTensor, ...] | None = None,
         samples_processed: int = 0,
     ) -> None:
@@ -107,8 +107,8 @@ class TensorBoardVisualizer:
             pre-flattened tuple of metric-name->float dictionaries, one per scale.
             When a `ScaleMetrics` is provided the method will extract scalar
             values via `tensor.item()` before logging.
-        generated_samples : tuple[TTensor, ...] | None, optional
-            Tuple of generated sample tensors, one per scale. Expected
+        generated_samples : dict[int, TTensor] | None, optional
+            Dictionary of generated sample tensors, one per scale. Expected
             tensor shapes: (B, C, H, W) or (C, H, W). The first sample in the
             batch is used for logging. Tensors are detached and moved to CPU
             before conversion to numpy arrays.
@@ -126,38 +126,31 @@ class TensorBoardVisualizer:
             return
 
         if isinstance(scale_metrics, ScaleMetrics):
-            flat_metrics: tuple[dict[str, float], ...] = (
-                scale_metrics.as_tuple_of_dicts()
-            )
+            flat_metrics: dict[int, dict[str, float]] = {
+                i: metrics
+                for i, metrics in enumerate(scale_metrics.as_tuple_of_dicts())
+            }
         else:
-            flat_metrics: tuple[dict[str, float], ...] = scale_metrics
+            flat_metrics: dict[int, dict[str, float]] = scale_metrics
 
         # Calculate timing info
         current_time = time.time()
         elapsed = current_time - self.start_time
 
         # Log individual scale metrics
-        for scale, metrics in enumerate(flat_metrics):
+        for scale, metrics in flat_metrics.items():
             # Discriminator losses
-            self.writer.add_scalar(
-                f"Scale_{scale}/D_Total", metrics.get("d_total", 0), epoch
-            )
-            self.writer.add_scalar(
-                f"Scale_{scale}/D_Real", metrics.get("d_real", 0), epoch
-            )
-            self.writer.add_scalar(
-                f"Scale_{scale}/D_Fake", metrics.get("d_fake", 0), epoch
-            )
+            self.writer.add_scalar(f"Scale_{scale}/D_Total", metrics["d_total"], epoch)
+            self.writer.add_scalar(f"Scale_{scale}/D_Real", metrics["d_real"], epoch)
+            self.writer.add_scalar(f"Scale_{scale}/D_Fake", metrics["d_fake"], epoch)
 
             # Generator losses
+            self.writer.add_scalar(f"Scale_{scale}/G_Total", metrics["g_total"], epoch)
             self.writer.add_scalar(
-                f"Scale_{scale}/G_Total", metrics.get("g_total", 0), epoch
+                f"Scale_{scale}/G_Adversarial", metrics["g_adv"], epoch
             )
             self.writer.add_scalar(
-                f"Scale_{scale}/G_Adversarial", metrics.get("g_adv", 0), epoch
-            )
-            self.writer.add_scalar(
-                f"Scale_{scale}/G_Reconstruction", metrics.get("g_rec", 0), epoch
+                f"Scale_{scale}/G_Reconstruction", metrics["g_rec"], epoch
             )
 
         # Compute and log mean losses across all scales
@@ -165,18 +158,18 @@ class TensorBoardVisualizer:
             scales = list(range(len(flat_metrics)))
 
             # Mean discriminator losses
-            mean_d_total = np.mean([flat_metrics[s].get("d_total", 0) for s in scales])
-            mean_d_real = np.mean([flat_metrics[s].get("d_real", 0) for s in scales])
-            mean_d_fake = np.mean([flat_metrics[s].get("d_fake", 0) for s in scales])
+            mean_d_total = np.mean([flat_metrics[s]["d_total"] for s in scales])
+            mean_d_real = np.mean([flat_metrics[s]["d_real"] for s in scales])
+            mean_d_fake = np.mean([flat_metrics[s]["d_fake"] for s in scales])
 
             self.writer.add_scalar("Mean/D_Total", mean_d_total, epoch)
             self.writer.add_scalar("Mean/D_Real", mean_d_real, epoch)
             self.writer.add_scalar("Mean/D_Fake", mean_d_fake, epoch)
 
             # Mean generator losses
-            mean_g_total = np.mean([flat_metrics[s].get("g_total", 0) for s in scales])
-            mean_g_adv = np.mean([flat_metrics[s].get("g_adv", 0) for s in scales])
-            mean_g_rec = np.mean([flat_metrics[s].get("g_rec", 0) for s in scales])
+            mean_g_total = np.mean([flat_metrics[s]["g_total"] for s in scales])
+            mean_g_adv = np.mean([flat_metrics[s]["g_adv"] for s in scales])
+            mean_g_rec = np.mean([flat_metrics[s]["g_rec"] for s in scales])
 
             self.writer.add_scalar("Mean/G_Total", mean_g_total, epoch)
             self.writer.add_scalar("Mean/G_Adversarial", mean_g_adv, epoch)
