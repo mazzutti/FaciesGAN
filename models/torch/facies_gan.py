@@ -529,29 +529,18 @@ class TorchFaciesGAN(
         """
 
         batch = len(indexes)
-
-        # Get spatial shape (H, W)
         spatial_shape = self.get_noise_shape(scale, use_base_channel=False)
-
-        # Determine number of random noise channels needed
         noise_channels = self.gen_input_channels
-
-        # Use helper lists to manage tensors for concatenation
         tensors_to_concat: list[torch.Tensor] = []
 
         if well is not None:
-            # Assume well is (Batch, C, H, W) or (Total, C, H, W)
-            # If (Total...), indexing [indexes] gives (Batch, C, H, W)
-            # channels is dim 1
             w = well[indexes].to(self.device)
             noise_channels -= w.shape[1]
-            # Will append later, but we need order: z, well, seismic
 
         if seismic is not None:
             s = seismic[indexes].to(self.device)
             noise_channels -= s.shape[1]
 
-        # Generate random noise part
         z = utils.generate_noise(
             (noise_channels, *spatial_shape),
             num_samp=batch,

@@ -174,135 +174,105 @@ class TorchTrainer(
                 for scale in scales
             )
 
-    def initialize_noise(
+    def compute_rec_input(
         self,
         scale: int,
         indexes: list[int],
         facies_pyramid: dict[int, torch.Tensor],
-        wells_pyramid: dict[int, torch.Tensor] = {},
-        seismic_pyramid: dict[int, torch.Tensor] = {},
     ) -> torch.Tensor:
-        """Initialize and append reconstruction noise for a specific scale.
-
-        For ``scale == 0`` this generates an initial ``z_rec`` and computes the
-        initial noise amplitude appended to ``self.model.noise_amp``. For
-        higher scales it upsamples the previous reconstruction, composes the
-        correct noise channels (optionally concatenating wells/seismic), and
-        stores the resulting ``z_rec`` in ``self.model.rec_noise``.
-
-        Parameters
-        ----------
-        scale : int
-            Current pyramid scale index.
-        indexes : list[int]
-            List of batch sample indices.
-        facies_pyramid : dict[int, torch.Tensor]
-            Dictionary of real facies data for all scales.
-        wells_pyramid : dict[int, torch.Tensor], optional
-            Dictionary of well-conditioning tensors per scale.
-        seismic_pyramid : dict[int, torch.Tensor], optional
-            Dictionary of seismic-conditioning tensors per scale.
-
-        Returns
-        -------
-        torch.Tensor
-            The upsampled previous reconstruction (``prev_rec``) matching
-            ``real_facies`` spatial shape.
-
-        Side effects
-        ------------
-        - Appends the generated reconstruction noise ``z_rec`` to
-          ``self.model.rec_noise``.
-        - Updates or appends the noise amplitude entry in ``self.model.noise_amp``.
-        """
-        # Prepare previous reconstruction
         real = facies_pyramid[scale]
         if scale == 0:
-            prev_rec = torch.zeros_like(real)
-            if len(self.model.rec_noise) < scale + 1:
-                z_rec = torch_utils.generate_noise(
-                    (self.noise_channels, *real.shape[2:]),
-                    device=self.device,
-                    num_samp=self.batch_size,
+            return torch.zeros_like(real)
+
+        return torch_utils.interpolate(
+            facies_pyramid[scale - 1][indexes],
+            real.shape[2:],
+        ).to(self.device)
+
+    def init_rec_noise_and_amp(
+        self,
+        scale: int,
+        indexes: list[int],
+        real: torch.Tensor,
+        wells_pyramid: dict[int, torch.Tensor] = {},
+        seismic_pyramid: dict[int, torch.Tensor] = {},
+    ) -> None:
+        if len(self.model.rec_noise) >= scale + 1:
+            return
+
+        if scale == 0:
+            z_rec = torch_utils.generate_noise(
+                (self.noise_channels, *real.shape[2:]),
+                device=self.device,
+                num_samp=self.batch_size,
+            )
+            z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
+            self.model.rec_noise.append(z_rec)
+
+            with torch.no_grad():
+                fake = self.model.generator(
+                    self.model.get_pyramid_noise(scale, indexes),
+                    [1.0] * (scale + 1),
+                    stop_scale=scale,
                 )
-                z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
-                self.model.rec_noise.append(z_rec)
 
-                # Calculate noise amplitude for scale 0
-                with torch.no_grad():
-                    fake = self.model.generator(
-                        self.model.get_pyramid_noise(scale, indexes),
-                        [1.0] * (scale + 1),
-                        stop_scale=scale,
-                    )
-
-                rmse = torch.sqrt(F.mse_loss(fake, real))
-                amp = self.scale0_noise_amp * rmse.item()
+            rmse = torch.sqrt(F.mse_loss(fake, real))
+            amp = self.scale0_noise_amp * rmse.item()
+            if len(self.model.noise_amps) <= scale:
                 self.model.noise_amps.append(amp)
+            else:
+                self.model.noise_amps[scale] = amp
+            return
 
+        # Determine how many noise channels we need after conditioning
+        num_cond_channels = 0
+        if len(wells_pyramid) > 0:
+            num_cond_channels += self.num_img_channels
+        if len(seismic_pyramid) > 0:
+            num_cond_channels += self.num_img_channels
+
+        noise_ch = self.noise_channels - num_cond_channels
+
+        z_rec = torch_utils.generate_noise(
+            (
+                noise_ch,
+                *real.shape[2:],
+            ),
+            device=self.device,
+            num_samp=self.batch_size,
+        )
+
+        to_concat = [z_rec]
+        if len(wells_pyramid) > 0:
+            to_concat.append(wells_pyramid[scale])
+        if len(seismic_pyramid) > 0:
+            to_concat.append(seismic_pyramid[scale])
+
+        if len(to_concat) > 1:
+            z_rec = torch.cat(to_concat, dim=1)
+
+        z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
+        self.model.rec_noise.append(z_rec)
+
+        with torch.no_grad():
+            fake = self.model.generator(
+                self.model.get_pyramid_noise(
+                    scale,
+                    indexes,
+                    wells_pyramid,
+                    seismic_pyramid,
+                ),
+                self.model.noise_amps + [1.0],
+                stop_scale=scale,
+            )
+
+        rmse = torch.sqrt(F.mse_loss(fake, real))
+        amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
+
+        if scale < len(self.model.noise_amps):
+            self.model.noise_amps[scale] = (amp + self.model.noise_amps[scale]) / 2
         else:
-            # For higher scales, upsample previous facies to current resolution
-            prev_rec = torch_utils.interpolate(
-                facies_pyramid[scale - 1][indexes], real.shape[2:]
-            ).to(self.device)
-
-            if len(self.model.rec_noise) < scale + 1:
-                # noise channel sizing for higher scales (empirical split)
-
-                # Determine how many noise channels we need after conditioning
-                num_cond_channels = 0
-                if len(wells_pyramid) > 0:
-                    num_cond_channels += self.num_img_channels
-                if len(seismic_pyramid) > 0:
-                    num_cond_channels += self.num_img_channels
-
-                noise_ch = self.noise_channels - num_cond_channels
-
-                z_rec = torch_utils.generate_noise(
-                    (
-                        noise_ch,
-                        *real.shape[2:],
-                    ),
-                    device=self.device,
-                    num_samp=self.batch_size,
-                )
-
-                to_concat = [z_rec]
-                if len(wells_pyramid) > 0:
-                    to_concat.append(wells_pyramid[scale])
-                if len(seismic_pyramid) > 0:
-                    to_concat.append(seismic_pyramid[scale])
-
-                if len(to_concat) > 1:
-                    z_rec = torch.cat(to_concat, dim=1)
-
-                z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
-                self.model.rec_noise.append(z_rec)
-
-                # Calculate noise amplitude based on reconstruction error
-                with torch.no_grad():
-                    fake = self.model.generator(
-                        self.model.get_pyramid_noise(
-                            scale,
-                            indexes,
-                            wells_pyramid,
-                            seismic_pyramid,
-                        ),
-                        self.model.noise_amps + [1.0],
-                        stop_scale=scale,
-                    )
-
-                rmse = torch.sqrt(F.mse_loss(fake, real))
-                amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
-
-                if scale < len(self.model.noise_amps):
-                    self.model.noise_amps[scale] = (
-                        amp + self.model.noise_amps[scale]
-                    ) / 2
-                else:
-                    self.model.noise_amps.append(amp)
-
-        return prev_rec
+            self.model.noise_amps.append(amp)
 
     def init_dataset(
         self,

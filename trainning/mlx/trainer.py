@@ -6,6 +6,7 @@ import mlx.core as mx
 import mlx.nn as nn  # type: ignore
 import mlx.optimizers as optim  # type: ignore
 from torch.utils.data import DataLoader
+import utils
 
 
 import background_workers as bw
@@ -29,9 +30,8 @@ from trainning.mlx.collate import collate
 from trainning.mlx.schedulers import MultiStepLR
 from typedefs import Batch
 from models.mlx import utils as mlx_utils
-import utils
 
-OptimzationStep = Callable[
+OptimizationStep = Callable[
     [
         mx.array | list[int],
         dict[int, mx.array],
@@ -55,7 +55,9 @@ class MLXTrainer(
 ):
     """Parallel trainer for multi-scale progressive FaciesGAN training in MLX."""
 
-    _compiled_optimization_step: OptimzationStep | None
+    _compiled_optimization_step: OptimizationStep | None
+    _optimization_results: list[tuple[IterableMetrics[mx.array], ...]]
+    _state_to_eval: list[Any]
 
     def __init__(
         self,
@@ -66,6 +68,16 @@ class MLXTrainer(
         self.compile_backend = options.compile_backend
         self._compiled_optimization_step = None
         super().__init__(options, fine_tuning, checkpoint_path)
+
+        # Container to hold results - must be part of outputs for compile
+        self._optimization_results: list[tuple[IterableMetrics[mx.array], ...]] = []
+
+        # State list to eval after compiled step
+        self._state_to_eval: list[Any] = [
+            cast(MLXFaciesGAN, self.model).state,
+            mx.random.state,  # type: ignore
+            self._optimization_results,
+        ]
 
         try:
             # Set memory limit for better memory management
@@ -153,116 +165,106 @@ class MLXTrainer(
             for scale in scales
         )
 
-    def initialize_noise(
+    def compute_rec_input(
         self,
         scale: int,
         indexes: list[int],
         facies_pyramid: dict[int, mx.array],
+    ) -> mx.array:
+        real_facies = facies_pyramid[scale]
+        if scale == 0:
+            return mx.zeros_like(real_facies)
+
+        tensor = facies_pyramid[scale - 1][indexes]
+        return mlx_utils.interpolate(
+            tensor,
+            real_facies.shape[1:3],
+        )
+
+    def init_rec_noise_and_amp(
+        self,
+        scale: int,
+        indexes: list[int],
+        real: mx.array,
         wells_pyramid: dict[int, mx.array] = {},
         seismic_pyramid: dict[int, mx.array] = {},
-    ) -> mx.array:
-        """Initialize reconstruction noise for a scale.
+    ) -> None:
+        """Initialize reconstruction noise and noise amplitude for a specific scale.
 
         Parameters
         ----------
         scale : int
-            The current scale index.
+            Current pyramid scale index.
         indexes : list[int]
-            List of batch sample indices.
-        facies_pyramid : dict[int, mx.array]
-            Dictionary of real facies tensors for all scales being trained (indexed 0, 1, 2...).
+            Batch sample indices.
+        real : mx.array
+            Real facies tensor for the current scale.
         wells_pyramid : dict[int, mx.array], optional
             Dictionary of well-conditioning tensors for all scales.
         seismic_pyramid : dict[int, mx.array], optional
             Dictionary of seismic-conditioning tensors for all scales.
-        Returns
-        -------
-        mx.array
-            The upsampled previous reconstruction (``rec_input``) matching
-            ``real_facies`` spatial shape.
-
-        Side effects
-        ------------
-        - Appends the generated reconstruction noise ``z_rec`` to
-          ``self.model.rec_noise``.
-        - Updates or appends the noise amplitude entry in ``self.model.noise_amp``.
         """
-        # Ensure heavy ops use default stream
-        # with mx.stream(self.gpu_stream):
-        real_facies = facies_pyramid[scale]
+        if len(self.model.rec_noise) > scale:
+            return
+
         if scale == 0:
-            rec_input = mx.zeros_like(real_facies)
-            if len(self.model.rec_noise) <= scale:
-                z_rec = mlx_utils.generate_noise(
-                    (*real_facies.shape[1:3], self.noise_channels),
-                    num_samp=self.batch_size,
-                )
-
-                p = self.model.zero_padding
-                z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
-                self.model.rec_noise.append(z_rec)
-
-                # Calculate noise amplitude for scale 0
-                fake = self.model.generator(
-                    self.model.get_pyramid_noise(scale, indexes),
-                    [1.0] * (scale + 1),
-                    stop_scale=scale,
-                )
-
-                rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
-                amp = self.options.scale0_noise_amp * rmse.item()
-                self.model.noise_amps.append(amp)
-        else:
-            # Interpolate previous scale facies
-            tensor = facies_pyramid[scale - 1][indexes]
-            rec_input = mlx_utils.interpolate(
-                tensor,
-                real_facies.shape[1:3],
+            z_rec = mlx_utils.generate_noise(
+                (*real.shape[1:3], self.noise_channels),
+                num_samp=self.batch_size,
             )
 
-            if len(self.model.rec_noise) <= scale:
-                # Logic for noise generation based on conditioning
-                shape = (*real_facies.shape[1:3], self.noise_channels)
-                if len(wells_pyramid) > 0:
-                    shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
-                if len(seismic_pyramid) > 0:
-                    shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
+            p = self.model.zero_padding
+            z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+            self.model.rec_noise.append(z_rec)
 
-                z_rec = mlx_utils.generate_noise(shape, num_samp=self.batch_size)
+            fake = self.model.generator(
+                self.model.get_pyramid_noise(scale, indexes),
+                [1.0] * (scale + 1),
+                stop_scale=scale,
+            )
+            rmse = mx.sqrt(nn.losses.mse_loss(fake, real))
+            amp = self.options.scale0_noise_amp * rmse.item()
+            if len(self.model.noise_amps) <= scale:
+                self.model.noise_amps.append(amp)
+            else:
+                self.model.noise_amps[scale] = amp
+            return
 
-                to_concat = [z_rec]
-                if len(wells_pyramid) > 0:
-                    to_concat.append(wells_pyramid[scale])
-                if len(seismic_pyramid) > 0:
-                    to_concat.append(seismic_pyramid[scale])
+        # Logic for noise generation based on conditioning
+        shape = (*real.shape[1:3], self.noise_channels)
+        if len(wells_pyramid) > 0:
+            shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
+        if len(seismic_pyramid) > 0:
+            shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
 
-                if len(to_concat) > 1:
-                    z_rec = mx.concat(to_concat, axis=-1)  # type: ignore
+        z_rec = mlx_utils.generate_noise(shape, num_samp=self.batch_size)
 
-                p = self.model.zero_padding
-                z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
-                self.model.rec_noise.append(z_rec)
+        to_concat = [z_rec]
+        if len(wells_pyramid) > 0:
+            to_concat.append(wells_pyramid[scale])
+        if len(seismic_pyramid) > 0:
+            to_concat.append(seismic_pyramid[scale])
+        if len(to_concat) > 1:
+            z_rec = mx.concat(to_concat, axis=-1)  # type: ignore
 
-                # Calculate noise amplitude based on reconstruction error
-                fake = self.model.generator(
-                    self.model.get_pyramid_noise(
-                        scale, indexes, wells_pyramid, seismic_pyramid
-                    ),
-                    self.model.noise_amps + [1.0],
-                    stop_scale=scale,
-                )
+        p = self.model.zero_padding
+        z_rec = mx.pad(z_rec, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+        self.model.rec_noise.append(z_rec)
 
-                rmse = mx.sqrt(nn.losses.mse_loss(fake, real_facies))
-                amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
+        fake = self.model.generator(
+            self.model.get_pyramid_noise(
+                scale, indexes, wells_pyramid, seismic_pyramid
+            ),
+            self.model.noise_amps + [1.0],
+            stop_scale=scale,
+        )
 
-                if scale < len(self.model.noise_amps):
-                    self.model.noise_amps[scale] = (
-                        amp + self.model.noise_amps[scale]
-                    ) / 2
-                else:
-                    self.model.noise_amps.append(amp)
-
-        return rec_input
+        rmse = mx.sqrt(nn.losses.mse_loss(fake, real))
+        amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
+        if scale < len(self.model.noise_amps):
+            self.model.noise_amps[scale] = (amp + self.model.noise_amps[scale]) / 2
+        else:
+            self.model.noise_amps.append(amp)
 
     def init_dataset(
         self,
@@ -419,9 +421,8 @@ class MLXTrainer(
             if getattr(self, "_compiled_optimization_step", None) is None:
                 self._compile_optimization_step()
 
-            to_eval: tuple[IterableMetrics[mx.array], ...] = cast(
-                OptimzationStep, self._compiled_optimization_step
-            )(
+            # Call compiled step (stores results in self._compiled_results)
+            result = cast(OptimizationStep, self._compiled_optimization_step)(
                 mx.array(indexes),
                 facies_pyramid,
                 rec_in_pyramid,
@@ -429,9 +430,8 @@ class MLXTrainer(
                 masks_pyramid,
                 seismic_pyramid,
             )
-
         else:
-            to_eval = cast(
+            result = cast(
                 tuple[IterableMetrics[mx.array], ...],
                 self.model(
                     self.generator_optimizers,
@@ -444,10 +444,14 @@ class MLXTrainer(
                     seismic_pyramid,
                 ),
             )
-        disc_results, gen_results = to_eval
+
+        self._optimization_results.clear()
+        self._optimization_results.append(result)
 
         # Evaluate all lazy computations
-        mx.eval(*disc_results, *gen_results)  # type: ignore
+        mx.eval(self._state_to_eval)  # type: ignore
+
+        disc_results, gen_results = self._optimization_results[0]
 
         # Vectorized metric aggregation using vmap-like stacking
         def aggregate_metrics_vectorized(
@@ -479,29 +483,13 @@ class MLXTrainer(
     def _compile_optimization_step(self) -> None:
         """Compile the forward call with MLX `mx.compile` for faster execution.
 
-        Uses partial to specify `inputs=self.model` and `outputs=self.model`,
-        ensuring parameter updates are tracked and avoiding uncaptured inputs.
-        The compiled function accepts the model instance explicitly as its first
-        argument and is called with `self.model`.
+        Uses partial to specify `inputs` and `outputs` with model.state,
+        optimizer states, and random state to ensure all updates are tracked.
         """
 
         from functools import partial
 
-        state: list[
-            FaciesGAN[
-                mx.array,
-                nn.Module,
-                optim.Optimizer,
-                MultiStepLR,
-            ]
-            | dict[int, optim.Optimizer]
-        ] = [
-            self.model,
-            self.generator_optimizers,
-            self.discriminator_optimizers,
-        ]
-
-        @partial(mx.compile, inputs=state, outputs=state)  # type: ignore
+        @partial(mx.compile, inputs=self._state_to_eval, outputs=self._state_to_eval)  # type: ignore
         def _optimization_step(
             indexes: list[int],
             facies_pyramid: dict[int, mx.array],
@@ -524,7 +512,7 @@ class MLXTrainer(
                 ),
             )
 
-        self._compiled_optimization_step = cast(OptimzationStep, _optimization_step)
+        self._compiled_optimization_step = _optimization_step  # type: ignore
 
     def setup_optimizers(self, scales: tuple[int, ...]) -> None:
         """Setup optimizers and schedulers on the model.
@@ -568,6 +556,18 @@ class MLXTrainer(
                 gamma=self.gamma,
                 optimizer=self.discriminator_optimizers[scale],
             )
+
+            # Build optimizer state lists
+            gen_opt_states = [
+                cast(dict[str, Any], opt.state)  # type: ignore
+                for opt in self.generator_optimizers.values()
+            ]
+            disc_opt_states = [
+                cast(dict[str, Any], opt.state)  # type: ignore
+                for opt in self.discriminator_optimizers.values()
+            ]
+
+            self._state_to_eval.extend([gen_opt_states, disc_opt_states])
 
             # Invalidate compiled step on optimizer change
             self._compiled_optimization_step = None

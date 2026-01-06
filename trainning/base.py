@@ -242,44 +242,6 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         raise NotImplementedError("Subclasses must implement init_dataset")
 
     @abstractmethod
-    def initialize_noise(
-        self,
-        scale: int,
-        indexes: list[int],
-        facies_pyramid: dict[int, TTensor],
-        wells_pyramid: dict[int, TTensor] = {},
-        seismic_pyramid: dict[int, TTensor] = {},
-    ) -> TTensor:
-        """Initialize reconstruction noise for a specific scale.
-
-        Parameters
-        ----------
-        scale : int
-            Current pyramid scale index.
-        indexes : list[int]
-            Batch sample indices.
-        facies_pyramid : tuple[TTensor, ...]
-            Tuple of real facies data for all scales.
-        wells_pyramid : dict[int, TTensor], optional
-            Dictionary of well-conditioning tensors for all scales.
-        seismic_pyramid : dict[int, TTensor], optional
-            Dictionary of seismic-conditioning tensors for all scales.
-
-        Returns
-        -------
-        TTensor
-            The upsampled previous reconstruction (``prev_rec``) matching
-            ``facies_pyramid`` spatial shape. Note: reconstruction noise ``z_rec``
-            is stored in ``self.model.rec_noise`` and is not returned.
-
-        Raises
-        ------
-        NotImplementedError
-            If the subclass does not implement this method.
-        """
-        raise NotImplementedError("Subclasses must implement initialize_noise")
-
-    @abstractmethod
     def generate_visualization_samples(
         self,
         scales: tuple[int, ...],
@@ -309,6 +271,70 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         raise NotImplementedError(
             "Subclasses must implement generate_visualization_samples"
         )
+
+    @abstractmethod
+    def compute_rec_input(
+        self,
+        scale: int,
+        indexes: list[int],
+        facies_pyramid: dict[int, TTensor],
+    ) -> TTensor:
+        """Compute the reconstruction input tensor for a specific scale.
+
+        This method upsamples the reconstruction from the previous scale
+        to match the spatial dimensions of the current scale's real facies.
+
+        Parameters
+        ----------
+        scale : int
+            Current pyramid scale index.
+        indexes : list[int]
+            Batch sample indices.
+        facies_pyramid : dict[int, TTensor]
+            Dictionary of real facies data for all scales.
+
+        Returns
+        -------
+        TTensor
+            The upsampled reconstruction input tensor for the current scale.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not implement this method.
+        """
+        raise NotImplementedError("Subclasses must implement compute_rec_input")
+
+    @abstractmethod
+    def init_rec_noise_and_amp(
+        self,
+        scale: int,
+        indexes: list[int],
+        real: TTensor,
+        wells_pyramid: dict[int, TTensor] = {},
+        seismic_pyramid: dict[int, TTensor] = {},
+    ) -> None:
+        """Initialize reconstruction noise and noise amplitude for a specific scale.
+
+        Parameters
+        ----------
+        scale : int
+            Current pyramid scale index.
+        indexes : list[int]
+            Batch sample indices.
+        real : TTensor
+            Real facies tensor for the current scale.
+        wells_pyramid : dict[int, TTensor], optional
+            Dictionary of well-conditioning tensors for all scales.
+        seismic_pyramid : dict[int, TTensor], optional
+            Dictionary of seismic-conditioning tensors for all scales.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not implement this method.
+        """
+        raise NotImplementedError("Subclasses must implement init_rec_noise_and_amp")
 
     @abstractmethod
     def create_batch_iterator(
@@ -408,20 +434,19 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         #             discriminator_schedulers[scale],
         #         )
 
-        # Initialize noise for all scales from 0 to max(scales)
-        # We need all scales because the generator internally processes
-        # from scale 0 to the target scale
         stop_scale = min(max(scales), self.stop_scale) + 1
-        rec_in_pyramid: dict[int, TTensor] = {
-            scale: self.initialize_noise(
+        rec_in_pyramid: dict[int, TTensor] = {}
+        for scale in range(stop_scale):
+            rec_in_pyramid[scale] = self.compute_rec_input(
+                scale, indexes, facies_pyramid
+            )
+            self.init_rec_noise_and_amp(
                 scale,
                 indexes,
-                facies_pyramid,
+                facies_pyramid[scale],
                 wells_pyramid,
                 seismic_pyramid,
             )
-            for scale in range(stop_scale)
-        }
 
         # Training loop - iterate epochs (0-based)
         for epoch in range(self.num_iter):
