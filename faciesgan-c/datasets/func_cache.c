@@ -1,7 +1,7 @@
 #include "func_cache.h"
 #include "c_generator.h"
-#include "../io/npz_create.h"
-#include "../io/npz_unzip.h"
+#include "io/npz_create.h"
+#include "io/npz_unzip.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

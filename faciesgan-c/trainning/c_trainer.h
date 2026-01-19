@@ -2,7 +2,7 @@
 #define C_TRAINER_H
 
 #include <mlx/c/stream.h>
-#include "../options.h"
+#include "options.h"
 
 int c_trainer_run(int num_samples, int num_scales, int channels, int height, int width, int batch_size);
 

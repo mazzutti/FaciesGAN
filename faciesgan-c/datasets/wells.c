@@ -1,6 +1,6 @@
 #include "wells.h"
 #include "utils.h"
-#include "../io/npz_unzip.h"
+#include "io/npz_unzip.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>

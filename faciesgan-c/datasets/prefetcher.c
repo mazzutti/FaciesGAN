@@ -10,7 +10,7 @@
 #include <mlx/c/ops.h>
 #include <mlx/c/device.h>
 #include <mlx/c/stream.h>
-#include "../utils_extra.h"
+#include "utils_extra.h"
 
 typedef struct InternalBatch
 {

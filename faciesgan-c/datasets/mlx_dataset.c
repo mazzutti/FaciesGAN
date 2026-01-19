@@ -1,6 +1,6 @@
 #include "mlx_dataset.h"
 #include "func_cache.h"
-#include "../io/npz_unzip.h"
+#include "io/npz_unzip.h"
 #include <mlx/c/io.h>
 #include <mlx/c/stream.h>
 #include <mlx/c/array.h>

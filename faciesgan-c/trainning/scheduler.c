@@ -2,8 +2,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
-#include "../io/npz_create.h"
-#include "../io/npz_unzip.h"
+#include "io/npz_create.h"
+#include "io/npz_unzip.h"
 
 struct MLXScheduler
 {

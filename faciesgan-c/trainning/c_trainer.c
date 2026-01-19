@@ -6,7 +6,7 @@
 #include "options.h"
 #include "trainning/pybridge.h"
 #include "trainning/train_step.h"
-#include "../datasets/func_cache.h"
+#include "datasets/func_cache.h"
 #include <errno.h>
 #include <limits.h>
 #include <mlx/c/array.h>

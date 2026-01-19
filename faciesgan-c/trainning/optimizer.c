@@ -4,8 +4,9 @@
 #include <math.h>
 #include <string.h>
 /* IO helpers for .npz serialization */
-#include "../io/npz_create.h"
-#include "../io/npz_unzip.h"
+#include "io/npz_create.h"
+#include "io/npz_unzip.h"
+/* Note: includes that reference mlx-c are left unchanged (mlx-c submodule) */
 #include "../mlx-c/mlx/c/io.h"
 #include "../mlx-c/mlx/c/io_types.h"
 

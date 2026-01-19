@@ -2,7 +2,7 @@
 #define FACIESGAN_DATASETS_UTILS_H
 
 #include <stddef.h>
-#include "../options.h"
+#include "options.h"
 
 typedef struct DatasetScale
 {

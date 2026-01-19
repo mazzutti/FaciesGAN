@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "custom_layer.h"
-#include "../trainning/train_step.h"
+#include "trainning/train_step.h"
 
 static mlx_array *make_synthetic_grad(const mlx_array *param)
 {
