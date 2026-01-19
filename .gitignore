@@ -3,11 +3,14 @@
 .idea
 **/.DS_Store
 .cache/
+.checkpoints/
 .ruff_cache
 .mypy_cache
 .pytest_cache
 **/__pycache__/**
 logs/**
 output/generated
+build/
+build_dbg/
 results/**
 **/events.out.tfevents*

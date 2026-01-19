@@ -116,12 +116,24 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
         facies_pyramids: tuple[torch.Tensor, ...] = torch_utils.to_facies_pyramids(
             self.scales
         )
-        wells_pyramids: tuple[torch.Tensor, ...] = torch_utils.to_wells_pyramids(
-            self.scales
-        )
-        seismic_pyramids: tuple[torch.Tensor, ...] = torch_utils.to_seismic_pyramids(
-            self.scales
-        )
+
+        # Respect training flags: avoid generating wells/seismic pyramids
+        # if the options explicitly disable them.
+        if getattr(self, "options", None) and getattr(self.options, "use_wells", False):
+            wells_pyramids: tuple[torch.Tensor, ...] = torch_utils.to_wells_pyramids(
+                self.scales
+            )
+        else:
+            wells_pyramids = tuple()
+
+        if getattr(self, "options", None) and getattr(
+            self.options, "use_seismic", False
+        ):
+            seismic_pyramids: tuple[torch.Tensor, ...] = (
+                torch_utils.to_seismic_pyramids(self.scales)
+            )
+        else:
+            seismic_pyramids = tuple()
 
         return facies_pyramids, wells_pyramids, seismic_pyramids
 

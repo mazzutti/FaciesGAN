@@ -361,7 +361,7 @@ class TorchSPADEDiscriminator(nn.Module):
         """
         # Initialize both the framework-agnostic base and the PyTorch module
 
-        nn.Module.__init__(self)
+        nn.Module.__init__(self)  # type: ignore
 
         self.head = TorchConvBlock(
             input_channels, num_features, kernel_size, padding_size, 1
@@ -427,7 +427,7 @@ class TorchColorQuantization(nn.Module):
         temperature : float, optional
             Softmax temperature used during training for soft assignments.
         """
-        super().__init__()
+        super().__init__()  # type: ignore
         self.temperature = temperature
 
         # Define pure colors in [-1, 1] range (tanh output range)

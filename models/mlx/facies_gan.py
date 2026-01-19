@@ -775,6 +775,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             z = self.concatenate_tensors([z, seismic])
         else:
             shape = self.get_noise_shape(scale, use_base_channel=False)
+            # Quiet path when no conditioning is present.
+
             z = utils.generate_noise((*shape, self.gen_input_channels), num_samp=batch)
 
         return self.generate_padding(z, value=0)

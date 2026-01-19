@@ -1,0 +1,38 @@
+{
+  "configurations": [
+    {
+      "name": "Mac",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "${workspaceFolder}/faciesgan-c/models",
+        "${workspaceFolder}/faciesgan-c/trainning",
+        "${workspaceFolder}/faciesgan-c",
+        "${workspaceFolder}/faciesgan-c/datasets",
+        "${workspaceFolder}/faciesgan-c/io",
+        "${workspaceFolder}/faciesgan-c/third_party",
+        "${workspaceFolder}/mlx-c",
+        "${workspaceFolder}/mlx-c/mlx",
+        "${workspaceFolder}/mlx-c/mlx/c"
+      ],
+      "defines": [],
+      "macFrameworkPath": [
+        "/System/Library/Frameworks",
+        "/Library/Frameworks"
+      ],
+      "compilerPath": "/usr/bin/clang",
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "macos-clang-arm64",
+      "browse": {
+        "path": [
+          "${workspaceFolder}/**",
+          "${workspaceFolder}/faciesgan-c/third_party",
+          "${workspaceFolder}/faciesgan-c/datasets",
+          "${workspaceFolder}/faciesgan-c/io"
+        ],
+        "limitSymbolsToIncludedHeaders": false
+      }
+    }
+  ],
+  "version": 4
+}

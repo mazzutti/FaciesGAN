@@ -232,17 +232,18 @@ class MLXTrainer(
 
         # Logic for noise generation based on conditioning
         shape = (*real.shape[1:3], self.noise_channels)
-        if len(wells_pyramid) > 0:
+        # Adjust shape only if conditioning is present for this scale
+        if wells_pyramid.get(scale, None) is not None:
             shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
-        if len(seismic_pyramid) > 0:
+        if seismic_pyramid.get(scale, None) is not None:
             shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
 
         z_rec = mlx_utils.generate_noise(shape, num_samp=self.batch_size)
 
         to_concat = [z_rec]
-        if len(wells_pyramid) > 0:
+        if wells_pyramid.get(scale, None) is not None:
             to_concat.append(wells_pyramid[scale])
-        if len(seismic_pyramid) > 0:
+        if seismic_pyramid.get(scale, None) is not None:
             to_concat.append(seismic_pyramid[scale])
         if len(to_concat) > 1:
             z_rec = mx.concat(to_concat, axis=-1)  # type: ignore

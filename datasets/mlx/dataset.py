@@ -113,12 +113,24 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
         facies_pyramids = mlx_utils.to_facies_pyramids(
             self.scales, channels_last=channels_last
         )
-        wells_pyramids = mlx_utils.to_wells_pyramids(
-            self.scales, channels_last=channels_last
-        )
-        seismic_pyramids = mlx_utils.to_seismic_pyramids(
-            self.scales, channels_last=channels_last
-        )
+
+        # Respect training flags: avoid generating wells/seismic pyramids
+        # if the options explicitly disable them.
+        if getattr(self, "options", None) and getattr(self.options, "use_wells", False):
+            wells_pyramids = mlx_utils.to_wells_pyramids(
+                self.scales, channels_last=channels_last
+            )
+        else:
+            wells_pyramids = tuple()
+
+        if getattr(self, "options", None) and getattr(
+            self.options, "use_seismic", False
+        ):
+            seismic_pyramids = mlx_utils.to_seismic_pyramids(
+                self.scales, channels_last=channels_last
+            )
+        else:
+            seismic_pyramids = tuple()
 
         return facies_pyramids, wells_pyramids, seismic_pyramids
 

@@ -41,12 +41,22 @@ class PyramidsDataset(Dataset[Batch[TTensor]]):
         channels_last: bool = False,
     ) -> None:
         self.data_dir = options.input_path
+        # Keep a reference to the options so subclasses can respect flags
+        # such as `use_wells` and `use_seismic` when generating pyramids.
+        self.options = options
         self.batches: list[Batch[TTensor]] = []
         self.scales = self.generate_scales(options, channels_last)
         if regenerate:
             self.clean_cache()
 
         fp, wp, sp = self.generate_pyramids()
+
+        # Respect explicit flags: if wells/seismic are disabled in options,
+        # treat their pyramids as empty even if files exist on disk.
+        if not getattr(options, "use_wells", False):
+            wp = tuple()
+        if not getattr(options, "use_seismic", False):
+            sp = tuple()
 
         n_samples = 0
         if fp and fp[0].shape[0] > 0:

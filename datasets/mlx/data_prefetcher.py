@@ -68,7 +68,9 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
             scale: mx.array(facies[i]) for i, scale in enumerate(self.scales)
         }
 
-        # Vectorized wells and masks if wells are present
+        # Vectorized wells and masks if wells are present. When wells are
+        # absent we still provide per-scale empty arrays so compiled code
+        # that indexes the dictionaries can rely on the keys existing.
         if len(wells) > 0:
             wells_pyramid: dict[int, mx.array] = {
                 scale: mx.array(wells[i]) for i, scale in enumerate(self.scales)
@@ -79,10 +81,14 @@ class MLXDataPrefetcher(DataPrefetcher[mx.array]):
                 for scale, w in wells_pyramid.items()
             }
         else:
+            # No conditioning: return empty dicts. Callers should test
+            # truthiness (e.g. "if wells_pyramid and wells_pyramid[i]")
+            # before indexing. An empty dict avoids unnecessary per-scale
+            # None placeholders.
             wells_pyramid = {}
             masks_pyramid = {}
 
-        # Vectorized seismic if present
+        # Vectorized seismic if present. Provide empty per-scale entries when absent.
         if len(seismic) > 0:
             seismic_pyramid: dict[int, mx.array] = {
                 scale: mx.array(seismic[i]) for i, scale in enumerate(self.scales)
