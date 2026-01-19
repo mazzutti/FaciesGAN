@@ -1,0 +1,101 @@
+#ifndef FACIESGAN_C_OPTIONS_H
+#define FACIESGAN_C_OPTIONS_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+    typedef struct TrainningOptions
+    {
+        int alpha;
+        int batch_size;
+        double beta1;
+        int crop_size;
+        int discriminator_steps;
+        int num_img_channels;
+        double gamma;
+        int generator_steps;
+        int gpu_device;
+        int img_color_min;
+        int img_color_max;
+        char *input_path;
+        /* Optional exact output fullpath (corresponds to Python's
+         * `output_fullpath` argument). NULL when not provided. */
+        char *output_fullpath;
+        int kernel_size;
+        double lambda_grad;
+        double lr_d;
+        int lr_decay;
+        double lr_g;
+        int manual_seed; /* -1 means none */
+        int max_size;
+        int min_num_feature;
+        int min_size;
+        double noise_amp;
+        double min_noise_amp;
+        double scale0_noise_amp;
+        double well_loss_penalty;
+        double lambda_diversity;
+        int num_diversity_samples;
+        int num_feature;
+        int num_generated_per_real;
+        int num_iter;
+        int num_layer;
+        int noise_channels;
+        int num_real_facies;
+        int num_train_pyramids;
+        int num_parallel_scales;
+        int num_workers;
+        char *output_path;
+        int padding_size;
+        bool regen_npy_gz;
+        int save_interval;
+        int start_scale;
+        int stride;
+        int stop_scale;
+        bool use_cpu;
+        bool use_profiler;
+        bool use_mlx;
+        bool use_wells;
+        bool use_seismic;
+        bool hand_off_to_c;
+        /* wells_mask_columns omitted for simplicity (empty by default) */
+        bool enable_tensorboard;
+        bool enable_plot_facies;
+        bool compile_backend;
+    } TrainningOptions;
+
+    typedef struct ResumeOptions
+    {
+        bool fine_tuning;
+        char *checkpoint_path;
+        int num_iter; /* -1 means none */
+        int start_scale;
+    } ResumeOptions;
+
+    /* Create/destroy helpers */
+    TrainningOptions *mlx_options_new_trainning_defaults(void);
+    void mlx_options_free_trainning(TrainningOptions *opt);
+
+    ResumeOptions *mlx_options_new_resume_defaults(void);
+    void mlx_options_free_resume(ResumeOptions *opt);
+
+    /* Forward-declare MLXTrainOptions from the base manager so callers can
+     * convert the C `TrainningOptions` into the MLX-specific train options
+     * used by the C manager factory functions. The full definition lives in
+     * `models/base_manager.h` and is included by the implementation file. */
+    struct MLXTrainOptions;
+    void mlx_options_to_mlx_train_opts(const TrainningOptions *t, struct MLXTrainOptions *out);
+
+    /* Utilities */
+    TrainningOptions *mlx_options_clone(const TrainningOptions *src);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif /* FACIESGAN_C_OPTIONS_H */
