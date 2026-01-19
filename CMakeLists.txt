@@ -51,6 +51,7 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/third_party/miniz_tdef.c
   faciesgan-c/third_party/miniz_tinfl.c
   faciesgan-c/third_party/miniz_zip.c
+  faciesgan-c/trainning/c_trainer_api.c
 )
 
 target_include_directories(custom_layer

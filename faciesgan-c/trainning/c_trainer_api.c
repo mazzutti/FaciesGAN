@@ -9,12 +9,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <limits.h>
 
 struct CTrainer
 {
     TrainningOptions opts;
     MLXFaciesGAN *model;
-    MLXOptimizer **gen_opts; /* per-scale */
+    MLXOptimizer **gen_opts;  /* per-scale */
     MLXOptimizer **disc_opts; /* per-scale */
     MLXScheduler **gen_scheds;
     MLXScheduler **disc_scheds;
@@ -94,19 +95,63 @@ int c_trainer_setup_optimizers(CTrainer *t, const int *scales, int n_scales)
     return 0;
 }
 
-int c_trainer_optimization_step(CTrainer *t, int *indexes, int n_indexes)
+int c_trainer_optimization_step(
+    CTrainer *t,
+    const int *indexes,
+    int n_indexes,
+    mlx_array **facies_pyramid,
+    int n_facies,
+    mlx_array **rec_in_pyramid,
+    int n_rec,
+    mlx_array **wells_pyramid,
+    int n_wells,
+    mlx_array **masks_pyramid,
+    int n_masks,
+    mlx_array **seismic_pyramid,
+    int n_seismic,
+    const int *active_scales,
+    int n_active_scales)
 {
-    if (!t)
+    if (!t || !t->model)
         return -1;
-    /* For now expose a thin wrapper that calls the high-level per-scale
-     * optimize helpers. We assume callers will set up per-scale optimizers
-     * via `c_trainer_setup_optimizers`. Use scale 0..n_scales-1 active. */
-    if (!t->model || !t->gen_opts)
-        return -1;
-    /* No facies_pyramid / rec inputs provided here; this is a placeholder
-     * that signals a single-step entry. A richer API would accept the
-     * per-scale arrays similar to the Python side. */
-    int rc = mlx_faciesgan_optimize_generator_scales(t->model, indexes, n_indexes, t->gen_opts, NULL, NULL, NULL, NULL, t->n_scales);
+
+    int rc = 0;
+    /* First apply discriminator updates if optimizers are present */
+    if (t->disc_opts)
+    {
+        rc = mlx_faciesgan_optimize_discriminator_scales(
+            t->model,
+            indexes,
+            n_indexes,
+            t->disc_opts,
+            facies_pyramid,
+            NULL, /* rec_in not used for discriminator */
+            wells_pyramid,
+            masks_pyramid,
+            seismic_pyramid,
+            active_scales,
+            n_active_scales);
+        if (rc != 0)
+            return rc;
+    }
+
+    /* Then apply generator updates */
+    if (t->gen_opts)
+    {
+        rc = mlx_faciesgan_optimize_generator_scales(
+            t->model,
+            indexes,
+            n_indexes,
+            t->gen_opts,
+            facies_pyramid,
+            rec_in_pyramid,
+            wells_pyramid,
+            masks_pyramid,
+            seismic_pyramid,
+            active_scales,
+            n_active_scales);
+    }
+
     return rc;
 }
 

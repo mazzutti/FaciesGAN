@@ -20,8 +20,27 @@ CTrainer *c_trainer_create_with_opts(const TrainningOptions *opts);
 /* Destroy trainer and free resources. */
 void c_trainer_destroy(CTrainer *t);
 
-/* Run a single optimization step; a thin wrapper around train_step. */
-int c_trainer_optimization_step(CTrainer *t, int *indexes, int n_indexes);
+/* Run a single optimization step; accepts per-scale arrays mirroring the
+ * Python API: facies_pyramid, rec_in_pyramid, wells_pyramid, masks_pyramid,
+ * seismic_pyramid. `active_scales` is an array of scale indices to operate on.
+ */
+int c_trainer_optimization_step(
+	CTrainer *t,
+	const int *indexes,
+	int n_indexes,
+	mlx_array **facies_pyramid,
+	int n_facies,
+	mlx_array **rec_in_pyramid,
+	int n_rec,
+	mlx_array **wells_pyramid,
+	int n_wells,
+	mlx_array **masks_pyramid,
+	int n_masks,
+	mlx_array **seismic_pyramid,
+	int n_seismic,
+	const int *active_scales,
+	int n_active_scales
+);
 
 /* Setup optimizers and schedulers for provided scales. */
 int c_trainer_setup_optimizers(CTrainer *t, const int *scales, int n_scales);
