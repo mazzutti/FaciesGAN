@@ -161,9 +161,7 @@ target_include_directories(faciesgan PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c $
 target_link_libraries(faciesgan PRIVATE facies_prefetcher custom_layer)
 
 # Build C-native trainer
-target_sources(faciesgan PRIVATE
-  faciesgan-c/trainning/c_trainer.c
-)
+# (old `c_trainer.c` removed; functionality provided by `c_trainer_api.c`)
 target_include_directories(faciesgan PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c)
 
 ## Optional Python bridge for TensorBoard/background workers

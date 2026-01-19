@@ -1,7 +1,7 @@
 // Minimal C port of main.py: CLI and optional hand-off to compiled example
 #include "options.h"
 #include "utils.h"
-#include "trainning/c_trainer.h"
+#include "trainning/c_trainer_api.h"
 #include "data_files.h"
 
 #include <getopt.h>
@@ -573,8 +573,48 @@ int main(int argc, char **argv)
     printf("Output path: %s\n", topt->output_path);
     printf("============================================================\n\n");
 
-    printf("Launching C-native trainer...\n");
-    int rc = c_trainer_run_with_opts(topt);
+    printf("Launching C-native trainer (CTrainer API)...\n");
+
+    int rc = 1;
+    CTrainer *trainer = c_trainer_create_with_opts(topt);
+    if (!trainer)
+    {
+        fprintf(stderr, "Failed to create CTrainer\n");
+    }
+    else
+    {
+        /* Setup optimizers for default scales (NULL indicates library defaults). */
+        rc = c_trainer_setup_optimizers(trainer, NULL, 0);
+        if (rc != 0)
+            fprintf(stderr, "c_trainer_setup_optimizers failed: %d\n", rc);
+        else
+        {
+            /* Run a minimal optimization loop using the new API. */
+            int n_scales = c_trainer_get_n_scales(trainer);
+            int *active = NULL;
+            if (n_scales > 0)
+            {
+                active = (int *)malloc(sizeof(int) * (size_t)n_scales);
+                for (int i = 0; i < n_scales; ++i)
+                    active[i] = i;
+            }
+
+            int steps = topt->num_iter > 0 ? topt->num_iter : 1;
+            for (int s = 0; s < steps; ++s)
+            {
+                int step_rc = c_trainer_optimization_step(trainer, NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL, 0, active, n_scales);
+                if (step_rc != 0)
+                {
+                    fprintf(stderr, "c_trainer_optimization_step failed at iter %d: %d\n", s, step_rc);
+                    break;
+                }
+            }
+
+            if (active)
+                free(active);
+        }
+        c_trainer_destroy(trainer);
+    }
 
     mlx_options_free_trainning(topt);
     if (wells_mask_columns)

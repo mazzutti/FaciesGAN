@@ -1,5 +1,4 @@
 #include "trainning/c_trainer_api.h"
-#include "trainning/c_trainer.h"
 #include "trainning/train_manager.h"
 #include "trainning/train_step.h"
 #include "models/facies_gan.h"
@@ -79,9 +78,27 @@ void c_trainer_destroy(CTrainer *t)
 
 int c_trainer_setup_optimizers(CTrainer *t, const int *scales, int n_scales)
 {
-    if (!t || !scales || n_scales <= 0)
+    if (!t)
         return -1;
-    for (int i = 0; i < n_scales; ++i)
+
+    int *local_scales = NULL;
+    int local_n = n_scales;
+
+    /* If caller passes NULL/0, interpret as "all scales" */
+    if (!scales || n_scales <= 0)
+    {
+        if (t->n_scales <= 0)
+            return -1;
+        local_n = t->n_scales;
+        local_scales = (int *)malloc(sizeof(int) * (size_t)local_n);
+        if (!local_scales)
+            return -1;
+        for (int i = 0; i < local_n; ++i)
+            local_scales[i] = i;
+        scales = local_scales;
+    }
+
+    for (int i = 0; i < local_n; ++i)
     {
         int sc = scales[i];
         /* create Adam optimizers with defaults (mirrors Python defaults) */
@@ -92,7 +109,16 @@ int c_trainer_setup_optimizers(CTrainer *t, const int *scales, int n_scales)
         t->gen_scheds[sc] = mlx_scheduler_multistep_create_with_init(milestones, 1, t->opts.gamma, (const float *)&t->opts.lr_g, 1);
         t->disc_scheds[sc] = mlx_scheduler_multistep_create_with_init(milestones, 1, t->opts.gamma, (const float *)&t->opts.lr_d, 1);
     }
+    if (local_scales)
+        free(local_scales);
     return 0;
+}
+
+int c_trainer_get_n_scales(CTrainer *t)
+{
+    if (!t)
+        return 0;
+    return t->n_scales;
 }
 
 int c_trainer_optimization_step(
@@ -125,9 +151,7 @@ int c_trainer_optimization_step(
             n_indexes,
             t->disc_opts,
             facies_pyramid,
-            NULL, /* rec_in not used for discriminator */
             wells_pyramid,
-            masks_pyramid,
             seismic_pyramid,
             active_scales,
             n_active_scales);

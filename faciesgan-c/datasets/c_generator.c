@@ -12,7 +12,7 @@
 /* Avoid using stb_image_resize2.h (missing in third_party); implement a
     small bilinear resizer in-place instead of depending on stb_image_resize. */
 
-#include "../io/npz_unzip.h"
+#include "io/npz_unzip.h"
 #include <mlx/c/array.h>
 #include <mlx/c/io.h>
 #include <mlx/c/stream.h>

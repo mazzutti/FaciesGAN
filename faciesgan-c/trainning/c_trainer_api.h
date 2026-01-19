@@ -1,7 +1,6 @@
 #ifndef C_TRAINER_API_H
 #define C_TRAINER_API_H
 
-#include "trainning/c_trainer.h"
 #include "trainning/train_step.h"
 #include "trainning/train_manager.h"
 #include "options.h"
@@ -25,26 +24,27 @@ void c_trainer_destroy(CTrainer *t);
  * seismic_pyramid. `active_scales` is an array of scale indices to operate on.
  */
 int c_trainer_optimization_step(
-	CTrainer *t,
-	const int *indexes,
-	int n_indexes,
-	mlx_array **facies_pyramid,
-	int n_facies,
-	mlx_array **rec_in_pyramid,
-	int n_rec,
-	mlx_array **wells_pyramid,
-	int n_wells,
-	mlx_array **masks_pyramid,
-	int n_masks,
-	mlx_array **seismic_pyramid,
-	int n_seismic,
-	const int *active_scales,
-	int n_active_scales
-);
+    CTrainer *t,
+    const int *indexes,
+    int n_indexes,
+    mlx_array **facies_pyramid,
+    int n_facies,
+    mlx_array **rec_in_pyramid,
+    int n_rec,
+    mlx_array **wells_pyramid,
+    int n_wells,
+    mlx_array **masks_pyramid,
+    int n_masks,
+    mlx_array **seismic_pyramid,
+    int n_seismic,
+    const int *active_scales,
+    int n_active_scales);
 
 /* Setup optimizers and schedulers for provided scales. */
 int c_trainer_setup_optimizers(CTrainer *t, const int *scales, int n_scales);
 
+/* Return number of scales available in the underlying model. */
+int c_trainer_get_n_scales(CTrainer *t);
 /* Load model weights for a scale from checkpoint dir. */
 int c_trainer_load_model(CTrainer *t, int scale, const char *checkpoint_dir);
 
