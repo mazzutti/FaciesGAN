@@ -51,7 +51,7 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/third_party/miniz_tdef.c
   faciesgan-c/third_party/miniz_tinfl.c
   faciesgan-c/third_party/miniz_zip.c
-  faciesgan-c/trainning/c_trainer_api.c
+  # faciesgan-c/trainning/c_trainer_api.c
 )
 
 target_include_directories(custom_layer
@@ -111,7 +111,6 @@ target_sources(facies_prefetcher PRIVATE
   faciesgan-c/io/npz_create.c
   faciesgan-c/datasets/func_cache.c
   faciesgan-c/datasets/mlx_dataset.c
-  faciesgan-c/datasets/mlx_pyramids_dataset.c
   faciesgan-c/datasets/wells.c
 )
 
@@ -158,10 +157,17 @@ add_executable(faciesgan
 )
 
 target_include_directories(faciesgan PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
-target_link_libraries(faciesgan PRIVATE facies_prefetcher custom_layer)
+target_link_libraries(faciesgan PRIVATE facies_prefetcher custom_layer mlxc)
+
+# Include the C-native trainer implementation so the executable provides a
+# runtime `MLXTrainer_run_full` implementation (used when running the
+# dataset-driven trainer from the CLI). The library `custom_layer` contains a
+# stub to avoid linking dataset internals into the shared library; the
+# executable should supply the real implementation.
+target_sources(faciesgan PRIVATE faciesgan-c/trainning/mlx_trainer_api.c)
 
 # Build C-native trainer
-# (old `c_trainer.c` removed; functionality provided by `c_trainer_api.c`)
+# (old `c_trainer.c` removed; functionality provided by `mlx_trainer_api.c`)
 target_include_directories(faciesgan PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c)
 
 ## Optional Python bridge for TensorBoard/background workers
@@ -183,6 +189,47 @@ add_executable(gen_cache
 target_include_directories(gen_cache PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
 target_link_libraries(gen_cache PRIVATE mlxc)
 
+# Smoke-test executable for the new MLXTrainer API
+add_executable(c_trainer_smoke
+  faciesgan-c/tools/c_trainer_smoke.c
+)
+target_include_directories(c_trainer_smoke PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+target_link_libraries(c_trainer_smoke PRIVATE mlxc custom_layer facies_prefetcher)
+target_sources(c_trainer_smoke PRIVATE faciesgan-c/trainning/mlx_trainer_api.c)
+if(Python3_FOUND)
+  target_sources(c_trainer_smoke PRIVATE faciesgan-c/trainning/pybridge.c)
+  target_include_directories(c_trainer_smoke PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c)
+  target_link_libraries(c_trainer_smoke PRIVATE Python3::Python)
+endif()
+
+# Small test executable for prefetcher iterator
+add_executable(prefetcher_test
+  faciesgan-c/tools/prefetcher_test.c
+)
+target_include_directories(prefetcher_test PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+target_link_libraries(prefetcher_test PRIVATE mlxc facies_prefetcher)
+target_link_libraries(prefetcher_test PRIVATE custom_layer)
+
+# Direct NPZ -> stacked .npy comparator helper
+add_executable(compare_direct
+  faciesgan-c/tools/compare_direct.c
+)
+target_include_directories(compare_direct PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+target_link_libraries(compare_direct PRIVATE mlxc facies_prefetcher)
+target_link_libraries(compare_direct PRIVATE custom_layer)
+ 
+# Dataloader sampler test
+add_executable(dataloader_sampler_test
+  faciesgan-c/tools/dataloader_sampler_test.c
+)
+target_include_directories(dataloader_sampler_test PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+target_link_libraries(dataloader_sampler_test PRIVATE mlxc facies_prefetcher custom_layer)
+
+add_executable(facies_worker
+  faciesgan-c/tools/facies_worker.c
+)
+target_include_directories(facies_worker PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+target_link_libraries(facies_worker PRIVATE mlxc facies_prefetcher custom_layer)
 include(GNUInstallDirs)
 install(TARGETS custom_layer
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -213,6 +260,6 @@ install(TARGETS facies_prefetcher
 install(FILES faciesgan-c/datasets/prefetcher.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES faciesgan-c/datasets/collate.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES faciesgan-c/datasets/dataloader.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
-install(FILES faciesgan-c/datasets/mlx_pyramids_dataset.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES faciesgan-c/datasets/mlx_dataset.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 message(STATUS "Configured FaciesGAN MLX-C build. Use: mkdir build && cd build && cmake .. && make")

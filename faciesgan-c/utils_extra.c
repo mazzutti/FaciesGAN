@@ -1,6 +1,7 @@
 #include "utils_extra.h"
 
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <math.h>
 
@@ -11,7 +12,9 @@ int mlx_array_to_float_buffer(const mlx_array a, float **out_buf, size_t *out_el
     if (!out_buf || !out_elems)
         return -1;
     /* Ensure data is available on host */
-    mlx_array_eval(a);
+    bool ok_avail = false;
+    if (_mlx_array_is_available(&ok_avail, a) != 0 || !ok_avail)
+        return -1;
     if (mlx_array_dtype(a) != MLX_FLOAT32)
         return -1;
     size_t elems = (size_t)mlx_array_size(a);
@@ -176,7 +179,9 @@ int mlx_denorm_array(const mlx_array in, mlx_array *out, int ceiling)
     if (!out)
         return -1;
     /* Ensure evaluated and float32 */
-    mlx_array_eval(in);
+    bool ok_avail = false;
+    if (_mlx_array_is_available(&ok_avail, in) != 0 || !ok_avail)
+        return -1;
     if (mlx_array_dtype(in) != MLX_FLOAT32)
         return -1;
     size_t elems = mlx_array_size(in);
@@ -308,7 +313,11 @@ int mlx_apply_well_mask_array(const mlx_array facies, mlx_array *out, const mlx_
     if (mlx_array_to_float_buffer(facies, &fac_buf, &fac_elems, &fac_ndim, &fac_shape) != 0)
         return -1;
     /* Convert mask to uint8 host buffer */
-    mlx_array_eval(mask);
+    bool ok_mask = false;
+    if (_mlx_array_is_available(&ok_mask, mask) != 0 || !ok_mask)
+    {
+        return -1;
+    }
     int m_dtype = mlx_array_dtype(mask);
     size_t mask_elems = mlx_array_size(mask);
     unsigned char *mask_buf = (unsigned char *)malloc(mask_elems);

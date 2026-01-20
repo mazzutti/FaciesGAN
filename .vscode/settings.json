@@ -63,7 +63,7 @@
   "python.analysis.supportRestructuredText": true,
   "python-envs.pythonProjects": [],
   "[c]": {
-    "editor.defaultFormatter": "ms-vscode.cpptools"
+    "editor.defaultFormatter": "xaver.clang-format"
   },
 
 }

@@ -12,6 +12,21 @@
 #include <mlx/c/array.h>
 #include <mlx/c/stream.h>
 
+/* comparator for qsort: compare strings pointed to by array elements */
+static int cmp_strptr(const void *a, const void *b)
+{
+    const char *const *pa = (const char *const *)a;
+    const char *const *pb = (const char *const *)b;
+    const unsigned char *sa = (const unsigned char *)*pa;
+    const unsigned char *sb = (const unsigned char *)*pb;
+    while (*sa && (*sa == *sb))
+    {
+        sa++;
+        sb++;
+    }
+    return (int)(*sa) - (int)(*sb);
+}
+
 /* Helper: find first .npz file in data_root/subdir (sorted lexicographically) */
 static int find_first_npz(const char *data_root, const char *subdir, char *out_path, size_t out_len)
 {
@@ -52,7 +67,7 @@ static int find_first_npz(const char *data_root, const char *subdir, char *out_p
     if (n == 0)
         return -1;
     if (n > 1)
-        qsort(list, n, sizeof(char *), (int (*)(const void *, const void *))strcmp);
+        qsort(list, n, sizeof(char *), cmp_strptr);
     strncpy(out_path, list[0], out_len - 1);
     out_path[out_len - 1] = '\0';
     for (int i = 0; i < n; ++i)
