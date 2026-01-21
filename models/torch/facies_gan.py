@@ -63,7 +63,7 @@ class TorchFaciesGAN(
         noise_channels : int, optional
             Number of input noise channels, by default 3.
         """
-        nn.Module.__init__(self)
+        nn.Module.__init__(self)  # type: ignore
         # Initialize framework-agnostic attributes in the base class
         super().__init__(options, noise_channels, *args, **kwargs)
 

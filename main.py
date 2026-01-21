@@ -14,7 +14,7 @@ from datetime import datetime
 import torch
 from dateutil import tz
 
-from config import CHECKPOINT_PATH, OPT_FILE
+from config import OPT_FILE
 from log import init_output_logging
 from options import TrainningOptions
 from trainning import TorchTrainer, MLXTrainer
@@ -38,7 +38,12 @@ def get_arguments() -> ArgumentParser:
     # load, input, save configurations:
     parser.add_argument("--manual-seed", type=int, help="manual seed")
     parser.add_argument(
-        "--output-path", help="output folder path", default="facies_gan_parallel"
+        "--output-path", help="output folder path", default="resuslts/py/"
+    )
+    parser.add_argument(
+        "--output-fullpath",
+        help="Set exact output path (overrides automatic timestamp prefix).",
+        default=None,
     )
     parser.add_argument("--stop-scale", type=int, help="stop scale", default=6)
     parser.add_argument(
@@ -229,6 +234,11 @@ def get_arguments() -> ArgumentParser:
         action="store_true",
         help="enable JIT compilation for MLX training (can significantly speed up training)",
     )
+    parser.add_argument(
+        "--hand-off-to-c",
+        action="store_true",
+        help="Hand off orchestration to compiled C library via ctypes (thin wrapper)",
+    )
 
     return parser
 
@@ -257,9 +267,7 @@ def main() -> None:
         torch.manual_seed(options.manual_seed)  # type: ignore
 
     timestamp = datetime.now(tz.tzlocal()).strftime("%Y_%m_%d_%H_%M_%S")
-    options.output_path = os.path.join(
-        CHECKPOINT_PATH, f"{timestamp}_{options.output_path}"
-    )
+    options.output_path = os.path.join(options.output_path, timestamp)
     options.start_scale = 0
 
     os.makedirs(options.output_path, exist_ok=True)

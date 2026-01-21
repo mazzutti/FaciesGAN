@@ -398,6 +398,7 @@ mypy .
 * ✅ **Interpolator Architecture**: Refactored with base class and multiple implementations
 * ✅ **ColorEncoder**: Efficient palette-based RGB conversion with device support
 * ✅ **Pyramid Caching**: Added joblib-based caching for 10x faster repeated training
+* ✅ **C API Clarification**: C-side trainer API now uses the canonical header `trainning/mlx_trainer_api.h` and `MLXTrainer_*` symbols; the older `c_trainer_api.h` wrapper was removed.
 * ✅ **DataFiles Enum**: Centralized file path management
 * ✅ **Type Safety**: Complete type hints with Pylance strict mode
 * ✅ **Dataset Restructure**: Organized data into facies/wells/seismic directories

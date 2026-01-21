@@ -74,7 +74,7 @@ class TorchDiscriminator(Discriminator[torch.Tensor, nn.Module], nn.Module):
         Discriminator.__init__(  # type: ignore
             self, num_layer, kernel_size, padding_size, input_channels
         )
-        nn.Module.__init__(self)
+        nn.Module.__init__(self)  # type: ignore
 
         self.discs: list[nn.Module] = list()
 

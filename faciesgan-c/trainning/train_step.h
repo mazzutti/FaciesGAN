@@ -1,0 +1,91 @@
+#ifndef MLX_C_TRAIN_STEP_H
+#define MLX_C_TRAIN_STEP_H
+
+#include "autodiff.h"
+#include "facies_gan.h"
+#include "base_manager.h"
+#include "optimizer.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+    /* Apply SGD to a generator using provided gradients (array length == n).
+     * Returns 0 on success, -1 on error.
+     */
+    int mlx_faciesgan_apply_sgd_to_generator(MLXFaciesGAN *m, MLXOptimizer *opt, mlx_array **grads, int n);
+
+    /* Apply SGD to a discriminator using provided gradients (array length == n).
+     * Returns 0 on success, -1 on error.
+     */
+    int mlx_faciesgan_apply_sgd_to_discriminator(MLXFaciesGAN *m, MLXOptimizer *opt, mlx_array **grads, int n);
+
+    /* Convenience train-step that updates both generator and discriminator parameters.
+     * Each grads array must match the parameter counts for its model.
+     */
+    int mlx_faciesgan_train_step(MLXFaciesGAN *m, MLXOptimizer *opt_g, mlx_array **gen_grads, int gen_n, MLXOptimizer *opt_d, mlx_array **disc_grads, int disc_n);
+
+    /* Wrappers that accept an MLXBaseManager (adapter-backed) */
+    int mlx_base_apply_sgd_to_generator(MLXBaseManager *mgr, MLXOptimizer *opt, mlx_array **grads, int n);
+    int mlx_base_apply_sgd_to_discriminator(MLXBaseManager *mgr, MLXOptimizer *opt, mlx_array **grads, int n);
+    int mlx_base_train_step(MLXBaseManager *mgr, MLXOptimizer *opt_g, mlx_array **gen_grads, int gen_n, MLXOptimizer *opt_d, mlx_array **disc_grads, int disc_n);
+
+    /* AGValue-based helpers: collect grads from AGValue params and apply SGD. */
+    int mlx_base_apply_sgd_to_generator_from_ag(MLXBaseManager *mgr, MLXOptimizer *opt, AGValue **params, int n);
+    int mlx_base_apply_sgd_to_discriminator_from_ag(MLXBaseManager *mgr, MLXOptimizer *opt, AGValue **params, int n);
+    int mlx_base_train_step_from_ag(MLXBaseManager *mgr, MLXOptimizer *opt_g, AGValue **gen_params, int gen_n, MLXOptimizer *opt_d, AGValue **disc_params, int disc_n);
+
+    /* Metrics & gradient packaging structures ---------------------------------*/
+    typedef struct MLXScaleMetrics
+    {
+        mlx_array *fake;  /* scalar */
+        mlx_array *well;  /* scalar */
+        mlx_array *div;   /* scalar */
+        mlx_array *rec;   /* scalar */
+        mlx_array *total; /* scalar */
+    } MLXScaleMetrics;
+
+    typedef struct MLXScaleResults
+    {
+        int scale;
+        MLXScaleMetrics metrics;
+        mlx_array **gen_grads; /* array of mlx_array* (length = gen_n) */
+        int gen_n;
+        mlx_array **disc_grads;
+        int disc_n;
+    } MLXScaleResults;
+
+    typedef struct MLXResults
+    {
+        int n_scales;
+        MLXScaleResults *scales; /* malloc'd array of length n_scales */
+    } MLXResults;
+
+    /* Collect per-scale metrics and gradient arrays for generator and
+       discriminator. Caller receives malloc'd MLXResults and must free it via
+       `mlx_results_free`. Returns 0 on success. */
+    int mlx_faciesgan_collect_metrics_and_grads(
+        MLXFaciesGAN *m,
+        const int *indexes,
+        int n_indexes,
+        const int *active_scales,
+        int n_active_scales,
+        mlx_array **facies_pyramid,
+        mlx_array **rec_in_pyramid,
+        mlx_array **wells_pyramid,
+        mlx_array **masks_pyramid,
+        mlx_array **seismic_pyramid,
+        float lambda_diversity,
+        float well_loss_penalty,
+        float alpha,
+        float lambda_grad,
+        MLXResults **out_results);
+
+    void mlx_results_free(MLXResults *res);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif

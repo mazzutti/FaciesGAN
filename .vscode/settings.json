@@ -26,7 +26,10 @@
     "**/__pycache__",
     "**/.pytest_cache",
     "results/",
-    ".cache/"
+    ".cache/",
+    "build/",
+    "build_dbg/",
+    "mlx-c/"
   ],
   "editor.defaultFormatter": "ms-python.black-formatter",
   "python.analysis.enableTroubleshootMissingImports": true,
@@ -58,5 +61,9 @@
   "python.analysis.typeEvaluation.analyzeUnannotatedFunctions": true,
   "python.analysis.languageServerMode": "full",
   "python.analysis.supportRestructuredText": true,
+  "python-envs.pythonProjects": [],
+  "[c]": {
+    "editor.defaultFormatter": "xaver.clang-format"
+  },
 
 }

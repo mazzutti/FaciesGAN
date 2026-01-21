@@ -165,9 +165,45 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                 cond = z_in[..., self.output_channels :] + padded_facie
                 z_in = mx.concat([noise, cond], axis=-1)
             else:
-                z_in = z_in + padded_facie
+                # If channel counts differ unexpectedly, add only to the
+                # image channels and preserve any extra noise/conditioning
+                # channels to avoid broadcasting errors.
+                try:
+                    z_ch = z_in.shape[-1]
+                    img_ch = padded_facie.shape[-1]
+                except Exception:
+                    z_ch = None
+                    img_ch = None
 
-            out_facie = cast(mx.array, self.gens[index](z_in)) + out_facie
+                if z_ch is not None and img_ch is not None and z_ch != img_ch:
+                    # Add padded_facie to the first `img_ch` channels and
+                    # concatenate the remaining channels unchanged.
+                    first = z_in[..., :img_ch] + padded_facie
+                    if z_ch > img_ch:
+                        rest = z_in[..., img_ch:]
+                        z_in = mx.concat([first, rest], axis=-1)
+                    else:
+                        # z has fewer channels than image (unlikely) — pad
+                        pad = mx.zeros(
+                            (z_in.shape[0], z_in.shape[1], z_in.shape[2], img_ch - z_ch)
+                        )
+                        z_in = mx.concat([first, pad], axis=-1)
+                else:
+                    z_in = z_in + padded_facie
+
+            # Ensure module receives expected input channel count; if z_in
+            # contains extra conditioning/noise channels (unexpected), trim
+            # to `self.input_channels` before passing to the submodule.
+            try:
+                mod_in_ch = self.input_channels
+                if z_in.shape[-1] != mod_in_ch:
+                    z_mod = z_in[..., :mod_in_ch]
+                else:
+                    z_mod = z_in
+            except Exception:
+                z_mod = z_in
+
+            out_facie = cast(mx.array, self.gens[index](z_mod)) + out_facie
         # Apply color quantization to enforce pure colors
         out_facie = self.color_quantizer(out_facie)
         return out_facie

@@ -9,6 +9,8 @@ arguments used throughout the project. They may be passed as the
 import argparse
 from dataclasses import dataclass
 
+from config import DATA_DIR, RESULTS_DIR
+
 
 @dataclass
 class TrainningOptions(argparse.Namespace):
@@ -31,7 +33,7 @@ class TrainningOptions(argparse.Namespace):
         generator_steps: int = 3,
         gpu_device: int = 0,
         img_color_range: tuple[int, int] = (0, 255),
-        input_path: str = "data",
+        input_path: str = DATA_DIR,
         kernel_size: int = 3,
         lambda_grad: float = 0.1,
         lr_d: float = 5e-05,
@@ -56,7 +58,7 @@ class TrainningOptions(argparse.Namespace):
         num_train_pyramids: int = 200,
         num_parallel_scales: int = 2,
         num_workers: int = 4,
-        output_path: str = "results",
+        output_path: str = RESULTS_DIR,
         padding_size: int = 0,
         regen_npy_gz: bool = False,
         save_interval: int = 100,

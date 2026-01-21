@@ -16,7 +16,7 @@
         "--input-path",
         "data",
         "--output-path",
-        "results/",
+        "results/py/",
         "--num-train-pyramids",
         "1",
         "--batch-size",
@@ -24,7 +24,7 @@
         "--num-workers",
         "0",
         "--num-iter",
-        "4000",
+        "200",
         "--num-parallel-scales",
         "7",
         "--discriminator-steps",
@@ -46,6 +46,54 @@
         "--compile-backend"
         // "--use-profiler"
       ]
+    },
+    {
+      "name": "C: Launch FaciesGAN (lldb)",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build/faciesgan",
+      "preLaunchTask": "Build FaciesGAN",
+      "args": [
+        "--input-path",
+        "data",
+        "--output-path",
+        "results/c/",
+        "--num-train-pyramids",
+        "1",
+        "--batch-size",
+        "1",
+        "--num-workers",
+        "0",
+        "--num-iter",
+        "200",
+        "--num-parallel-scales",
+        "7",
+        "--discriminator-steps",
+        "3",
+        "--generator-steps",
+        "3",
+        "--alpha",
+        "10",
+        "--scale0-noise-amp",
+        "1.5",
+        "--min-noise-amp",
+        "0.3",
+        "--lambda-diversity",
+        "1.0",
+        "--no-tensorboard",
+        "--use-wells",
+        "--use-seismic",
+        "--use-mlx",
+        "--compile-backend"
+      ],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "NUM_STEPS": "200",
+        "OUTPUT_PATH": "${workspaceFolder}/results/"
+      },
+      "stopOnEntry": false,
+      "terminal": "integrated"
     }
-  ]
+  ],
 }

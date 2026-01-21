@@ -96,7 +96,7 @@ class ExtractUniqueColors:
                 img = Image.fromarray(
                     (np.clip(facies_np_full, 0.0, 1.0) * 255).astype("uint8")
                 )
-                thumb = img.resize((16, 16), Image.BILINEAR)
+                thumb = img.resize((16, 16), Image.Resampling.BILINEAR)
                 thumb_np = np.array(thumb).astype(np.float32) / 255.0
 
             try:
@@ -218,7 +218,7 @@ class PreprocessWellMask:
                 mask_img = Image.fromarray((mask_2d > 0.5).astype("uint8") * 255)
                 # PIL resize expects (width, height)
                 resized = mask_img.resize(
-                    (target_shape[1], target_shape[0]), Image.NEAREST
+                    (target_shape[1], target_shape[0]), Image.Resampling.NEAREST
                 )
                 mask_2d = np.array(resized) > 127
 
@@ -325,7 +325,7 @@ class QuantizeToPureColors:
         try:
             # Create a small thumbnail to fingerprint the image (faster than hashing full data)
             img = Image.fromarray((np.clip(arr, 0.0, 1.0) * 255).astype("uint8"))
-            thumb = img.resize((16, 16), Image.BILINEAR)
+            thumb = img.resize((16, 16), Image.Resampling.BILINEAR)
             # Convert thumbnail to a numpy array and use ndarray.tobytes() which has a known signature
             thumb_arr = np.asarray(thumb)
             h = hashlib.sha1(thumb_arr.tobytes()).hexdigest()[:12]
@@ -448,12 +448,12 @@ def apply_well_mask(
             target_h, target_w = result.shape[0], result.shape[1]
             if well_2d.ndim == 2:
                 img = Image.fromarray((well_2d * 255).astype("uint8"))
-                resized = img.resize((target_w, target_h), Image.NEAREST)
+                resized = img.resize((target_w, target_h), Image.Resampling.NEAREST)
                 well_2d = np.array(resized).astype(np.float32) / 255.0
             else:
                 # RGB case
                 img = Image.fromarray((well_2d * 255).astype("uint8"), mode="RGB")
-                resized = img.resize((target_w, target_h), Image.NEAREST)
+                resized = img.resize((target_w, target_h), Image.Resampling.NEAREST)
                 well_2d = np.array(resized).astype(np.float32) / 255.0
     else:
         # Legacy path: compute mask processing inline
@@ -470,17 +470,19 @@ def apply_well_mask(
             target_h, target_w = result.shape[0], result.shape[1]
             # Resize mask
             mask_img = Image.fromarray((mask_2d > 0.5).astype("uint8") * 255)
-            resized_mask = mask_img.resize((target_w, target_h), Image.NEAREST)
+            resized_mask = mask_img.resize(
+                (target_w, target_h), Image.Resampling.NEAREST
+            )
             mask_2d = np.array(resized_mask) > 127
 
             # Resize well data
             if well_2d.ndim == 2:
                 img = Image.fromarray((well_2d * 255).astype("uint8"))
-                resized = img.resize((target_w, target_h), Image.NEAREST)
+                resized = img.resize((target_w, target_h), Image.Resampling.NEAREST)
                 well_2d = np.array(resized).astype(np.float32) / 255.0
             else:
                 img = Image.fromarray((well_2d * 255).astype("uint8"), mode="RGB")
-                resized = img.resize((target_w, target_h), Image.NEAREST)
+                resized = img.resize((target_w, target_h), Image.Resampling.NEAREST)
                 well_2d = np.array(resized).astype(np.float32) / 255.0
 
         # Find well column locations by summing mask vertically
@@ -1009,11 +1011,11 @@ def plot_generated_facies(
             # Use PIL for faster nearest/bilinear resizing
             if real_arr.ndim == 2:
                 img = Image.fromarray((real_arr * 255).astype("uint8"))
-                resized = img.resize((cell_size, cell_size), Image.NEAREST)
+                resized = img.resize((cell_size, cell_size), Image.Resampling.NEAREST)
                 real_arr = np.array(resized).astype(np.float32) / 255.0
             else:
                 img = Image.fromarray((real_arr * 255).astype("uint8"), mode="RGB")
-                resized = img.resize((cell_size, cell_size), Image.BICUBIC)
+                resized = img.resize((cell_size, cell_size), Image.Resampling.BICUBIC)
                 real_arr = np.array(resized).astype(np.float32) / 255.0
 
         # Apply well mask to show well pixels with original colors and replace black with white
@@ -1042,7 +1044,7 @@ def plot_generated_facies(
         h, w = real_rgb.shape[:2]
         real_img = Image.fromarray(real_rgb, mode="RGB")
         if h != cell_size or w != cell_size:
-            real_img = real_img.resize((cell_size, cell_size), Image.BICUBIC)
+            real_img = real_img.resize((cell_size, cell_size), Image.Resampling.BICUBIC)
 
         # Paste into grid with spacing, margin, and title
         x_offset = margin
@@ -1083,13 +1085,17 @@ def plot_generated_facies(
                 # Resize generated array using PIL for speed and visual quality
                 if gen_arr_np.ndim == 2:
                     img = Image.fromarray((gen_arr_np * 255).astype("uint8"))
-                    resized = img.resize((cell_size, cell_size), Image.NEAREST)
+                    resized = img.resize(
+                        (cell_size, cell_size), Image.Resampling.NEAREST
+                    )
                     gen_arr_np = np.array(resized).astype(np.float32) / 255.0
                 else:
                     img = Image.fromarray(
                         (gen_arr_np * 255).astype("uint8"), mode="RGB"
                     )
-                    resized = img.resize((cell_size, cell_size), Image.BICUBIC)
+                    resized = img.resize(
+                        (cell_size, cell_size), Image.Resampling.BICUBIC
+                    )
                     gen_arr_np = np.array(resized).astype(np.float32) / 255.0
 
             # Handle both grayscale (H, W) and RGB (H, W, C) arrays BEFORE quantization
@@ -1128,7 +1134,9 @@ def plot_generated_facies(
             h, w = gen_rgb.shape[:2]
             gen_img = Image.fromarray(gen_rgb, mode="RGB")
             if h != cell_size or w != cell_size:
-                gen_img = gen_img.resize((cell_size, cell_size), Image.BICUBIC)
+                gen_img = gen_img.resize(
+                    (cell_size, cell_size), Image.Resampling.BICUBIC
+                )
 
             x_offset = margin + (j + 1) * (cell_size + spacing)
 

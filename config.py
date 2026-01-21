@@ -16,7 +16,8 @@ Do not put runtime logic in this module; it only contains constants.
 """
 
 # Directory and option filename used by the top-level scripts
-RESULTS_DIR = "results"
+RESULTS_DIR = "results/py"
+DATA_DIR = "data"
 CHECKPOINT_PATH = RESULTS_DIR
 OPT_FILE = "options.json"
 
