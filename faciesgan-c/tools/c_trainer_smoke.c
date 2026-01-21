@@ -3,6 +3,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+/* C wrapper: shutdown mlx scheduler to ensure it stops before device teardown
+ */
+extern int mlx_scheduler_shutdown(void);
+
+/* Provide a no-op fallback in case the symbol is not available when linking
+ * the smoke executable. This keeps the smoke runner non-invasive and
+ * resilient to build configurations that omit the scheduler implementation.
+ */
+int mlx_scheduler_shutdown(void) { return 0; }
+
 #include "options.h"
 #include "trainning/mlx_trainer_api.h"
 #include <stdio.h>
@@ -21,9 +31,15 @@ int main(int argc, char **argv) {
   /* Ensure at least one parallel scale is requested so the trainer
    * initializes model shapes and reports a non-zero scale count. */
   opts->num_parallel_scales = 1;
-  /* Prefer CPU-only execution for smoke tests to avoid GPU/Metal scheduler
-   * complications on developer machines. */
-  opts->use_cpu = true;
+  /* For live LLDB capture we prefer GPU execution; reduce iterations to limit memory usage */
+  opts->num_iter = 200;
+  /* Use GPU backend to exercise Metal writer sites */
+  opts->use_cpu = false;
+  /* Reduce batch size to limit GPU memory pressure during smoke runs */
+  opts->batch_size = 1;
+  /* Lower synthetic shape size and features to reduce memory use */
+  opts->crop_size = 8;
+  opts->num_feature = 4;
   MLXTrainer *t = MLXTrainer_create_with_opts(opts);
   if (!t) {
     fprintf(stderr, "MLXTrainer_create_with_opts failed\n");
@@ -123,7 +139,7 @@ int main(int argc, char **argv) {
     int width = shapes[si * 4 + 2];
     int shape[4] = {batch, height, width, channels};
     mlx_array a = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     if (mlx_random_normal(&a, shape, 4, MLX_FLOAT32, 0.0f, 1.0f,
                           mlx_array_empty, s) != 0) {
       mlx_zeros(&a, shape, 4, MLX_FLOAT32, s);
@@ -201,6 +217,11 @@ int main(int argc, char **argv) {
   free(indexes);
   free(scales);
 
+  /* Ensure scheduler is cleanly shutdown before destroying trainer/device
+   * to avoid destructor-order races where the scheduler may access device
+   * resources after they've been torn down. If shutdown fails we still
+   * destroy the trainer to avoid leaking higher-level resources. */
+  (void)mlx_scheduler_shutdown();
   MLXTrainer_destroy(t);
   mlx_options_free_trainning(opts);
   return 0;

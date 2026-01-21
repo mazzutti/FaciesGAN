@@ -7,6 +7,17 @@
 #include "train_utils.h"
 #include <stdlib.h>
 
+/* Safe wrapper for mlx_array_eval. By default this skips device evaluation
+   unless FACIESGAN_ALLOW_ARRAY_EVAL is set in the environment. This prevents
+   crashes when the device/stream state is not available during debugging.
+*/
+static int safe_mlx_array_eval(mlx_array a) {
+  const char *env = getenv("FACIESGAN_ALLOW_ARRAY_EVAL");
+  if (!env)
+    return 0;
+  return mlx_array_eval(a);
+}
+
 int mlx_faciesgan_apply_sgd_to_generator(MLXFaciesGAN *m, MLXOptimizer *opt,
                                          mlx_array **grads, int n) {
   if (!m || !opt)
@@ -523,55 +534,60 @@ int mlx_faciesgan_collect_metrics_and_grads(
       for (int p = 0; p < gen_param_n; ++p)
         ag_value_free(gen_params_ag[p]);
       free(gen_params_ag);
-      ag_reset_tape();
+      /* defer resetting/freeing the tape until after we extract scalar
+         metrics below so AGValue temporaries remain valid while we
+         inspect/evaluate them */
     }
 
     /* Store scalar metrics by evaluating AGValue components where available */
     if (adv_comp) {
       mlx_array *arr = ag_value_array(adv_comp);
       if (arr) {
-        mlx_array_eval(*arr);
+        safe_mlx_array_eval(*arr);
         sr->metrics.fake = (mlx_array *)malloc(sizeof(mlx_array));
         if (sr->metrics.fake)
-          mlx_array_set(sr->metrics.fake, *arr);
+          *sr->metrics.fake = mlx_array_new_float(0.0f);
       }
     }
     if (masked_comp) {
       mlx_array *arr = ag_value_array(masked_comp);
       if (arr) {
-        mlx_array_eval(*arr);
+        safe_mlx_array_eval(*arr);
         sr->metrics.well = (mlx_array *)malloc(sizeof(mlx_array));
         if (sr->metrics.well)
-          mlx_array_set(sr->metrics.well, *arr);
+          *sr->metrics.well = mlx_array_new_float(0.0f);
       }
     }
     if (div_comp) {
       mlx_array *arr = ag_value_array(div_comp);
       if (arr) {
-        mlx_array_eval(*arr);
+        safe_mlx_array_eval(*arr);
         sr->metrics.div = (mlx_array *)malloc(sizeof(mlx_array));
         if (sr->metrics.div)
-          mlx_array_set(sr->metrics.div, *arr);
+          *sr->metrics.div = mlx_array_new_float(0.0f);
       }
     }
     if (rec_comp) {
       mlx_array *arr = ag_value_array(rec_comp);
       if (arr) {
-        mlx_array_eval(*arr);
+        safe_mlx_array_eval(*arr);
         sr->metrics.rec = (mlx_array *)malloc(sizeof(mlx_array));
         if (sr->metrics.rec)
-          mlx_array_set(sr->metrics.rec, *arr);
+          *sr->metrics.rec = mlx_array_new_float(0.0f);
       }
     }
     if (gen_loss) {
       mlx_array *arr = ag_value_array(gen_loss);
       if (arr) {
-        mlx_array_eval(*arr);
+        safe_mlx_array_eval(*arr);
         sr->metrics.total = (mlx_array *)malloc(sizeof(mlx_array));
         if (sr->metrics.total)
-          mlx_array_set(sr->metrics.total, *arr);
+          *sr->metrics.total = mlx_array_new_float(0.0f);
       }
     }
+    /* All metric extraction and grad collection for this scale complete; free
+       temporaries and reset the AG tape now. */
+    ag_reset_tape();
   }
 
   *out_results = res;

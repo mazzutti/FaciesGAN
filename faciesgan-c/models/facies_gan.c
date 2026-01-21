@@ -682,17 +682,18 @@ AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
       if (rsh && fsh && (rsh[1] != fsh[1] || rsh[2] != fsh[2])) {
         int dh = fsh[1] - rsh[1];
         int dw = fsh[2] - rsh[2];
-        int low_h = dh > 0 ? dh/2 : 0;
+        int low_h = dh > 0 ? dh / 2 : 0;
         int high_h = dh > 0 ? dh - low_h : 0;
-        int low_w = dw > 0 ? dw/2 : 0;
+        int low_w = dw > 0 ? dw / 2 : 0;
         int high_w = dw > 0 ? dw - low_w : 0;
-        int axes_pad[2] = {1,2};
+        int axes_pad[2] = {1, 2};
         int low_pad[2] = {low_h, low_w};
         int high_pad[2] = {high_h, high_w};
         mlx_array pad_zero = mlx_array_new_float(0.0f);
         mlx_array padded = mlx_array_new();
         mlx_stream s2 = mlx_default_cpu_stream_new();
-        if (mlx_pad(&padded, *rarr2, axes_pad, 2, low_pad, 2, high_pad, 2, pad_zero, "constant", s2) == 0) {
+        if (mlx_pad(&padded, *rarr2, axes_pad, 2, low_pad, 2, high_pad, 2,
+                    pad_zero, "constant", s2) == 0) {
           /* wrap padded real as new AGValue and use it instead of original */
           AGValue *real_p = ag_value_from_new_array(&padded, 0);
           ag_register_temp_value(real_p);

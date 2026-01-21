@@ -1735,9 +1735,6 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         }
       }
     }
-
-    
-    
   }
 
   /* Training: soft assignment

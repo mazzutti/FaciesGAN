@@ -43,6 +43,7 @@ void *MLXTrainer_get_model_ctx(MLXTrainer *t);
 #include "trainning/train_utils.h"
 #include <dirent.h>
 #include <errno.h>
+#include <execinfo.h>
 #include <limits.h>
 #include <mlx/c/array.h>
 #include <mlx/c/device.h>
@@ -791,6 +792,15 @@ int MLXTrainer_train_scales(MLXTrainer *t, const int *indexes, int n_indexes,
   if (!t || !indexes || n_indexes <= 0 || !facies_pyramid || n_facies <= 0 ||
       !scales || n_scales <= 0 || num_iter <= 0)
     return -1;
+
+  /* Writer canary: emit backtrace when MLXTrainer runs training loop */
+  fprintf(stderr, "[writer_canary] func=MLXTrainer_train_scales tid=%lu\n",
+          (unsigned long)pthread_self());
+  {
+    void *bt[64];
+    int bt_size = backtrace(bt, 64);
+    backtrace_symbols_fd(bt, bt_size, fileno(stderr));
+  }
 
   /* Prepare rec_in_pyramid once per iteration as Python does */
   for (int epoch = 0; epoch < num_iter; ++epoch) {

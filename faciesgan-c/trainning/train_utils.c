@@ -1,10 +1,12 @@
 #include "train_utils.h"
 #include "models/custom_layer.h"
 #include "models/facies_gan.h"
+#include <execinfo.h>
 #include <math.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdbool.h>
 
 int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
                           mlx_array **facies_pyramid, mlx_array **out) {
@@ -12,6 +14,15 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
     return -1;
   if (scale < 0)
     return -1;
+
+  /* Writer canary: emit backtrace when this hot function runs */
+  fprintf(stderr, "[writer_canary] func=mlx_compute_rec_input tid=%lu\n",
+          (unsigned long)pthread_self());
+  {
+    void *bt[64];
+    int bt_size = backtrace(bt, 64);
+    backtrace_symbols_fd(bt, bt_size, fileno(stderr));
+  }
 
   /* create a default CPU stream for MLX ops and ensure it's freed */
   mlx_stream s = mlx_default_cpu_stream_new();
@@ -362,7 +373,8 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
   /* extract scalar value (skip host eval when disabled via env var to avoid
      invoking device schedulers in smoke runs) */
   double rmse = 0.0;
-  /* Prefer reading host value only when available to avoid forcing device eval */
+  /* Prefer reading host value only when available to avoid forcing device eval
+   */
   bool ok_root = false;
   if (_mlx_array_is_available(&ok_root, root) == 0 && ok_root) {
     const float *pdata = mlx_array_data_float32(root);

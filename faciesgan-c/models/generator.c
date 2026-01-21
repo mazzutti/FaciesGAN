@@ -22,12 +22,13 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
       int high_h = dh - low_h;
       int low_w = dw / 2;
       int high_w = dw - low_w;
-      int axes_pad[2] = {1,2};
+      int axes_pad[2] = {1, 2};
       int low_pad[2] = {low_h, low_w};
       int high_pad[2] = {high_h, high_w};
       mlx_array zero = mlx_array_new_float(0.0f);
       mlx_array padded = mlx_array_new();
-      if (mlx_pad(&padded, a, axes_pad, 2, low_pad, 2, high_pad, 2, zero, "constant", s) == 0) {
+      if (mlx_pad(&padded, a, axes_pad, 2, low_pad, 2, high_pad, 2, zero,
+                  "constant", s) == 0) {
         if (a.ctx)
           mlx_array_free(a);
         a_copy = padded;
@@ -42,12 +43,13 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
       int high_h = pdh - low_h;
       int low_w = pdw / 2;
       int high_w = pdw - low_w;
-      int axes_pad[2] = {1,2};
+      int axes_pad[2] = {1, 2};
       int low_pad[2] = {low_h, low_w};
       int high_pad[2] = {high_h, high_w};
       mlx_array zero = mlx_array_new_float(0.0f);
       mlx_array padded = mlx_array_new();
-      if (mlx_pad(&padded, b, axes_pad, 2, low_pad, 2, high_pad, 2, zero, "constant", s) == 0) {
+      if (mlx_pad(&padded, b, axes_pad, 2, low_pad, 2, high_pad, 2, zero,
+                  "constant", s) == 0) {
         if (b.ctx)
           mlx_array_free(b);
         b_copy = padded;
@@ -58,9 +60,9 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
     }
   }
   int rc = mlx_add(out, a_copy, b_copy, s);
-  /* If we allocated padded copies, they are now owned by *out or should be freed
-     by caller; mlx_add returns a new array in *out on success. Free any leftover
-     temp arrays that weren't moved into out. */
+  /* If we allocated padded copies, they are now owned by *out or should be
+     freed by caller; mlx_add returns a new array in *out on success. Free any
+     leftover temp arrays that weren't moved into out. */
   return rc;
 }
 
@@ -941,7 +943,8 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
      * If one is smaller, pad it with zeros centrally. */
     const int *mos_sh = mlx_array_shape(out_mod);
     const int *ups_sh = mlx_array_shape(upsampled);
-    if (mos_sh && ups_sh && (mos_sh[1] != ups_sh[1] || mos_sh[2] != ups_sh[2])) {
+    if (mos_sh && ups_sh &&
+        (mos_sh[1] != ups_sh[1] || mos_sh[2] != ups_sh[2])) {
       int dh = ups_sh[1] - mos_sh[1];
       int dw = ups_sh[2] - mos_sh[2];
       if (dh == 0 && dw == 0) {
