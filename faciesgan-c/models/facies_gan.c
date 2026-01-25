@@ -5,11 +5,10 @@
 #include <string.h>
 /* Standard string/memory functions provided by <string.h> */
 #include "custom_layer.h"
-#include <trainning/autodiff.h>
-#include <trainning/train_step.h>
-/* IO helpers from MLX C API */
 #include <mlx/c/io.h>
 #include <mlx/c/map.h>
+#include <trainning/autodiff.h>
+#include <trainning/train_step.h>
 
 struct MLXFaciesGAN {
   int num_layer;
@@ -28,7 +27,7 @@ struct MLXFaciesGAN {
   MLXDiscriminator *discriminator;
   /* optional shapes & noise amp bookkeeping (set via set_shapes /
    * set_noise_amps) */
-  int *shapes_flat;
+  int *shapes;
   int n_shapes;
   float *noise_amps;
   int n_noise_amps;
@@ -72,7 +71,7 @@ MLXFaciesGAN *mlx_faciesgan_create(int num_layer, int kernel_size,
   m->generator_steps = generator_steps;
   m->generator = NULL;
   m->discriminator = NULL;
-  m->shapes_flat = NULL;
+  m->shapes = NULL;
   m->n_shapes = 0;
   m->noise_amps = NULL;
   m->n_noise_amps = 0;
@@ -165,33 +164,60 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
       }
       free(axes);
 
-      /* multiply mean by -10 and take exp(-10 * mean) */
-      mlx_array neg10 = mlx_array_new_float(-10.0f);
+      /* approximate exp(-10 * mean_sq) with 1 / (1 + 10 * mean_sq) */
+      mlx_array coef = mlx_array_new_float(10.0f);
       mlx_array prod = mlx_array_new();
-      if (mlx_multiply(&prod, mean, neg10, s) != 0) {
+      if (mlx_multiply(&prod, mean, coef, s) != 0) {
         mlx_array_free(diff);
         mlx_array_free(sq);
         mlx_array_free(mean);
-        mlx_array_free(neg10);
+        mlx_array_free(coef);
         mlx_array_free(prod);
         continue;
       }
-      mlx_exp(&prod, prod, s);
+      mlx_array one = mlx_array_new_float(1.0f);
+      mlx_array den = mlx_array_new();
+      if (mlx_add(&den, one, prod, s) != 0) {
+        mlx_array_free(diff);
+        mlx_array_free(sq);
+        mlx_array_free(mean);
+        mlx_array_free(coef);
+        mlx_array_free(prod);
+        mlx_array_free(one);
+        mlx_array_free(den);
+        continue;
+      }
+      mlx_array val = mlx_array_new();
+      if (mlx_divide(&val, one, den, s) != 0) {
+        mlx_array_free(diff);
+        mlx_array_free(sq);
+        mlx_array_free(mean);
+        mlx_array_free(coef);
+        mlx_array_free(prod);
+        mlx_array_free(one);
+        mlx_array_free(den);
+        mlx_array_free(val);
+        continue;
+      }
 
       /* accumulate into acc */
       mlx_array tmp = mlx_array_new();
-      if (mlx_add(&tmp, acc, prod, s) == 0) {
+      if (mlx_add(&tmp, acc, val, s) == 0) {
         mlx_array_free(acc);
         acc = tmp;
       } else {
         mlx_array_free(tmp);
       }
 
+      mlx_array_free(coef);
+      mlx_array_free(prod);
+      mlx_array_free(one);
+      mlx_array_free(den);
+      mlx_array_free(val);
+
       mlx_array_free(diff);
       mlx_array_free(sq);
       mlx_array_free(mean);
-      mlx_array_free(neg10);
-      mlx_array_free(prod);
       pairs++;
     }
   }
@@ -349,8 +375,8 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
 void mlx_faciesgan_free(MLXFaciesGAN *m) {
   if (!m)
     return;
-  if (m->shapes_flat)
-    free(m->shapes_flat);
+  if (m->shapes)
+    free(m->shapes);
   if (m->noise_amps)
     free(m->noise_amps);
   free(m);
@@ -647,11 +673,37 @@ AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
    * then wrap as AGValue (no grad). For debug / CPU-only smoke runs we allow
    * skipping MLX array eval via the FACIESGAN_SKIP_ARRAY_EVAL env var and
    * fall back to a fixed scalar alpha. */
-  /* Use a deterministic scalar alpha for gradient-penalty in the C smoke
-     runner to avoid invoking device RNG paths that may crash in some
-     debug/runtime states. This is acceptable for smoke testing. */
-  AGValue *alpha = ag_scalar_float(0.5f);
-  ag_register_temp_value(alpha);
+  /* Sample random alpha with shape (batch,1,1,1) to match Python behavior. */
+  AGValue *alpha = NULL;
+  {
+    mlx_array *rarr = ag_value_array(real);
+    if (rarr) {
+      const int *rsh = mlx_array_shape(*rarr);
+      if (rsh) {
+        int batch = rsh[0];
+        int shape[4] = {batch, 1, 1, 1};
+        mlx_array a = mlx_array_new();
+        mlx_array low = mlx_array_new_float(0.0f);
+        mlx_array high = mlx_array_new_float(1.0f);
+        mlx_stream s2 = mlx_default_cpu_stream_new();
+        if (mlx_random_uniform(&a, low, high, shape, 4, MLX_FLOAT32,
+                               mlx_array_empty, s2) == 0) {
+          alpha = ag_value_from_new_array(&a, 0);
+          ag_register_temp_value(alpha);
+        } else {
+          mlx_array_free(a);
+        }
+        mlx_array_free(low);
+        mlx_array_free(high);
+        mlx_stream_free(s2);
+      }
+    }
+    if (!alpha) {
+      /* fallback to scalar 0.5 if sampling failed */
+      alpha = ag_scalar_float(0.5f);
+      ag_register_temp_value(alpha);
+    }
+  }
 
   /* interpolates = alpha * real + (1-alpha) * fake */
   AGValue *one = ag_scalar_float(1.0f);
@@ -1097,23 +1149,22 @@ int mlx_faciesgan_train_step_from_ag(MLXFaciesGAN *m, MLXOptimizer *opt_g,
   return 0;
 }
 
-int mlx_faciesgan_set_shapes(MLXFaciesGAN *m, const int *shapes_flat,
-                             int n_scales) {
+int mlx_faciesgan_set_shapes(MLXFaciesGAN *m, const int *shapes, int n_scales) {
   if (!m)
     return -1;
-  if (m->shapes_flat) {
-    free(m->shapes_flat);
-    m->shapes_flat = NULL;
+  if (m->shapes) {
+    free(m->shapes);
+    m->shapes = NULL;
     m->n_shapes = 0;
   }
-  if (!shapes_flat || n_scales <= 0)
+  if (!shapes || n_scales <= 0)
     return 0;
   /* assume each scale shape is 4 ints (N,H,W,C) */
   int total = n_scales * 4;
-  m->shapes_flat = (int *)malloc(sizeof(int) * total);
-  if (!m->shapes_flat)
+  m->shapes = (int *)malloc(sizeof(int) * total);
+  if (!m->shapes)
     return -1;
-  memcpy(m->shapes_flat, shapes_flat, sizeof(int) * total);
+  memcpy(m->shapes, shapes, sizeof(int) * total);
   m->n_shapes = n_scales;
   return 0;
 }
@@ -1135,12 +1186,12 @@ int mlx_faciesgan_set_noise_amps(MLXFaciesGAN *m, const float *amps, int n) {
   return 0;
 }
 
-int mlx_faciesgan_get_shapes_flat(MLXFaciesGAN *m, int **out_shapes_flat,
+int mlx_faciesgan_get_shapes_flat(MLXFaciesGAN *m, int **out_shapes,
                                   int *out_n_scales) {
-  if (!m || !out_shapes_flat || !out_n_scales)
+  if (!m || !out_shapes || !out_n_scales)
     return -1;
-  if (!m->shapes_flat || m->n_shapes == 0) {
-    *out_shapes_flat = NULL;
+  if (!m->shapes || m->n_shapes == 0) {
+    *out_shapes = NULL;
     *out_n_scales = 0;
     return 0;
   }
@@ -1148,8 +1199,8 @@ int mlx_faciesgan_get_shapes_flat(MLXFaciesGAN *m, int **out_shapes_flat,
   int *copy = (int *)malloc(sizeof(int) * total);
   if (!copy)
     return -1;
-  memcpy(copy, m->shapes_flat, sizeof(int) * total);
-  *out_shapes_flat = copy;
+  memcpy(copy, m->shapes, sizeof(int) * total);
+  *out_shapes = copy;
   *out_n_scales = m->n_shapes;
   return 0;
 }
@@ -1235,8 +1286,8 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                            ? 1
                            : 0;
     int c = 0;
-    if (m->shapes_flat && m->n_shapes > i) {
-      const int *s0 = &m->shapes_flat[i * 4];
+    if (m->shapes && m->n_shapes > i) {
+      const int *s0 = &m->shapes[i * 4];
       batch = s0[0];
       h = s0[1];
       w = s0[2];
@@ -1291,16 +1342,37 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
       mlx_array idx = mlx_array_new_data(indexes, idx_shape, 1, MLX_INT32);
       mlx_array wells_sel = mlx_array_new();
       mlx_array seismic_sel = mlx_array_new();
-      if (mlx_gather_single(&wells_sel, *wells_pyramid[i], idx, 0, NULL, 0,
-                            s) == 0 &&
-          mlx_gather_single(&seismic_sel, *seismic_pyramid[i], idx, 0, NULL, 0,
-                            s) == 0) {
+      int wells_ndim = (int)mlx_array_ndim(*wells_pyramid[i]);
+      int seismic_ndim = (int)mlx_array_ndim(*seismic_pyramid[i]);
+      /* Build slice sizes for wells and seismic (axes after axis=0) */
+      int *wells_slice = NULL;
+      int wells_slice_num = 0;
+      if (wells_ndim > 1) {
+        wells_slice_num = wells_ndim - 1;
+        wells_slice = (int *)malloc(sizeof(int) * wells_slice_num);
+        const int *w_sh = mlx_array_shape(*wells_pyramid[i]);
+        for (int si = 0; si < wells_slice_num; ++si)
+          wells_slice[si] = w_sh[si + 1];
+      }
+      int *seis_slice = NULL;
+      int seis_slice_num = 0;
+      if (seismic_ndim > 1) {
+        seis_slice_num = seismic_ndim - 1;
+        seis_slice = (int *)malloc(sizeof(int) * seis_slice_num);
+        const int *z_sh = mlx_array_shape(*seismic_pyramid[i]);
+        for (int si = 0; si < seis_slice_num; ++si)
+          seis_slice[si] = z_sh[si + 1];
+      }
+      if (wells_ndim > 0 && seismic_ndim > 0 &&
+          mlx_gather_single(&wells_sel, *wells_pyramid[i], idx, 0, wells_slice,
+                            wells_slice_num, s) == 0 &&
+          mlx_gather_single(&seismic_sel, *seismic_pyramid[i], idx, 0,
+                            seis_slice, seis_slice_num, s) == 0) {
         mlx_vector_array vec = mlx_vector_array_new_data(
             (const mlx_array[]){*a, wells_sel, seismic_sel}, 3);
         mlx_array znew = mlx_array_new();
         if (mlx_concatenate_axis(&znew, vec, 3, s) == 0) {
-          if (a->ctx)
-            mlx_array_free(*a);
+          mlx_array_free(*a);
           *a = znew;
         } else {
           mlx_array_free(znew);
@@ -1312,22 +1384,37 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
         mlx_array_free(wells_sel);
         mlx_array_free(seismic_sel);
       }
+      if (wells_slice)
+        free(wells_slice);
+      if (seis_slice)
+        free(seis_slice);
       mlx_array_free(idx);
     } else if (indexes && n_indexes > 0 && wells_pyramid && wells_pyramid[i]) {
       /* build indices array */
       int idx_shape[1] = {n_indexes};
       mlx_array idx = mlx_array_new_data(indexes, idx_shape, 1, MLX_INT32);
       mlx_array cond_sel = mlx_array_new();
-      if (mlx_gather_single(&cond_sel, *wells_pyramid[i], idx, 0, NULL, 0, s) ==
-          0) {
+      int cond_ndim = (int)mlx_array_ndim(*wells_pyramid[i]);
+      int *slice_sizes = NULL;
+      int slice_num = 0;
+      if (cond_ndim > 0) {
+        /* pass full shape (all dimensions) to mlx_gather_single */
+        slice_num = cond_ndim;
+        slice_sizes = (int *)malloc(sizeof(int) * slice_num);
+        const int *sh = mlx_array_shape(*wells_pyramid[i]);
+        for (int si = 0; si < slice_num; ++si)
+          slice_sizes[si] = sh[si];
+      }
+      if (cond_ndim > 0 &&
+          mlx_gather_single(&cond_sel, *wells_pyramid[i], idx, 0, slice_sizes,
+                            slice_num, s) == 0) {
         /* concat noise and cond_sel */
         mlx_vector_array vec =
             mlx_vector_array_new_data((const mlx_array[]){*a, cond_sel}, 2);
         mlx_array znew = mlx_array_new();
         if (mlx_concatenate_axis(&znew, vec, 3, s) == 0) {
           /* replace a with concatenated */
-          if (a->ctx)
-            mlx_array_free(*a);
+          mlx_array_free(*a);
           *a = znew;
         } else {
           mlx_array_free(znew);
@@ -1339,19 +1426,31 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
         mlx_array_free(cond_sel);
       }
       mlx_array_free(idx);
+      if (slice_sizes)
+        free(slice_sizes);
     } else if (indexes && n_indexes > 0 && seismic_pyramid &&
                seismic_pyramid[i]) {
       int idx_shape[1] = {n_indexes};
       mlx_array idx = mlx_array_new_data(indexes, idx_shape, 1, MLX_INT32);
       mlx_array cond_sel = mlx_array_new();
-      if (mlx_gather_single(&cond_sel, *seismic_pyramid[i], idx, 0, NULL, 0,
-                            s) == 0) {
+      int cond_ndim = (int)mlx_array_ndim(*seismic_pyramid[i]);
+      int *slice_sizes2 = NULL;
+      int slice_num2 = 0;
+      if (cond_ndim > 0) {
+        slice_num2 = cond_ndim;
+        slice_sizes2 = (int *)malloc(sizeof(int) * slice_num2);
+        const int *sh2 = mlx_array_shape(*seismic_pyramid[i]);
+        for (int si = 0; si < slice_num2; ++si)
+          slice_sizes2[si] = sh2[si];
+      }
+      if (cond_ndim > 0 &&
+          mlx_gather_single(&cond_sel, *seismic_pyramid[i], idx, 0,
+                            slice_sizes2, slice_num2, s) == 0) {
         mlx_vector_array vec =
             mlx_vector_array_new_data((const mlx_array[]){*a, cond_sel}, 2);
         mlx_array znew = mlx_array_new();
         if (mlx_concatenate_axis(&znew, vec, 3, s) == 0) {
-          if (a->ctx)
-            mlx_array_free(*a);
+          mlx_array_free(*a);
           *a = znew;
         } else {
           mlx_array_free(znew);
@@ -1362,6 +1461,8 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
         mlx_array_free(cond_sel);
       }
       mlx_array_free(idx);
+      if (slice_sizes2)
+        free(slice_sizes2);
     }
 
     /* Apply padding consistent with Python generate_padding */
@@ -1373,8 +1474,7 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
     mlx_array padded = mlx_array_new();
     if (mlx_pad(&padded, *a, axes, 2, low_pad, 2, high_pad, 2, pad_val,
                 "constant", s) == 0) {
-      if (a->ctx)
-        mlx_array_free(*a);
+      mlx_array_free(*a);
       *a = padded;
     } else {
       mlx_array_free(padded);
@@ -1556,10 +1656,10 @@ int mlx_faciesgan_save_shape(MLXFaciesGAN *m, const char *scale_path,
                              int scale) {
   if (!m || !scale_path)
     return -1;
-  if (!m->shapes_flat || scale < 0 || scale >= m->n_shapes)
+  if (!m->shapes || scale < 0 || scale >= m->n_shapes)
     return -1;
 
-  const int *s0 = &m->shapes_flat[scale * 4];
+  const int *s0 = &m->shapes[scale * 4];
   int shape_vals[4] = {s0[0], s0[1], s0[2], s0[3]};
 
   mlx_array arr = mlx_array_new();
@@ -1616,17 +1716,17 @@ int mlx_faciesgan_load_shape(MLXFaciesGAN *m, const char *scale_path,
       /* append shape tuple (take up to 4 ints) */
       int tocopy = elems >= 4 ? 4 : (int)elems;
       int *newflat =
-          (int *)realloc(m->shapes_flat, sizeof(int) * (m->n_shapes + 1) * 4);
+          (int *)realloc(m->shapes, sizeof(int) * (m->n_shapes + 1) * 4);
       if (!newflat) {
         mlx_map_string_to_array_free(map);
         mlx_map_string_to_string_free(meta);
         mlx_stream_free(s);
         return -1;
       }
-      m->shapes_flat = newflat;
+      m->shapes = newflat;
       int base = m->n_shapes * 4;
       for (int i = 0; i < 4; ++i)
-        m->shapes_flat[base + i] = (i < tocopy) ? (int)data[i] : 0;
+        m->shapes[base + i] = (i < tocopy) ? (int)data[i] : 0;
       m->n_shapes += 1;
     }
   }
@@ -2192,6 +2292,69 @@ AGValue *mlx_faciesgan_compute_recovery_loss_ag(
   (void)seismic_pyramid;
   if (!rec_in || !real || alpha == 0.0f)
     return ag_scalar_float(0.0f);
+
+  /* debug prints removed */
+
+  /* If `rec_in` has an extra singleton leading dimension (e.g. shape
+     (1,1,H,W,C)) but `real` is (1,H,W,C), squeeze that dimension so
+     broadcasting works. */
+  {
+    mlx_array *rarr = ag_value_array(rec_in);
+    mlx_array *rearr = ag_value_array(real);
+    if (rarr && rearr) {
+      int r_nd = (int)mlx_array_ndim(*rarr);
+      const int *r_sh = mlx_array_shape(*rarr);
+      int s_nd = (int)mlx_array_ndim(*rearr);
+      /* handle the pattern discovered in logs: rec_in ndim==5 and
+         a singleton second axis */
+      if (r_nd == 5 && r_sh && r_sh[1] == 1 && s_nd == 4) {
+        mlx_stream _s = mlx_default_cpu_stream_new();
+        mlx_array tmp = mlx_array_new();
+        int new_shape[4] = {r_sh[0], r_sh[2], r_sh[3], r_sh[4]};
+        if (mlx_reshape(&tmp, *rarr, new_shape, 4, _s) == 0) {
+          AGValue *squeezed = ag_value_from_new_array(&tmp, 0);
+          ag_register_temp_value(squeezed);
+          rec_in = squeezed;
+        } else {
+          /* reshape failed: free tmp if needed */
+          mlx_array_free(tmp);
+        }
+        mlx_stream_free(_s);
+      }
+      /* After optional squeeze, ensure spatial dims match `real` by
+         upsampling/downsampling via AG op so gradients flow. */
+      mlx_array *rarr2 = ag_value_array(rec_in);
+      if (rarr2) {
+        const int *rsh2 = mlx_array_shape(*rarr2);
+        const int *sh_real = mlx_array_shape(*rearr);
+        if (rsh2 && sh_real) {
+          int rh = rsh2[1];
+          int rw = rsh2[2];
+          int th = sh_real[1];
+          int tw = sh_real[2];
+          if (rh != th || rw != tw) {
+            /* Avoid attempting to downsample via ag_upsample (unsupported).
+             * Instead, upsample the smaller of the two operands so that
+             * shapes match. This preserves gradients and avoids calling
+             * mlx_upsample_forward with a smaller target than the source. */
+            if (rh < th || rw < tw) {
+              AGValue *ups = ag_upsample(rec_in, th, tw, "linear", 1);
+              if (ups) {
+                ag_register_temp_value(ups);
+                rec_in = ups;
+              }
+            } else {
+              AGValue *ups_real = ag_upsample(real, rh, rw, "linear", 1);
+              if (ups_real) {
+                ag_register_temp_value(ups_real);
+                real = ups_real;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
 
   AGValue *diff = ag_sub(rec_in, real);
   ag_register_temp_value(diff);

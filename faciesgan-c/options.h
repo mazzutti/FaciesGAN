@@ -21,15 +21,13 @@ typedef struct TrainningOptions {
   int img_color_min;
   int img_color_max;
   char *input_path;
-  /* Optional exact output fullpath (corresponds to Python's
-   * `output_fullpath` argument). NULL when not provided. */
   char *output_fullpath;
   int kernel_size;
   double lambda_grad;
   double lr_d;
   int lr_decay;
   double lr_g;
-  int manual_seed; /* -1 means none */
+  int manual_seed;
   int max_size;
   int min_num_feature;
   int min_size;
@@ -61,9 +59,6 @@ typedef struct TrainningOptions {
   bool use_wells;
   bool use_seismic;
   bool hand_off_to_c;
-  /* Optional list of wells mask columns (matches Python's
-   * `options.wells_mask_columns`). The C CLI collects these and may
-   * transfer ownership into this struct. */
   int *wells_mask_columns;
   size_t wells_mask_count;
   bool enable_tensorboard;
@@ -74,11 +69,10 @@ typedef struct TrainningOptions {
 typedef struct ResumeOptions {
   bool fine_tuning;
   char *checkpoint_path;
-  int num_iter; /* -1 means none */
+  int num_iter;
   int start_scale;
 } ResumeOptions;
 
-/* Create/destroy helpers */
 TrainningOptions *mlx_options_new_trainning_defaults(void);
 void mlx_options_free_trainning(TrainningOptions *opt);
 

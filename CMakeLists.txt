@@ -1,6 +1,19 @@
 cmake_minimum_required(VERSION 3.16)
 project(FaciesGAN_MLXC LANGUAGES C CXX)
 
+# Option to enable AddressSanitizer for debugging memory issues
+option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
+
+if(ENABLE_ASAN)
+  message(STATUS "AddressSanitizer: enabled (building with -fsanitize=address)")
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang" OR CMAKE_C_COMPILER_ID MATCHES "GNU")
+    add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+    add_link_options(-fsanitize=address)
+  else()
+    message(WARNING "ENABLE_ASAN set but compiler is not Clang/GNU; skipping sanitizer flags")
+  endif()
+endif()
+
 
 # Optionally set MLXC_DIR to point to the installed mlx-c package config
 if(NOT DEFINED MLXC_DIR)
@@ -39,7 +52,7 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/trainning/logger.c
   faciesgan-c/options.c
   faciesgan-c/utils.c
-  faciesgan-c/utils_extra.c
+  # faciesgan-c/utils_extra.c (merged into utils.c)
   faciesgan-c/trainning/scheduler.c
   faciesgan-c/trainning/train_manager.c
   faciesgan-c/trainning/autodiff.c
@@ -60,6 +73,7 @@ target_include_directories(custom_layer
     ${PROJECT_SOURCE_DIR}/faciesgan-c/models
     ${PROJECT_SOURCE_DIR}/faciesgan-c
 )
+
 
 target_include_directories(custom_layer PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c/third_party)
 
@@ -104,9 +118,8 @@ target_include_directories(facies_prefetcher
 # STB-based C generator is enabled by including the third_party headers.
 target_include_directories(facies_prefetcher PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c/third_party)
 
-# Add C generator and NPZ unzip helper
+# Add NPZ unzip helper and dataset sources
 target_sources(facies_prefetcher PRIVATE
-  faciesgan-c/datasets/c_generator.c
   faciesgan-c/io/npz_unzip.c
   faciesgan-c/io/npz_create.c
   faciesgan-c/datasets/func_cache.c
@@ -165,6 +178,11 @@ target_link_libraries(faciesgan PRIVATE facies_prefetcher custom_layer mlxc)
 # stub to avoid linking dataset internals into the shared library; the
 # executable should supply the real implementation.
 target_sources(faciesgan PRIVATE faciesgan-c/trainning/mlx_trainer_api.c)
+target_sources(faciesgan PRIVATE faciesgan-c/trainer.c)
+target_sources(faciesgan PRIVATE faciesgan-c/cli/options_builder.c)
+target_sources(faciesgan PRIVATE faciesgan-c/cli/cli_args.c)
+target_sources(faciesgan PRIVATE faciesgan-c/cli/cli_help.c)
+target_sources(faciesgan PRIVATE faciesgan-c/cli/cli_defs.c)
 
 # Build C-native trainer
 # (old `c_trainer.c` removed; functionality provided by `mlx_trainer_api.c`)
@@ -183,11 +201,10 @@ endif()
 
 # Install targets
 
-add_executable(gen_cache
-  faciesgan-c/tools/gen_cache.c
-)
-target_include_directories(gen_cache PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
-target_link_libraries(gen_cache PRIVATE mlxc)
+## removed gen_cache executable from top-level CMake (generated code now
+## integrated into library). Building the standalone `gen_cache` tool was
+## causing build failures when the source file was absent; the lightweight
+## generator is available via `gen_cache_generate()` in the C generator.
 
 # Smoke-test executable for the new MLXTrainer API
 add_executable(c_trainer_smoke

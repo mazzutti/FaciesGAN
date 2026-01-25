@@ -17,9 +17,24 @@ from abc import ABC, abstractmethod
 from typing import Any, Iterator, cast
 
 from tensorboardX import SummaryWriter  # type: ignore
-from tqdm import tqdm
 from typing_extensions import Generic
 
+
+class DummyProgress:
+    def update(self, n: int = 1) -> None:
+        pass
+
+    def set_description(self, desc: str) -> None:
+        pass
+
+    def write(self, s: str) -> None:
+        print(s)
+
+    def close(self) -> None:
+        pass
+
+
+from torch.hub import tqdm
 import utils
 from config import RESULT_FACIES_PATH
 from datasets import PyramidsDataset
@@ -387,7 +402,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         scale_paths: dict[int, str],
         results_paths: dict[int, str],
         batch_id: int,
-        progress: "tqdm[Any]",
+        progress: "tqdm[Any]",  # type: ignore
         facies_pyramid: dict[int, TTensor],
         wells_pyramid: dict[int, TTensor] = {},
         masks_pyramid: dict[int, TTensor] = {},
@@ -450,7 +465,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         # Training loop - iterate epochs (0-based)
         for epoch in range(self.num_iter):
-            progress.set_description(
+            progress.set_description(  # type: ignore
                 f"Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch+1:4d}/{self.num_iter}]"
             )
 
@@ -670,7 +685,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         generated_samples: tuple[TTensor, ...],
         writers: dict[int, SummaryWriter],
         results_paths: dict[int, str],
-        progress: "tqdm[Any]",
+        progress: "tqdm[Any]",  # type: ignore
         facies_pyramid: dict[int, TTensor],
         wells_pyramid: dict[int, TTensor],
         masks_pyramid: dict[int, TTensor],
@@ -745,7 +760,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 )
 
             lines.append("  └" + "─" * 99 + "┘")
-            progress.write("\n".join(lines))
+            progress.write("\n".join(lines))  # type: ignore
 
         # Save to TensorBoard and log per-scale
         for scale in scales:
@@ -910,7 +925,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
     def log_epoch(
         self,
-        epochs: "tqdm[int]",
+        epochs: "tqdm[int]",  # type: ignore
         writer: SummaryWriter,
         epoch: int,
         generator_metrics: GeneratorMetrics[TTensor],
@@ -942,7 +957,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         # Update progress bar description with more detailed info
         if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
-            epochs.set_description(
+            epochs.set_description(  # type: ignore
                 "Epoch [{:4d}/{}] Scales {} | G: {:.3f} | D: {:.3f}".format(
                     epoch + 1,
                     self.num_iter,

@@ -3,6 +3,7 @@
 
 #include "mlx/c/stream.h"
 #include "mlx/c/vector.h"
+#include "mlx_dataset.h"
 #include <stdbool.h>
 #include <stddef.h>
 
@@ -10,8 +11,7 @@
 extern "C" {
 #endif
 
-typedef struct facies_dataset_ facies_dataset;
-typedef struct facies_dataloader_ facies_dataloader;
+struct MLXDataloader;
 
 typedef int (*facies_collate_fn)(mlx_vector_array *out_facies,
                                  mlx_vector_array *out_wells,
@@ -32,22 +32,23 @@ typedef int (*facies_sampler_reset_fn)(void *ctx);
 // Worker init function: called in worker process with worker id
 typedef int (*facies_worker_init_fn)(int worker_id, void *ctx);
 // Create dataset from precomputed pyramids (vectors of per-sample vector_array)
-int facies_dataset_new(facies_dataset **out,
+/* Use `MLXPyramidsDataset` directly for dataset APIs. */
+int facies_dataset_new(MLXPyramidsDataset **out,
                        const mlx_vector_vector_array facies_pyramids,
                        const mlx_vector_vector_array wells_pyramids,
                        const mlx_vector_vector_array seismic_pyramids);
 
 // Free dataset
-int facies_dataset_free(facies_dataset *ds);
+int facies_dataset_free(MLXPyramidsDataset *ds);
 
 // Create dataloader
-int facies_dataloader_new(facies_dataloader **out, facies_dataset *ds,
+int facies_dataloader_new(struct MLXDataloader **out, MLXPyramidsDataset *ds,
                           size_t batch_size, bool shuffle, bool drop_last,
                           unsigned int seed);
 
 // Extended constructor supporting multi-worker prefetching and options.
 int facies_dataloader_new_ex(
-    facies_dataloader **out, facies_dataset *ds, size_t batch_size,
+    struct MLXDataloader **out, MLXPyramidsDataset *ds, size_t batch_size,
     bool shuffle, bool drop_last, unsigned int seed, int num_workers,
     int prefetch_factor, bool persistent_workers, int timeout_ms,
     facies_collate_fn collate, void *collate_ctx, bool pin_memory,
@@ -60,15 +61,16 @@ int facies_dataloader_new_ex(
     const char *worker_init_sym);
 
 // Reset iterator to start
-int facies_dataloader_reset(facies_dataloader *dl);
+int facies_dataloader_reset(struct MLXDataloader *dl);
 
 // Get next batch: returns 0 on success, 2 when iteration finished, 1 on error.
-int facies_dataloader_next(facies_dataloader *dl, mlx_vector_array *out_facies,
+int facies_dataloader_next(struct MLXDataloader *dl,
+                           mlx_vector_array *out_facies,
                            mlx_vector_array *out_wells,
                            mlx_vector_array *out_seismic, const mlx_stream s);
 
 // Free dataloader
-int facies_dataloader_free(facies_dataloader *dl);
+int facies_dataloader_free(struct MLXDataloader *dl);
 
 #ifdef __cplusplus
 }

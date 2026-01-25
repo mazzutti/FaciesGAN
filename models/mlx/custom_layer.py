@@ -220,7 +220,8 @@ class MLXSPADE(nn.Module):
         gamma = self.mlp_gamma(activated_input)
         beta = self.mlp_beta(activated_input)
         normalized = self.norm(x)
-        return normalized * (1 + gamma) + beta
+        out = normalized * (1 + gamma) + beta
+        return out
 
 
 class MLXSPADEConvBlock(nn.Module):
@@ -358,7 +359,8 @@ class MLXSPADEGenerator(nn.Module):
             x = cast(mx.array, block(x, cond))
 
         # Final output layer
-        out = cast(mx.array, self.activation(self.tail_conv(x)))
+        tail = self.tail_conv(x)
+        out = cast(mx.array, self.activation(tail))
         return out
 
 

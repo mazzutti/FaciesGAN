@@ -15,15 +15,6 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
   if (scale < 0)
     return -1;
 
-  /* Writer canary: emit backtrace when this hot function runs */
-  fprintf(stderr, "[writer_canary] func=mlx_compute_rec_input tid=%lu\n",
-          (unsigned long)pthread_self());
-  {
-    void *bt[64];
-    int bt_size = backtrace(bt, 64);
-    backtrace_symbols_fd(bt, bt_size, fileno(stderr));
-  }
-
   /* create a default CPU stream for MLX ops and ensure it's freed */
   mlx_stream s = mlx_default_cpu_stream_new();
 
@@ -59,13 +50,28 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
   int idx_shape[1] = {n_indexes};
   mlx_array idx = mlx_array_new_data(indexes, idx_shape, 1, MLX_INT32);
   mlx_array sel = mlx_array_new();
-  if (mlx_gather_single(&sel, *facies_pyramid[scale - 1], idx, 0, NULL, 0, s) !=
-      0) {
+  /* Build trailing slice sizes for gather (axes after axis=0) */
+  int fac_nd = (int)mlx_array_ndim(*facies_pyramid[scale - 1]);
+  int *slice_sizes = NULL;
+  int slice_num = 0;
+  if (fac_nd > 0) {
+    slice_num = fac_nd;
+    slice_sizes = (int *)malloc(sizeof(int) * slice_num);
+    const int *sh = mlx_array_shape(*facies_pyramid[scale - 1]);
+    for (int si = 0; si < slice_num; ++si)
+      slice_sizes[si] = sh[si];
+  }
+  if (mlx_gather_single(&sel, *facies_pyramid[scale - 1], idx, 0, slice_sizes,
+                        slice_num, s) != 0) {
     mlx_array_free(idx);
+    if (slice_sizes)
+      free(slice_sizes);
     mlx_stream_free(s);
     return -1;
   }
   mlx_array_free(idx);
+  if (slice_sizes)
+    free(slice_sizes);
 
   /* upsample to match target spatial dims */
   const int *shape = mlx_array_shape(*facies_pyramid[scale]);
@@ -86,8 +92,10 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
   mlx_upsample_free(u);
 
   /* free intermediate selection if different from result */
-  if (sel.ctx)
-    mlx_array_free(sel);
+  /* Don't free `sel` here: some backends create `up` as a view
+     referencing `sel`'s storage. Freeing `sel` can cause a
+     use-after-free when `up` is later used. Let the caller
+     (or higher-level cleanup) release these arrays. */
 
   mlx_array *res = (mlx_array *)malloc(sizeof(mlx_array));
   if (!res) {
@@ -213,77 +221,14 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     }
   }
 
-  for (int i = 0; i < n_noises; ++i) {
-    fprintf(stdout, "[debug] noise[%d] ndim=%zu\n", i,
-            mlx_array_ndim(zvals[i]));
-  }
+  (void)n_noises;
+  (void)zvals;
   /* Print shapes for real and pyramids to help debug broadcasting issues */
-  if (real) {
-    int real_ndim = (int)mlx_array_ndim(*real);
-    const int *rshape = mlx_array_shape(*real);
-    fprintf(stdout, "[debug] real ndim=%d", real_ndim);
-    if (rshape) {
-      fprintf(stdout, " shape=(");
-      for (int a = 0; a < real_ndim; ++a) {
-        fprintf(stdout, "%d%s", rshape[a], (a + 1 < real_ndim) ? "," : "");
-      }
-      fprintf(stdout, ")\n");
-    } else {
-      fprintf(stdout, " (no shape)\n");
-    }
-  }
-  if (wells_pyramid) {
-    for (int wi = 0; wi <= scale && wells_pyramid[wi]; ++wi) {
-      int w_ndim = (int)mlx_array_ndim(*wells_pyramid[wi]);
-      const int *wshape = mlx_array_shape(*wells_pyramid[wi]);
-      fprintf(stdout, "[debug] wells[%d] ndim=%d", wi, w_ndim);
-      if (wshape) {
-        fprintf(stdout, " shape=(");
-        for (int a = 0; a < w_ndim; ++a)
-          fprintf(stdout, "%d%s", wshape[a], (a + 1 < w_ndim) ? "," : "");
-        fprintf(stdout, ")\n");
-      } else
-        fprintf(stdout, " (no shape)\n");
-    }
-  }
-  if (seismic_pyramid) {
-    for (int si = 0; si <= scale && seismic_pyramid[si]; ++si) {
-      int s_ndim = (int)mlx_array_ndim(*seismic_pyramid[si]);
-      const int *sshape = mlx_array_shape(*seismic_pyramid[si]);
-      fprintf(stdout, "[debug] seismic[%d] ndim=%d", si, s_ndim);
-      if (sshape) {
-        fprintf(stdout, " shape=(");
-        for (int a = 0; a < s_ndim; ++a)
-          fprintf(stdout, "%d%s", sshape[a], (a + 1 < s_ndim) ? "," : "");
-        fprintf(stdout, ")\n");
-      } else
-        fprintf(stdout, " (no shape)\n");
-    }
-  }
-  for (int i = 0; i < n_noises; ++i) {
-    int ndim = (int)mlx_array_ndim(zvals[i]);
-    const int *sh = mlx_array_shape(zvals[i]);
-    fprintf(stdout, "[debug] zvals[%d] ndim=%d", i, ndim);
-    if (sh) {
-      fprintf(stdout, " shape=(");
-      for (int a = 0; a < ndim; ++a)
-        fprintf(stdout, "%d%s", sh[a], (a + 1 < ndim) ? "," : "");
-      fprintf(stdout, ")\n");
-    } else
-      fprintf(stdout, " (no shape)\n");
-  }
-  int in_ndim = (int)mlx_array_ndim(in_noise);
-  const int *in_sh = mlx_array_shape(in_noise);
-  fprintf(stdout, "[debug] in_noise ndim=%d", in_ndim);
-  if (in_sh) {
-    fprintf(stdout, " shape=(");
-    for (int a = 0; a < in_ndim; ++a)
-      fprintf(stdout, "%d%s", in_sh[a], (a + 1 < in_ndim) ? "," : "");
-    fprintf(stdout, ")\n");
-  } else
-    fprintf(stdout, " (no shape)\n");
-  fprintf(stdout, "[debug] calling generate_fake: n_noises=%d scale=%d\n",
-          n_noises, scale);
+  (void)real;
+  (void)wells_pyramid;
+  (void)seismic_pyramid;
+  (void)in_noise;
+  (void)scale;
   mlx_array_t fake = mlx_faciesgan_generate_fake(m, zvals, n_noises, use_amps,
                                                  use_n, in_noise, scale, scale);
 

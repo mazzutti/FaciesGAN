@@ -1,46 +1,21 @@
 // This file is a rename of c_trainer_api.c — kept identical contents.
-#include "models/base_manager.h"
-#include "models/facies_gan.h"
-#include "optimizer.h"
-#include "trainning/train_manager.h"
-#include "trainning/train_step.h"
-
-/* Inlined MLXTrainer API (previously in mlx_trainer_api.h) to produce a
- * single-file implementation as requested. Keep declarations here so this
- * source is self-contained for the trainer API. */
-
-typedef struct MLXTrainer MLXTrainer;
-
-MLXTrainer *MLXTrainer_create_with_opts(const TrainningOptions *opts);
-void MLXTrainer_destroy(MLXTrainer *t);
-int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
-                   int width, int batch_size);
-int MLXTrainer_run_with_opts(const TrainningOptions *opts);
-int MLXTrainer_run_full(const TrainningOptions *opts);
-int MLXTrainer_optimization_step(MLXTrainer *t, const int *indexes,
-                                 int n_indexes, mlx_array **facies_pyramid,
-                                 int n_facies, mlx_array **rec_in_pyramid,
-                                 int n_rec, mlx_array **wells_pyramid,
-                                 int n_wells, mlx_array **masks_pyramid,
-                                 int n_masks, mlx_array **seismic_pyramid,
-                                 int n_seismic, const int *active_scales,
-                                 int n_active_scales);
-int MLXTrainer_setup_optimizers(MLXTrainer *t, const int *scales, int n_scales);
-int MLXTrainer_get_n_scales(MLXTrainer *t);
-int MLXTrainer_load_model(MLXTrainer *t, int scale, const char *checkpoint_dir);
-int MLXTrainer_save_generated_facies(MLXTrainer *t, int scale, int epoch,
-                                     const char *results_path);
-void *MLXTrainer_get_model_ctx(MLXTrainer *t);
+#include "trainning/mlx_trainer_api.h"
 #include "datasets/dataloader.h"
 #include "datasets/func_cache.h"
 #include "datasets/mlx_dataset.h"
 #include "datasets/prefetcher.h"
+#include "datasets/utils.h"
 #include "datasets/wells.h"
 #include "io/npz_unzip.h"
+#include "models/base_manager.h"
+#include "models/facies_gan.h"
+#include "optimizer.h"
+#include "pybridge.h"
 #include "trainning/pybridge.h"
 #include "trainning/train_manager.h"
 #include "trainning/train_step.h"
 #include "trainning/train_utils.h"
+#include "utils.h"
 #include <dirent.h>
 #include <errno.h>
 #include <execinfo.h>
@@ -62,249 +37,323 @@ void *MLXTrainer_get_model_ctx(MLXTrainer *t);
 #include <time.h>
 #include <unistd.h>
 
-/* Producer thread args and implementation moved to file-scope so the thread
- * function is not defined inside another function (nested functions are
- * invalid in C). This thread pulls batches from a facies_dataloader and
- * pushes them into a PrefetcherHandle. */
-typedef struct ProducerArgs {
-  facies_dataloader *dl;
-  PrefetcherHandle ph;
-  mlx_stream s;
-} ProducerArgs;
-
-static void *producer_thread(void *v) {
-  ProducerArgs *a = (ProducerArgs *)v;
-  facies_dataloader *dl = a->dl;
-  PrefetcherHandle ph = a->ph;
-  mlx_stream s = a->s;
-  while (1) {
-    mlx_vector_array facs = mlx_vector_array_new();
-    mlx_vector_array wells_out = mlx_vector_array_new();
-    mlx_vector_array seis_out = mlx_vector_array_new();
-    int rc = facies_dataloader_next(dl, &facs, &wells_out, &seis_out, s);
-    if (rc == 2) {
-      mlx_vector_array_free(facs);
-      mlx_vector_array_free(wells_out);
-      mlx_vector_array_free(seis_out);
-      break;
-    } else if (rc != 0) {
-      mlx_vector_array_free(facs);
-      mlx_vector_array_free(wells_out);
-      mlx_vector_array_free(seis_out);
-      break;
-    }
-
-    int nsc = (int)mlx_vector_array_size(facs);
-    mlx_array *fac_arr = NULL;
-    mlx_array *well_arr = NULL;
-    mlx_array *sei_arr = NULL;
-    if (nsc > 0) {
-      fac_arr = (mlx_array *)malloc(sizeof(mlx_array) * nsc);
-      for (int i = 0; i < nsc; ++i) {
-        mlx_array tmp = mlx_array_new();
-        if (mlx_vector_array_get(&tmp, facs, i) != 0) {
-          mlx_array_free(tmp);
-          tmp = mlx_array_new();
-        }
-        fac_arr[i] = tmp;
-      }
-    }
-    int nw = (int)mlx_vector_array_size(wells_out);
-    if (nw > 0) {
-      well_arr = (mlx_array *)malloc(sizeof(mlx_array) * nw);
-      for (int i = 0; i < nw; ++i) {
-        mlx_array tmp = mlx_array_new();
-        if (mlx_vector_array_get(&tmp, wells_out, i) != 0) {
-          mlx_array_free(tmp);
-          tmp = mlx_array_new();
-        }
-        well_arr[i] = tmp;
-      }
-    }
-    int ns = (int)mlx_vector_array_size(seis_out);
-    if (ns > 0) {
-      sei_arr = (mlx_array *)malloc(sizeof(mlx_array) * ns);
-      for (int i = 0; i < ns; ++i) {
-        mlx_array tmp = mlx_array_new();
-        if (mlx_vector_array_get(&tmp, seis_out, i) != 0) {
-          mlx_array_free(tmp);
-          tmp = mlx_array_new();
-        }
-        sei_arr[i] = tmp;
-      }
-    }
-
-    /* push into prefetcher (copies into internal buffers/stream) */
-    prefetcher_push_mlx(ph, fac_arr, nsc, well_arr, nw, NULL, 0, sei_arr, ns);
-
-    /* free our temporary copies */
-    if (fac_arr) {
-      for (int i = 0; i < nsc; ++i)
-        mlx_array_free(fac_arr[i]);
-      free(fac_arr);
-    }
-    if (well_arr) {
-      for (int i = 0; i < nw; ++i)
-        mlx_array_free(well_arr[i]);
-      free(well_arr);
-    }
-    if (sei_arr) {
-      for (int i = 0; i < ns; ++i)
-        mlx_array_free(sei_arr[i]);
-      free(sei_arr);
-    }
-
-    mlx_vector_array_free(facs);
-    mlx_vector_array_free(wells_out);
-    mlx_vector_array_free(seis_out);
+MLXTrainer *MLXTrainer_new(const TrainningOptions *opts, int fine_tuning,
+                           const char *checkpoint_path) {
+  MLXTrainer *trainer = (MLXTrainer *)malloc(sizeof(MLXTrainer));
+  memset(trainer, 0, sizeof(*trainer));
+  trainer->opts = *opts;
+  /* initialize fine-tuning flag and checkpoint path from explicit args */
+  trainer->fine_tuning = fine_tuning ? 1 : 0;
+  trainer->checkpoint_path = NULL;
+  if (checkpoint_path && checkpoint_path[0] != '\0') {
+    trainer->checkpoint_path = strdup(checkpoint_path);
+  } else {
+    trainer->checkpoint_path = strdup(".checkpoints");
   }
-  prefetcher_mark_finished(a->ph);
-  mlx_stream_free(a->s);
-  return NULL;
-}
 
-struct MLXTrainer {
-  TrainningOptions opts;
-  MLXFaciesGAN *model;
-  MLXOptimizer **gen_opts;  /* per-scale */
-  MLXOptimizer **disc_opts; /* per-scale */
-  MLXScheduler **gen_scheds;
-  MLXScheduler **disc_scheds;
-  int n_scales;
-  /* Optional per-trainer prefetcher/iterator for batch iteration */
-  PrefetcherHandle batch_prefetcher;
-  PrefetcherIteratorHandle batch_iterator;
-  pthread_t batch_producer;
-  int batch_producer_running;
-};
+  /* Derived convenience fields mirroring Python Trainer initialisation */
+  trainer->start_scale = opts->start_scale;
+  trainer->stop_scale = opts->stop_scale;
+  trainer->output_path = NULL;
+  if (opts->output_path && opts->output_path[0] != '\0')
+    trainer->output_path = strdup(opts->output_path);
+  trainer->num_iter = opts->num_iter;
+  trainer->save_interval = opts->save_interval;
+  trainer->num_parallel_scales = opts->num_parallel_scales;
 
-MLXTrainer *MLXTrainer_create_with_opts(const TrainningOptions *opts) {
-  MLXTrainer *t = (MLXTrainer *)malloc(sizeof(MLXTrainer));
-  memset(t, 0, sizeof(*t));
-  t->opts = *opts; /* copy options */
-  MLXBaseManager *mgr = mlx_base_manager_create_from_trainning(&t->opts);
-  if (!mgr) {
-    free(t);
-    return NULL;
-  }
-  if (t->opts.num_parallel_scales > 0) {
-    mlx_base_manager_init_scales(mgr, 0, t->opts.num_parallel_scales);
-  }
-  {
-    const char *ckpt = ".checkpoints";
-    (void)mlx_base_manager_load(mgr, ckpt, 1 /*load_shapes*/,
-                                -1 /*until_scale*/, 0 /*load_disc*/,
-                                0 /*load_wells*/);
-  }
-  t->model = (MLXFaciesGAN *)mlx_base_manager_get_user_ctx(mgr);
-  if (!t->model) {
-    mlx_base_manager_free(mgr);
-    free(t);
-    return NULL;
-  }
-  /* number of scales is driven by the model state/shapes (4 ints per
-   * scale: batch, channels, height, width). `mlx_faciesgan_get_shapes_flat`
-   * returns the number of scales and a flat array with 4*scales ints. */
-  int *shapes = NULL;
-  int n_scales = 0;
-  if (mlx_faciesgan_get_shapes_flat(t->model, &shapes, &n_scales) == 0 &&
-      n_scales > 0) {
-    t->n_scales = n_scales;
+  /* compute batch_size = min(options.batch_size, options.num_train_pyramids) */
+  trainer->batch_size = opts->batch_size < opts->num_train_pyramids
+                            ? opts->batch_size
+                            : opts->num_train_pyramids;
+  if (opts->wells_mask_count > 0 &&
+      opts->batch_size < (int)opts->wells_mask_count)
+    trainer->batch_size = (int)opts->wells_mask_count;
 
-    /* Print shapes in a compact table similar to Python Trainer.__init__ */
-    fprintf(stdout, "Generated facies shapes:\n");
-    fprintf(stdout, "╔══════════╦══════════╦══════════╦══════════╗\n");
-    fprintf(stdout, "║ %8s ║ %8s ║ %8s ║ %8s ║\n", "Batch", "Channels",
-            "Height", "Width");
-    fprintf(stdout, "╠══════════╬══════════╬══════════╬══════════╣\n");
-    for (int si = 0; si < n_scales; ++si) {
-      int b = shapes[si * 4 + 0];
-      int c = shapes[si * 4 + 1];
-      int h = shapes[si * 4 + 2];
-      int w = shapes[si * 4 + 3];
-      fprintf(stdout, "║ %8d ║ %8d ║ %8d ║ %8d ║\n", b, c, h, w);
+  /* Feature flags */
+  trainer->enable_tensorboard = opts->enable_tensorboard ? 1 : 0;
+  trainer->enable_plot_facies = opts->enable_plot_facies ? 1 : 0;
+
+  trainer->num_img_channels = opts->num_img_channels;
+  trainer->noise_channels = opts->noise_channels +
+                            (opts->use_wells ? opts->num_img_channels : 0) +
+                            (opts->use_seismic ? opts->num_img_channels : 0);
+  trainer->num_real_facies = opts->num_real_facies;
+  trainer->num_generated_per_real = opts->num_generated_per_real;
+
+  /* copy wells mask columns list from options (if present) */
+  trainer->wells_mask_columns = NULL;
+  trainer->wells_mask_count = 0;
+  if (opts->wells_mask_count > 0 && opts->wells_mask_columns) {
+    trainer->wells_mask_columns =
+        (int *)malloc(sizeof(int) * opts->wells_mask_count);
+    if (trainer->wells_mask_columns) {
+      memcpy(trainer->wells_mask_columns, opts->wells_mask_columns,
+             sizeof(int) * opts->wells_mask_count);
+      trainer->wells_mask_count = opts->wells_mask_count;
     }
-    fprintf(stdout, "╚══════════╩══════════╩══════════╩══════════╝\n");
-
-    free(shapes);
   }
-  /* nothing dataset-specific here; MLXTrainer_run_full handles dataset-driven
-   * runs */
-  /* allocate arrays for per-scale optimizers/schedulers */
-  /* Allocate enough slots for either discovered model scales or the
-   * configured number of parallel scales (whichever is larger). This
-   * avoids calloc(0,...) and prevents out-of-bounds writes when
-   * `MLXTrainer_setup_optimizers` uses `num_parallel_scales`. */
-  int alloc_n = t->n_scales;
-  if (t->opts.num_parallel_scales > alloc_n)
-    alloc_n = t->opts.num_parallel_scales;
+
+  /* Optimizer configuration (defaults from options) */
+  trainer->lr_g = opts->lr_g;
+  trainer->lr_d = opts->lr_d;
+  trainer->beta1 = opts->beta1;
+  trainer->lr_decay = opts->lr_decay;
+  trainer->gamma = opts->gamma;
+
+  /* Model parameters */
+  trainer->zero_padding = opts->num_layer * (opts->kernel_size / 2);
+  trainer->noise_amp = opts->noise_amp;
+  trainer->min_noise_amp = opts->min_noise_amp;
+  trainer->scale0_noise_amp = opts->scale0_noise_amp;
+
+  (void)MLXTrainer_init_dataset(trainer);
+  (void)MLXTrainer_init_scales(trainer);
+  (void)MLXTrainer_create_dataloader(trainer);
+
+  fprintf(stdout, "DataLoader num_workers: %d\n", trainer->opts.num_workers);
+
+  (void)MLXTrainer_create_model(trainer);
+  mlx_faciesgan_set_shapes(trainer->model, trainer->scales, trainer->n_scales);
+
+  int alloc_n = trainer->n_scales;
+  if (trainer->opts.num_parallel_scales > alloc_n)
+    alloc_n = trainer->opts.num_parallel_scales;
   if (alloc_n <= 0)
     alloc_n = 1;
-  t->gen_opts =
+  trainer->gen_opts =
       (MLXOptimizer **)calloc((size_t)alloc_n, sizeof(MLXOptimizer *));
-  t->disc_opts =
+  trainer->disc_opts =
       (MLXOptimizer **)calloc((size_t)alloc_n, sizeof(MLXOptimizer *));
-  t->gen_scheds =
+  trainer->gen_scheds =
       (MLXScheduler **)calloc((size_t)alloc_n, sizeof(MLXScheduler *));
-  t->disc_scheds =
+  trainer->disc_scheds =
       (MLXScheduler **)calloc((size_t)alloc_n, sizeof(MLXScheduler *));
 
-  t->batch_prefetcher = NULL;
-  t->batch_iterator = NULL;
-  t->batch_producer_running = 0;
+  /* Print scales table (moved out of init_scales for constructor-level
+   * display). Only print when scales were populated. */
+  if (trainer->scales && trainer->n_scales > 0) {
+    fprintf(stdout, "Generated facie shapes:\n");
+    fprintf(stdout, "╔══════════╦══════════╦══════════╦══════════╗\n");
+    fprintf(stdout, "║ %8s ║ %8s ║ %8s ║ %8s ║\n", "Batch", "Height", "Width",
+            "Channels");
+    fprintf(stdout, "╠══════════╬══════════╬══════════╬══════════╣\n");
+    for (int si = 0; si < trainer->n_scales; ++si) {
+      /* stored as NHWC: [batch, height, width, channels] */
+      int b = trainer->scales[si * 4 + 0];
+      int h = trainer->scales[si * 4 + 1];
+      int w = trainer->scales[si * 4 + 2];
+      int c = trainer->scales[si * 4 + 3];
+      /* print as Batch, Height, Width, Channels */
+      fprintf(stdout, "║ %8d ║ %8d ║ %8d ║ %8d ║\n", b, h, w, c);
+    }
+    fprintf(stdout, "╚══════════╩══════════╩══════════╩══════════╝\n");
+  }
 
-  return t;
+  /* Initialize TensorBoard-style logging paths and print guidance when
+   * enabled. We don't implement a visualizer in C; instead create the
+   * directories and print the tensorboard --logdir hint (parity with
+   * Python Trainer.__init__). */
+  if (trainer->enable_tensorboard) {
+    char viz_path[PATH_BUFSZ];
+    char log_dir[PATH_BUFSZ];
+    const char *base_out = trainer->output_path ? trainer->output_path : ".";
+    join_path(viz_path, sizeof(viz_path), base_out, "training_visualizations");
+    join_path(log_dir, sizeof(log_dir), base_out, "tensorboard_logs");
+    /* dataset_info: "<num_pyramids> pyramids, <batch> batch size" */
+    char dataset_info[PATH_BUFSZ];
+    snprintf(dataset_info, sizeof(dataset_info), "%d pyramids, %d batch size",
+             trainer->opts.num_train_pyramids, trainer->batch_size);
+    if (trainer->opts.wells_mask_count > 0) {
+      /* append a short wells note (full column list can be large) */
+      strncat(dataset_info, ", wells present",
+              sizeof(dataset_info) - strlen(dataset_info) - 1);
+    }
+    /* Ensure directories exist (best-effort). */
+    (void)mlx_create_dirs(viz_path);
+    (void)mlx_create_dirs(log_dir);
+    fprintf(stdout, "📊 TensorBoard logging enabled!\n");
+    fprintf(stdout, "   View training progress: tensorboard --logdir=%s\n",
+            log_dir);
+    fprintf(stdout, "   Then open: http://localhost:6006\n");
+    /* Optionally print small dataset hint for parity with Python output */
+    fprintf(stdout, "   %s\n", dataset_info);
+    /* Create the Python-side visualizer (best-effort). Use update_interval=1
+     * to match Python trainer default behavior. The pybridge manages a
+     * global visualizer instance. */
+    if (!pybridge_create_visualizer(trainer->n_scales, log_dir, log_dir, 1)) {
+      fprintf(stderr,
+              "warning: failed to initialize Python TensorBoard visualizer\n");
+    }
+  } else {
+    fprintf(stdout, "📊 TensorBoard logging disabled\n");
+  }
+
+  mlx_pyramids_dataset_dump_batches_npz(trainer->dataset,
+                                        "results/c_dataset_batches.npz");
+
+  return trainer;
 }
 
-void MLXTrainer_destroy(MLXTrainer *t) {
-  if (!t)
+void MLXTrainer_destroy(MLXTrainer *trainer) {
+  if (!trainer)
     return;
-  if (t->model)
-    mlx_faciesgan_free(t->model);
+
+  if (trainer->model)
+    mlx_faciesgan_free(trainer->model);
 
   /* free per-scale optimizer/scheduler instances (allocated to max of
    * discovered scales or configured parallel scales). */
-  int alloc_n = t->n_scales;
-  if (t->opts.num_parallel_scales > alloc_n)
-    alloc_n = t->opts.num_parallel_scales;
+  int alloc_n = trainer->n_scales;
+  if (trainer->opts.num_parallel_scales > alloc_n)
+    alloc_n = trainer->opts.num_parallel_scales;
   if (alloc_n <= 0)
     alloc_n = 1;
 
-  if (t->gen_opts) {
+  if (trainer->gen_opts) {
     for (int i = 0; i < alloc_n; ++i) {
-      if (t->gen_opts[i])
-        mlx_adam_free(t->gen_opts[i]);
+      if (trainer->gen_opts[i])
+        mlx_adam_free(trainer->gen_opts[i]);
     }
   }
-  if (t->disc_opts) {
+  if (trainer->disc_opts) {
     for (int i = 0; i < alloc_n; ++i) {
-      if (t->disc_opts[i])
-        mlx_adam_free(t->disc_opts[i]);
+      if (trainer->disc_opts[i])
+        mlx_adam_free(trainer->disc_opts[i]);
     }
   }
-  if (t->gen_scheds) {
+  if (trainer->gen_scheds) {
     for (int i = 0; i < alloc_n; ++i) {
-      if (t->gen_scheds[i])
-        mlx_scheduler_free(t->gen_scheds[i]);
+      if (trainer->gen_scheds[i])
+        mlx_scheduler_free(trainer->gen_scheds[i]);
     }
   }
-  if (t->disc_scheds) {
+  if (trainer->disc_scheds) {
     for (int i = 0; i < alloc_n; ++i) {
-      if (t->disc_scheds[i])
-        mlx_scheduler_free(t->disc_scheds[i]);
+      if (trainer->disc_scheds[i])
+        mlx_scheduler_free(trainer->disc_scheds[i]);
     }
   }
 
-  free(t->gen_opts);
-  free(t->disc_opts);
-  free(t->gen_scheds);
-  free(t->disc_scheds);
-  free(t);
+  if (trainer->gen_opts)
+    free(trainer->gen_opts);
+  if (trainer->disc_opts)
+    free(trainer->disc_opts);
+  if (trainer->gen_scheds)
+    free(trainer->gen_scheds);
+  if (trainer->disc_scheds)
+    free(trainer->disc_scheds);
+
+  if (trainer->scales)
+    free(trainer->scales);
+
+  if (trainer->checkpoint_path)
+    free(trainer->checkpoint_path);
+
+  if (trainer->output_path)
+    free(trainer->output_path);
+
+  if (trainer->wells_mask_columns)
+    free(trainer->wells_mask_columns);
+
+  /* Close Python visualizer if one was created via pybridge. */
+  if (trainer->enable_tensorboard) {
+    (void)pybridge_close_visualizer();
+  }
+
+  /* Free dataset/dataloader if created during MLXTrainer_new. */
+  if (trainer->data_loader) {
+    facies_dataloader_free(trainer->data_loader);
+    trainer->data_loader = NULL;
+  }
+  if (trainer->dataset) {
+    facies_dataset_free(trainer->dataset);
+    trainer->dataset = NULL;
+  }
+
+  /* destroy prefetcher resources if any */
+  if (trainer->batch_iterator) {
+    prefetcher_iterator_destroy(trainer->batch_iterator);
+    trainer->batch_iterator = NULL;
+  }
+  if (trainer->batch_prefetcher) {
+    prefetcher_destroy(trainer->batch_prefetcher);
+    trainer->batch_prefetcher = NULL;
+  }
+
+  free(trainer);
 }
 
-int MLXTrainer_setup_optimizers(MLXTrainer *t, const int *scales,
-                                int n_scales) {
+int MLXTrainer_get_shapes_flat(MLXTrainer *t, int **out_shapes, int *out_n) {
+  if (!t || !out_shapes || !out_n)
+    return -1;
+  *out_shapes = t->scales;
+  *out_n = t->n_scales;
+  return 0;
+}
+
+int MLXTrainer_set_shapes(MLXTrainer *t, const int *shapes, int n_scales) {
   if (!t)
+    return -1;
+  if (t->scales)
+    free(t->scales);
+  if (!shapes || n_scales <= 0) {
+    t->scales = NULL;
+    t->n_scales = 0;
+    return 0;
+  }
+  t->scales = (int *)malloc(sizeof(int) * 4 * (size_t)n_scales);
+  if (!t->scales)
+    return -1;
+  memcpy(t->scales, shapes, sizeof(int) * 4 * (size_t)n_scales);
+  t->n_scales = n_scales;
+  return 0;
+}
+
+int MLXTrainer_init_dataset(MLXTrainer *trainer) {
+  /* Create dataset using the canonical constructor to avoid duplicating
+   * loading logic. Use channels_last=1 to match Python trainer behavior. */
+  MLXPyramidsDataset *ds = NULL;
+  if (mlx_pyramids_dataset_new(&ds, &trainer->opts, 0, 0, 1) != 0) {
+    return -1;
+  }
+
+  trainer->dataset = ds;
+  trainer->num_of_batchs = ds->n_samples > 0 && trainer->batch_size > 0
+                               ? (ds->n_samples / trainer->batch_size)
+                               : 0;
+  return 0;
+}
+
+int MLXTrainer_create_visualizer(MLXTrainer *trainer, int update_interval) {
+  if (!trainer || !trainer->enable_tensorboard)
+    return 0;
+  const char *base_out = trainer->output_path ? trainer->output_path : ".";
+  char log_dir[PATH_BUFSZ];
+  join_path(log_dir, sizeof(log_dir), base_out, "tensorboard_logs");
+  return pybridge_create_visualizer(trainer->n_scales, base_out, log_dir,
+                                    update_interval);
+}
+
+int MLXTrainer_update_visualizer(MLXTrainer *trainer, int epoch,
+                                 const char *metrics_json,
+                                 int samples_processed) {
+  (void)trainer;
+  if (!trainer || !trainer->enable_tensorboard)
+    return 0;
+  return pybridge_update_visualizer_from_json(epoch, metrics_json,
+                                              samples_processed);
+}
+
+int MLXTrainer_close_visualizer(MLXTrainer *trainer) {
+  (void)trainer;
+  if (!trainer || !trainer->enable_tensorboard)
+    return 0;
+  return pybridge_close_visualizer();
+}
+
+int MLXTrainer_setup_optimizers(MLXTrainer *trainer, const int *scales,
+                                int n_scales) {
+  if (!trainer)
     return -1;
 
   int *local_scales = NULL;
@@ -315,10 +364,10 @@ int MLXTrainer_setup_optimizers(MLXTrainer *t, const int *scales,
    * present; otherwise fall back to discovered model scales. This mirrors
    * the Python trainer which uses options to determine parallelism. */
   if (!scales || n_scales <= 0) {
-    if (t->opts.num_parallel_scales > 0) {
-      local_n = t->opts.num_parallel_scales;
-    } else if (t->n_scales > 0) {
-      local_n = t->n_scales;
+    if (trainer->opts.num_parallel_scales > 0) {
+      local_n = trainer->opts.num_parallel_scales;
+    } else if (trainer->n_scales > 0) {
+      local_n = trainer->n_scales;
     } else {
       return -1;
     }
@@ -333,24 +382,30 @@ int MLXTrainer_setup_optimizers(MLXTrainer *t, const int *scales,
   for (int i = 0; i < local_n; ++i) {
     int sc = scales[i];
     /* create Adam optimizers with defaults (mirrors Python defaults) */
-    t->gen_opts[sc] =
-        mlx_adam_create(t->opts.lr_g, t->opts.beta1, 0.999f, 1e-8f);
-    t->disc_opts[sc] =
-        mlx_adam_create(t->opts.lr_d, t->opts.beta1, 0.999f, 1e-8f);
+    trainer->gen_opts[sc] =
+        mlx_adam_create(trainer->opts.lr_g, trainer->opts.beta1, 0.999f, 1e-8f);
+    trainer->disc_opts[sc] =
+        mlx_adam_create(trainer->opts.lr_d, trainer->opts.beta1, 0.999f, 1e-8f);
     /* schedulers: multistep with single milestone (lr_decay) */
-    int milestones[1] = {t->opts.lr_decay};
-    t->gen_scheds[sc] = mlx_scheduler_multistep_create_with_init(
-        milestones, 1, t->opts.gamma, (const float *)&t->opts.lr_g, 1);
-    t->disc_scheds[sc] = mlx_scheduler_multistep_create_with_init(
-        milestones, 1, t->opts.gamma, (const float *)&t->opts.lr_d, 1);
+    int milestones[1] = {trainer->opts.lr_decay};
+    trainer->gen_scheds[sc] = mlx_scheduler_multistep_create_with_init(
+        milestones, 1, trainer->opts.gamma, (const float *)&trainer->opts.lr_g,
+        1);
+    trainer->disc_scheds[sc] = mlx_scheduler_multistep_create_with_init(
+        milestones, 1, trainer->opts.gamma, (const float *)&trainer->opts.lr_d,
+        1);
     /* attach scheduler and optimizer so LR updates propagate */
-    if (t->gen_opts[sc] && t->gen_scheds[sc]) {
-      mlx_optimizer_attach_scheduler(t->gen_opts[sc], t->gen_scheds[sc]);
-      mlx_scheduler_attach_optimizer(t->gen_scheds[sc], t->gen_opts[sc]);
+    if (trainer->gen_opts[sc] && trainer->gen_scheds[sc]) {
+      mlx_optimizer_attach_scheduler(trainer->gen_opts[sc],
+                                     trainer->gen_scheds[sc]);
+      mlx_scheduler_attach_optimizer(trainer->gen_scheds[sc],
+                                     trainer->gen_opts[sc]);
     }
-    if (t->disc_opts[sc] && t->disc_scheds[sc]) {
-      mlx_optimizer_attach_scheduler(t->disc_opts[sc], t->disc_scheds[sc]);
-      mlx_scheduler_attach_optimizer(t->disc_scheds[sc], t->disc_opts[sc]);
+    if (trainer->disc_opts[sc] && trainer->disc_scheds[sc]) {
+      mlx_optimizer_attach_scheduler(trainer->disc_opts[sc],
+                                     trainer->disc_scheds[sc]);
+      mlx_scheduler_attach_optimizer(trainer->disc_scheds[sc],
+                                     trainer->disc_opts[sc]);
     }
   }
   if (local_scales)
@@ -358,136 +413,55 @@ int MLXTrainer_setup_optimizers(MLXTrainer *t, const int *scales,
   return 0;
 }
 
-/* Producer thread used by trainer-created prefetchers. */
-typedef struct TrainerProducerArgs {
-  facies_dataloader *dl;
-  PrefetcherHandle ph;
-  mlx_stream s;
-} TrainerProducerArgs;
+/* Producer thread logic is now centralized in datasets/prefetcher.c.
+ * Use `prefetcher_start_from_dataloader` to spawn a producer.
+ */
 
-static void *trainer_producer_thread(void *v) {
-  TrainerProducerArgs *a = (TrainerProducerArgs *)v;
-  facies_dataloader *dl = a->dl;
-  PrefetcherHandle ph = a->ph;
-  mlx_stream s = a->s;
-
-  while (1) {
-    mlx_vector_array facs = mlx_vector_array_new();
-    mlx_vector_array wells_out = mlx_vector_array_new();
-    mlx_vector_array seis_out = mlx_vector_array_new();
-    int rc = facies_dataloader_next(dl, &facs, &wells_out, &seis_out, s);
-    if (rc == 2) {
-      mlx_vector_array_free(facs);
-      mlx_vector_array_free(wells_out);
-      mlx_vector_array_free(seis_out);
-      break;
-    } else if (rc != 0) {
-      mlx_vector_array_free(facs);
-      mlx_vector_array_free(wells_out);
-      mlx_vector_array_free(seis_out);
-      break;
-    }
-
-    int nsc = (int)mlx_vector_array_size(facs);
-    mlx_array *fac_arr = NULL;
-    mlx_array *well_arr = NULL;
-    mlx_array *sei_arr = NULL;
-    if (nsc > 0) {
-      fac_arr = (mlx_array *)malloc(sizeof(mlx_array) * nsc);
-      for (int i = 0; i < nsc; ++i) {
-        mlx_array tmp = mlx_array_new();
-        if (mlx_vector_array_get(&tmp, facs, i) != 0) {
-          mlx_array_free(tmp);
-          tmp = mlx_array_new();
-        }
-        fac_arr[i] = tmp;
-      }
-    }
-    int nw = (int)mlx_vector_array_size(wells_out);
-    if (nw > 0) {
-      well_arr = (mlx_array *)malloc(sizeof(mlx_array) * nw);
-      for (int i = 0; i < nw; ++i) {
-        mlx_array tmp = mlx_array_new();
-        if (mlx_vector_array_get(&tmp, wells_out, i) != 0) {
-          mlx_array_free(tmp);
-          tmp = mlx_array_new();
-        }
-        well_arr[i] = tmp;
-      }
-    }
-    int ns = (int)mlx_vector_array_size(seis_out);
-    if (ns > 0) {
-      sei_arr = (mlx_array *)malloc(sizeof(mlx_array) * ns);
-      for (int i = 0; i < ns; ++i) {
-        mlx_array tmp = mlx_array_new();
-        if (mlx_vector_array_get(&tmp, seis_out, i) != 0) {
-          mlx_array_free(tmp);
-          tmp = mlx_array_new();
-        }
-        sei_arr[i] = tmp;
-      }
-    }
-
-    prefetcher_push_mlx(ph, fac_arr, nsc, well_arr, nw, NULL, 0, sei_arr, ns);
-
-    if (fac_arr) {
-      for (int i = 0; i < nsc; ++i)
-        mlx_array_free(fac_arr[i]);
-      free(fac_arr);
-    }
-    if (well_arr) {
-      for (int i = 0; i < nw; ++i)
-        mlx_array_free(well_arr[i]);
-      free(well_arr);
-    }
-    if (sei_arr) {
-      for (int i = 0; i < ns; ++i)
-        mlx_array_free(sei_arr[i]);
-      free(sei_arr);
-    }
-
-    mlx_vector_array_free(facs);
-    mlx_vector_array_free(wells_out);
-    mlx_vector_array_free(seis_out);
-  }
-
-  prefetcher_mark_finished(ph);
-  if (a->s.ctx)
-    mlx_stream_free(a->s);
-  free(a);
-  return NULL;
-}
-
-int MLXTrainer_get_n_scales(MLXTrainer *t) {
-  if (!t)
-    return 0;
-  return t->n_scales;
-}
-
-int MLXTrainer_compute_rec_input(MLXTrainer *t, int scale, const int *indexes,
-                                 int n_indexes, mlx_array **facies_pyramid,
-                                 mlx_array **out) {
-  (void)t;
+int MLXTrainer_compute_rec_input(MLXTrainer *trainer, int scale,
+                                 const int *indexes, int n_indexes,
+                                 mlx_array **facies_pyramid, mlx_array **out) {
+  (void)trainer;
   return mlx_compute_rec_input(scale, indexes, n_indexes, facies_pyramid, out);
 }
 
-int MLXTrainer_init_rec_noise_and_amp(MLXTrainer *t, int scale,
+int MLXTrainer_init_rec_noise_and_amp(MLXTrainer *trainer, int scale,
                                       const int *indexes, int n_indexes,
                                       const mlx_array *real,
                                       mlx_array **wells_pyramid,
                                       mlx_array **seismic_pyramid) {
-  if (!t)
+  if (!trainer)
     return -1;
-  return mlx_init_rec_noise_and_amp(t->model, scale, indexes, n_indexes, real,
-                                    wells_pyramid, seismic_pyramid);
+  return mlx_init_rec_noise_and_amp(trainer->model, scale, indexes, n_indexes,
+                                    real, wells_pyramid, seismic_pyramid);
 }
 
-PrefetcherIteratorHandle MLXTrainer_create_batch_iterator(MLXTrainer *t,
-                                                          facies_dataloader *dl,
-                                                          const int *scales,
-                                                          int n_scales) {
-  if (!t || !dl)
+PrefetcherIteratorHandle
+MLXTrainer_create_batch_iterator(MLXTrainer *trainer, struct MLXDataloader *dl,
+                                 const int *scales, int n_scales) {
+  if (!trainer)
     return NULL;
+
+  /* Lazily initialise dataset/dataloader if caller didn't provide one. */
+  if (!dl) {
+    /* Prefer an existing trainer-owned dataloader when available. */
+    if (trainer->data_loader) {
+      dl = trainer->data_loader;
+    } else {
+      if (!trainer->dataset) {
+        if (MLXTrainer_init_dataset(trainer) != 0)
+          return NULL;
+      }
+      unsigned int seed = (unsigned int)(trainer->opts.manual_seed >= 0
+                                             ? trainer->opts.manual_seed
+                                             : (int)time(NULL));
+      if (MLXTrainer_create_dataloader(trainer) != 0) {
+        return NULL;
+      }
+      dl = trainer->data_loader;
+      /* Record ownership so MLXTrainer_destroy will free it. */
+      trainer->data_loader = dl;
+    }
+  }
   int qcap = 4;
   mlx_stream s = mlx_default_cpu_stream_new();
   PrefetcherHandle ph =
@@ -497,38 +471,69 @@ PrefetcherIteratorHandle MLXTrainer_create_batch_iterator(MLXTrainer *t,
       mlx_stream_free(s);
     return NULL;
   }
-  t->batch_prefetcher = ph;
-  t->batch_iterator = prefetcher_iterator_create(ph);
-  TrainerProducerArgs *args =
-      (TrainerProducerArgs *)malloc(sizeof(TrainerProducerArgs));
-  args->dl = dl;
-  args->ph = ph;
-  args->s = mlx_default_cpu_stream_new();
-  pthread_create(&t->batch_producer, NULL, trainer_producer_thread, args);
-  pthread_detach(t->batch_producer);
-  t->batch_producer_running = 1;
-  return t->batch_iterator;
+  trainer->batch_prefetcher = ph;
+  trainer->batch_iterator = prefetcher_iterator_create(ph);
+  /* Start the centralized prefetcher producer thread which will read from
+   * the dataloader and push into the prefetcher. The helper detaches the
+   * thread and will free the provided stream when finished. */
+  mlx_stream prod_stream = mlx_default_cpu_stream_new();
+  if (prefetcher_start_from_dataloader(ph, dl, prod_stream) != 0) {
+    if (prod_stream.ctx)
+      mlx_stream_free(prod_stream);
+    prefetcher_destroy(ph);
+    trainer->batch_prefetcher = NULL;
+    trainer->batch_iterator = NULL;
+    return NULL;
+  }
+  trainer->batch_producer_running = 1;
+  return trainer->batch_iterator;
 }
 
-int MLXTrainer_create_dataloader(MLXTrainer *t, facies_dataloader **out,
-                                 facies_dataset *ds, size_t batch_size,
-                                 unsigned int seed, int num_workers,
-                                 int prefetch_factor, int timeout_ms) {
-  (void)t;
-  if (!out || !ds)
+int MLXTrainer_create_dataloader(MLXTrainer *trainer) {
+  if (!trainer)
     return -1;
-  return facies_dataloader_new_ex(
-      out, ds, batch_size, false, false, seed, num_workers, prefetch_factor,
+
+  /* If dataloader already exists, treat as success. */
+  if (trainer->data_loader)
+    return 0;
+
+  /* Ensure dataset is initialised. */
+  if (!trainer->dataset) {
+    if (MLXTrainer_init_dataset(trainer) != 0)
+      return -1;
+  }
+
+  MLXPyramidsDataset *ds = trainer->dataset;
+  size_t batch_size =
+      trainer->batch_size > 0
+          ? (size_t)trainer->batch_size
+          : (trainer->opts.batch_size > 0 ? (size_t)trainer->opts.batch_size
+                                          : 1);
+  unsigned int seed =
+      (unsigned int)(trainer->opts.manual_seed >= 0 ? trainer->opts.manual_seed
+                                                    : (int)time(NULL));
+  int num_workers = trainer->opts.num_workers;
+  int prefetch_factor = 2;
+  int timeout_ms = 2000;
+
+  struct MLXDataloader *dl = NULL;
+  int rc = facies_dataloader_new_ex(
+      &dl, ds, batch_size, false, false, seed, num_workers, prefetch_factor,
       num_workers > 0, timeout_ms, NULL, NULL, false, NULL, NULL, NULL, NULL,
       NULL, NULL, NULL, NULL, 0, NULL, NULL);
+  if (rc != 0)
+    return rc;
+
+  trainer->data_loader = dl;
+  return 0;
 }
 
 int MLXTrainer_generate_visualization_samples(
-    MLXTrainer *t, const int *scales, int n_scales, const int *indexes,
+    MLXTrainer *trainer, const int *scales, int n_scales, const int *indexes,
     int n_indexes, mlx_array **wells_pyramid, int n_wells,
     mlx_array **seismic_pyramid, int n_seismic, mlx_array ***out_generated,
     int *n_out) {
-  if (!t || !scales || n_scales <= 0 || !out_generated || !n_out)
+  if (!trainer || !scales || n_scales <= 0 || !out_generated || !n_out)
     return -1;
   mlx_array **out = (mlx_array **)malloc(sizeof(mlx_array *) * n_scales);
   if (!out)
@@ -537,16 +542,16 @@ int MLXTrainer_generate_visualization_samples(
     int scale = scales[i];
     mlx_array **noises = NULL;
     int n_noises = 0;
-    if (mlx_faciesgan_get_pyramid_noise(t->model, scale, indexes, n_indexes,
-                                        &noises, &n_noises, wells_pyramid,
-                                        seismic_pyramid, 0) != 0) {
+    if (mlx_faciesgan_get_pyramid_noise(
+            trainer->model, scale, indexes, n_indexes, &noises, &n_noises,
+            wells_pyramid, seismic_pyramid, 0) != 0) {
       out[i] = NULL;
       continue;
     }
     float *use_amps = NULL;
     int use_n = 0;
-    if (mlx_faciesgan_get_noise_amplitude(t->model, scale, &use_amps, &use_n) !=
-        0) {
+    if (mlx_faciesgan_get_noise_amplitude(trainer->model, scale, &use_amps,
+                                          &use_n) != 0) {
       use_amps = (float *)malloc(sizeof(float) * (scale + 1));
       if (!use_amps) {
         out[i] = NULL;
@@ -588,9 +593,11 @@ int MLXTrainer_generate_visualization_samples(
         if (mlx_array_ndim(zvals[j]) == 0) {
           mlx_stream _s = mlx_default_cpu_stream_new();
           int shape0[4] = {
-              1, t->opts.crop_size > 0 ? t->opts.crop_size : 32,
-              t->opts.crop_size > 0 ? t->opts.crop_size : 32,
-              t->opts.num_img_channels > 0 ? t->opts.num_img_channels : 1};
+              1, trainer->opts.crop_size > 0 ? trainer->opts.crop_size : 32,
+              trainer->opts.crop_size > 0 ? trainer->opts.crop_size : 32,
+              trainer->opts.num_img_channels > 0
+                  ? trainer->opts.num_img_channels
+                  : 1};
           mlx_array tmp = mlx_array_new();
           if (mlx_zeros(&tmp, shape0, 4, MLX_FLOAT32, _s) == 0) {
             zvals[j] = tmp;
@@ -604,16 +611,12 @@ int MLXTrainer_generate_visualization_samples(
     mlx_array in_noise = mlx_array_new();
     if (n_noises > 0)
       in_noise = zvals[0];
-    for (int j = 0; j < n_noises; ++j) {
-      fprintf(stdout, "[debug] save_generated noise[%d] ndim=%zu\n", j,
-              mlx_array_ndim(zvals[j]));
-    }
-    fprintf(
-        stdout,
-        "[debug] save_generated calling generate_fake: n_noises=%d scale=%d\n",
-        n_noises, scale);
-    mlx_array fake = mlx_faciesgan_generate_fake(
-        t->model, zvals, n_noises, use_amps, use_n, in_noise, scale, scale);
+    (void)n_noises;
+    (void)zvals;
+    (void)scale;
+    mlx_array fake =
+        mlx_faciesgan_generate_fake(trainer->model, zvals, n_noises, use_amps,
+                                    use_n, in_noise, scale, scale);
 
     for (int j = 0; j < n_noises; ++j) {
       if (noises[j]) {
@@ -640,7 +643,7 @@ int MLXTrainer_generate_visualization_samples(
   return 0;
 }
 
-int MLXTrainer_optimization_step(MLXTrainer *t, const int *indexes,
+int MLXTrainer_optimization_step(MLXTrainer *trainer, const int *indexes,
                                  int n_indexes, mlx_array **facies_pyramid,
                                  int n_facies, mlx_array **rec_in_pyramid,
                                  int n_rec, mlx_array **wells_pyramid,
@@ -649,23 +652,24 @@ int MLXTrainer_optimization_step(MLXTrainer *t, const int *indexes,
                                  int n_seismic, const int *active_scales,
                                  int n_active_scales) {
   /* destroy prefetcher resources if any */
-  if (t->batch_iterator) {
-    prefetcher_iterator_destroy(t->batch_iterator);
-    t->batch_iterator = NULL;
+  if (trainer->batch_iterator) {
+    prefetcher_iterator_destroy(trainer->batch_iterator);
+    trainer->batch_iterator = NULL;
   }
-  if (t->batch_prefetcher) {
-    prefetcher_destroy(t->batch_prefetcher);
-    t->batch_prefetcher = NULL;
+  if (trainer->batch_prefetcher) {
+    prefetcher_destroy(trainer->batch_prefetcher);
+    trainer->batch_prefetcher = NULL;
   }
-  if (!t)
+  if (!trainer)
     return -1;
 
   MLXResults *res = NULL;
   int rc = mlx_faciesgan_collect_metrics_and_grads(
-      t->model, indexes, n_indexes, active_scales, n_active_scales,
+      trainer->model, indexes, n_indexes, active_scales, n_active_scales,
       facies_pyramid, rec_in_pyramid, wells_pyramid, masks_pyramid,
-      seismic_pyramid, t->opts.lambda_diversity, t->opts.well_loss_penalty,
-      t->opts.alpha, t->opts.lambda_grad, &res);
+      seismic_pyramid, trainer->opts.lambda_diversity,
+      trainer->opts.well_loss_penalty, trainer->opts.alpha,
+      trainer->opts.lambda_grad, &res);
   if (rc != 0 || !res) {
     if (res)
       mlx_results_free(res);
@@ -680,25 +684,28 @@ int MLXTrainer_optimization_step(MLXTrainer *t, const int *indexes,
     int sc = sr->scale;
 
     /* Step schedulers (advance by one) if present */
-    if (t->gen_scheds && t->gen_scheds[sc])
-      mlx_scheduler_step_auto(t->gen_scheds[sc],
-                              t->gen_opts ? t->gen_opts[sc] : NULL);
-    if (t->disc_scheds && t->disc_scheds[sc])
-      mlx_scheduler_step_auto(t->disc_scheds[sc],
-                              t->disc_opts ? t->disc_opts[sc] : NULL);
+    if (trainer->gen_scheds && trainer->gen_scheds[sc])
+      mlx_scheduler_step_auto(trainer->gen_scheds[sc],
+                              trainer->gen_opts ? trainer->gen_opts[sc] : NULL);
+    if (trainer->disc_scheds && trainer->disc_scheds[sc])
+      mlx_scheduler_step_auto(trainer->disc_scheds[sc],
+                              trainer->disc_opts ? trainer->disc_opts[sc]
+                                                 : NULL);
 
     /* Apply generator grads */
-    if (sr->gen_n > 0 && sr->gen_grads && t->gen_opts && t->gen_opts[sc]) {
-      int r = mlx_faciesgan_apply_sgd_to_generator(t->model, t->gen_opts[sc],
-                                                   sr->gen_grads, sr->gen_n);
+    if (sr->gen_n > 0 && sr->gen_grads && trainer->gen_opts &&
+        trainer->gen_opts[sc]) {
+      int r = mlx_faciesgan_apply_sgd_to_generator(
+          trainer->model, trainer->gen_opts[sc], sr->gen_grads, sr->gen_n);
       if (r != 0)
         overall = -1;
     }
 
     /* Apply discriminator grads */
-    if (sr->disc_n > 0 && sr->disc_grads && t->disc_opts && t->disc_opts[sc]) {
+    if (sr->disc_n > 0 && sr->disc_grads && trainer->disc_opts &&
+        trainer->disc_opts[sc]) {
       int r = mlx_faciesgan_apply_sgd_to_discriminator(
-          t->model, t->disc_opts[sc], sr->disc_grads, sr->disc_n);
+          trainer->model, trainer->disc_opts[sc], sr->disc_grads, sr->disc_n);
       if (r != 0)
         overall = -1;
     }
@@ -708,29 +715,30 @@ int MLXTrainer_optimization_step(MLXTrainer *t, const int *indexes,
   return overall == 0 ? 0 : -1;
 }
 
-int MLXTrainer_load_model(MLXTrainer *t, int scale,
+int MLXTrainer_load_model(MLXTrainer *trainer, int scale,
                           const char *checkpoint_dir) {
-  if (!t || !checkpoint_dir)
+  if (!trainer || !checkpoint_dir)
     return -1;
   /* Reuse existing per-scale state loaders (load_*_state). The expected
    * argument is a directory path for the scale; pass `checkpoint_dir/scale`. */
   char scale_dir[PATH_MAX];
   snprintf(scale_dir, PATH_MAX, "%s/%d", checkpoint_dir, scale);
-  if (mlx_faciesgan_load_generator_state(t->model, scale_dir, scale) != 0)
+  if (mlx_faciesgan_load_generator_state(trainer->model, scale_dir, scale) != 0)
     return -1;
-  if (mlx_faciesgan_load_discriminator_state(t->model, scale_dir, scale) != 0)
+  if (mlx_faciesgan_load_discriminator_state(trainer->model, scale_dir,
+                                             scale) != 0)
     return -1;
   return 0;
 }
 
-int MLXTrainer_save_generated_facies(MLXTrainer *t, int scale, int epoch,
+int MLXTrainer_save_generated_facies(MLXTrainer *trainer, int scale, int epoch,
                                      const char *results_path) {
-  if (!t || !results_path)
+  if (!trainer || !results_path)
     return -1;
   /* Generate noises and call numeric forward (similar to train_utils.c) */
   mlx_array **noises = NULL;
   int n_noises = 0;
-  if (mlx_faciesgan_get_pyramid_noise(t->model, scale, NULL, 0, &noises,
+  if (mlx_faciesgan_get_pyramid_noise(trainer->model, scale, NULL, 0, &noises,
                                       &n_noises, NULL, NULL, 0) != 0)
     return -1;
 
@@ -750,9 +758,9 @@ int MLXTrainer_save_generated_facies(MLXTrainer *t, int scale, int epoch,
     use_amps[i] = 1.0f;
 
   mlx_array in_noise = mlx_array_new();
-  mlx_array_t fake =
-      mlx_faciesgan_generate_fake(t->model, (const mlx_array *)noises, n_noises,
-                                  use_amps, scale + 1, in_noise, scale, scale);
+  mlx_array_t fake = mlx_faciesgan_generate_fake(
+      trainer->model, (const mlx_array *)noises, n_noises, use_amps, scale + 1,
+      in_noise, scale, scale);
 
   /* free noises */
   for (int i = 0; i < n_noises; ++i) {
@@ -773,34 +781,76 @@ int MLXTrainer_save_generated_facies(MLXTrainer *t, int scale, int epoch,
   return rc;
 }
 
-void *MLXTrainer_get_model_ctx(MLXTrainer *t) {
-  if (!t)
+void *MLXTrainer_get_model_ctx(MLXTrainer *trainer) {
+  if (!trainer)
     return NULL;
-  return (void *)t->model;
+  return (void *)trainer->model;
 }
 
-void *MLXTrainer_create_model(MLXTrainer *t) {
-  return MLXTrainer_get_model_ctx(t);
+void *MLXTrainer_create_model(MLXTrainer *trainer) {
+  if (!trainer)
+    return NULL;
+
+  MLXBaseManager *mgr = mlx_base_manager_create_from_trainning(&trainer->opts);
+  if (!mgr)
+    return NULL;
+  if (trainer->opts.num_parallel_scales > 0) {
+    mlx_base_manager_init_scales(mgr, 0, trainer->opts.num_parallel_scales);
+  }
+  /* Use provided checkpoint path when loading shapes/state; fall back to
+   * literal if allocation failed. The `checkpoint_path` was initialised
+   * earlier to reflect explicit args or defaults. */
+  {
+    const char *ckpt =
+        trainer->checkpoint_path ? trainer->checkpoint_path : ".checkpoints";
+    (void)mlx_base_manager_load(mgr, ckpt, 1 /*load_shapes*/,
+                                -1 /*until_scale*/, 0 /*load_disc*/,
+                                0 /*load_wells*/);
+  }
+  trainer->model = (MLXFaciesGAN *)mlx_base_manager_get_user_ctx(mgr);
+  if (!trainer->model) {
+    mlx_base_manager_free(mgr);
+    return NULL;
+  }
+  return (void *)trainer->model;
 }
 
-int MLXTrainer_train_scales(MLXTrainer *t, const int *indexes, int n_indexes,
-                            mlx_array **facies_pyramid, int n_facies,
-                            mlx_array **wells_pyramid, int n_wells,
-                            mlx_array **masks_pyramid, int n_masks,
+int MLXTrainer_init_scales(MLXTrainer *trainer) {
+  /* If scales already set, nothing to do. */
+  if (trainer->scales && trainer->n_scales > 0)
+    return 0;
+  DatasetScale *arr = NULL;
+  int n = 0;
+  if (dataset_generate_scales(&trainer->opts, 1 /*channels_last*/, &arr, &n) !=
+      0) {
+    return -1;
+  }
+
+  trainer->scales = (int *)malloc(sizeof(int) * 4 * (size_t)n);
+  if (!trainer->scales) {
+    free(arr);
+    return -1;
+  }
+  for (int si = 0; si < n; ++si) {
+    trainer->scales[si * 4 + 0] = arr[si].batch;
+    trainer->scales[si * 4 + 1] = arr[si].height;
+    trainer->scales[si * 4 + 2] = arr[si].width;
+    trainer->scales[si * 4 + 3] = arr[si].channels;
+  }
+  trainer->n_scales = n;
+  free(arr);
+  return 0;
+}
+
+int MLXTrainer_train_scales(MLXTrainer *trainer, const int *indexes,
+                            int n_indexes, mlx_array **facies_pyramid,
+                            int n_facies, mlx_array **wells_pyramid,
+                            int n_wells, mlx_array **masks_pyramid, int n_masks,
                             mlx_array **seismic_pyramid, int n_seismic,
                             const int *scales, int n_scales, int num_iter) {
-  if (!t || !indexes || n_indexes <= 0 || !facies_pyramid || n_facies <= 0 ||
-      !scales || n_scales <= 0 || num_iter <= 0)
+  if (!trainer || !indexes || n_indexes <= 0 || !facies_pyramid ||
+      n_facies <= 0 || !scales || n_scales <= 0 || num_iter <= 0)
     return -1;
-
-  /* Writer canary: emit backtrace when MLXTrainer runs training loop */
-  fprintf(stderr, "[writer_canary] func=MLXTrainer_train_scales tid=%lu\n",
-          (unsigned long)pthread_self());
-  {
-    void *bt[64];
-    int bt_size = backtrace(bt, 64);
-    backtrace_symbols_fd(bt, bt_size, fileno(stderr));
-  }
 
   /* Prepare rec_in_pyramid once per iteration as Python does */
   for (int epoch = 0; epoch < num_iter; ++epoch) {
@@ -814,14 +864,14 @@ int MLXTrainer_train_scales(MLXTrainer *t, const int *indexes, int n_indexes,
       (void)mlx_compute_rec_input(si, indexes, n_indexes, facies_pyramid, &r);
       rec_pyr[si] = r;
       (void)mlx_init_rec_noise_and_amp(
-          (MLXFaciesGAN *)MLXTrainer_get_model_ctx(t), si, indexes, n_indexes,
-          facies_pyramid[si], wells_pyramid, seismic_pyramid);
+          (MLXFaciesGAN *)MLXTrainer_get_model_ctx(trainer), si, indexes,
+          n_indexes, facies_pyramid[si], wells_pyramid, seismic_pyramid);
     }
 
     int rc = MLXTrainer_optimization_step(
-        t, indexes, n_indexes, facies_pyramid, n_facies, rec_pyr, n_facies,
-        wells_pyramid, n_wells, masks_pyramid, n_masks, seismic_pyramid,
-        n_seismic, scales, n_scales);
+        trainer, indexes, n_indexes, facies_pyramid, n_facies, rec_pyr,
+        n_facies, wells_pyramid, n_wells, masks_pyramid, n_masks,
+        seismic_pyramid, n_seismic, scales, n_scales);
 
     for (int si = 0; si < n_facies; ++si) {
       if (rec_pyr[si]) {
@@ -880,7 +930,7 @@ int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
   mlx_vector_vector_array wells = mlx_vector_vector_array_new();
   mlx_vector_vector_array seismic = mlx_vector_vector_array_new();
 
-  facies_dataset *ds = NULL;
+  MLXPyramidsDataset *ds = NULL;
   if (facies_dataset_new(&ds, facies_pyramids, wells, seismic) != 0) {
     fprintf(stderr, "failed to create facies_dataset\n");
     mlx_vector_vector_array_free(facies_pyramids);
@@ -889,7 +939,7 @@ int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
     return 1;
   }
 
-  facies_dataloader *dl = NULL;
+  struct MLXDataloader *dl = NULL;
   if (facies_dataloader_new(&dl, ds, (size_t)batch_size, false, false,
                             (unsigned int)time(NULL)) != 0) {
     fprintf(stderr, "failed to create facies_dataloader\n");
@@ -964,132 +1014,119 @@ int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
 int MLXTrainer_run_with_opts(const TrainningOptions *opts) {
   if (!opts)
     return -1;
-  return MLXTrainer_run_full(opts);
+  MLXTrainer *trainer = MLXTrainer_new(opts, 0, ".checkpoints");
+  if (!trainer)
+    return -1;
+  int rc = MLXTrainer_train(trainer);
+  MLXTrainer_destroy(trainer);
+  return rc;
 }
 
-/* Minimal MLXTrainer_run_full stub to keep the renamed file self-contained.
- * The full dataset-driven implementation is large and lives elsewhere; if
- * you want the full behavior restored under the new filename I can inline
- * it here as well. */
-int MLXTrainer_run_full(const TrainningOptions *opts) {
-  if (!opts)
+/* Minimal MLXTrainer_train implementation to keep file self-contained.
+ * It expects an already-created `MLXTrainer*` and mirrors the previous
+ * dataset-driven behavior which was based on TrainningOptions stored in
+ * the trainer. */
+int MLXTrainer_train(MLXTrainer *trainer) {
+  if (!trainer)
     return -1;
 
-  MLXTrainer *t = MLXTrainer_create_with_opts(opts);
-  if (!t)
-    return -1;
+  TrainningOptions *opts = &trainer->opts;
 
-  int n_scales = MLXTrainer_get_n_scales(t);
+  int n_scales = trainer->n_scales;
   if (n_scales <= 0) {
-    MLXTrainer_destroy(t);
-    fprintf(stderr, "no model scales available\n");
-    return -1;
-  }
-
-  /* Attempt to load MLX pyramids dataset from function cache (parity with
-   * Python MLXPyramidsDataset). This populates facies/wells/seismic
-   * vector-of-vector arrays which we pass to the existing facies_dataset
-   * constructor. */
-  mlx_vector_vector_array facies_pyramids = mlx_vector_vector_array_new();
-  mlx_vector_vector_array wells = mlx_vector_vector_array_new();
-  mlx_vector_vector_array masks = mlx_vector_vector_array_new();
-  mlx_vector_vector_array seismic = mlx_vector_vector_array_new();
-  int loaded_samples = 0;
-  const char *cache_dir = opts->output_path ? opts->output_path : ".";
-  int desired = opts->num_train_pyramids > 0 ? opts->num_train_pyramids : 1024;
-  if (mlx_pyramids_dataset_load(
-          opts->input_path ? opts->input_path : ".", cache_dir, desired,
-          opts->stop_scale, opts->crop_size, opts->num_img_channels,
-          opts->use_wells ? 1 : 0, opts->use_seismic ? 1 : 0, opts->manual_seed,
-          &facies_pyramids, &wells, &masks, &seismic, &loaded_samples) != 0) {
-    fprintf(stderr,
-            "failed to load MLX pyramids dataset; falling back to synthetic\n");
-    /* fallback to previous synthetic behavior: build a small synthetic
-     * dataset to allow quick smoke runs. */
-    int num_samples = 64;
-    for (int si = 0; si < num_samples; ++si) {
-      mlx_vector_array sample = mlx_vector_array_new();
-      for (int sc = 0; sc < n_scales; ++sc) {
-        int shape[3];
-        shape[0] = opts->crop_size > 0 ? opts->crop_size : 32;
-        shape[1] = shape[0];
-        shape[2] = opts->num_img_channels > 0 ? opts->num_img_channels : 1;
-        mlx_array a = mlx_array_new();
-        mlx_stream s = mlx_default_cpu_stream_new();
-        if (mlx_random_normal(&a, shape, 3, MLX_FLOAT32, 0.0f, 1.0f,
-                              mlx_array_empty, s) != 0) {
-          mlx_zeros(&a, shape, 3, MLX_FLOAT32, s);
-        }
-        mlx_stream_free(s);
-        mlx_vector_array_append_value(sample, a);
-        mlx_array_free(a);
-      }
-      mlx_vector_vector_array_append_value(facies_pyramids, sample);
-      mlx_vector_array_free(sample);
+    /* Synthesize model shapes from options when no shapes are present
+     * (mirrors the smoke runner behaviour to ensure model scales exist).
+     */
+    int synth_n = opts->num_parallel_scales > 0 ? opts->num_parallel_scales : 1;
+    int *synth = (int *)malloc(sizeof(int) * 4 * synth_n);
+    if (!synth) {
+      return -1;
+    }
+    int batch = opts->batch_size > 0 ? opts->batch_size : 1;
+    for (int si = 0; si < synth_n; ++si) {
+      synth[si * 4 + 0] = batch;
+      synth[si * 4 + 1] = opts->crop_size > 0 ? opts->crop_size : 64;
+      synth[si * 4 + 2] = opts->crop_size > 0 ? opts->crop_size : 64;
+      synth[si * 4 + 3] =
+          opts->num_img_channels > 0 ? opts->num_img_channels : 3;
+    }
+    if (mlx_faciesgan_set_shapes(trainer->model, synth, synth_n) != 0) {
+      free(synth);
+      fprintf(stderr, "failed to set synthetic model shapes\n");
+      return -1;
+    }
+    free(synth);
+    /* Ensure trainer reflects the synthesized shapes count */
+    trainer->n_scales = synth_n;
+    n_scales = trainer->n_scales;
+    if (n_scales <= 0) {
+      fprintf(stderr, "no model scales available after synth\n");
+      return -1;
     }
   }
 
-  facies_dataset *ds = NULL;
-  if (facies_dataset_new(&ds, facies_pyramids, wells, seismic) != 0) {
-    fprintf(stderr, "failed to create facies_dataset\n");
-    mlx_vector_vector_array_free(facies_pyramids);
-    mlx_vector_vector_array_free(wells);
-    mlx_vector_vector_array_free(seismic);
-    MLXTrainer_destroy(t);
-    return -1;
+  /* Ensure generator scales exist for the discovered/synthesized shapes so
+   * subsequent noise/forward calls have initialized modules. */
+  for (int si = 0; si < n_scales; ++si) {
+    (void)mlx_faciesgan_create_generator_scale(
+        trainer->model, si, opts->num_feature, opts->min_num_feature);
   }
 
-  /* Create dataloader with options-driven parameters (best-effort mapping).
-     Use facies_dataloader_new_ex to configure workers and prefetch. */
-  facies_dataloader *dl = NULL;
-  unsigned int seed = (unsigned int)(opts->manual_seed >= 0 ? opts->manual_seed
-                                                            : (int)time(NULL));
-  if (facies_dataloader_new_ex(
-          &dl, ds, (size_t)opts->batch_size, false, false, seed,
-          opts->num_workers, 2, opts->num_workers > 0, 2000, NULL, NULL, false,
-          NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL) != 0) {
-    fprintf(stderr, "failed to create facies_dataloader\n");
-    facies_dataset_free(ds);
-    mlx_vector_vector_array_free(facies_pyramids);
-    mlx_vector_vector_array_free(wells);
-    mlx_vector_vector_array_free(seismic);
-    MLXTrainer_destroy(t);
-    return -1;
+  MLXPyramidsDataset *ds = NULL;
+  struct MLXDataloader *dl = NULL;
+  int created_dl = 0;
+
+  if (!trainer->dataset) {
+    if (MLXTrainer_init_dataset(trainer) != 0) {
+      fprintf(stderr, "failed to initialise dataset\n");
+      return -1;
+    }
+  }
+  ds = trainer->dataset;
+
+  if (trainer->data_loader) {
+    dl = trainer->data_loader;
+  } else {
+    unsigned int seed =
+        (unsigned int)(opts->manual_seed >= 0 ? opts->manual_seed
+                                              : (int)time(NULL));
+    if (MLXTrainer_create_dataloader(trainer) != 0) {
+      fprintf(stderr, "failed to create facies_dataloader\n");
+      return -1;
+    }
+    dl = trainer->data_loader;
+    created_dl = 1;
   }
 
-  /* Visualizer / background worker bridge (best-effort) */
-  pybridge_create_visualizer(
-      n_scales, opts->output_path ? opts->output_path : ".", NULL, 1);
-  pybridge_create_background_worker(2, 32);
+  /* Visualizer / background worker bridge (best-effort). Honor user option */
+  if (opts->enable_tensorboard) {
+    pybridge_create_visualizer(
+        n_scales, opts->output_path ? opts->output_path : ".", NULL, 1);
+    pybridge_create_background_worker(2, 32);
+  }
 
   /* Setup optimizers for all scales */
   int *scales = (int *)malloc(sizeof(int) * n_scales);
   for (int i = 0; i < n_scales; ++i)
     scales[i] = i;
-  MLXTrainer_setup_optimizers(t, scales, n_scales);
+  MLXTrainer_setup_optimizers(trainer, scales, n_scales);
 
-  /* Create a prefetcher and a small producer thread that pulls from the
-     facies dataloader and enqueues prepared MLX pyramids into the
-     prefetcher. This mirrors Python's MLXDataPrefetcher behavior. */
-  PrefetcherHandle ph = NULL;
+  /* Create a prefetcher/iterator via the centralized helper so ownership
+   * and producer thread logic is consistent. */
   PrefetcherIteratorHandle pit = NULL;
   int *scale_list = (int *)malloc(sizeof(int) * n_scales);
+  if (!scale_list) {
+    fprintf(stderr, "failed to allocate scale list\n");
+    return -1;
+  }
   for (int i = 0; i < n_scales; ++i)
     scale_list[i] = i;
-  /* queue capacity: heuristic based on workers/prefetch factor */
-  int qcap = opts->num_workers > 0 ? opts->num_workers * 2 : 4;
-  mlx_stream stream_for_prefetch = mlx_default_cpu_stream_new();
-  ph = prefetcher_create_with_stream(qcap, stream_for_prefetch, scale_list,
-                                     n_scales);
-  pit = prefetcher_iterator_create(ph);
-
-  ProducerArgs pargs;
-  pargs.dl = dl;
-  pargs.ph = ph;
-  pargs.s = mlx_default_cpu_stream_new();
-  pthread_t prod_th;
-  pthread_create(&prod_th, NULL, producer_thread, &pargs);
-  pthread_detach(prod_th);
+  pit = MLXTrainer_create_batch_iterator(trainer, dl, scale_list, n_scales);
+  free(scale_list);
+  if (!pit) {
+    fprintf(stderr, "failed to create prefetcher iterator\n");
+    return -1;
+  }
 
   /* Training loop: consume prepared pyramids from prefetcher iterator */
   mlx_stream s = mlx_default_cpu_stream_new();
@@ -1111,7 +1148,7 @@ int MLXTrainer_run_full(const TrainningOptions *opts) {
     for (int si = 0; si < nsc; ++si) {
       mlx_array tmp = mlx_array_new();
       if (pb->facies)
-        mlx_array_set(&tmp, pb->facies[si]);
+        mlx_copy(&tmp, pb->facies[si], s);
       mlx_array *pp = (mlx_array *)malloc(sizeof(mlx_array));
       *pp = tmp;
       fac_pyr[si] = pp;
@@ -1120,7 +1157,7 @@ int MLXTrainer_run_full(const TrainningOptions *opts) {
       well_pyr = (mlx_array **)malloc(sizeof(mlx_array *) * nsc);
       for (int si = 0; si < nsc; ++si) {
         mlx_array tmp = mlx_array_new();
-        mlx_array_set(&tmp, pb->wells[si]);
+        mlx_copy(&tmp, pb->wells[si], s);
         mlx_array *pp = (mlx_array *)malloc(sizeof(mlx_array));
         *pp = tmp;
         well_pyr[si] = pp;
@@ -1130,7 +1167,7 @@ int MLXTrainer_run_full(const TrainningOptions *opts) {
       seis_pyr = (mlx_array **)malloc(sizeof(mlx_array *) * nsc);
       for (int si = 0; si < nsc; ++si) {
         mlx_array tmp = mlx_array_new();
-        mlx_array_set(&tmp, pb->seismic[si]);
+        mlx_copy(&tmp, pb->seismic[si], s);
         mlx_array *pp = (mlx_array *)malloc(sizeof(mlx_array));
         *pp = tmp;
         seis_pyr[si] = pp;
@@ -1163,13 +1200,13 @@ int MLXTrainer_run_full(const TrainningOptions *opts) {
         }
         /* initialize noise amplitudes based on current real sample */
         (void)mlx_init_rec_noise_and_amp(
-            t->model, si, indexes, batch_n,
+            trainer->model, si, indexes, batch_n,
             fac_pyr && fac_pyr[si] ? fac_pyr[si] : NULL, well_pyr, seis_pyr);
       }
     }
 
     int step_rc = MLXTrainer_optimization_step(
-        t, indexes, batch_n, fac_pyr, nsc, rec_pyr, nsc, well_pyr,
+        trainer, indexes, batch_n, fac_pyr, nsc, rec_pyr, nsc, well_pyr,
         well_pyr ? nsc : 0, NULL, 0, seis_pyr, seis_pyr ? nsc : 0, scales, act);
 
     /* free rec pyramids */
@@ -1224,18 +1261,16 @@ int MLXTrainer_run_full(const TrainningOptions *opts) {
 
     if (batches % opts->save_interval == 0) {
       MLXTrainer_save_generated_facies(
-          t, 0, batches, opts->output_path ? opts->output_path : ".");
+          trainer, 0, batches, opts->output_path ? opts->output_path : ".");
     }
   }
 
   mlx_stream_free(s);
-  facies_dataloader_free(dl);
-  facies_dataset_free(ds);
-  mlx_vector_vector_array_free(facies_pyramids);
-  mlx_vector_vector_array_free(wells);
-  mlx_vector_vector_array_free(seismic);
+  /* Free local dataset/dataloader only when they were created by this
+   * function. If trainer owns them (created in MLXTrainer_new) they will be
+   * freed by MLXTrainer_destroy below. */
+  if (created_dl && dl)
+    facies_dataloader_free(dl);
   free(scales);
-  MLXTrainer_destroy(t);
-  pybridge_close_visualizer();
   return 0;
 }

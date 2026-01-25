@@ -15,7 +15,6 @@ Design notes:
 
 from __future__ import annotations
 
-import atexit
 import logging
 import multiprocessing as mp
 import threading
@@ -101,8 +100,6 @@ class BackgroundWorker:
         self._pending: set[Future[bool]] = set()
         self._pending_cond = threading.Condition()
         self._max_pending = int(max_pending)
-
-        atexit.register(self.shutdown)
         self._initialized = True
 
     def _on_done(self, fut: Future[bool]) -> None:

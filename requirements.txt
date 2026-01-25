@@ -3,7 +3,6 @@ pillow
 sympy
 torch
 torchvision
-tqdm
 numpy
 packaging
 python-dateutil

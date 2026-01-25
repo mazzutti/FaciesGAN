@@ -23,9 +23,8 @@
 #include <stddef.h>
 
 /* Project helpers */
-#include "utils_extra.h"
-
-/* (Instrumentation removed) */
+#include "../trainning/mlx_compat.h"
+#include "utils.h"
 
 struct MLXLeakyReLU {
   float negative_slope;
@@ -113,6 +112,10 @@ mlx_array_t mlx_leakyrelu_forward(MLXLeakyReLU *m, mlx_array_t x) {
   }
 
 cleanup:
+  /* Ensure any queued work on `s` completed before freeing temporaries */
+  if (s.ctx)
+    mlx_synchronize(s);
+
   /* Free temporaries if they were allocated (ctx==0 indicates empty) */
   if (scaled.ctx)
     mlx_array_free(scaled);
@@ -259,11 +262,11 @@ MLXConvBlock *mlx_convblock_create(int in_ch, int out_ch, int kernel_size,
   m->in_ch = in_ch;
   m->out_ch = out_ch;
 
-  /* Allocate weight buffer (C_out, KH, KW, C_in) and initialize to zeros */
   size_t wcount = (size_t)out_ch * (size_t)kernel_size * (size_t)kernel_size *
                   (size_t)in_ch;
   float *wbuf = (float *)calloc(wcount, sizeof(float));
   if (wbuf) {
+    /* MLX canonical conv-weight layout: (out_ch, KH, KW, in_ch) */
     int wshape[4] = {out_ch, kernel_size, kernel_size, in_ch};
     mlx_array w = mlx_array_new_data(wbuf, wshape, 4, MLX_FLOAT32);
     /* copy made by mlx_array_new_data; free host buffer */
@@ -307,8 +310,8 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
   mlx_array y = mlx_array_new();
   if (m->conv) {
     mlx_array *wptr = (mlx_array *)m->conv;
-    if (mlx_conv2d(&y, x, *wptr, m->stride, m->stride, m->padding, m->padding,
-                   1, 1, 1, s) != 0) {
+    if (safe_mlx_conv2d(&y, x, *wptr, m->stride, m->stride, m->padding,
+                        m->padding, 1, 1, 1, s) != 0) {
       /* conv failed: fallback to input */
       return x;
     }
@@ -474,6 +477,7 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
   size_t shared_count = (size_t)hidden_nc * kernel_size * kernel_size * cond_nc;
   float *shared_buf = (float *)calloc(shared_count, sizeof(float));
   if (shared_buf) {
+    /* canonical: (out_ch=hidden_nc, KH, KW, in_ch=cond_nc) */
     int sshape[4] = {hidden_nc, kernel_size, kernel_size, cond_nc};
     mlx_array sw = mlx_array_new_data(shared_buf, sshape, 4, MLX_FLOAT32);
 
@@ -490,6 +494,7 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
   size_t gamma_count = (size_t)norm_nc * kernel_size * kernel_size * hidden_nc;
   float *gamma_buf = (float *)calloc(gamma_count, sizeof(float));
   if (gamma_buf) {
+    /* canonical: (out_ch=norm_nc, KH, KW, in_ch=hidden_nc) */
     int gshape[4] = {norm_nc, kernel_size, kernel_size, hidden_nc};
     mlx_array gw = mlx_array_new_data(gamma_buf, gshape, 4, MLX_FLOAT32);
 
@@ -506,6 +511,7 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
   size_t beta_count = (size_t)norm_nc * kernel_size * kernel_size * hidden_nc;
   float *beta_buf = (float *)calloc(beta_count, sizeof(float));
   if (beta_buf) {
+    /* canonical: (out_ch=norm_nc, KH, KW, in_ch=hidden_nc) */
     int bshape[4] = {norm_nc, kernel_size, kernel_size, hidden_nc};
     mlx_array bw = mlx_array_new_data(beta_buf, bshape, 4, MLX_FLOAT32);
 
@@ -612,8 +618,8 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
       mlx_array_free(cond_up);
     return x;
   }
-  if (mlx_conv2d(&shared, cond_up, *m->mlp_shared_w, 1, 1, m->padding,
-                 m->padding, 1, 1, 1, s) != 0) {
+  if (safe_mlx_conv2d(&shared, cond_up, *m->mlp_shared_w, 1, 1, m->padding,
+                      m->padding, 1, 1, 1, s) != 0) {
     if (cond_up_alloc)
       mlx_array_free(cond_up);
     return x;
@@ -634,16 +640,16 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     mlx_array_free(shared_act);
     return x;
   }
-  if (mlx_conv2d(&gamma, shared_act, *m->mlp_gamma_w, 1, 1, m->padding,
-                 m->padding, 1, 1, 1, s) != 0) {
+  if (safe_mlx_conv2d(&gamma, shared_act, *m->mlp_gamma_w, 1, 1, m->padding,
+                      m->padding, 1, 1, 1, s) != 0) {
     if (cond_up_alloc)
       mlx_array_free(cond_up);
     mlx_array_free(shared);
     mlx_array_free(shared_act);
     return x;
   }
-  if (mlx_conv2d(&beta, shared_act, *m->mlp_beta_w, 1, 1, m->padding,
-                 m->padding, 1, 1, 1, s) != 0) {
+  if (safe_mlx_conv2d(&beta, shared_act, *m->mlp_beta_w, 1, 1, m->padding,
+                      m->padding, 1, 1, 1, s) != 0) {
     if (cond_up_alloc)
       mlx_array_free(cond_up);
     mlx_array_free(shared);
@@ -866,11 +872,11 @@ MLXSPADEConvBlock *mlx_spadeconv_create(int in_ch, int out_ch, int cond_ch,
   m->in_ch = in_ch;
   m->out_ch = out_ch;
 
-  /* Allocate conv weights (out_ch, KH, KW, in_ch) initialized to zeros */
   size_t wcount = (size_t)out_ch * (size_t)kernel_size * (size_t)kernel_size *
                   (size_t)in_ch;
   float *wbuf = (float *)calloc(wcount, sizeof(float));
   if (wbuf) {
+    /* MLX canonical conv-weight layout: (out_ch, KH, KW, in_ch) */
     int wshape[4] = {out_ch, kernel_size, kernel_size, in_ch};
     mlx_array w = mlx_array_new_data(wbuf, wshape, 4, MLX_FLOAT32);
     free(wbuf);
@@ -932,8 +938,8 @@ mlx_array_t mlx_spadeconv_forward(MLXSPADEConvBlock *m, mlx_array_t x,
   if (m->conv) {
     mlx_array out = mlx_array_new();
     mlx_array *wptr = (mlx_array *)m->conv;
-    if (mlx_conv2d(&out, y, *wptr, m->stride, m->stride, m->padding, m->padding,
-                   1, 1, 1, s) != 0) {
+    if (safe_mlx_conv2d(&out, y, *wptr, m->stride, m->stride, m->padding,
+                        m->padding, 1, 1, 1, s) != 0) {
       /* conv failed: cleanup and return input x */
       mlx_array_free(y);
       return x;
@@ -989,6 +995,7 @@ MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
       (size_t)num_features * kernel_size * kernel_size * input_channels;
   float *init_buf = (float *)calloc(init_count, sizeof(float));
   if (init_buf) {
+    /* canonical: (out_ch=num_features, KH, KW, in_ch=input_channels) */
     int ishape[4] = {num_features, kernel_size, kernel_size, input_channels};
     mlx_array iw = mlx_array_new_data(init_buf, ishape, 4, MLX_FLOAT32);
     free(init_buf);
@@ -1015,7 +1022,8 @@ MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
           in_ch, out_ch, input_channels, kernel_size, block_pad, 1, 64);
       current_features = out_ch;
     }
-    /* Allocate tail conv weights (output_channels, KH, KW, current_features) */
+    /* Allocate tail conv weights in MLX canonical layout:
+     * (out_ch=output_channels, KH, KW, in_ch=current_features) */
     size_t tail_count = (size_t)output_channels * kernel_size * kernel_size *
                         (size_t)current_features;
     float *tail_buf = (float *)calloc(tail_count, sizeof(float));
@@ -1070,7 +1078,7 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
   if (m->init_conv) {
     mlx_array *iw = (mlx_array *)m->init_conv;
     int pad = m->kernel_size / 2;
-    if (mlx_conv2d(&x, cond, *iw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
+    if (safe_mlx_conv2d(&x, cond, *iw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
       return cond;
     }
     /* debug: print init conv output shape */
@@ -1135,7 +1143,7 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
     mlx_array out = mlx_array_new();
     mlx_array *tw = (mlx_array *)m->tail_conv;
     int pad = m->kernel_size / 2;
-    if (mlx_conv2d(&out, x, *tw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
+    if (safe_mlx_conv2d(&out, x, *tw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
       if (x.ctx != cond.ctx)
         mlx_array_free(x);
       return cond;
@@ -1305,12 +1313,14 @@ MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
   m->body = NULL;
   m->tail = NULL;
 
-  /* Allocate head conv weights: (num_features, KH, KW, input_channels) */
+  /* Allocate head conv weights: (KH, KW, in_ch=input_channels,
+   * out_ch=num_features) - channels-last */
   size_t head_count =
       (size_t)num_features * kernel_size * kernel_size * (size_t)input_channels;
   float *head_buf = (float *)calloc(head_count, sizeof(float));
   if (head_buf) {
-    int hshape[4] = {num_features, kernel_size, kernel_size, input_channels};
+    /* canonical: (out_ch=num_features, KH, KW, in_ch=input_channels) */
+    int hshape[4] = {kernel_size, kernel_size, input_channels, num_features};
     mlx_array hw = mlx_array_new_data(head_buf, hshape, 4, MLX_FLOAT32);
     free(head_buf);
     mlx_array *hwptr = (mlx_array *)malloc(sizeof(mlx_array));
@@ -1337,12 +1347,17 @@ MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
           in_ch, out_ch, input_channels, kernel_size, padding_size, 1, 64);
       current_features = out_ch;
     }
-    /* Allocate tail conv weights (1, KH, KW, current_features) => single output
-     * channel */
+    /* Allocate tail conv weights in MLX layout: (in_ch=current_features, KH,
+     * KW, out_ch=1) This keeps weight memory ordering consistent with other
+     * tail_convs which use [C_in, KH, KW, C_out]. */
     size_t tail_count =
-        (size_t)1 * kernel_size * kernel_size * (size_t)current_features;
+        (size_t)current_features * kernel_size * kernel_size * (size_t)1;
     float *tail_buf = (float *)calloc(tail_count, sizeof(float));
     if (tail_buf) {
+      /* Store tail weights in canonical MLX layout: (out_ch=1, KH, KW,
+       * in_ch=current_features) This makes weight.last == input_channels so
+       * forward/backward see a consistent layout and avoids runtime transposes
+       * and tape mismatches. */
       int tshape[4] = {1, kernel_size, kernel_size, current_features};
       mlx_array tw = mlx_array_new_data(tail_buf, tshape, 4, MLX_FLOAT32);
       free(tail_buf);

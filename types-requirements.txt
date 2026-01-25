@@ -1,8 +1,7 @@
 # Confirmed installable type stub packages (for mypy/IDE)
-types - requests
-types - PyYAML
-types - Pillow
-types - tqdm
-matplotlib - stubs
-scikit - learn - stubs
-scipy - stubs
+types-requests
+types-PyYAML
+types-Pillow
+matplotlib-stubs
+scikit-learn-stubs
+scipy-stubs

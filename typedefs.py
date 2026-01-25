@@ -10,7 +10,15 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from trainning.mlx.schedulers import MultiStepLR
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from trainning.mlx.schedulers import MultiStepLR
+else:
+    # Avoid importing training internals at module import time to prevent
+    # circular imports when other modules (e.g., `trainning.base`) import
+    # `typedefs`. Use a permissive fallback for runtime typing.
+    MultiStepLR = object  # type: ignore
 
 # Generic type variables for type hinting
 T = TypeVar("T")

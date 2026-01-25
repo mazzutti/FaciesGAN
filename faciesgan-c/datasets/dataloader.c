@@ -1,10 +1,13 @@
 #include "dataloader.h"
 #include "collate.h"
+#include "faciesgan-c/utils.h"
 #include "mlx/c/array.h"
-#include "utils_extra.h"
 #include <errno.h>
+#include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/time.h>
@@ -101,15 +104,8 @@ static int write_vv_fd(int fd, const mlx_vector_vector_array vv,
   return 0;
 }
 
-struct facies_dataset_ {
-  mlx_vector_vector_array facies;
-  mlx_vector_vector_array wells;
-  mlx_vector_vector_array seismic;
-  size_t n_samples;
-};
-
-struct facies_dataloader_ {
-  facies_dataset *ds;
+struct MLXDataloader {
+  MLXPyramidsDataset *ds;
   size_t batch_size;
   size_t *indices;
   size_t idx; // next index
@@ -178,19 +174,21 @@ struct facies_dataloader_ {
   int next_worker;
 };
 
-int facies_dataset_new(facies_dataset **out,
+int facies_dataset_new(MLXPyramidsDataset **out,
                        const mlx_vector_vector_array facies_pyramids,
                        const mlx_vector_vector_array wells_pyramids,
                        const mlx_vector_vector_array seismic_pyramids) {
   if (!out)
     return 1;
-  facies_dataset *ds = (facies_dataset *)malloc(sizeof(facies_dataset));
+  MLXPyramidsDataset *ds = (MLXPyramidsDataset *)calloc(1, sizeof(*ds));
   if (!ds)
     return 1;
+
   ds->facies = mlx_vector_vector_array_new();
   ds->wells = mlx_vector_vector_array_new();
   ds->seismic = mlx_vector_vector_array_new();
-  // copy data references into our vectors
+
+  /* copy data references into dataset's vectors */
   size_t nf = mlx_vector_vector_array_size(facies_pyramids);
   for (size_t i = 0; i < nf; ++i) {
     mlx_vector_array tmp = mlx_vector_array_new();
@@ -207,12 +205,12 @@ int facies_dataset_new(facies_dataset **out,
     }
     mlx_vector_array_free(tmp);
   }
-  // wells/seismic may be empty
+
+  /* wells/seismic may be empty */
   size_t nw = mlx_vector_vector_array_size(wells_pyramids);
   for (size_t i = 0; i < nw; ++i) {
     mlx_vector_array tmp = mlx_vector_array_new();
     if (mlx_vector_vector_array_get(&tmp, wells_pyramids, i)) {
-      // cleanup
       mlx_vector_vector_array_free(ds->facies);
       mlx_vector_vector_array_free(ds->wells);
       free(ds);
@@ -227,6 +225,7 @@ int facies_dataset_new(facies_dataset **out,
     }
     mlx_vector_array_free(tmp);
   }
+
   size_t ns = mlx_vector_vector_array_size(seismic_pyramids);
   for (size_t i = 0; i < ns; ++i) {
     mlx_vector_array tmp = mlx_vector_array_new();
@@ -248,18 +247,21 @@ int facies_dataset_new(facies_dataset **out,
     mlx_vector_array_free(tmp);
   }
 
-  ds->n_samples = mlx_vector_vector_array_size(ds->facies);
+  ds->n_samples = (int)mlx_vector_vector_array_size(ds->facies);
+  ds->batches = NULL;
+  ds->n_batches = 0;
+  ds->scales = NULL;
+  ds->n_scales = 0;
+
   *out = ds;
   return 0;
 }
 
-int facies_dataset_free(facies_dataset *ds) {
+int facies_dataset_free(MLXPyramidsDataset *ds) {
   if (!ds)
-    return 0;
-  mlx_vector_vector_array_free(ds->facies);
-  mlx_vector_vector_array_free(ds->wells);
-  mlx_vector_vector_array_free(ds->seismic);
-  free(ds);
+    return 1;
+  /* reuse existing dataset free helper */
+  mlx_pyramids_dataset_free(ds);
   return 0;
 }
 
@@ -275,7 +277,7 @@ static void shuffle_indices(size_t *idxs, size_t n, unsigned int seed) {
   }
 }
 
-int facies_dataloader_new(facies_dataloader **out, facies_dataset *ds,
+int facies_dataloader_new(struct MLXDataloader **out, MLXPyramidsDataset *ds,
                           size_t batch_size, bool shuffle, bool drop_last,
                           unsigned int seed) {
   return facies_dataloader_new_ex(
@@ -283,7 +285,7 @@ int facies_dataloader_new(facies_dataloader **out, facies_dataset *ds,
       false, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL);
 }
 
-static int build_tasks(facies_dataloader *dl) {
+static int build_tasks(struct MLXDataloader *dl) {
   if (!dl)
     return 1;
   size_t n = dl->n_indices;
@@ -410,7 +412,7 @@ static int build_tasks(facies_dataloader *dl) {
   return 0;
 }
 
-static int queue_push(facies_dataloader *dl, mlx_vector_array fac,
+static int queue_push(struct MLXDataloader *dl, mlx_vector_array fac,
                       mlx_vector_array wells, mlx_vector_array seismic,
                       int err) {
   pthread_mutex_lock(&dl->q_mutex);
@@ -433,7 +435,8 @@ static int queue_push(facies_dataloader *dl, mlx_vector_array fac,
   return 0;
 }
 
-static int queue_pop_timeout(facies_dataloader *dl, mlx_vector_array *out_fac,
+static int queue_pop_timeout(struct MLXDataloader *dl,
+                             mlx_vector_array *out_fac,
                              mlx_vector_array *out_well,
                              mlx_vector_array *out_seis, int *out_err) {
   struct timespec ts;
@@ -478,7 +481,7 @@ static int queue_pop_timeout(facies_dataloader *dl, mlx_vector_array *out_fac,
 }
 
 struct pthread_worker_arg {
-  facies_dataloader *dl;
+  struct MLXDataloader *dl;
   int worker_id;
   uint64_t last_epoch;
 };
@@ -490,7 +493,7 @@ static pthread_mutex_t mlx_eval_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static void *worker_thread(void *arg) {
   struct pthread_worker_arg *wa = (struct pthread_worker_arg *)arg;
-  facies_dataloader *dl = wa->dl;
+  struct MLXDataloader *dl = wa->dl;
   int worker_id = wa->worker_id;
   mlx_stream s = mlx_default_cpu_stream_new();
   /* worker-local epoch tracking */
@@ -587,13 +590,13 @@ static int read_vector_array_from_fd(int fd, mlx_vector_array *out_vec);
 static int serialize_vec_to_fd(int fd, mlx_vector_array vec);
 
 struct reader_arg {
-  facies_dataloader *dl;
+  struct MLXDataloader *dl;
   int worker;
 };
 
 static void *proc_reader_thread(void *arg) {
   struct reader_arg *ra = (struct reader_arg *)arg;
-  facies_dataloader *dl = ra->dl;
+  struct MLXDataloader *dl = ra->dl;
   int worker = ra->worker;
   int fd = dl->result_rfds[worker];
   while (1) {
@@ -681,7 +684,7 @@ static void *proc_reader_thread(void *arg) {
 }
 
 static void *proc_dispatcher_thread(void *arg) {
-  facies_dataloader *dl = (facies_dataloader *)arg;
+  struct MLXDataloader *dl = (struct MLXDataloader *)arg;
   while (1) {
     pthread_mutex_lock(&dl->task_mutex);
     if (dl->next_task >= dl->n_tasks) {
@@ -865,7 +868,7 @@ static int serialize_vec_to_fd(int fd, mlx_vector_array vec) {
  * (ndim,int32 dims[], uint64 elems, float[elems]) Then similarly for wells
  * (per-sample scales) and seismic.
  */
-static int write_dataset_to_fd(int fd, facies_dataset *ds) {
+static int write_dataset_to_fd(int fd, MLXPyramidsDataset *ds) {
   if (!ds)
     return 1;
   uint64_t n_samples = (uint64_t)ds->n_samples;
@@ -893,7 +896,8 @@ static int write_dataset_to_fd(int fd, facies_dataset *ds) {
  * elems, float[elems] After facies, uint32_t n_scales_wells, ... then
  * n_scales_seismic, ...
  */
-static int worker_process_loop(int task_fd, int result_fd, facies_dataset *ds,
+static int worker_process_loop(int task_fd, int result_fd,
+                               MLXPyramidsDataset *ds,
                                facies_collate_fn collate_cb,
                                void *collate_ctx) {
   while (1) {
@@ -1000,7 +1004,7 @@ static int worker_process_loop(int task_fd, int result_fd, facies_dataset *ds,
   return 0;
 }
 
-int facies_dataloader_reset(facies_dataloader *dl) {
+int facies_dataloader_reset(struct MLXDataloader *dl) {
   if (!dl)
     return 1;
   dl->idx = 0;
@@ -1056,7 +1060,8 @@ int facies_dataloader_reset(facies_dataloader *dl) {
   return 0;
 }
 
-int facies_dataloader_next(facies_dataloader *dl, mlx_vector_array *out_facies,
+int facies_dataloader_next(struct MLXDataloader *dl,
+                           mlx_vector_array *out_facies,
                            mlx_vector_array *out_wells,
                            mlx_vector_array *out_seismic, const mlx_stream s) {
   if (!dl)
@@ -1189,7 +1194,7 @@ int facies_dataloader_next(facies_dataloader *dl, mlx_vector_array *out_facies,
   return 0;
 }
 
-int facies_dataloader_free(facies_dataloader *dl) {
+int facies_dataloader_free(struct MLXDataloader *dl) {
   if (!dl)
     return 0;
   /* signal workers to finish and join */
@@ -1287,7 +1292,7 @@ int facies_dataloader_free(facies_dataloader *dl) {
 }
 
 int facies_dataloader_new_ex(
-    facies_dataloader **out, facies_dataset *ds, size_t batch_size,
+    struct MLXDataloader **out, MLXPyramidsDataset *ds, size_t batch_size,
     bool shuffle, bool drop_last, unsigned int seed, int num_workers,
     int prefetch_factor, bool persistent_workers, int timeout_ms,
     facies_collate_fn collate, void *collate_ctx, bool pin_memory,
@@ -1300,8 +1305,8 @@ int facies_dataloader_new_ex(
     const char *worker_init_sym) {
   if (!out || !ds)
     return 1;
-  facies_dataloader *dl =
-      (facies_dataloader *)calloc(1, sizeof(facies_dataloader));
+  struct MLXDataloader *dl =
+      (struct MLXDataloader *)calloc(1, sizeof(struct MLXDataloader));
   if (!dl)
     return 1;
   dl->ds = ds;
@@ -1432,9 +1437,20 @@ int facies_dataloader_new_ex(
         setenv("FACIES_WORKER_RESULT_FD", result_fd_str, 1);
         /* exec worker binary located in current working directory */
         const char *exe = "./facies_worker";
+        /* resolve exe to absolute path for logging */
+        char exe_resolved[PATH_MAX];
+        const char *exe_to_report = exe;
+        if (realpath(exe, exe_resolved) != NULL) {
+          exe_to_report = exe_resolved;
+        }
+        fprintf(stderr,
+                "facies_dataloader: child pid=%d exec '%s' (resolved '%s')\n",
+                (int)getpid(), exe, exe_to_report);
         const char *argv_exec[2] = {"facies_worker", NULL};
         execv(exe, (char *const *)argv_exec);
-        /* if exec failed, exit child */
+        /* if exec failed, log error and exit child */
+        fprintf(stderr, "facies_dataloader: execv('%s') failed: %s\n", exe,
+                strerror(errno));
         _exit(1);
       } else if (pid > 0) {
         /* parent */
@@ -1492,6 +1508,44 @@ int facies_dataloader_new_ex(
       if (dl->result_rfds[i] >= 0) {
         pthread_create(&dl->proc_readers[i], NULL, proc_reader_thread,
                        &dl->reader_args[i]);
+      }
+    }
+    /* wait for per-worker init responses (proc_reader_thread sets
+     * dl->worker_init_done and dl->worker_init_err_msg). If any worker
+     * reports an init error, kill children and fail fast. */
+    {
+      int wait_ms = 5000;
+      struct timeval st, now;
+      gettimeofday(&st, NULL);
+      int all_done = 0;
+      while (1) {
+        all_done = 1;
+        for (int wi = 0; wi < dl->num_workers; ++wi) {
+          if (!dl->worker_init_done[wi]) {
+            all_done = 0;
+            break;
+          }
+        }
+        if (all_done)
+          break;
+        gettimeofday(&now, NULL);
+        long elapsed =
+            (now.tv_sec - st.tv_sec) * 1000 + (now.tv_usec - st.tv_usec) / 1000;
+        if (elapsed > wait_ms)
+          break;
+        usleep(50000);
+      }
+      for (int wi = 0; wi < dl->num_workers; ++wi) {
+        if (dl->worker_init_err_msg && dl->worker_init_err_msg[wi]) {
+          /* mark global fail-fast so other threads/tools can observe */
+          ff_set();
+          for (int j = 0; j < dl->num_workers; ++j) {
+            if (dl->pids && dl->pids[j] > 0)
+              kill(dl->pids[j], SIGKILL);
+          }
+          facies_dataloader_free(dl);
+          return 1;
+        }
       }
     }
     pthread_create(&dl->proc_dispatcher, NULL, proc_dispatcher_thread, dl);

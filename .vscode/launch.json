@@ -11,7 +11,13 @@
       "justMyCode": false,
       "subProcess": true,
       "redirectOutput": true,
-      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
+        "VIRTUAL_ENV": "${workspaceFolder}/.venv",
+        "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}",
+        "FG_INSTRUMENT_LOKY": "1",
+        "PYTHONWARNINGS": "ignore::UserWarning"
+      },
       "args": [
         "--input-path",
         "data",
@@ -24,7 +30,7 @@
         "--num-workers",
         "0",
         "--num-iter",
-        "200",
+        "1",
         "--num-parallel-scales",
         "7",
         "--discriminator-steps",
@@ -43,9 +49,24 @@
         "--use-wells",
         "--use-seismic",
         "--use-mlx",
-        "--compile-backend"
-        // "--use-profiler"
+        // "--compile-backend"
       ]
+    },
+    {
+      "name": "Python: Attach FaciesGAN (debugpy)",
+      "type": "debugpy",
+      "request": "attach",
+      "connect": {
+        "host": "127.0.0.1",
+        "port": 5678
+      },
+      "pathMappings": [
+        {
+          "localRoot": "${workspaceFolder}",
+          "remoteRoot": "${workspaceFolder}"
+        }
+      ],
+      "justMyCode": false
     },
     {
       "name": "C: Launch FaciesGAN (lldb)",
@@ -65,7 +86,7 @@
         "--num-workers",
         "0",
         "--num-iter",
-        "200",
+        "1",
         "--num-parallel-scales",
         "7",
         "--discriminator-steps",
@@ -87,13 +108,29 @@
         "--compile-backend"
       ],
       "cwd": "${workspaceFolder}",
-      "envFile": "${workspaceFolder}/.env",
       "env": {
         "NUM_STEPS": "200",
-        "OUTPUT_PATH": "${workspaceFolder}/results/"
+        "OUTPUT_PATH": "${workspaceFolder}/results/",
+        "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build-asan/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
+        "VIRTUAL_ENV": "${workspaceFolder}/.venv",
+        "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
       },
       "stopOnEntry": false,
-      "terminal": "integrated"
+      "terminal": "integrated",
+      "initCommands": [
+        "settings set target.max-children-count 256",
+        "settings set target.max-string-summary-length 512"
+      ]
     }
   ],
+  "compounds": [
+    {
+      "name": "Parallel: Python + C (with dumps)",
+      "preLaunchTask": "prepare-parallel-dumps",
+      "configurations": [
+        "Python: Launch FaciesGAN (debugpy)",
+        "C: Launch FaciesGAN (lldb)"
+      ]
+    }
+  ]
 }

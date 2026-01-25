@@ -1,9 +1,22 @@
 #include "generator.h"
+#include "../trainning/mlx_compat.h"
 #include "custom_layer.h"
 #include <mlx/c/vector.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Safe free helper: frees internal MLX storage if present and NULLs the ctx
+ * field on the caller-side struct so subsequent callers don't double-free.
+ */
+static inline void mlx_array_safe_free(mlx_array *a) {
+  if (!a)
+    return;
+  if (a->ctx) {
+    mlx_array_free(*a);
+    a->ctx = NULL;
+  }
+}
 
 /* Helper: perform elementwise add with defensive central padding of the
  * smaller operand to match spatial dims (axes 1 and 2) before calling
@@ -13,6 +26,8 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
   const int *bsh = mlx_array_shape(b);
   mlx_array a_copy = a;
   mlx_array b_copy = b;
+  int a_padded = 0;
+  int b_padded = 0;
   /* If shapes available and spatial dims differ, pad the smaller one */
   if (ash && bsh && (ash[1] != bsh[1] || ash[2] != bsh[2])) {
     int dh = bsh[1] - ash[1];
@@ -29,13 +44,12 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
       mlx_array padded = mlx_array_new();
       if (mlx_pad(&padded, a, axes_pad, 2, low_pad, 2, high_pad, 2, zero,
                   "constant", s) == 0) {
-        if (a.ctx)
-          mlx_array_free(a);
         a_copy = padded;
+        a_padded = 1;
       } else {
-        mlx_array_free(padded);
+        mlx_array_safe_free(&padded);
       }
-      mlx_array_free(zero);
+      mlx_array_safe_free(&zero);
     } else if (dh <= 0 && dw <= 0) {
       int pdh = -dh;
       int pdw = -dw;
@@ -50,19 +64,51 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
       mlx_array padded = mlx_array_new();
       if (mlx_pad(&padded, b, axes_pad, 2, low_pad, 2, high_pad, 2, zero,
                   "constant", s) == 0) {
-        if (b.ctx)
-          mlx_array_free(b);
         b_copy = padded;
+        b_padded = 1;
       } else {
-        mlx_array_free(padded);
+        mlx_array_safe_free(&padded);
       }
-      mlx_array_free(zero);
+      mlx_array_safe_free(&zero);
     }
   }
-  int rc = mlx_add(out, a_copy, b_copy, s);
-  /* If we allocated padded copies, they are now owned by *out or should be
-     freed by caller; mlx_add returns a new array in *out on success. Free any
-     leftover temp arrays that weren't moved into out. */
+  /* To avoid aliasing/in-place updates from the backend which can lead to
+   * callers freeing the same underlying storage twice, make local copies of
+   * the operands (after any padding) and perform the add on those copies. */
+  mlx_array a_tmp = mlx_array_new();
+  mlx_array b_tmp = mlx_array_new();
+  int r1 = mlx_copy(&a_tmp, a_copy, s);
+  int r2 = mlx_copy(&b_tmp, b_copy, s);
+  if (r1 != 0 || r2 != 0) {
+    if (a_tmp.ctx)
+      mlx_array_safe_free(&a_tmp);
+    if (b_tmp.ctx)
+      mlx_array_safe_free(&b_tmp);
+    if (a_padded)
+      mlx_array_safe_free(&a_copy);
+    if (b_padded)
+      mlx_array_safe_free(&b_copy);
+    return -1;
+  }
+
+  int rc = mlx_add(out, a_tmp, b_tmp, s);
+
+  /* ensure any async work on the provided stream completed before freeing
+     temporaries which may be referenced by backend kernels */
+  if (s.ctx)
+    mlx_synchronize(s);
+
+  /* free the temporary copies */
+  if (a_tmp.ctx)
+    mlx_array_safe_free(&a_tmp);
+  if (b_tmp.ctx)
+    mlx_array_safe_free(&b_tmp);
+
+  if (a_padded)
+    mlx_array_safe_free(&a_copy);
+  if (b_padded)
+    mlx_array_safe_free(&b_copy);
+
   return rc;
 }
 
@@ -157,7 +203,7 @@ void mlx_generator_free(MLXGenerator *m) {
           free(s->body);
         }
         if (s->tail_conv) {
-          mlx_array_free(*s->tail_conv);
+          mlx_array_safe_free(s->tail_conv);
           free(s->tail_conv);
         }
       }
@@ -180,9 +226,14 @@ int mlx_generator_create_scale(MLXGenerator *m, int scale, int num_features,
     return -1;
   if (scale == 0) {
     s->is_spade = 1;
+    /* Pass conditioning channel count (cond_channels) when available so
+     * SPADE internals allocate weights matching the actual conditioning
+     * tensor channels. Fall back to m->input_channels if cond not used. */
+    int spade_in_ch =
+        m->has_cond_channels ? m->cond_channels : m->input_channels;
     s->spade = mlx_spadegen_create(
         m->num_layer, m->kernel_size, m->padding_size, num_features,
-        min_num_features, m->output_channels, m->input_channels);
+        min_num_features, m->output_channels, spade_in_ch);
     s->head = NULL;
     s->body = NULL;
     s->n_body = 0;
@@ -213,10 +264,13 @@ int mlx_generator_create_scale(MLXGenerator *m, int scale, int num_features,
                           m->kernel_size * (size_t)current_features;
       float *tail_buf = (float *)calloc(tail_count, sizeof(float));
       if (tail_buf) {
+        /* tail_conv weights in canonical MLX layout:
+         * (out_ch=m->output_channels, KH, KW, in_ch=current_features) */
         int tshape[4] = {m->output_channels, m->kernel_size, m->kernel_size,
                          current_features};
         mlx_array tw = mlx_array_new_data(tail_buf, tshape, 4, MLX_FLOAT32);
         free(tail_buf);
+        /* keep tail_conv weights in MLX layout: [C_in, KH, KW, C_out] */
         mlx_array *twptr = (mlx_array *)malloc(sizeof(mlx_array));
         if (twptr) {
           *twptr = tw;
@@ -570,17 +624,7 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
         upsampled = tmp;
       }
     }
-    /* debug: report upsampled shape */
-    {
-      int up_ndim = (int)mlx_array_ndim(upsampled);
-      const int *upsh = mlx_array_shape(upsampled);
-      fprintf(stderr, "[gen_debug] upsampled ndim=%d", up_ndim);
-      if (upsh) {
-        fprintf(stderr, " shape=(%d,%d,%d,%d)\n", upsh[0], upsh[1], upsh[2],
-                upsh[3]);
-      } else
-        fprintf(stderr, " (no shape)\n");
-    }
+    /* report upsampled shape removed (debug prints cleared) */
 
     /* Prepare z_in (possibly scale noise and concat cond) */
     mlx_array_t z_in = z_list[index];
@@ -593,6 +637,10 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
       /* noise = z_in[..., :out_ch] */
       int start_noise[4] = {0, 0, 0, 0};
       int stop_noise[4] = {shape[0], shape[1], shape[2], out_ch};
+      int znd = mlx_array_ndim(z_in);
+      const int *zsh = mlx_array_shape(z_in);
+      (void)znd;
+      (void)zsh;
       mlx_array noise = mlx_array_new();
       if (mlx_slice(&noise, z_in, start_noise, 4, stop_noise, 4, NULL, 0, s) !=
           0) {
@@ -708,7 +756,6 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
       {
         int z_ndim = (int)mlx_array_ndim(z_in);
         const int *zsh = mlx_array_shape(z_in);
-        fprintf(stderr, "[gen_debug] after_prepare z_in ndim=%d", z_ndim);
         if (zsh) {
           fprintf(stderr, " shape=(");
           for (int _a = 0; _a < z_ndim; ++_a)
@@ -748,7 +795,6 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
         const int *zin_sh = mlx_array_shape(z_in);
         int up_ndim2 = (int)mlx_array_ndim(upsampled);
         const int *up_sh2 = mlx_array_shape(upsampled);
-        fprintf(stderr, "[gen_debug] before_add z_in ndim=%d", zin_ndim);
         if (zin_sh) {
           fprintf(stderr, " shape=(%d,%d,%d,%d)", zin_sh[0], zin_sh[1],
                   zin_sh[2], zin_sh[3]);
@@ -780,8 +826,9 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
           mlx_array zin_padded = mlx_array_new();
           if (mlx_pad(&zin_padded, z_in, axes_pad, 2, low_pad, 2, high_pad, 2,
                       pad_zero, "constant", s) == 0) {
-            if (z_in.ctx)
+            if (z_in.ctx) {
               mlx_array_free(z_in);
+            }
             z_in = zin_padded;
           }
           mlx_array_free(pad_zero);
@@ -790,8 +837,9 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
       /* z_in = z_in + padded */
       mlx_array sum = mlx_array_new();
       if (safe_add(&sum, z_in, upsampled, s) == 0) {
-        if (z_in.ctx)
+        if (z_in.ctx) {
           mlx_array_free(z_in);
+        }
         z_in = sum;
       }
     }
@@ -808,38 +856,42 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
               index, smod ? smod->is_spade : -1, smod && smod->head ? 1 : 0,
               smod ? smod->n_body : 0, smod && smod->tail_conv ? 1 : 0,
               zin_ndim);
-      if (zin_sh) {
-        fprintf(stderr, " shape=(");
-        for (int _a = 0; _a < zin_ndim; ++_a)
-          fprintf(stderr, "%d%s", zin_sh[_a], (_a + 1 < zin_ndim) ? "," : "");
-        fprintf(stderr, ")\n");
-      } else
-        fprintf(stderr, " (no shape)\n");
+      (void)zin_sh;
     }
     mlx_array out_mod = mlx_array_new();
     if (smod) {
       if (smod->is_spade && smod->spade) {
+        fprintf(stderr,
+                "[gen_debug] calling spadegen_forward smod=%p spade=%p "
+                "z_in.ctx=%p\n",
+                (void *)smod, (void *)smod->spade, (void *)z_in.ctx);
+        fflush(stderr);
         out_mod = mlx_spadegen_forward(smod->spade, z_in);
       } else {
         /* head */
         mlx_array cur = z_in;
+        int cur_is_alias = 1; /* cur initially aliases z_in; track ownership to
+                                 avoid double-free */
         if (smod->head) {
           mlx_array nx = mlx_convblock_forward(smod->head, cur);
-          if (cur.ctx != nx.ctx)
-            mlx_array_free(cur);
+          if (cur.ctx != nx.ctx) {
+            if (cur_is_alias) {
+              if (z_in.ctx) {
+                mlx_array_free(z_in);
+                z_in = mlx_array_new();
+              }
+              cur_is_alias = 0;
+            } else {
+              mlx_array_free(cur);
+            }
+          }
           cur = nx;
+          cur_is_alias = 0;
           /* Debug: head output shape */
           {
             int c_ndim = (int)mlx_array_ndim(cur);
             const int *csh = mlx_array_shape(cur);
-            fprintf(stderr, "[gen_debug] head_out ndim=%d", c_ndim);
-            if (csh) {
-              fprintf(stderr, " shape=(");
-              for (int _a = 0; _a < c_ndim; ++_a)
-                fprintf(stderr, "%d%s", csh[_a], (_a + 1 < c_ndim) ? "," : "");
-              fprintf(stderr, ")\n");
-            } else
-              fprintf(stderr, " (no shape)\n");
+            (void)csh;
           }
         }
         /* body */
@@ -848,30 +900,33 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
             if (!smod->body[bi])
               continue;
             mlx_array nx = mlx_convblock_forward(smod->body[bi], cur);
-            if (cur.ctx != nx.ctx)
-              mlx_array_free(cur);
+            if (cur.ctx != nx.ctx) {
+              if (cur_is_alias) {
+                if (z_in.ctx) {
+                  mlx_array_free(z_in);
+                  z_in = mlx_array_new();
+                }
+                cur_is_alias = 0;
+              } else {
+                mlx_array_free(cur);
+              }
+            }
             cur = nx;
+            cur_is_alias = 0;
             /* Debug: body output shape after body[%d] */
             {
               int b_ndim = (int)mlx_array_ndim(cur);
               const int *bsh = mlx_array_shape(cur);
-              fprintf(stderr, "[gen_debug] body_out[%d] ndim=%d", bi, b_ndim);
-              if (bsh) {
-                fprintf(stderr, " shape=(");
-                for (int _a = 0; _a < b_ndim; ++_a)
-                  fprintf(stderr, "%d%s", bsh[_a],
-                          (_a + 1 < b_ndim) ? "," : "");
-                fprintf(stderr, ")\n");
-              } else
-                fprintf(stderr, " (no shape)\n");
+              (void)bsh;
             }
           }
         }
         /* tail conv + tanh if present */
         if (smod->tail_conv) {
           mlx_array outc = mlx_array_new();
-          if (mlx_conv2d(&outc, cur, *smod->tail_conv, 1, 1, m->padding_size,
-                         m->padding_size, 1, 1, 1, s) == 0) {
+          if (safe_mlx_conv2d(&outc, cur, *smod->tail_conv, 1, 1,
+                              m->padding_size, m->padding_size, 1, 1, 1,
+                              s) == 0) {
             mlx_array t = mlx_array_new();
             if (mlx_tanh(&t, outc, s) == 0) {
               out_mod = t;
@@ -885,31 +940,26 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
           {
             int o_ndim = (int)mlx_array_ndim(out_mod);
             const int *osh = mlx_array_shape(out_mod);
-            fprintf(stderr, "[gen_debug] out_mod ndim=%d", o_ndim);
-            if (osh) {
-              fprintf(stderr, " shape=(");
-              for (int _a = 0; _a < o_ndim; ++_a)
-                fprintf(stderr, "%d%s", osh[_a], (_a + 1 < o_ndim) ? "," : "");
-              fprintf(stderr, ")\n");
-            } else
-              fprintf(stderr, " (no shape)\n");
+            (void)osh;
           }
-          if (cur.ctx && cur.ctx != out_mod.ctx)
-            mlx_array_free(cur);
+          if (cur.ctx && cur.ctx != out_mod.ctx) {
+            if (cur_is_alias) {
+              if (z_in.ctx) {
+                mlx_array_free(z_in);
+                z_in = mlx_array_new();
+              }
+              cur_is_alias = 0;
+            } else {
+              mlx_array_free(cur);
+            }
+          }
         } else {
           out_mod = cur;
           /* Debug: out_mod (no tail) shape */
           {
             int o_ndim = (int)mlx_array_ndim(out_mod);
             const int *osh = mlx_array_shape(out_mod);
-            fprintf(stderr, "[gen_debug] out_mod ndim=%d", o_ndim);
-            if (osh) {
-              fprintf(stderr, " shape=(");
-              for (int _a = 0; _a < o_ndim; ++_a)
-                fprintf(stderr, "%d%s", osh[_a], (_a + 1 < o_ndim) ? "," : "");
-              fprintf(stderr, ")\n");
-            } else
-              fprintf(stderr, " (no shape)\n");
+            (void)osh;
           }
         }
       }
@@ -919,24 +969,10 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
     {
       int mo_ndim = (int)mlx_array_ndim(out_mod);
       const int *mos = mlx_array_shape(out_mod);
-      fprintf(stderr, "[gen_debug] before_add out_mod ndim=%d", mo_ndim);
-      if (mos) {
-        fprintf(stderr, " shape=(");
-        for (int _a = 0; _a < mo_ndim; ++_a)
-          fprintf(stderr, "%d%s", mos[_a], (_a + 1 < mo_ndim) ? "," : "");
-        fprintf(stderr, ")\n");
-      } else
-        fprintf(stderr, " (no shape)\n");
+      (void)mos;
       int up_ndim = (int)mlx_array_ndim(upsampled);
       const int *ups = mlx_array_shape(upsampled);
-      fprintf(stderr, "[gen_debug] before_add upsampled ndim=%d", up_ndim);
-      if (ups) {
-        fprintf(stderr, " shape=(");
-        for (int _a = 0; _a < up_ndim; ++_a)
-          fprintf(stderr, "%d%s", ups[_a], (_a + 1 < up_ndim) ? "," : "");
-        fprintf(stderr, ")\n");
-      } else
-        fprintf(stderr, " (no shape)\n");
+      (void)ups;
     }
 
     /* Ensure spatial shapes match between out_mod and upsampled before adding.
@@ -999,17 +1035,21 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
     mlx_array new_out = mlx_array_new();
     if (safe_add(&new_out, out_mod, upsampled, s) == 0) {
       if (out_mod.ctx &&
-          !mlx_array_is_in_list(out_mod, z_list, z_count, in_noise))
-        mlx_array_free(out_mod);
+          !mlx_array_is_in_list(out_mod, z_list, z_count, in_noise)) {
+        mlx_array_safe_free(&out_mod);
+      }
       if (upsampled.ctx &&
-          !mlx_array_is_in_list(upsampled, z_list, z_count, in_noise))
-        mlx_array_free(upsampled);
+          !mlx_array_is_in_list(upsampled, z_list, z_count, in_noise)) {
+        mlx_array_safe_free(&upsampled);
+      }
       out_facie = new_out;
     } else {
       /* fallback: keep upsampled */
       if (out_mod.ctx && out_mod.ctx != upsampled.ctx &&
-          !mlx_array_is_in_list(out_mod, z_list, z_count, in_noise))
+          !mlx_array_is_in_list(out_mod, z_list, z_count, in_noise)) {
+        mlx_array_safe_free(&out_mod);
         mlx_array_free(out_mod);
+      }
       out_facie = upsampled;
     }
 

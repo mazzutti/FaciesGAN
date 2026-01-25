@@ -4,6 +4,8 @@ This provides a clean, real-time, non-blocking visualization using TensorBoard.
 Much more responsive than matplotlib with better interactivity.
 """
 
+from __future__ import annotations
+
 # pyright: reportUnknownMemberType=false
 import os
 import time
@@ -11,9 +13,18 @@ import time
 import numpy as np
 import torch
 from tensorboardX import SummaryWriter  # pyright: ignore
+from typing import TYPE_CHECKING
 
-from trainning.metrics import ScaleMetrics
-from typedefs import TTensor
+if TYPE_CHECKING:
+    from trainning.metrics import ScaleMetrics
+    from typedefs import TTensor  # type: ignore
+else:
+    # Use string-based/type-agnostic annotations at runtime to avoid importing
+    # the `trainning` package here and creating a circular import during
+    # package initialization. The actual types are only needed for static
+    # type checking.
+    ScaleMetrics = object  # type: ignore
+    TTensor = object  # type: ignore
 
 
 class TensorBoardVisualizer:
@@ -67,11 +78,13 @@ class TensorBoardVisualizer:
         self.dataset_info = dataset_info or "Unknown dataset"
 
         # Setup TensorBoard logging
-        if log_dir is None:
+        if not log_dir:
             log_dir = os.path.join(output_dir, "tensorboard_logs")
 
-        os.makedirs(log_dir, exist_ok=True)
-        os.makedirs(output_dir, exist_ok=True)
+        # Ensure directories exist; guard against empty strings and race conditions.
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        os.makedirs(output_dir or ".", exist_ok=True)
 
         # Create TensorBoard writer
         self.writer = SummaryWriter(log_dir=log_dir)

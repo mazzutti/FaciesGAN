@@ -1,9 +1,9 @@
 #include "collate.h"
+#include "faciesgan-c/utils.h"
 #include "mlx/c/array.h"
 #include "mlx/c/ops.h"
 #include "mlx/c/stream.h"
 #include "mlx/c/vector.h"
-#include "utils_extra.h"
 #include <stdbool.h>
 #include <stdlib.h>
 
@@ -44,6 +44,12 @@ static int process_optional(mlx_vector_array *out_vec,
       mlx_vector_array_free(sample_v);
     }
     mlx_array stacked = mlx_array_new();
+    size_t vec_n = mlx_vector_array_size(scale_vec);
+    if (vec_n == 0) {
+      mlx_vector_array_free(scale_vec);
+      mlx_array_free(stacked);
+      return 1;
+    }
     if (mlx_stack(&stacked, scale_vec, s)) {
       mlx_vector_array_free(scale_vec);
       mlx_array_free(stacked);
@@ -132,6 +138,12 @@ int facies_collate(mlx_vector_array *out_facies, mlx_vector_array *out_wells,
 
     // Stack along new batch axis
     mlx_array stacked = mlx_array_new();
+    size_t vec_n = mlx_vector_array_size(scale_vec);
+    if (vec_n == 0) {
+      mlx_vector_array_free(scale_vec);
+      mlx_array_free(stacked);
+      return 1;
+    }
     if (mlx_stack(&stacked, scale_vec, s)) {
       mlx_vector_array_free(scale_vec);
       mlx_array_free(stacked);

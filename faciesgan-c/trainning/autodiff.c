@@ -1,4 +1,5 @@
 #include "autodiff.h"
+#include "mlx_compat.h"
 #include <mlx/c/mlx.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -17,6 +18,8 @@ struct AGValue {
   int requires_grad;
   int owns_arr;
   AGNode *creator;
+  mlx_array
+      *external_ptr; /* optional pointer to original mlx_array when wrapping */
   /* When building a create_graph gradient pass, this field holds an AGValue*
      representing the symbolic gradient of some scalar output wrt this value.
      It is NULL in normal reverse-mode usage. */
@@ -110,6 +113,18 @@ AGValue *ag_value_from_array(mlx_array *arr, int requires_grad) {
   v->creator = NULL;
   v->owns_arr =
       0; /* by default, wrapping external arrays does not take ownership */
+  v->external_ptr = arr; /* keep original pointer for possible in-place fixes */
+  /* Debug logging removed by default; enable with FG_ENABLE_DEBUG */
+#ifdef FG_ENABLE_DEBUG
+  {
+    void *actx = arr ? arr->ctx : NULL;
+    fprintf(stderr,
+            "[DBG_AG_CREATE] ag_value_from_array v=%p arr.ctx=%p "
+            "requires_grad=%d owns_arr=%d\n",
+            (void *)v, actx, v->requires_grad, v->owns_arr);
+    fflush(stderr);
+  }
+#endif
   return v;
 }
 
@@ -117,19 +132,61 @@ AGValue *ag_value_from_new_array(mlx_array *arr, int requires_grad) {
   AGValue *v = calloc(1, sizeof(AGValue));
   if (!v)
     return NULL;
-  if (arr)
-    v->arr = *arr;
-  else
+  /* Make a deep copy of the provided array so the AGValue owns an
+     independent buffer. This avoids reuse-after-free when callers free or
+     reuse the original array/ctx while asynchronous kernels may still be
+     operating on it. */
+  if (arr) {
     v->arr = mlx_array_new();
+    mlx_stream s = mlx_default_cpu_stream_new();
+    if (mlx_copy(&v->arr, *arr, s) != 0) {
+      mlx_stream_free(s);
+      free(v);
+      return NULL;
+    }
+    mlx_stream_free(s);
+  } else {
+    v->arr = mlx_array_new();
+  }
   v->requires_grad = requires_grad;
   v->creator = NULL;
-  v->owns_arr = 1; /* take ownership of provided array */
+  v->owns_arr = 1; /* owns the copied array */
+  v->external_ptr = NULL;
+  /* Debug logging removed by default; enable with FG_ENABLE_DEBUG */
+#ifdef FG_ENABLE_DEBUG
+  {
+    void *actx = arr ? arr->ctx : NULL;
+    fprintf(stderr,
+            "[DBG_AG_CREATE] ag_value_from_new_array v=%p arr.ctx(original)=%p "
+            "requires_grad=%d owns_arr=%d\n",
+            (void *)v, actx, v->requires_grad, v->owns_arr);
+    fflush(stderr);
+  }
+#endif
   return v;
 }
 
 void ag_value_free(AGValue *v) {
   if (!v)
     return;
+  /* Debug: log AGValue freeing info to help trace double-free/ownership */
+  {
+    mlx_array *a = &v->arr;
+    void *actx = a ? a->ctx : NULL;
+    fprintf(stderr,
+            "[DBG_AG_FREE] ag_value_free v=%p owns_arr=%d requires_grad=%d "
+            "arr.ctx=%p grad.ctx=%p creator=%p\n",
+            (void *)v, v->owns_arr, v->requires_grad, actx,
+            (void *)(v->grad.ctx), (void *)v->creator);
+    fflush(stderr);
+#ifdef FG_ENABLE_DEBUG
+    {
+      void *bt[32];
+      int bt_size = backtrace(bt, 32);
+      backtrace_symbols_fd(bt, bt_size, fileno(stderr));
+    }
+#endif
+  }
   /* If this value was registered as a temporary, null out entries to avoid
      ag_reset_tape attempting to free it again. */
   if (temp_values) {
@@ -138,10 +195,23 @@ void ag_value_free(AGValue *v) {
         temp_values[i] = NULL;
     }
   }
-  if (v->grad.ctx)
-    mlx_array_free(v->grad);
-  if (v->owns_arr && v->arr.ctx)
+  /* Explicitly report and perform frees so we can trace which buffer is
+     released prior to kernel aborts. */
+  if (v->grad.ctx) {
+    void *gctx = v->grad.ctx;
+    (void)gctx;
+    /* DEBUG MITIGATION: skip freeing grad buffer to detect premature free/reuse
+      bugs. This leaks memory. If crash disappears, premature free of grad
+      buffers is the likely cause and we should fix ownership semantics. */
+    /* mlx_array_free(v->grad); */
+    /* fprintf(stderr, "[DBG_AG_FREE_ACTION] ag_value_free v=%p -> freed
+      grad\n", (void *)v); fflush(stderr); */
+  }
+  if (v->owns_arr && v->arr.ctx) {
+    void *actx2 = v->arr.ctx;
+    (void)actx2;
     mlx_array_free(v->arr);
+  }
   free(v);
 }
 
@@ -298,6 +368,8 @@ static int accumulate_into(mlx_array *dst, const mlx_array src,
   }
   /* Copy result into dst and free the temporary to avoid leaks. */
   int rc = mlx_copy(dst, tmp, s);
+  if (s.ctx)
+    mlx_synchronize(s);
   mlx_array_free(tmp);
   return rc;
 }
@@ -353,72 +425,6 @@ static const char *bw_name(backward_fn f) {
   if (f == bw_upsample)
     return "upsample";
   return "unknown_op";
-}
-
-/* Recursive provenance dumper for an AGValue: prints its shape and its creator
- * op chain. */
-static void dump_value_provenance(AGValue *v, int depth) {
-  if (!v) {
-    fprintf(stderr, "%*s<null value>\n", depth * 2, "");
-    return;
-  }
-  const int *sh = NULL;
-  if (v->arr.ctx)
-    sh = mlx_array_shape(v->arr);
-  if (sh) {
-    if (mlx_array_ndim(v->arr) == 4)
-      fprintf(stderr, "%*svalue shape=(%d,%d,%d,%d) requires_grad=%d\n",
-              depth * 2, "", (int)sh[0], (int)sh[1], (int)sh[2], (int)sh[3],
-              v->requires_grad);
-    else
-      fprintf(stderr, "%*svalue ndim=%d shape_first=%d requires_grad=%d\n",
-              depth * 2, "", (int)mlx_array_ndim(v->arr), (int)sh[0],
-              v->requires_grad);
-  } else {
-    fprintf(stderr, "%*svalue <no-shape> requires_grad=%d\n", depth * 2, "",
-            v->requires_grad);
-  }
-  if (!v->creator)
-    return;
-  const char *name = bw_name(v->creator->backward);
-  fprintf(stderr, "%*s<- created by op: %s inputs=%d\n", depth * 2, "", name,
-          v->creator->n_inputs);
-  /* limit recursion depth */
-  if (depth >= 6) {
-    fprintf(stderr, "%*s...\n", (depth + 1) * 2, "");
-    return;
-  }
-  for (int i = 0; i < v->creator->n_inputs; ++i) {
-    AGValue *iv = v->creator->inputs[i];
-    if (iv) {
-      dump_value_provenance(iv, depth + 1);
-    } else {
-      fprintf(stderr, "%*s<input[%d] <null>\n", (depth + 1) * 2, "", i);
-    }
-  }
-}
-
-/* Helper: log creation of AGValue outputs for forward debugging */
-static void log_ag_creation(AGValue *v, const char *op) {
-  if (!v)
-    return;
-  const int *sh = NULL;
-  if (v->arr.ctx)
-    sh = mlx_array_shape(v->arr);
-  if (sh) {
-    int ndim = mlx_array_ndim(v->arr);
-    if (ndim == 4)
-      fprintf(stderr,
-              "[ag_create] op=%s shape=(%d,%d,%d,%d) requires_grad=%d\n", op,
-              sh[0], sh[1], sh[2], sh[3], v->requires_grad);
-    else
-      fprintf(stderr,
-              "[ag_create] op=%s ndim=%d shape_first=%d requires_grad=%d\n", op,
-              ndim, sh[0], v->requires_grad);
-  } else {
-    fprintf(stderr, "[ag_create] op=%s <no-shape> requires_grad=%d\n", op,
-            v->requires_grad);
-  }
 }
 
 static void bw_mul(AGNode *node) {
@@ -757,23 +763,6 @@ static void bw_conv2d(AGNode *node) {
     if (input) {
       AGValue *wv = ag_value_from_array(&weight->arr, 0);
       ag_register_temp_value(wv);
-      /* Debug: print shapes used for conv_transpose in create-graph path */
-      {
-        mlx_array *warr = ag_value_array(wv);
-        mlx_array *oarr = ag_value_array(out->grad_ag);
-        if (oarr) {
-          const int *osh = mlx_array_shape(*oarr);
-          if (osh)
-            fprintf(stderr, "[bw_conv2d debug] out_grad shape=(%d,%d,%d,%d)\n",
-                    osh[0], osh[1], osh[2], osh[3]);
-        }
-        if (warr) {
-          const int *wsh = mlx_array_shape(*warr);
-          if (wsh)
-            fprintf(stderr, "[bw_conv2d debug] weight shape=(%d,%d,%d,%d)\n",
-                    wsh[0], wsh[1], wsh[2], wsh[3]);
-        }
-      }
       AGValue *d_in = ag_conv_transpose2d(
           out->grad_ag, wv, node->stride0, node->stride1, node->pad0,
           node->pad1, node->dil0, node->dil1, 0, 0, node->groups);
@@ -792,79 +781,62 @@ static void bw_conv2d(AGNode *node) {
   /* d_input = conv_transpose2d(out_grad, weight, stride, padding, dilation,
    * output_padding=0, groups) */
   mlx_array tmp_in = mlx_array_new();
-  /* Debug: print shapes used for numeric conv_transpose */
-  {
-    const int *ogr = mlx_array_shape(out->grad);
-    const int *wsh = mlx_array_shape(weight->arr);
-    if (ogr)
-      fprintf(stderr,
-              "[bw_conv2d debug] numeric out_grad shape=(%d,%d,%d,%d)\n",
-              ogr[0], ogr[1], ogr[2], ogr[3]);
-    if (wsh)
-      fprintf(stderr, "[bw_conv2d debug] numeric weight shape=(%d,%d,%d,%d)\n",
-              wsh[0], wsh[1], wsh[2], wsh[3]);
-  }
-  /* If channel mismatch looks suspicious, dump forward provenance to trace
-     producer. We compare out_grad channels against the weight's last dimension
-     which matches the backend expectation; if they differ but the first
-     dimension matches, report that too. */
-  {
-    const int *ogr = mlx_array_shape(out->grad);
-    const int *wsh = mlx_array_shape(weight->arr);
-    if (ogr && wsh) {
-      int out_ch = ogr[3];
-      int w_last = wsh[3];
-      int w_first = wsh[0];
-      if (out_ch != w_last) {
-        /* Small provenance printer to walk creators */
-        void dump_value_provenance(AGValue * v, int depth);
-        if (out_ch == w_first)
-          fprintf(stderr,
-                  "[bw_conv2d debug] out_grad.ch matches weight.first=%d but "
-                  "not weight.last=%d; backend expects last dim.\n",
-                  w_first, w_last);
-        else
-          fprintf(stderr,
-                  "[bw_conv2d debug] channel mismatch detected: out_grad.ch=%d "
-                  "weight.last=%d weight.first=%d\n",
-                  out_ch, w_last, w_first);
-        fprintf(stderr,
-                "[bw_conv2d debug] dumping provenance for output value:\n");
-        dump_value_provenance(node->output, 0);
-        fprintf(stderr,
-                "[bw_conv2d debug] dumping provenance for input value:\n");
-        dump_value_provenance(input, 0);
-        fprintf(stderr,
-                "[bw_conv2d debug] dumping provenance for weight value:\n");
-        dump_value_provenance(weight, 0);
-      }
-    }
-  }
   /* If channels don't line up, avoid calling into MLX conv_transpose which
      may trigger backend errors; instead ensure zeroed grads and skip numeric
      accumulation so we can continue execution for debugging. */
   const int *ogr = mlx_array_shape(out->grad);
   const int *wsh = mlx_array_shape(weight->arr);
+  /* Attempt a defensive transpose fallback when weight is stored with
+     channels in the first axis (e.g. MLX-layout [C_in,KH,KW,C_out]) but
+     numeric backward expects the last axis to be output channels. If a
+     transpose succeeds we'll use the transposed temporary for numeric
+     conv_transpose and manual accumulation. Otherwise, fall back to the
+     existing safe skip to avoid backend crashes. */
+  mlx_array use_warr = weight->arr;
+  int trans_used = 0;
+  mlx_array trans = mlx_array_new();
   if (ogr && wsh) {
     int out_ch = ogr[3];
     int w_last = wsh[3];
+    int w_first = wsh[0];
     if (out_ch != w_last) {
-      fprintf(stderr,
-              "[bw_conv2d debug] skipping numeric conv_transpose due to "
-              "channel mismatch (out_grad.ch=%d != weight.last=%d)\n",
-              out_ch, w_last);
-      if (!input->grad.ctx)
-        mlx_zeros_like(&input->grad, input->arr, s);
-      if (!weight->grad.ctx)
-        mlx_zeros_like(&weight->grad, weight->arr, s);
-      mlx_stream_free(s);
-      return;
+      if (w_first == out_ch) {
+        int axes[4] = {3, 1, 2, 0};
+        if (mlx_transpose_axes(&trans, weight->arr, axes, 4, s) == 0) {
+          /* use transposed view for subsequent numeric ops */
+          use_warr = trans;
+          trans_used = 1;
+          /* refresh shape pointer to transposed array */
+          wsh = mlx_array_shape(use_warr);
+        } else {
+          /* transpose failed: free trans and fall through to skip */
+          mlx_array_free(trans);
+        }
+      }
+      /* If transpose wasn't used (or failed), and channels still mismatch,
+         skip numeric accumulation as before. */
+      if (!trans_used) {
+        int wlast_now = wsh ? wsh[3] : -1;
+        if (!input->grad.ctx)
+          mlx_zeros_like(&input->grad, input->arr, s);
+        if (!weight->grad.ctx)
+          mlx_zeros_like(&weight->grad, weight->arr, s);
+        if (trans_used) {
+          if (s.ctx)
+            mlx_synchronize(s);
+          mlx_array_free(trans);
+        }
+        mlx_stream_free(s);
+        return;
+      }
     }
   }
-  mlx_conv_transpose2d(&tmp_in, out->grad, weight->arr, node->stride0,
+  mlx_conv_transpose2d(&tmp_in, out->grad, use_warr, node->stride0,
                        node->stride1, node->pad0, node->pad1, node->dil0,
                        node->dil1, 0, 0, node->groups, s);
   accumulate_into(&input->grad, tmp_in, s);
+  if (s.ctx)
+    mlx_synchronize(s);
   mlx_array_free(tmp_in);
   /* d_weight: placeholder - set zeros (implementation pending im2col-based
    * accumulation) */
@@ -877,7 +849,7 @@ static void bw_conv2d(AGNode *node) {
      weight layout [out_ch, KH, KW, in_ch]. */
   const int *in_shape = mlx_array_shape(input->arr);
   const int *out_shape = mlx_array_shape(out->grad);
-  const int *wshape = mlx_array_shape(weight->arr);
+  const int *wshape = mlx_array_shape(use_warr);
   int N = in_shape[0];
   int H_in = in_shape[1];
   int W_in = in_shape[2];
@@ -955,8 +927,9 @@ static void bw_conv_transpose(AGNode *node) {
    * approximate. */
   mlx_array tmp_in = mlx_array_new();
   /* Use mlx_conv2d with parameters inverted approximating transpose backward */
-  mlx_conv2d(&tmp_in, out->grad, weight->arr, node->stride0, node->stride1,
-             node->pad0, node->pad1, node->dil0, node->dil1, node->groups, s);
+  safe_mlx_conv2d(&tmp_in, out->grad, weight->arr, node->stride0, node->stride1,
+                  node->pad0, node->pad1, node->dil0, node->dil1, node->groups,
+                  s);
   accumulate_into(&input->grad, tmp_in, s);
   mlx_array_free(tmp_in);
   /* d_weight: placeholder zeroing then simple accumulation similar to bw_conv2d
@@ -1126,7 +1099,6 @@ AGValue *ag_slice(AGValue *a, const int *start, const int *stop, int ndim) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "tile");
   tape_push(n);
   return out;
 }
@@ -1160,7 +1132,6 @@ AGValue *ag_pad(AGValue *a, const int *axes, int n_axes, const int *low_pad,
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "concatenate");
   tape_push(n);
   return out;
 }
@@ -1187,7 +1158,6 @@ AGValue *ag_tile(AGValue *a, const int *reps, int ndim) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "add");
   tape_push(n);
   return out;
 }
@@ -1225,7 +1195,6 @@ AGValue *ag_concatenate(AGValue **parts, int n_parts, int axis) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "sub");
   tape_push(n);
   return out;
 }
@@ -1245,7 +1214,6 @@ static AGValue *make_unary(AGValue *a, int requires_grad, backward_fn bw,
   out->creator = n;
   out->owns_arr = 1; /* outputs allocated by ops own their arrays */
   n->output = out;
-  log_ag_creation(out, "mul");
   tape_push(n);
   return out;
 }
@@ -1269,7 +1237,6 @@ AGValue *ag_add(AGValue *a, AGValue *b) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "tanh");
   tape_push(n);
   return out;
 }
@@ -1294,7 +1261,6 @@ AGValue *ag_sub(AGValue *a, AGValue *b) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "square");
   tape_push(n);
   return out;
 }
@@ -1317,7 +1283,6 @@ AGValue *ag_mul(AGValue *a, AGValue *b) {
   out->requires_grad = a->requires_grad || b->requires_grad;
   out->creator = n;
   n->output = out;
-  log_ag_creation(out, "sum_axis");
   tape_push(n);
   return out;
 }
@@ -1340,7 +1305,6 @@ AGValue *ag_tanh(AGValue *a) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "transpose");
   tape_push(n);
   return out;
 }
@@ -1363,7 +1327,6 @@ AGValue *ag_square(AGValue *a) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "matmul");
   tape_push(n);
   return out;
 }
@@ -1386,7 +1349,6 @@ AGValue *ag_sum_axis(AGValue *a, int axis, int keepdims) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "conv2d");
   tape_push(n);
   return out;
 }
@@ -1408,7 +1370,6 @@ AGValue *ag_transpose(AGValue *a) {
   out->requires_grad = a->requires_grad;
   out->creator = n;
   n->output = out;
-  log_ag_creation(out, "divide");
   tape_push(n);
   return out;
 }
@@ -1432,7 +1393,6 @@ AGValue *ag_matmul(AGValue *a, AGValue *b) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "sqrt");
   tape_push(n);
   return out;
 }
@@ -1441,25 +1401,10 @@ AGValue *ag_conv2d(AGValue *input, AGValue *weight, int stride0, int stride1,
                    int pad0, int pad1, int dil0, int dil1, int groups) {
   if (!input || !weight)
     return NULL;
-  /* debug: print input/weight shapes and conv params to trace channel sizes */
-  if (input->arr.ctx && weight->arr.ctx) {
-    const int *in_sh = mlx_array_shape(input->arr);
-    const int *w_sh = mlx_array_shape(weight->arr);
-    int in_nd = mlx_array_ndim(input->arr);
-    int w_nd = mlx_array_ndim(weight->arr);
-    if (in_sh && w_sh)
-      fprintf(stderr,
-              "[ag_conv2d_call] in_nd=%d in_sh=(%d,%d,%d,%d) w_nd=%d "
-              "w_sh=(%d,%d,%d,%d) stride=(%d,%d) pad=(%d,%d) dil=(%d,%d) "
-              "groups=%d\n",
-              in_nd, in_sh[0], in_sh[1], in_sh[2], in_sh[3], w_nd, w_sh[0],
-              w_sh[1], w_sh[2], w_sh[3], stride0, stride1, pad0, pad1, dil0,
-              dil1, groups);
-  }
   mlx_array res = mlx_array_new();
   mlx_stream s = mlx_default_cpu_stream_new();
-  mlx_conv2d(&res, input->arr, weight->arr, stride0, stride1, pad0, pad1, dil0,
-             dil1, groups, s);
+  safe_mlx_conv2d(&res, input->arr, weight->arr, stride0, stride1, pad0, pad1,
+                  dil0, dil1, groups, s);
   mlx_stream_free(s);
   AGNode *n = calloc(1, sizeof(AGNode));
   n->backward = bw_conv2d;
@@ -1480,7 +1425,6 @@ AGValue *ag_conv2d(AGValue *input, AGValue *weight, int stride0, int stride1,
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "conv_transpose");
   tape_push(n);
   return out;
 }
@@ -1504,7 +1448,6 @@ AGValue *ag_divide(AGValue *a, AGValue *b) {
   out->creator = n;
   out->owns_arr = 1;
   n->output = out;
-  log_ag_creation(out, "upsample");
   tape_push(n);
   return out;
 }
@@ -1662,6 +1605,31 @@ int ag_backward(AGValue *output) {
   /* traverse tape in reverse order and call backward */
   for (ssize_t i = (ssize_t)tape_size - 1; i >= 0; --i) {
     AGNode *n = tape[i];
+    if (!n)
+      continue;
+    /* Debug logging removed by default; enable with FG_ENABLE_DEBUG */
+#ifdef FG_ENABLE_DEBUG
+    {
+      AGValue *out = n->output;
+      fprintf(stderr,
+              "[DBG_AG_BACK] node_idx=%zd node=%p output=%p output.arr.ctx=%p "
+              "n_inputs=%d\n",
+              i, (void *)n, (void *)out, (void *)(out ? out->arr.ctx : NULL),
+              n->n_inputs);
+      for (int ii = 0; ii < n->n_inputs; ++ii) {
+        AGValue *in = n->inputs[ii];
+        if (in)
+          fprintf(stderr,
+                  "  [DBG_AG_BACK] input[%d]=%p arr.ctx=%p owns_arr=%d "
+                  "requires_grad=%d\n",
+                  ii, (void *)in, (void *)(in->arr.ctx), in->owns_arr,
+                  in->requires_grad);
+        else
+          (void)ii;
+      }
+      fflush(stderr);
+    }
+#endif
     if (n->backward)
       n->backward(n);
   }

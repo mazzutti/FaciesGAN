@@ -2,6 +2,7 @@
 #ifndef FACIESGAN_PREFETCHER_H
 #define FACIESGAN_PREFETCHER_H
 
+#include "dataloader.h"
 #include <mlx/c/device.h>
 #include <mlx/c/stream.h>
 #include <mlx/c/vector.h>
@@ -129,6 +130,17 @@ void prefetcher_destroy(PrefetcherHandle h);
 // `prefetcher_pop` to return NULL once the internal queue is empty. Does not
 // free the prefetcher.
 void prefetcher_mark_finished(PrefetcherHandle h);
+
+/* Start a background producer thread that reads batches from a
+ * `MLXDataloader` and pushes them into the given `PrefetcherHandle`.
+ * The function spawns a detached thread and returns 0 on success. The
+ * provided `stream` is used when calling `facies_dataloader_next` and is
+ * freed by the background thread when finished. Returns non-zero on
+ * failure.
+ */
+int prefetcher_start_from_dataloader(PrefetcherHandle ph,
+                                     struct MLXDataloader *dl,
+                                     mlx_stream stream);
 
 #ifdef __cplusplus
 }

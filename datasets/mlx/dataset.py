@@ -13,6 +13,9 @@ import datasets.utils as data_utils
 from datasets.base import PyramidsDataset
 from options import TrainningOptions
 import random
+import io
+import zipfile
+import numpy as np
 
 
 class MLXPyramidsDataset(PyramidsDataset[mx.array]):
@@ -191,3 +194,70 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
             seismic_scale = mx.stack(seismic_list, axis=0)
 
         return facies_scale, wells_scale, seismic_scale
+
+    def dump_batches_npz(self, npz_path: str) -> int:
+        """Dump per-sample per-scale arrays into an .npz archive.
+
+        The archive members follow the pattern `sample_<i>/facies_<s>.npy`,
+        `sample_<i>/wells_<s>.npy`, and `sample_<i>/seismic_<s>.npy` to match
+        the C implementation.
+        Returns 0 on success, -1 on error.
+        """
+        if not hasattr(self, "batches") or not self.batches:
+            return -1
+
+        members = []  # list of (name, bytes)
+        for si, batch in enumerate(self.batches):
+            # facies
+            for s, a in enumerate(batch.facies):
+                try:
+                    arr = a.numpy() if hasattr(a, "numpy") else np.array(a)
+                except Exception:
+                    arr = np.array(a)
+                buf = io.BytesIO()
+                np.save(buf, arr)
+                members.append((f"sample_{si}/facies_{s}.npy", buf.getvalue()))
+
+            # wells
+            if len(batch.wells) > 0:
+                for s, a in enumerate(batch.wells):
+                    try:
+                        arr = a.numpy() if hasattr(a, "numpy") else np.array(a)
+                    except Exception:
+                        arr = np.array(a)
+                    buf = io.BytesIO()
+                    np.save(buf, arr)
+                    members.append((f"sample_{si}/wells_{s}.npy", buf.getvalue()))
+
+            # seismic
+            if len(batch.seismic) > 0:
+                for s, a in enumerate(batch.seismic):
+                    try:
+                        arr = a.numpy() if hasattr(a, "numpy") else np.array(a)
+                    except Exception:
+                        arr = np.array(a)
+                    buf = io.BytesIO()
+                    np.save(buf, arr)
+                    members.append((f"sample_{si}/seismic_{s}.npy", buf.getvalue()))
+
+        # ensure parent dir exists
+        import os
+
+        parent = os.path.dirname(npz_path)
+        if parent and not os.path.exists(parent):
+            os.makedirs(parent, exist_ok=True)
+
+        try:
+            with zipfile.ZipFile(npz_path, "w", compression=zipfile.ZIP_STORED) as zf:
+                for name, data in members:
+                    zf.writestr(name, data)
+        except Exception:
+            return -1
+        return 0
+
+
+def mlx_pyramids_dataset_dump_batches_npz(ds: MLXPyramidsDataset, npz_path: str) -> int:
+    """Module-level helper mirroring the C API."""
+    if not ds:
+        return -1
+    return ds.dump_batches_npz(npz_path)

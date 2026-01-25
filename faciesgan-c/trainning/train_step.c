@@ -232,7 +232,6 @@ int mlx_faciesgan_collect_metrics_and_grads(
     }
     for (int p = 0; p < gen_param_n; ++p) {
       gen_params_ag[p] = ag_value_from_array(gen_params_list[p], 1);
-      ag_register_temp_value(gen_params_ag[p]);
     }
     mlx_generator_free_parameters_list(gen_params_list);
 
@@ -335,7 +334,6 @@ int mlx_faciesgan_collect_metrics_and_grads(
             (AGValue **)malloc(sizeof(AGValue *) * disc_param_n);
         for (int p = 0; p < disc_param_n; ++p) {
           disc_params_ag[p] = ag_value_from_array(disc_params_list[p], 1);
-          ag_register_temp_value(disc_params_ag[p]);
         }
         mlx_discriminator_free_parameters_list(disc_params_list);
         mlx_array **disc_grads = NULL;
@@ -544,45 +542,70 @@ int mlx_faciesgan_collect_metrics_and_grads(
       mlx_array *arr = ag_value_array(adv_comp);
       if (arr) {
         safe_mlx_array_eval(*arr);
-        sr->metrics.fake = (mlx_array *)malloc(sizeof(mlx_array));
-        if (sr->metrics.fake)
-          *sr->metrics.fake = mlx_array_new_float(0.0f);
+        mlx_array tmp = mlx_array_new();
+        if (mlx_array_set(&tmp, *arr) == 0) {
+          sr->metrics.fake = (mlx_array *)malloc(sizeof(mlx_array));
+          if (sr->metrics.fake)
+            *sr->metrics.fake = tmp;
+        } else {
+          mlx_array_free(tmp);
+        }
       }
     }
     if (masked_comp) {
       mlx_array *arr = ag_value_array(masked_comp);
       if (arr) {
         safe_mlx_array_eval(*arr);
-        sr->metrics.well = (mlx_array *)malloc(sizeof(mlx_array));
-        if (sr->metrics.well)
-          *sr->metrics.well = mlx_array_new_float(0.0f);
+        mlx_array tmp = mlx_array_new();
+        if (mlx_array_set(&tmp, *arr) == 0) {
+          sr->metrics.well = (mlx_array *)malloc(sizeof(mlx_array));
+          if (sr->metrics.well)
+            *sr->metrics.well = tmp;
+        } else {
+          mlx_array_free(tmp);
+        }
       }
     }
     if (div_comp) {
       mlx_array *arr = ag_value_array(div_comp);
       if (arr) {
         safe_mlx_array_eval(*arr);
-        sr->metrics.div = (mlx_array *)malloc(sizeof(mlx_array));
-        if (sr->metrics.div)
-          *sr->metrics.div = mlx_array_new_float(0.0f);
+        mlx_array tmp = mlx_array_new();
+        if (mlx_array_set(&tmp, *arr) == 0) {
+          sr->metrics.div = (mlx_array *)malloc(sizeof(mlx_array));
+          if (sr->metrics.div)
+            *sr->metrics.div = tmp;
+        } else {
+          mlx_array_free(tmp);
+        }
       }
     }
     if (rec_comp) {
       mlx_array *arr = ag_value_array(rec_comp);
       if (arr) {
         safe_mlx_array_eval(*arr);
-        sr->metrics.rec = (mlx_array *)malloc(sizeof(mlx_array));
-        if (sr->metrics.rec)
-          *sr->metrics.rec = mlx_array_new_float(0.0f);
+        mlx_array tmp = mlx_array_new();
+        if (mlx_array_set(&tmp, *arr) == 0) {
+          sr->metrics.rec = (mlx_array *)malloc(sizeof(mlx_array));
+          if (sr->metrics.rec)
+            *sr->metrics.rec = tmp;
+        } else {
+          mlx_array_free(tmp);
+        }
       }
     }
     if (gen_loss) {
       mlx_array *arr = ag_value_array(gen_loss);
       if (arr) {
         safe_mlx_array_eval(*arr);
-        sr->metrics.total = (mlx_array *)malloc(sizeof(mlx_array));
-        if (sr->metrics.total)
-          *sr->metrics.total = mlx_array_new_float(0.0f);
+        mlx_array tmp = mlx_array_new();
+        if (mlx_array_set(&tmp, *arr) == 0) {
+          sr->metrics.total = (mlx_array *)malloc(sizeof(mlx_array));
+          if (sr->metrics.total)
+            *sr->metrics.total = tmp;
+        } else {
+          mlx_array_free(tmp);
+        }
       }
     }
     /* All metric extraction and grad collection for this scale complete; free

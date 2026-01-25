@@ -2,6 +2,18 @@
   "version": "2.0.0",
   "tasks": [
     {
+      "label": "prepare-parallel-dumps",
+      "type": "shell",
+      "presentation": { "reveal": "always", "panel": "shared" },
+      "problemMatcher": [],
+      "command": "bash",
+      "args": [
+        "-g",
+        "-lc",
+        "EPOCH=$(date +%s) && echo \"FG_C_DUMP_DIR=\\\"${PWD}/dumps/c_run_${EPOCH}\\\"\" > ${PWD}/.env && echo \"FG_PY_DUMP_DIR=\\\"${PWD}/dumps/py_run_${EPOCH}\\\"\" >> ${PWD}/.env && echo \"OUTPUT_PATH=${PWD}/results/\" >> ${PWD}/.env && echo \"PYTHONPATH=${PWD}/.venv/lib/python3.13/site-packages:${PWD}/build/_deps/mlx-src/python:${PWD}/mlx-c/python\" >> ${PWD}/.env && echo \"VIRTUAL_ENV=${PWD}/.venv\" >> ${PWD}/.env && echo \"PATH=${PWD}/.venv/bin:${env:PATH}\" >> ${PWD}/.env && echo Created .env with epoch ${EPOCH}"
+      ]
+    },
+    {
       "label": "CMake Configure (Debug)",
       "type": "shell",
       "command": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug",
