@@ -2,22 +2,19 @@
 
 #include "datasets/data_files.h"
 #include "models/base_manager.h"
+#include "trainning/array_helpers.h"
 #include <stdlib.h>
 #include <string.h>
 
 static char *dupstr(const char *s) {
   if (!s)
     return NULL;
-  char *p = (char *)malloc(strlen(s) + 1);
-  if (!p)
-    return NULL;
-  strcpy(p, s);
-  return p;
+  return strdup(s);
 }
 
 TrainningOptions *mlx_options_new_trainning_defaults(void) {
-  TrainningOptions *o = (TrainningOptions *)malloc(sizeof(TrainningOptions));
-  if (!o)
+  TrainningOptions *o = NULL;
+  if (mlx_alloc_pod((void **)&o, sizeof(TrainningOptions), 1) != 0)
     return NULL;
   o->alpha = 10;
   o->batch_size = 1;
@@ -84,16 +81,18 @@ void mlx_options_free_trainning(TrainningOptions *opt) {
     free(opt->input_path);
   if (opt->output_path)
     free(opt->output_path);
-  if (opt->wells_mask_columns)
-    free(opt->wells_mask_columns);
+  if (opt->wells_mask_columns) {
+    mlx_free_int_array(&opt->wells_mask_columns, NULL);
+    opt->wells_mask_count = 0;
+  }
   if (opt->output_fullpath)
     free(opt->output_fullpath);
-  free(opt);
+  mlx_free_pod((void **)&opt);
 }
 
 ResumeOptions *mlx_options_new_resume_defaults(void) {
-  ResumeOptions *r = (ResumeOptions *)malloc(sizeof(ResumeOptions));
-  if (!r)
+  ResumeOptions *r = NULL;
+  if (mlx_alloc_pod((void **)&r, sizeof(ResumeOptions), 1) != 0)
     return NULL;
   r->fine_tuning = false;
   r->checkpoint_path = dupstr("");
@@ -107,7 +106,7 @@ void mlx_options_free_resume(ResumeOptions *opt) {
     return;
   if (opt->checkpoint_path)
     free(opt->checkpoint_path);
-  free(opt);
+  mlx_free_pod((void **)&opt);
 }
 
 void mlx_options_to_mlx_train_opts(const TrainningOptions *t,
@@ -132,19 +131,20 @@ void mlx_options_to_mlx_train_opts(const TrainningOptions *t,
 TrainningOptions *mlx_options_clone(const TrainningOptions *src) {
   if (!src)
     return NULL;
-  TrainningOptions *c = (TrainningOptions *)malloc(sizeof(TrainningOptions));
-  if (!c)
+  TrainningOptions *c = NULL;
+  if (mlx_alloc_pod((void **)&c, sizeof(TrainningOptions), 1) != 0)
     return NULL;
   memcpy(c, src, sizeof(TrainningOptions));
   /* Deep-copy string fields */
   c->input_path = src->input_path ? dupstr(src->input_path) : NULL;
   c->output_path = src->output_path ? dupstr(src->output_path) : NULL;
   if (src->wells_mask_count > 0 && src->wells_mask_columns) {
-    c->wells_mask_columns = (int *)malloc(sizeof(int) * src->wells_mask_count);
-    if (c->wells_mask_columns)
+    if (mlx_alloc_int_array(&c->wells_mask_columns, src->wells_mask_count) ==
+        0) {
       memcpy(c->wells_mask_columns, src->wells_mask_columns,
              sizeof(int) * src->wells_mask_count);
-    c->wells_mask_count = src->wells_mask_count;
+      c->wells_mask_count = src->wells_mask_count;
+    }
   } else {
     c->wells_mask_columns = NULL;
     c->wells_mask_count = 0;

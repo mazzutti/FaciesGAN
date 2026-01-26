@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 /* MLX headers needed for array/stream helpers */
+#include "trainning/array_helpers.h"
 #include <mlx/c/array.h>
 #include <mlx/c/io.h>
 #include <mlx/c/ops.h>
@@ -146,9 +147,15 @@ int dataset_generate_scales(const TrainningOptions *opts, int channels_last,
   int channels = opts->num_img_channels > 0 ? opts->num_img_channels : 1;
 
   int nscales = stop_scale + 1;
-  DatasetScale *arr = malloc(sizeof(DatasetScale) * nscales);
-  if (!arr)
-    return -1;
+  DatasetScale *arr = NULL;
+  if ((size_t)nscales > (size_t)INT_MAX) {
+    arr = malloc(sizeof(DatasetScale) * (size_t)nscales);
+    if (!arr)
+      return -1;
+  } else {
+    if (mlx_alloc_pod((void **)&arr, sizeof(DatasetScale), nscales) != 0)
+      return -1;
+  }
 
   double scale_factor = 1.0;
   if (stop_scale > 0) {
@@ -206,8 +213,8 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
     return -1;
   }
 
-  mlx_array *fac = (mlx_array *)malloc(sizeof(mlx_array) * (size_t)local_n);
-  if (!fac) {
+  mlx_array *fac = NULL;
+  if (mlx_alloc_mlx_array_vals(&fac, local_n) != 0) {
     return -1;
   }
 
@@ -359,8 +366,8 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
     return -1;
   }
 
-  mlx_array *seis = (mlx_array *)malloc(sizeof(mlx_array) * (size_t)local_n);
-  if (!seis) {
+  mlx_array *seis = NULL;
+  if (mlx_alloc_mlx_array_vals(&seis, local_n) != 0) {
     return -1;
   }
 
@@ -506,8 +513,8 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
     return -1;
   }
 
-  mlx_array *wells = (mlx_array *)malloc(sizeof(mlx_array) * (size_t)local_n);
-  if (!wells) {
+  mlx_array *wells = NULL;
+  if (mlx_alloc_mlx_array_vals(&wells, local_n) != 0) {
     return -1;
   }
 

@@ -13,18 +13,64 @@ struct MLXOptimizer;
 struct MLXScheduler;
 typedef void *PrefetcherHandle;
 
+/* Forward declare trainer for use in ops/vtable. */
+struct MLXTrainer;
+
+/* Optional operations vtable to allow instance-method style calls. */
+typedef struct MLXTrainerOps {
+  int (*train)(struct MLXTrainer *trainer);
+  int (*train_scales)(struct MLXTrainer *trainer, const int *indexes,
+                      int n_indexes, mlx_array **facies_pyramid, int n_facies,
+                      mlx_array **wells_pyramid, int n_wells,
+                      mlx_array **masks_pyramid, int n_masks,
+                      mlx_array **seismic_pyramid, int n_seismic,
+                      const int *scales, int n_scales, int num_iter);
+  int (*optimization_step)(struct MLXTrainer *trainer, const int *indexes,
+                           int n_indexes, mlx_array **facies_pyramid,
+                           int n_facies, mlx_array **rec_in_pyramid, int n_rec,
+                           mlx_array **wells_pyramid, int n_wells,
+                           mlx_array **masks_pyramid, int n_masks,
+                           mlx_array **seismic_pyramid, int n_seismic,
+                           const int *active_scales, int n_active_scales);
+  void *(*create_model)(struct MLXTrainer *trainer);
+  void (*destroy)(struct MLXTrainer *trainer);
+  PrefetcherIteratorHandle (*create_batch_iterator)(struct MLXTrainer *trainer,
+                                                    struct MLXDataloader *dl,
+                                                    const int *scales,
+                                                    int n_scales);
+  int (*create_dataloader)(struct MLXTrainer *trainer);
+  int (*init_dataset)(struct MLXTrainer *trainer);
+  int (*generate_visualization_samples)(struct MLXTrainer *trainer,
+                                        const int *scales, int n_scales,
+                                        const int *indexes, int n_indexes,
+                                        mlx_array **wells_pyramid, int n_wells,
+                                        mlx_array **seismic_pyramid,
+                                        int n_seismic,
+                                        mlx_array ***out_generated, int *n_out);
+  int (*create_visualizer)(struct MLXTrainer *trainer, int update_interval);
+  int (*update_visualizer)(struct MLXTrainer *trainer, int epoch,
+                           const char *metrics_json, int samples_processed);
+  int (*close_visualizer)(struct MLXTrainer *trainer);
+  int (*setup_optimizers)(struct MLXTrainer *trainer, const int *scales,
+                          int n_scales);
+  int (*load_model)(struct MLXTrainer *trainer, int scale,
+                    const char *checkpoint_dir);
+  int (*save_generated_facies)(struct MLXTrainer *trainer, int scale, int epoch,
+                               const char *results_path);
+  void *(*get_model_ctx)(struct MLXTrainer *trainer);
+  int (*get_shapes_flat)(struct MLXTrainer *t, int **out_shapes, int *out_n);
+  int (*set_shapes)(struct MLXTrainer *t, const int *shapes, int n_scales);
+} MLXTrainerOps;
+
 typedef struct MLXTrainer {
   TrainningOptions opts;
   struct MLXFaciesGAN *model;
-  struct MLXOptimizer **gen_opts;  /* per-scale */
-  struct MLXOptimizer **disc_opts; /* per-scale */
+  struct MLXOptimizer **gen_opts;
+  struct MLXOptimizer **disc_opts;
   struct MLXScheduler **gen_scheds;
   struct MLXScheduler **disc_scheds;
   int n_scales;
-  /* Flat scales array: 4 ints per scale. Stored in NHWC order:
-   * (Batch, Height, Width, Channels). */
-  int *scales; /* owned by trainer, length = 4 * n_scales */
-  /* Convenience fields mirroring Python Trainer attributes */
+  int *scales;
   int start_scale;
   int stop_scale;
   char *output_path;
@@ -36,7 +82,6 @@ typedef struct MLXTrainer {
   int noise_channels;
   int num_real_facies;
   int num_generated_per_real;
-  /* Optional list of wells mask column indices (copied from options) */
   int *wells_mask_columns;
   size_t wells_mask_count;
   int enable_tensorboard;
@@ -50,23 +95,20 @@ typedef struct MLXTrainer {
   float noise_amp;
   float min_noise_amp;
   float scale0_noise_amp;
-  /* Fine-tuning flag and checkpoint path (mirrors TrainningOptions defaults) */
   int fine_tuning;
   char *checkpoint_path;
-  /* Optional per-trainer prefetcher/iterator for batch iteration */
   PrefetcherHandle batch_prefetcher;
   PrefetcherIteratorHandle batch_iterator;
   pthread_t batch_producer;
   int batch_producer_running;
-  /* Dataset / dataloader prepared during initialisation (optional). */
   MLXPyramidsDataset *dataset;
   struct MLXDataloader *data_loader;
   int num_of_batchs;
+  /* Optional ops/vtable for OO-like instance methods. If NULL, callers can
+   * continue to use the MLXTrainer_* functions declared in this header. */
+  MLXTrainerOps *ops;
 } MLXTrainer;
 
-/* Compute reconstruction input for `scale` given `facies_pyramid` and
- * `indexes`. On success returns 0 and sets `out` to a newly-allocated
- * `mlx_array*` (caller must free). */
 int MLXTrainer_compute_rec_input(MLXTrainer *trainer, int scale,
                                  const int *indexes, int n_indexes,
                                  mlx_array **facies_pyramid, mlx_array **out);

@@ -2,7 +2,7 @@
 #include "custom_layer.h"
 
 int main(void) {
-    printf("Creating color quantization module...\n");
+    /* creation message removed */
     MLXColorQuantization *q = mlx_colorquant_create(0.1f);
     if (!q) {
         fprintf(stderr, "Failed to create module\n");
@@ -12,6 +12,6 @@ int main(void) {
     /* In a full integration you'd pass a real mlx_array_t pointer here.
        We just exercise create/free to ensure the library compiles and links. */
     mlx_colorquant_free(q);
-    printf("OK\n");
+    /* OK message removed */
     return 0;
 }

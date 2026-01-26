@@ -20,6 +20,8 @@
 
 #include <math.h>
 
+#include "trainning/array_helpers.h"
+
 int mlx_create_dirs(const char *path) {
   if (!path || path[0] == '\0')
     return -1;
@@ -317,8 +319,10 @@ int mlx_array_to_float_buffer(const mlx_array a, float **out_buf,
   const float *data = mlx_array_data_float32(a);
   if (!data)
     return -1;
-  float *buf = (float *)malloc(sizeof(float) * elems);
-  if (!buf)
+  if (elems > INT_MAX)
+    return -1;
+  float *buf = NULL;
+  if (mlx_alloc_float_buf(&buf, (int)elems) != 0)
     return -1;
   memcpy(buf, data, sizeof(float) * elems);
   *out_buf = buf;
@@ -329,9 +333,8 @@ int mlx_array_to_float_buffer(const mlx_array a, float **out_buf,
     int ndim = mlx_array_ndim(a);
     int *shape = NULL;
     if (ndim > 0) {
-      shape = (int *)malloc(sizeof(int) * ndim);
-      if (!shape) {
-        free(buf);
+      if (mlx_alloc_int_array(&shape, ndim) != 0) {
+        mlx_free_float_buf(&buf, NULL);
         return -1;
       }
       const int *s = mlx_array_shape(a);
@@ -350,12 +353,14 @@ int mlx_array_from_float_buffer(mlx_array *out, const float *buf,
   size_t elems = 1;
   for (int i = 0; i < ndim; ++i)
     elems *= (size_t)shape[i];
-  float *tmp = (float *)malloc(sizeof(float) * elems);
-  if (!tmp)
+  if (elems > INT_MAX)
+    return -1;
+  float *tmp = NULL;
+  if (mlx_alloc_float_buf(&tmp, (int)elems) != 0)
     return -1;
   memcpy(tmp, buf, sizeof(float) * elems);
   int rc = mlx_array_set_data(out, tmp, shape, ndim, MLX_FLOAT32);
-  free(tmp);
+  mlx_free_float_buf(&tmp, NULL);
   return rc == 0 ? 0 : -1;
 }
 
@@ -394,10 +399,12 @@ void apply_well_mask_cpu(const float *facies, float *out, int h, int w, int c,
   for (size_t i = 0; i < npixels * (size_t)c; ++i)
     out[i] = facies[i];
 
-  unsigned char *col_has = (unsigned char *)malloc((size_t)w);
-  if (!col_has)
-    return;
-  memset(col_has, 0, (size_t)w);
+  unsigned char *col_has = NULL;
+  if (w > 0) {
+    if (mlx_alloc_pod((void **)&col_has, sizeof(unsigned char), w) != 0)
+      return;
+    memset(col_has, 0, (size_t)w);
+  }
   for (int y = 0; y < h; ++y) {
     for (int x = 0; x < w; ++x) {
       if (mask[y * w + x])
@@ -440,7 +447,8 @@ void apply_well_mask_cpu(const float *facies, float *out, int h, int w, int c,
     }
   }
 
-  free(col_has);
+  if (col_has)
+    mlx_free_pod((void **)&col_has);
 }
 
 int mlx_denorm_array(const mlx_array in, mlx_array *out, int ceiling) {
@@ -455,8 +463,10 @@ int mlx_denorm_array(const mlx_array in, mlx_array *out, int ceiling) {
   const float *data = mlx_array_data_float32(in);
   if (!data)
     return -1;
-  float *buf = (float *)malloc(sizeof(float) * elems);
-  if (!buf)
+  if (elems > INT_MAX)
+    return -1;
+  float *buf = NULL;
+  if (mlx_alloc_float_buf(&buf, (int)elems) != 0)
     return -1;
   for (size_t i = 0; i < elems; ++i) {
     float v = (data[i] + 1.0f) * 0.5f;
@@ -472,7 +482,7 @@ int mlx_denorm_array(const mlx_array in, mlx_array *out, int ceiling) {
   const int *shape = mlx_array_shape(in);
   mlx_array out_arr = mlx_array_new_data(buf, shape, ndim, MLX_FLOAT32);
   *out = out_arr;
-  free(buf);
+  mlx_free_float_buf(&buf, NULL);
   return 0;
 }
 
@@ -493,9 +503,9 @@ int mlx_quantize_array(const mlx_array in, mlx_array *out,
   int *pal_shape = NULL;
   if (mlx_array_to_float_buffer(palette, &pal_buf, &pal_elems, &pal_ndim,
                                 &pal_shape) != 0) {
-    free(in_buf);
+    mlx_free_float_buf(&in_buf, NULL);
     if (in_shape)
-      free(in_shape);
+      mlx_free_int_array(&in_shape, NULL);
     return -1;
   }
   int c = 1;
@@ -509,24 +519,33 @@ int mlx_quantize_array(const mlx_array in, mlx_array *out,
     w = in_shape[1];
     c = 1;
   } else {
-    free(in_buf);
-    free(pal_buf);
+    mlx_free_float_buf(&in_buf, NULL);
+    mlx_free_float_buf(&pal_buf, NULL);
     if (in_shape)
-      free(in_shape);
+      mlx_free_int_array(&in_shape, NULL);
     if (pal_shape)
-      free(pal_shape);
+      mlx_free_int_array(&pal_shape, NULL);
     return -1;
   }
   size_t npixels = (size_t)h * (size_t)w;
   int ncolors = (int)(pal_elems / (size_t)c);
-  float *out_buf = (float *)malloc(sizeof(float) * npixels * (size_t)c);
-  if (!out_buf) {
-    free(in_buf);
-    free(pal_buf);
+  if (npixels * (size_t)c > (size_t)INT_MAX) {
+    mlx_free_float_buf(&in_buf, NULL);
+    mlx_free_float_buf(&pal_buf, NULL);
     if (in_shape)
-      free(in_shape);
+      mlx_free_int_array(&in_shape, NULL);
     if (pal_shape)
-      free(pal_shape);
+      mlx_free_int_array(&pal_shape, NULL);
+    return -1;
+  }
+  float *out_buf = NULL;
+  if (mlx_alloc_float_buf(&out_buf, (int)(npixels * (size_t)c)) != 0) {
+    mlx_free_float_buf(&in_buf, NULL);
+    mlx_free_float_buf(&pal_buf, NULL);
+    if (in_shape)
+      mlx_free_int_array(&in_shape, NULL);
+    if (pal_shape)
+      mlx_free_int_array(&pal_shape, NULL);
     return -1;
   }
   quantize_pixels_float(in_buf, out_buf, npixels, c, pal_buf, ncolors);
@@ -545,13 +564,13 @@ int mlx_quantize_array(const mlx_array in, mlx_array *out,
   mlx_array out_arr =
       mlx_array_new_data(out_buf, shape_out, ndim_out, MLX_FLOAT32);
   *out = out_arr;
-  free(in_buf);
-  free(pal_buf);
+  mlx_free_float_buf(&in_buf, NULL);
+  mlx_free_float_buf(&pal_buf, NULL);
   if (in_shape)
-    free(in_shape);
+    mlx_free_int_array(&in_shape, NULL);
   if (pal_shape)
-    free(pal_shape);
-  free(out_buf);
+    mlx_free_int_array(&pal_shape, NULL);
+  mlx_free_float_buf(&out_buf, NULL);
   return 0;
 }
 
@@ -572,12 +591,25 @@ int mlx_apply_well_mask_array(const mlx_array facies, mlx_array *out,
   }
   int m_dtype = mlx_array_dtype(mask);
   size_t mask_elems = mlx_array_size(mask);
-  unsigned char *mask_buf = (unsigned char *)malloc(mask_elems);
-  if (!mask_buf) {
-    free(fac_buf);
-    if (fac_shape)
-      free(fac_shape);
-    return -1;
+  unsigned char *mask_buf = NULL;
+  int mask_buf_helper = 0;
+  if (mask_elems > 0) {
+    if (mask_elems > (size_t)INT_MAX) {
+      mask_buf = (unsigned char *)malloc(mask_elems);
+      mask_buf_helper = 0;
+    } else {
+      if (mlx_alloc_pod((void **)&mask_buf, sizeof(unsigned char),
+                        (int)mask_elems) == 0)
+        mask_buf_helper = 1;
+      else
+        mask_buf = (unsigned char *)malloc(mask_elems);
+    }
+    if (!mask_buf) {
+      mlx_free_float_buf(&fac_buf, NULL);
+      if (fac_shape)
+        mlx_free_int_array(&fac_shape, NULL);
+      return -1;
+    }
   }
   if (m_dtype == MLX_BOOL) {
     const bool *mb = mlx_array_data_bool(mask);
@@ -588,10 +620,15 @@ int mlx_apply_well_mask_array(const mlx_array facies, mlx_array *out,
     for (size_t i = 0; i < mask_elems; ++i)
       mask_buf[i] = mb[i];
   } else {
-    free(fac_buf);
+    mlx_free_float_buf(&fac_buf, NULL);
     if (fac_shape)
-      free(fac_shape);
-    free(mask_buf);
+      mlx_free_int_array(&fac_shape, NULL);
+    if (mask_buf) {
+      if (mask_buf_helper)
+        mlx_free_pod((void **)&mask_buf);
+      else
+        free(mask_buf);
+    }
     return -1;
   }
   float *well_buf = NULL;
@@ -600,10 +637,15 @@ int mlx_apply_well_mask_array(const mlx_array facies, mlx_array *out,
   int *well_shape = NULL;
   if (mlx_array_to_float_buffer(well, &well_buf, &well_elems, &well_ndim,
                                 &well_shape) != 0) {
-    free(fac_buf);
+    mlx_free_float_buf(&fac_buf, NULL);
     if (fac_shape)
-      free(fac_shape);
-    free(mask_buf);
+      mlx_free_int_array(&fac_shape, NULL);
+    if (mask_buf) {
+      if (mask_buf_helper)
+        mlx_free_pod((void **)&mask_buf);
+      else
+        free(mask_buf);
+    }
     return -1;
   }
   int h = 1, w = 1, c = 1, wc = 1;
@@ -621,15 +663,35 @@ int mlx_apply_well_mask_array(const mlx_array facies, mlx_array *out,
   } else if (well_ndim == 2) {
     wc = 1;
   }
-  float *out_buf = (float *)malloc(sizeof(float) * fac_elems);
-  if (!out_buf) {
-    free(fac_buf);
+  if (fac_elems > INT_MAX) {
+    mlx_free_float_buf(&fac_buf, NULL);
     if (fac_shape)
-      free(fac_shape);
-    free(mask_buf);
-    free(well_buf);
+      mlx_free_int_array(&fac_shape, NULL);
+    if (mask_buf) {
+      if (mask_buf_helper)
+        mlx_free_pod((void **)&mask_buf);
+      else
+        free(mask_buf);
+    }
+    mlx_free_float_buf(&well_buf, NULL);
     if (well_shape)
-      free(well_shape);
+      mlx_free_int_array(&well_shape, NULL);
+    return -1;
+  }
+  float *out_buf = NULL;
+  if (mlx_alloc_float_buf(&out_buf, (int)fac_elems) != 0) {
+    mlx_free_float_buf(&fac_buf, NULL);
+    if (fac_shape)
+      mlx_free_int_array(&fac_shape, NULL);
+    if (mask_buf) {
+      if (mask_buf_helper)
+        mlx_free_pod((void **)&mask_buf);
+      else
+        free(mask_buf);
+    }
+    mlx_free_float_buf(&well_buf, NULL);
+    if (well_shape)
+      mlx_free_int_array(&well_shape, NULL);
     return -1;
   }
   apply_well_mask_cpu(fac_buf, out_buf, h, w, c, mask_buf, well_buf, wc);
@@ -638,14 +700,19 @@ int mlx_apply_well_mask_array(const mlx_array facies, mlx_array *out,
   mlx_array out_arr =
       mlx_array_new_data(out_buf, shape_in, ndim_out, MLX_FLOAT32);
   *out = out_arr;
-  free(fac_buf);
+  mlx_free_float_buf(&fac_buf, NULL);
   if (fac_shape)
-    free(fac_shape);
-  free(mask_buf);
-  free(well_buf);
+    mlx_free_int_array(&fac_shape, NULL);
+  if (mask_buf) {
+    if (mask_buf_helper)
+      mlx_free_pod((void **)&mask_buf);
+    else
+      free(mask_buf);
+  }
+  mlx_free_float_buf(&well_buf, NULL);
   if (well_shape)
-    free(well_shape);
-  free(out_buf);
+    mlx_free_int_array(&well_shape, NULL);
+  mlx_free_float_buf(&out_buf, NULL);
   return 0;
 }
 

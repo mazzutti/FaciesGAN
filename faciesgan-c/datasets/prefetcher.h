@@ -13,20 +13,20 @@ extern "C" {
 #endif
 
 typedef struct PrefetchedBatch {
-  float *facies;
-  int facies_ndim;
-  int facies_shape[8];
-  int facies_len;
+    float *facies;
+    int facies_ndim;
+    int facies_shape[8];
+    int facies_len;
 
-  float *wells;
-  int wells_ndim;
-  int wells_shape[8];
-  int wells_len;
+    float *wells;
+    int wells_ndim;
+    int wells_shape[8];
+    int wells_len;
 
-  float *seismic;
-  int seismic_ndim;
-  int seismic_shape[8];
-  int seismic_len;
+    float *seismic;
+    int seismic_ndim;
+    int seismic_shape[8];
+    int seismic_len;
 } PrefetchedBatch;
 
 /* Prepared pyramids batch (per-scale MLX arrays). To match the Python
@@ -35,13 +35,23 @@ typedef struct PrefetchedBatch {
  * entry is absent the corresponding mlx_array will be empty (ndim == 0).
  */
 typedef struct PrefetchedPyramidsBatch {
-  int n_scales;
-  int *scales; /* heap-allocated array of length n_scales */
+    int n_scales;
+    int *scales; /* heap-allocated array of length n_scales */
 
-  mlx_array *facies;  /* array length n_scales */
-  mlx_array *wells;   /* array length n_scales */
-  mlx_array *masks;   /* array length n_scales */
-  mlx_array *seismic; /* array length n_scales */
+    mlx_array *facies;  /* array length n_scales */
+    mlx_array *wells;   /* array length n_scales */
+    mlx_array *masks;   /* array length n_scales */
+    mlx_array *seismic; /* array length n_scales */
+    /* Convenience pointer arrays referencing the above `mlx_array` values.
+     * These are allocated with `mlx_alloc_ptr_array` and point into the
+     * corresponding `*_vals` arrays (i.e. elements are addresses of
+     * `facies[i]`). They are optional and may be NULL. The caller should
+     * treat them as non-owning pointers to the `*_vals` storage; the
+     * underlying `mlx_array` values are freed by `prefetcher_free_pyramids`. */
+    mlx_array **facies_ptrs;
+    mlx_array **wells_ptrs;
+    mlx_array **masks_ptrs;
+    mlx_array **seismic_ptrs;
 } PrefetchedPyramidsBatch;
 
 typedef void *PrefetcherHandle;
@@ -86,7 +96,7 @@ PrefetcherHandle prefetcher_create(int max_queue, int device_index,
 // Create a prefetcher using an explicit MLX stream. The provided `stream`
 // is copied into the prefetcher and used for enqueueing copies.
 PrefetcherHandle prefetcher_create_with_stream(int max_queue, mlx_stream stream,
-                                               const int *scales, int n_scales);
+        const int *scales, int n_scales);
 
 /* Push already-constructed MLX arrays representing per-scale pyramids.
  * Each pointer array must point to `n_*` mlx_array values. Arrays are copied
@@ -131,6 +141,10 @@ void prefetcher_destroy(PrefetcherHandle h);
 // free the prefetcher.
 void prefetcher_mark_finished(PrefetcherHandle h);
 
+/* Stop background producers and wait for them to exit. This does not free
+ * the prefetcher itself; call `prefetcher_destroy` after `prefetcher_stop`
+ * to free resources. Returns 0 on success. */
+int prefetcher_stop(PrefetcherHandle h);
 /* Start a background producer thread that reads batches from a
  * `MLXDataloader` and pushes them into the given `PrefetcherHandle`.
  * The function spawns a detached thread and returns 0 on success. The

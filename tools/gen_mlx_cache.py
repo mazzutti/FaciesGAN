@@ -12,6 +12,15 @@ import numpy as np
 import os
 import sys
 
+# Ensure the project root is on sys.path so imports like `datasets.*` work
+# when this script is executed from the `tools/` directory or elsewhere.
+try:
+    _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+    _REPO_ROOT = os.path.dirname(_THIS_DIR)
+    if _REPO_ROOT not in sys.path:
+        sys.path.insert(0, _REPO_ROOT)
+except Exception:
+    pass
 from datasets.torch.utils import to_facies_pyramids
 from datasets.torch.utils import to_seismic_pyramids
 from datasets.torch.utils import to_wells_pyramids

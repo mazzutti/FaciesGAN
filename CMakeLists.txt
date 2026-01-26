@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(FaciesGAN_MLXC LANGUAGES C CXX)
 
+# Export compile commands for IDEs (e.g. VSCode/C++ Intellisense)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Export compile_commands.json for editor integration")
+
 # Option to enable AddressSanitizer for debugging memory issues
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 
@@ -54,10 +57,12 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/utils.c
   # faciesgan-c/utils_extra.c (merged into utils.c)
   faciesgan-c/trainning/scheduler.c
+  faciesgan-c/trainning/array_helpers.c
   faciesgan-c/trainning/train_manager.c
   faciesgan-c/trainning/autodiff.c
   faciesgan-c/trainning/python_entry.c
   faciesgan-c/trainning/train_utils.c
+  faciesgan-c/trainning/mlx_compat.c
   faciesgan-c/io/npz_create.c
   faciesgan-c/io/npz_unzip.c
   faciesgan-c/third_party/miniz.c
@@ -195,6 +200,13 @@ if(Python3_FOUND)
   target_sources(faciesgan PRIVATE faciesgan-c/trainning/pybridge.c)
   target_include_directories(faciesgan PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c)
   target_link_libraries(faciesgan PRIVATE Python3::Python)
+  # Expose Python include dirs to the faciesgan target so IDEs can resolve
+  # Python headers for translation units that include <Python.h>.
+  if(TARGET Python3::Python)
+    if(Python3_INCLUDE_DIRS)
+      target_include_directories(faciesgan PRIVATE ${Python3_INCLUDE_DIRS})
+    endif()
+  endif()
 else()
   message(STATUS "Python3 development not found; building without Python bridge")
 endif()
@@ -206,47 +218,57 @@ endif()
 ## causing build failures when the source file was absent; the lightweight
 ## generator is available via `gen_cache_generate()` in the C generator.
 
-# Smoke-test executable for the new MLXTrainer API
-add_executable(c_trainer_smoke
-  faciesgan-c/tools/c_trainer_smoke.c
-)
-target_include_directories(c_trainer_smoke PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
-target_link_libraries(c_trainer_smoke PRIVATE mlxc custom_layer facies_prefetcher)
-target_sources(c_trainer_smoke PRIVATE faciesgan-c/trainning/mlx_trainer_api.c)
-if(Python3_FOUND)
-  target_sources(c_trainer_smoke PRIVATE faciesgan-c/trainning/pybridge.c)
-  target_include_directories(c_trainer_smoke PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c)
-  target_link_libraries(c_trainer_smoke PRIVATE Python3::Python)
+if(EXISTS "${PROJECT_SOURCE_DIR}/faciesgan-c/tools/c_trainer_smoke.c")
+  # Smoke-test executable for the new MLXTrainer API
+  add_executable(c_trainer_smoke
+    faciesgan-c/tools/c_trainer_smoke.c
+  )
+  target_include_directories(c_trainer_smoke PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+  target_link_libraries(c_trainer_smoke PRIVATE mlxc custom_layer facies_prefetcher)
+  target_sources(c_trainer_smoke PRIVATE faciesgan-c/trainning/mlx_trainer_api.c)
+  if(Python3_FOUND)
+    target_sources(c_trainer_smoke PRIVATE faciesgan-c/trainning/pybridge.c)
+    target_include_directories(c_trainer_smoke PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c)
+    target_link_libraries(c_trainer_smoke PRIVATE Python3::Python)
+  endif()
 endif()
 
-# Small test executable for prefetcher iterator
-add_executable(prefetcher_test
-  faciesgan-c/tools/prefetcher_test.c
-)
-target_include_directories(prefetcher_test PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
-target_link_libraries(prefetcher_test PRIVATE mlxc facies_prefetcher)
-target_link_libraries(prefetcher_test PRIVATE custom_layer)
+if(EXISTS "${PROJECT_SOURCE_DIR}/faciesgan-c/tools/prefetcher_test.c")
+  # Small test executable for prefetcher iterator
+  add_executable(prefetcher_test
+    faciesgan-c/tools/prefetcher_test.c
+  )
+  target_include_directories(prefetcher_test PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+  target_link_libraries(prefetcher_test PRIVATE mlxc facies_prefetcher)
+  target_link_libraries(prefetcher_test PRIVATE custom_layer)
+endif()
 
-# Direct NPZ -> stacked .npy comparator helper
-add_executable(compare_direct
-  faciesgan-c/tools/compare_direct.c
-)
-target_include_directories(compare_direct PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
-target_link_libraries(compare_direct PRIVATE mlxc facies_prefetcher)
-target_link_libraries(compare_direct PRIVATE custom_layer)
+if(EXISTS "${PROJECT_SOURCE_DIR}/faciesgan-c/tools/compare_direct.c")
+  # Direct NPZ -> stacked .npy comparator helper
+  add_executable(compare_direct
+    faciesgan-c/tools/compare_direct.c
+  )
+  target_include_directories(compare_direct PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+  target_link_libraries(compare_direct PRIVATE mlxc facies_prefetcher)
+  target_link_libraries(compare_direct PRIVATE custom_layer)
+endif()
  
-# Dataloader sampler test
-add_executable(dataloader_sampler_test
-  faciesgan-c/tools/dataloader_sampler_test.c
-)
-target_include_directories(dataloader_sampler_test PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
-target_link_libraries(dataloader_sampler_test PRIVATE mlxc facies_prefetcher custom_layer)
+if(EXISTS "${PROJECT_SOURCE_DIR}/faciesgan-c/tools/dataloader_sampler_test.c")
+  # Dataloader sampler test
+  add_executable(dataloader_sampler_test
+    faciesgan-c/tools/dataloader_sampler_test.c
+  )
+  target_include_directories(dataloader_sampler_test PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+  target_link_libraries(dataloader_sampler_test PRIVATE mlxc facies_prefetcher custom_layer)
+endif()
 
-add_executable(facies_worker
-  faciesgan-c/tools/facies_worker.c
-)
-target_include_directories(facies_worker PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
-target_link_libraries(facies_worker PRIVATE mlxc facies_prefetcher custom_layer)
+if(EXISTS "${PROJECT_SOURCE_DIR}/faciesgan-c/tools/facies_worker.c")
+  add_executable(facies_worker
+    faciesgan-c/tools/facies_worker.c
+  )
+  target_include_directories(facies_worker PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
+  target_link_libraries(facies_worker PRIVATE mlxc facies_prefetcher custom_layer)
+endif()
 include(GNUInstallDirs)
 install(TARGETS custom_layer
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

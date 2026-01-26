@@ -1,12 +1,12 @@
 #include "scheduler.h"
-#include <stdlib.h>
-#include <string.h>
-#include <math.h>
+#include "array_helpers.h"
 #include "io/npz_create.h"
 #include "io/npz_unzip.h"
+#include <math.h>
+#include <stdlib.h>
+#include <string.h>
 
-struct MLXScheduler
-{
+struct MLXScheduler {
     int is_multistep;
     /* step-lr fields */
     int step_size;
@@ -27,8 +27,7 @@ struct MLXScheduler
 };
 
 /* Non-nested helper: find a key in JSON and return pointer after ':' */
-static const char *find_key_in(const char *p, const char *key)
-{
+static const char *find_key_in(const char *p, const char *key) {
     const char *k = strstr(p, key);
     if (!k)
         return NULL;
@@ -39,57 +38,36 @@ static const char *find_key_in(const char *p, const char *key)
 }
 
 /* After loading state, sync attached optimizer (if any) to current lr. */
-static void sync_attached_optimizer_after_load(MLXScheduler *s)
-{
+static void sync_attached_optimizer_after_load(MLXScheduler *s) {
     if (!s || !s->attached_optimizer)
         return;
     float tmp[16];
-    int n = mlx_scheduler_lr_for_step(s, s->last_step < 0 ? 0 : s->last_step, tmp, sizeof(tmp) / sizeof(tmp[0]));
+    int n = mlx_scheduler_lr_for_step(s, s->last_step < 0 ? 0 : s->last_step, tmp,
+                                      sizeof(tmp) / sizeof(tmp[0]));
     if (n > 0)
         mlx_optimizer_set_lr(s->attached_optimizer, tmp[0]);
 }
 
-static void update_cached_last_lr(MLXScheduler *s, const float *lrs, int n)
-{
+static void update_cached_last_lr(MLXScheduler *s, const float *lrs, int n) {
     if (!s)
         return;
-    if (s->_last_lr)
-        free(s->_last_lr);
+    /* reuse helper to free then copy */
+    mlx_free_float_array(&s->_last_lr, &s->_last_lr_n);
     if (n <= 0)
-    {
-        s->_last_lr = NULL;
-        s->_last_lr_n = 0;
         return;
-    }
-    s->_last_lr = (float *)malloc(sizeof(float) * n);
-    if (!s->_last_lr)
-    {
-        s->_last_lr_n = 0;
-        return;
-    }
-    for (int i = 0; i < n; ++i)
-        s->_last_lr[i] = lrs[i];
-    s->_last_lr_n = n;
+    mlx_copy_float_array(&s->_last_lr, &s->_last_lr_n, lrs, n);
 }
 
-static void print_lr_update(MLXScheduler *s, int step, const float *lrs, int n)
-{
+static void print_lr_update(MLXScheduler *s, int step, const float *lrs,
+                            int n) {
     if (!s || !s->verbose)
         return;
-    printf("[scheduler] step=%d lrs=[", step);
-    for (int i = 0; i < n; ++i)
-    {
-        printf("%g", lrs[i]);
-        if (i + 1 < n)
-            printf(", ");
-    }
-    printf("]\n");
+    /* verbose scheduler logging removed */
 }
 
-MLXScheduler *mlx_scheduler_step_lr_create(int step_size, float gamma)
-{
-    MLXScheduler *s = (MLXScheduler *)malloc(sizeof(MLXScheduler));
-    if (!s)
+MLXScheduler *mlx_scheduler_step_lr_create(int step_size, float gamma) {
+    MLXScheduler *s = NULL;
+    if (mlx_alloc_pod((void **)&s, sizeof(MLXScheduler), 1) != 0)
         return NULL;
     s->is_multistep = 0;
     s->step_size = step_size;
@@ -103,11 +81,13 @@ MLXScheduler *mlx_scheduler_step_lr_create(int step_size, float gamma)
     s->verbose = 0;
     s->_last_lr = NULL;
     s->_last_lr_n = 0;
+
     return s;
 }
 
-MLXScheduler *mlx_scheduler_step_lr_create_with_init(int step_size, float gamma, const float *init_lr, int n_init_lrs)
-{
+MLXScheduler *mlx_scheduler_step_lr_create_with_init(int step_size, float gamma,
+        const float *init_lr,
+        int n_init_lrs) {
     MLXScheduler *s = mlx_scheduler_step_lr_create(step_size, gamma);
     if (!s)
         return NULL;
@@ -116,20 +96,18 @@ MLXScheduler *mlx_scheduler_step_lr_create_with_init(int step_size, float gamma,
     return s;
 }
 
-MLXScheduler *mlx_scheduler_multistep_create(const int *milestones, int n_milestones, float gamma)
-{
+MLXScheduler *mlx_scheduler_multistep_create(const int *milestones,
+        int n_milestones, float gamma) {
     if (!milestones || n_milestones <= 0)
         return NULL;
-    MLXScheduler *s = (MLXScheduler *)malloc(sizeof(MLXScheduler));
-    if (!s)
+    MLXScheduler *s = NULL;
+    if (mlx_alloc_pod((void **)&s, sizeof(MLXScheduler), 1) != 0)
         return NULL;
     s->is_multistep = 1;
     s->step_size = 0;
     s->n_milestones = n_milestones;
-    s->milestones = (int *)malloc(sizeof(int) * n_milestones);
-    if (!s->milestones)
-    {
-        free(s);
+    if (mlx_alloc_int_array(&s->milestones, n_milestones) != 0) {
+        mlx_free_pod((void **)&s);
         return NULL;
     }
     for (int i = 0; i < n_milestones; ++i)
@@ -142,12 +120,17 @@ MLXScheduler *mlx_scheduler_multistep_create(const int *milestones, int n_milest
     s->verbose = 0;
     s->_last_lr = NULL;
     s->_last_lr_n = 0;
+
     return s;
 }
 
-MLXScheduler *mlx_scheduler_multistep_create_with_init(const int *milestones, int n_milestones, float gamma, const float *init_lr, int n_init_lrs)
-{
-    MLXScheduler *s = mlx_scheduler_multistep_create(milestones, n_milestones, gamma);
+MLXScheduler *mlx_scheduler_multistep_create_with_init(const int *milestones,
+        int n_milestones,
+        float gamma,
+        const float *init_lr,
+        int n_init_lrs) {
+    MLXScheduler *s =
+        mlx_scheduler_multistep_create(milestones, n_milestones, gamma);
     if (!s)
         return NULL;
     if (init_lr && n_init_lrs > 0)
@@ -155,21 +138,17 @@ MLXScheduler *mlx_scheduler_multistep_create_with_init(const int *milestones, in
     return s;
 }
 
-void mlx_scheduler_free(MLXScheduler *s)
-{
+void mlx_scheduler_free(MLXScheduler *s) {
     if (!s)
         return;
-    if (s->milestones)
-        free(s->milestones);
-    if (s->base_lrs)
-        free(s->base_lrs);
-    if (s->_last_lr)
-        free(s->_last_lr);
-    free(s);
+
+    mlx_free_int_array(&s->milestones, &s->n_milestones);
+    mlx_free_float_array(&s->base_lrs, &s->n_base_lrs);
+    mlx_free_float_array(&s->_last_lr, &s->_last_lr_n);
+    mlx_free_pod((void **)&s);
 }
 
-static void ensure_base_lrs_from_optimizer(MLXScheduler *s, MLXOptimizer *opt)
-{
+static void ensure_base_lrs_from_optimizer(MLXScheduler *s, MLXOptimizer *opt) {
     if (!s)
         return;
     if (s->n_base_lrs > 0)
@@ -177,35 +156,30 @@ static void ensure_base_lrs_from_optimizer(MLXScheduler *s, MLXOptimizer *opt)
     if (!opt)
         return;
     float cur = mlx_optimizer_get_lr(opt);
-    s->base_lrs = (float *)malloc(sizeof(float));
-    if (!s->base_lrs)
+    if (mlx_alloc_float_buf(&s->base_lrs, 1) != 0)
         return;
     s->base_lrs[0] = cur;
     s->n_base_lrs = 1;
 }
 
-int mlx_scheduler_lr_for_step(MLXScheduler *s, int step, float *out_lrs, int max_out)
-{
+int mlx_scheduler_lr_for_step(MLXScheduler *s, int step, float *out_lrs,
+                              int max_out) {
     if (!s || !out_lrs || max_out <= 0)
         return 0;
 
     /* Determine multiplicative factor */
     int count = 0;
-    if (s->is_multistep)
-    {
+    if (s->is_multistep) {
         for (int i = 0; i < s->n_milestones; ++i)
             if (step >= s->milestones[i])
                 ++count;
-    }
-    else
-    {
+    } else {
         if (s->step_size > 0)
             count = step / s->step_size;
     }
     float mul = powf(s->gamma, (float)count);
 
-    if (s->n_base_lrs > 0)
-    {
+    if (s->n_base_lrs > 0) {
         int n = s->n_base_lrs < max_out ? s->n_base_lrs : max_out;
         for (int i = 0; i < n; ++i)
             out_lrs[i] = s->base_lrs[i] * mul;
@@ -213,8 +187,7 @@ int mlx_scheduler_lr_for_step(MLXScheduler *s, int step, float *out_lrs, int max
     }
 
     /* No base_lrs defined: if there is an attached optimizer, use its lr */
-    if (s->attached_optimizer)
-    {
+    if (s->attached_optimizer) {
         float cur = mlx_optimizer_get_lr(s->attached_optimizer);
         out_lrs[0] = cur * mul;
         return 1;
@@ -224,8 +197,7 @@ int mlx_scheduler_lr_for_step(MLXScheduler *s, int step, float *out_lrs, int max
     return 0;
 }
 
-int mlx_scheduler_get_lr(MLXScheduler *s, float *out_lrs, int max_out)
-{
+int mlx_scheduler_get_lr(MLXScheduler *s, float *out_lrs, int max_out) {
     if (!s)
         return 0;
     int step = s->last_step;
@@ -234,51 +206,42 @@ int mlx_scheduler_get_lr(MLXScheduler *s, float *out_lrs, int max_out)
     return mlx_scheduler_lr_for_step(s, step, out_lrs, max_out);
 }
 
-void mlx_scheduler_set_base_lrs(MLXScheduler *s, const float *base_lrs, int n_base_lrs)
-{
+void mlx_scheduler_set_base_lrs(MLXScheduler *s, const float *base_lrs,
+                                int n_base_lrs) {
     if (!s)
         return;
-    if (s->base_lrs)
-        free(s->base_lrs);
-    if (!base_lrs || n_base_lrs <= 0)
-    {
+    /* free existing base_lrs then copy new values using helpers */
+
+    mlx_free_float_array(&s->base_lrs, &s->n_base_lrs);
+    if (!base_lrs || n_base_lrs <= 0) {
         s->base_lrs = NULL;
         s->n_base_lrs = 0;
         return;
     }
-    s->base_lrs = (float *)malloc(sizeof(float) * n_base_lrs);
-    if (!s->base_lrs)
-    {
-        s->n_base_lrs = 0;
-        return;
-    }
-    memcpy(s->base_lrs, base_lrs, sizeof(float) * n_base_lrs);
-    s->n_base_lrs = n_base_lrs;
+    mlx_copy_float_array(&s->base_lrs, &s->n_base_lrs, base_lrs,
+                         n_base_lrs);
+
 }
 
-void mlx_scheduler_set_last_step(MLXScheduler *s, int last_step)
-{
+void mlx_scheduler_set_last_step(MLXScheduler *s, int last_step) {
     if (!s)
         return;
     s->last_step = last_step;
 }
 
-int mlx_scheduler_get_last_step(MLXScheduler *s)
-{
+int mlx_scheduler_get_last_step(MLXScheduler *s) {
     if (!s)
         return -1;
     return s->last_step;
 }
 
-void mlx_scheduler_attach_optimizer(MLXScheduler *s, MLXOptimizer *opt)
-{
+void mlx_scheduler_attach_optimizer(MLXScheduler *s, MLXOptimizer *opt) {
     if (!s)
         return;
     s->attached_optimizer = opt;
 }
 
-int mlx_scheduler_serialize_state(MLXScheduler *s, char **out_json)
-{
+int mlx_scheduler_serialize_state(MLXScheduler *s, char **out_json) {
     if (!s || !out_json)
         return -1;
     /* Serialize into stable JSON. */
@@ -289,14 +252,14 @@ int mlx_scheduler_serialize_state(MLXScheduler *s, char **out_json)
     int off = 0;
     off += snprintf(buf + off, est - off, "{");
     off += snprintf(buf + off, est - off, "\"last_step\":%d,", s->last_step);
-    off += snprintf(buf + off, est - off, "\"is_multistep\":%d,", s->is_multistep);
+    off +=
+        snprintf(buf + off, est - off, "\"is_multistep\":%d,", s->is_multistep);
     off += snprintf(buf + off, est - off, "\"step_size\":%d,", s->step_size);
     off += snprintf(buf + off, est - off, "\"gamma\":%g,", s->gamma);
 
     /* base_lrs array */
     off += snprintf(buf + off, est - off, "\"base_lrs\":[");
-    for (int i = 0; i < s->n_base_lrs; ++i)
-    {
+    for (int i = 0; i < s->n_base_lrs; ++i) {
         off += snprintf(buf + off, est - off, "%g", s->base_lrs[i]);
         if (i + 1 < s->n_base_lrs)
             off += snprintf(buf + off, est - off, ",");
@@ -305,10 +268,8 @@ int mlx_scheduler_serialize_state(MLXScheduler *s, char **out_json)
 
     /* _last_lr cache (if present) */
     off += snprintf(buf + off, est - off, "\"_last_lr\":[");
-    if (s->_last_lr && s->_last_lr_n > 0)
-    {
-        for (int i = 0; i < s->_last_lr_n; ++i)
-        {
+    if (s->_last_lr && s->_last_lr_n > 0) {
+        for (int i = 0; i < s->_last_lr_n; ++i) {
             off += snprintf(buf + off, est - off, "%g", s->_last_lr[i]);
             if (i + 1 < s->_last_lr_n)
                 off += snprintf(buf + off, est - off, ",");
@@ -318,8 +279,7 @@ int mlx_scheduler_serialize_state(MLXScheduler *s, char **out_json)
 
     /* milestones array */
     off += snprintf(buf + off, est - off, "\"milestones\":[");
-    for (int i = 0; i < s->n_milestones; ++i)
-    {
+    for (int i = 0; i < s->n_milestones; ++i) {
         off += snprintf(buf + off, est - off, "%d", s->milestones[i]);
         if (i + 1 < s->n_milestones)
             off += snprintf(buf + off, est - off, ",");
@@ -331,8 +291,7 @@ int mlx_scheduler_serialize_state(MLXScheduler *s, char **out_json)
     return 0;
 }
 
-int mlx_scheduler_load_state_from_json(MLXScheduler *s, const char *json_str)
-{
+int mlx_scheduler_load_state_from_json(MLXScheduler *s, const char *json_str) {
     if (!s || !json_str)
         return -1;
     /* Minimal JSON parser tailored for our schema. Not a general JSON parser. */
@@ -354,40 +313,35 @@ int mlx_scheduler_load_state_from_json(MLXScheduler *s, const char *json_str)
 
     /* parse base_lrs array */
     const char *bstart = strstr(p, "\"base_lrs\"");
-    if (bstart)
-    {
+    if (bstart) {
         const char *lb = strchr(bstart, '[');
         const char *rb = lb ? strchr(lb, ']') : NULL;
-        if (lb && rb && rb > lb)
-        {
+        if (lb && rb && rb > lb) {
             int n = 0;
             const char *q = lb + 1;
-            while (q < rb)
-            {
-                while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t' || *q == ','))
+            while (q < rb) {
+                while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t' ||
+                                  *q == ','))
                     q++;
                 if (q >= rb)
                     break;
                 char *endptr = NULL;
-                (void)strtod(q, &endptr);
-                if (endptr && endptr > q)
-                {
+                strtod(q, &endptr);
+                if (endptr && endptr > q) {
                     n++;
                     q = endptr;
-                }
-                else
+                } else
                     break;
             }
-            if (n > 0)
-            {
+            if (n > 0) {
                 if (s->base_lrs)
-                    free(s->base_lrs);
-                s->base_lrs = (float *)malloc(sizeof(float) * n);
-                s->n_base_lrs = n;
+                    mlx_free_float_array(&s->base_lrs, &s->n_base_lrs);
+                if (mlx_alloc_float_buf(&s->base_lrs, n) == 0)
+                    s->n_base_lrs = n;
                 q = lb + 1;
-                for (int i = 0; i < n; ++i)
-                {
-                    while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t' || *q == ','))
+                for (int i = 0; i < n; ++i) {
+                    while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' ||
+                                      *q == '\t' || *q == ','))
                         q++;
                     if (q >= rb)
                         break;
@@ -402,40 +356,35 @@ int mlx_scheduler_load_state_from_json(MLXScheduler *s, const char *json_str)
 
     /* parse _last_lr array if present */
     const char *lstart = strstr(p, "\"_last_lr\"");
-    if (lstart)
-    {
+    if (lstart) {
         const char *lb = strchr(lstart, '[');
         const char *rb = lb ? strchr(lb, ']') : NULL;
-        if (lb && rb && rb > lb)
-        {
+        if (lb && rb && rb > lb) {
             int n = 0;
             const char *q = lb + 1;
-            while (q < rb)
-            {
-                while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t' || *q == ','))
+            while (q < rb) {
+                while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t' ||
+                                  *q == ','))
                     q++;
                 if (q >= rb)
                     break;
                 char *endptr = NULL;
-                (void)strtod(q, &endptr);
-                if (endptr && endptr > q)
-                {
+                strtod(q, &endptr);
+                if (endptr && endptr > q) {
                     n++;
                     q = endptr;
-                }
-                else
+                } else
                     break;
             }
-            if (n > 0)
-            {
+            if (n > 0) {
                 if (s->_last_lr)
-                    free(s->_last_lr);
-                s->_last_lr = (float *)malloc(sizeof(float) * n);
-                s->_last_lr_n = n;
+                    mlx_free_float_array(&s->_last_lr, &s->_last_lr_n);
+                if (mlx_alloc_float_buf(&s->_last_lr, n) == 0)
+                    s->_last_lr_n = n;
                 q = lb + 1;
-                for (int i = 0; i < n; ++i)
-                {
-                    while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t' || *q == ','))
+                for (int i = 0; i < n; ++i) {
+                    while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' ||
+                                      *q == '\t' || *q == ','))
                         q++;
                     if (q >= rb)
                         break;
@@ -449,40 +398,35 @@ int mlx_scheduler_load_state_from_json(MLXScheduler *s, const char *json_str)
     }
     /* parse milestones array */
     const char *mstart = strstr(p, "\"milestones\"");
-    if (mstart)
-    {
+    if (mstart) {
         const char *lb = strchr(mstart, '[');
         const char *rb = lb ? strchr(lb, ']') : NULL;
-        if (lb && rb && rb > lb)
-        {
+        if (lb && rb && rb > lb) {
             int n = 0;
             const char *q = lb + 1;
-            while (q < rb)
-            {
-                while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t' || *q == ','))
+            while (q < rb) {
+                while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t' ||
+                                  *q == ','))
                     q++;
                 if (q >= rb)
                     break;
                 char *endptr = NULL;
-                (void)strtol(q, &endptr, 10);
-                if (endptr && endptr > q)
-                {
+                strtol(q, &endptr, 10);
+                if (endptr && endptr > q) {
                     n++;
                     q = endptr;
-                }
-                else
+                } else
                     break;
             }
-            if (n > 0)
-            {
+            if (n > 0) {
                 if (s->milestones)
-                    free(s->milestones);
-                s->milestones = (int *)malloc(sizeof(int) * n);
-                s->n_milestones = n;
+                    mlx_free_int_array(&s->milestones, &s->n_milestones);
+                if (mlx_alloc_int_array(&s->milestones, n) == 0)
+                    s->n_milestones = n;
                 q = lb + 1;
-                for (int i = 0; i < n; ++i)
-                {
-                    while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' || *q == '\t' || *q == ','))
+                for (int i = 0; i < n; ++i) {
+                    while (q < rb && (*q == ' ' || *q == '\n' || *q == '\r' ||
+                                      *q == '\t' || *q == ','))
                         q++;
                     if (q >= rb)
                         break;
@@ -499,8 +443,7 @@ int mlx_scheduler_load_state_from_json(MLXScheduler *s, const char *json_str)
     sync_attached_optimizer_after_load(s);
     return 0;
 }
-int mlx_scheduler_save_to_npz(MLXScheduler *s, const char *npz_path)
-{
+int mlx_scheduler_save_to_npz(MLXScheduler *s, const char *npz_path) {
     if (!s || !npz_path)
         return -1;
     char *json = NULL;
@@ -517,8 +460,7 @@ int mlx_scheduler_save_to_npz(MLXScheduler *s, const char *npz_path)
     return rc;
 }
 
-int mlx_scheduler_load_from_npz(MLXScheduler *s, const char *npz_path)
-{
+int mlx_scheduler_load_from_npz(MLXScheduler *s, const char *npz_path) {
     if (!s || !npz_path)
         return -1;
     void *buf = NULL;
@@ -532,8 +474,8 @@ int mlx_scheduler_load_from_npz(MLXScheduler *s, const char *npz_path)
     return rc;
 }
 
-int mlx_scheduler_step_nullable(MLXScheduler *s, const int *step, float *out_lrs, int max_out)
-{
+int mlx_scheduler_step_nullable(MLXScheduler *s, const int *step,
+                                float *out_lrs, int max_out) {
     if (!s || !out_lrs || max_out <= 0)
         return 0;
 
@@ -547,8 +489,8 @@ int mlx_scheduler_step_nullable(MLXScheduler *s, const int *step, float *out_lrs
     return n;
 }
 
-int mlx_scheduler_step_and_get_lr(MLXScheduler *s, int step, MLXOptimizer *opt, float *out_lrs, int max_out)
-{
+int mlx_scheduler_step_and_get_lr(MLXScheduler *s, int step, MLXOptimizer *opt,
+                                  float *out_lrs, int max_out) {
     if (!s || !out_lrs || max_out <= 0)
         return 0;
 
@@ -562,8 +504,7 @@ int mlx_scheduler_step_and_get_lr(MLXScheduler *s, int step, MLXOptimizer *opt, 
     /* compute lrs for this step */
     float tmp[16];
     int n = mlx_scheduler_lr_for_step(s, step, tmp, sizeof(tmp) / sizeof(tmp[0]));
-    if (n <= 0)
-    {
+    if (n <= 0) {
         s->last_step = step;
         return 0;
     }
@@ -585,54 +526,47 @@ int mlx_scheduler_step_and_get_lr(MLXScheduler *s, int step, MLXOptimizer *opt, 
     return to_copy;
 }
 
-void mlx_scheduler_step_auto(MLXScheduler *s, MLXOptimizer *opt)
-{
+void mlx_scheduler_step_auto(MLXScheduler *s, MLXOptimizer *opt) {
     if (!s)
         return;
     int next = s->last_step < 0 ? 0 : s->last_step + 1;
     mlx_scheduler_step(s, next, opt);
 }
 
-int mlx_scheduler_call(MLXScheduler *s, int step, float *out_lrs, int max_out)
-{
+int mlx_scheduler_call(MLXScheduler *s, int step, float *out_lrs, int max_out) {
     return mlx_scheduler_lr_for_step(s, step, out_lrs, max_out);
 }
 
-void mlx_scheduler_apply_to_optimizers(MLXScheduler *s, MLXOptimizer **opts, int n_opts)
-{
+void mlx_scheduler_apply_to_optimizers(MLXScheduler *s, MLXOptimizer **opts,
+                                       int n_opts) {
     if (!s || !opts || n_opts <= 0)
         return;
     float *tmp = NULL;
     int n = 0;
     int alloced = 0;
-    if (s->n_base_lrs > 0)
-    {
+    if (s->n_base_lrs > 0) {
         tmp = s->base_lrs;
         n = s->n_base_lrs;
-    }
-    else
-    {
-        tmp = (float *)malloc(sizeof(float) * 1);
-        if (!tmp)
+    } else {
+        if (mlx_alloc_float_buf(&tmp, 1) != 0)
             return;
-        tmp[0] = s->attached_optimizer ? mlx_optimizer_get_lr(s->attached_optimizer) : 0.0f;
+        tmp[0] = s->attached_optimizer ? mlx_optimizer_get_lr(s->attached_optimizer)
+                 : 0.0f;
         n = 1;
         alloced = 1;
     }
 
-    for (int i = 0; i < n_opts; ++i)
-    {
+    for (int i = 0; i < n_opts; ++i) {
         float v = tmp[i < n ? i : (n - 1)];
         if (opts[i])
             mlx_optimizer_set_lr(opts[i], v);
     }
 
     if (alloced)
-        free(tmp);
+        mlx_free_float_buf(&tmp, NULL);
 }
 
-void mlx_scheduler_step(MLXScheduler *s, int step, MLXOptimizer *opt)
-{
+void mlx_scheduler_step(MLXScheduler *s, int step, MLXOptimizer *opt) {
     if (!s)
         return;
 
@@ -646,8 +580,7 @@ void mlx_scheduler_step(MLXScheduler *s, int step, MLXOptimizer *opt)
     /* compute lrs for this step */
     float tmp[16];
     int n = mlx_scheduler_lr_for_step(s, step, tmp, sizeof(tmp) / sizeof(tmp[0]));
-    if (n <= 0)
-    {
+    if (n <= 0) {
         /* still update last_step */
         s->last_step = step;
         return;

@@ -12,6 +12,7 @@
  * simple adapter path working without requiring callers to free the
  * user_ctx separately. */
 #include "facies_gan.h"
+#include "trainning/array_helpers.h"
 #include "utils.h"
 
 struct MLXBaseManager {
@@ -66,7 +67,8 @@ void mlx_base_manager_free(MLXBaseManager *mgr) {
     mgr->user_ctx = NULL;
   }
   for (size_t i = 0; i < mgr->shapes_count; ++i) {
-    free(mgr->shapes[i]);
+    if (mgr->shapes[i])
+      mlx_free_pod((void **)&mgr->shapes[i]);
   }
   free(mgr->shapes);
   free(mgr->shapes_ndim);
@@ -86,8 +88,8 @@ int mlx_base_manager_add_shape(MLXBaseManager *mgr, const int *shape,
     return -1;
   mgr->shapes = nshapes;
   mgr->shapes_ndim = nndim;
-  mgr->shapes[mgr->shapes_count] = (int *)malloc(sizeof(int) * ndim);
-  if (!mgr->shapes[mgr->shapes_count])
+  if (mlx_alloc_pod((void **)&mgr->shapes[mgr->shapes_count], sizeof(int),
+                    ndim) != 0)
     return -1;
   memcpy(mgr->shapes[mgr->shapes_count], shape, sizeof(int) * ndim);
   mgr->shapes_ndim[mgr->shapes_count] = ndim;
