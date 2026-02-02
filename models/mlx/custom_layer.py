@@ -254,9 +254,7 @@ class MLXSPADE(nn.Module):
         conditioning_input: mx.array,
         mode: Literal["linear"] = "linear",
         align_corners: bool = True,
-        return_intermediates: bool = False,
-    ) -> mx.array | tuple[mx.array, dict[str, mx.array]]:
-        intermediates: dict[str, mx.array] = {}
+    ) -> mx.array:
         activated_input = cast(
             mx.array,
             self.ensure_upsample(
@@ -270,11 +268,6 @@ class MLXSPADE(nn.Module):
         beta = self.mlp_beta(activated_input)
         normalized = self.norm(x)
         out = normalized * (1 + gamma) + beta
-        if return_intermediates:
-            intermediates["gamma"] = gamma
-            intermediates["beta"] = beta
-            intermediates["normed"] = normalized
-            return out, intermediates
         return out
 
 
@@ -322,27 +315,10 @@ class MLXSPADEConvBlock(nn.Module):
         _init_conv_weights(self.conv)
         self.activation = MLXLeakyReLU(negative_slope=0.2)
 
-    def __call__(
-        self, x: mx.array, cond: mx.array, return_intermediates: bool = False
-    ) -> mx.array | tuple[mx.array, dict[str, mx.array]]:
-        intermediates: dict[str, mx.array] = {}
-        if return_intermediates:
-            spade_out, spade_inter = self.spade(
-                x, cond, return_intermediates=True
-            )
-            intermediates["spade"] = spade_out
-            intermediates["gamma"] = spade_inter["gamma"]
-            intermediates["beta"] = spade_inter["beta"]
-            intermediates["normed"] = spade_inter["normed"]
-        else:
-            spade_out = self.spade(x, cond)
+    def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
+        spade_out = self.spade(x, cond)
         act_out = cast(mx.array, self.activation(spade_out))
-        if return_intermediates:
-            intermediates["act"] = act_out
         conv_out = self.conv(act_out)
-        if return_intermediates:
-            intermediates["conv"] = conv_out
-            return conv_out, intermediates
         return conv_out
 
     def reset_parameters(self) -> None:
@@ -428,36 +404,17 @@ class MLXSPADEGenerator(nn.Module):
         self.leaky_relu = MLXLeakyReLU(negative_slope=0.2)
         self.activation = nn.Tanh()
 
-    def __call__(
-        self, cond: mx.array, return_intermediates: bool = False
-    ) -> mx.array | tuple[mx.array, dict[str, mx.array]]:
-        intermediates: dict[str, mx.array] = {}
+    def __call__(self, cond: mx.array) -> mx.array:
         # Initial feature extraction
         x = self.init_conv(cond)
         x = cast(mx.array, self.leaky_relu(x))
-        if return_intermediates:
-            intermediates["gen_init"] = x
 
-        for i, block in enumerate(self.spade_blocks.layers):  # type: ignore
-            if return_intermediates:
-                out, inter = block(x, cond, return_intermediates=True)
-                x = cast(mx.array, out)
-                intermediates[f"gen_block_{i}"] = x
-                intermediates[f"gen_block_{i}_spade"] = inter["spade"]
-                intermediates[f"gen_block_{i}_gamma"] = inter["gamma"]
-                intermediates[f"gen_block_{i}_beta"] = inter["beta"]
-                intermediates[f"gen_block_{i}_normed"] = inter["normed"]
-                intermediates[f"gen_block_{i}_act"] = inter["act"]
-                intermediates[f"gen_block_{i}_conv"] = inter["conv"]
-            else:
-                x = cast(mx.array, block(x, cond))
+        for block in self.spade_blocks.layers:  # type: ignore
+            x = cast(mx.array, block(x, cond))
 
         # Final output layer
         tail = self.tail_conv(x)
         out = cast(mx.array, self.activation(tail))
-        if return_intermediates:
-            intermediates["gen_tail"] = out
-            return out, intermediates
         return out
 
     def reset_parameters(self) -> None:
@@ -488,7 +445,7 @@ class MLXScaleModule(nn.Module):
         self.tail = tail
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = self.head(x)
+        x = cast(mx.array, self.head(x))
         x = cast(mx.array, self.body(x))
         x = cast(mx.array, self.tail(x))
         return x
@@ -572,22 +529,6 @@ class MLXSPADEDiscriminator(nn.Module):
         x = self.head(x)
         x = cast(mx.array, self.body(x))
         return self.tail(x)
-
-    def forward_with_intermediates(self, x: mx.array) -> dict[str, Any]:
-        head_out = self.head(x)
-        body_outs: list[mx.array] = []
-        cur = head_out
-        layers = getattr(self.body, "layers", None)
-        if layers is None:
-            try:
-                layers = list(self.body)  # type: ignore[arg-type]
-            except Exception:
-                layers = []
-        for block in layers:  # type: ignore[assignment]
-            cur = cast(mx.array, block(cur))
-            body_outs.append(cur)
-        tail_out = self.tail(cur)
-        return {"head": head_out, "body": body_outs, "tail": tail_out}
 
     def reset_parameters(self) -> None:
         head_reset = getattr(cast(Any, self.head), "reset_parameters", None)

@@ -103,8 +103,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
         in_noise: mx.array | None = None,
         start_scale: int = 0,
         stop_scale: int | None = None,
-        collect_intermediates: bool = False,
-    ) -> mx.array | tuple[mx.array, dict[int, dict[str, mx.array]]]:
+    ) -> mx.array:
         """Generate facies through progressive pyramid synthesis.
 
         Parameters
@@ -137,8 +136,6 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             out_facie = in_noise
 
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
-
-        intermediates: dict[int, dict[str, mx.array]] = {}
         for index in range(start_scale, stop_scale + 1):
             height, width = out_facie.shape[1:3]
 
@@ -208,18 +205,10 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
                 z_mod = z_in
 
             out_mod = self.gens[index]
-            if collect_intermediates and isinstance(out_mod, MLXSPADEGenerator):
-                out_val, inter = out_mod(z_mod, return_intermediates=True)
-                inter["gen_in"] = z_mod
-                intermediates[index] = inter
-                out_facie = cast(mx.array, out_val) + out_facie
-            else:
-                out_tmp = cast(mx.array, out_mod(z_mod))
-                out_facie = out_tmp + out_facie
+            out_tmp = cast(mx.array, out_mod(z_mod))
+            out_facie = out_tmp + out_facie
         # Apply color quantization to enforce pure colors.
         out_facie = self.color_quantizer(out_facie)
-        if collect_intermediates:
-            return out_facie, intermediates
         return out_facie
 
     def create_scale(
