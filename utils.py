@@ -11,18 +11,70 @@ import hashlib
 import random
 import os
 from collections import OrderedDict
-from typing import Any, Self, cast
+from typing import Any, Self, cast, TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
 import scipy.stats as st
-import torch
+
+if TYPE_CHECKING:
+    import torch as torch
+else:
+    if os.getenv("FG_NO_TORCH_IMPORT") == "1":
+
+        class _TorchDevice:
+            def __init__(self, device: str = "cpu") -> None:
+                self.type = device
+
+            def __repr__(self) -> str:
+                return f"torch.device('{self.type}')"
+
+        class _TorchBackendsMPS:
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+            @staticmethod
+            def is_built() -> bool:
+                return True
+
+        class _TorchBackends:
+            mps = _TorchBackendsMPS()
+
+        class _TorchCuda:
+            @staticmethod
+            def is_available() -> bool:
+                return False
+
+        def _manual_seed(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        class _TorchStubTensor:
+            pass
+
+        class _TorchStub:
+            Tensor = _TorchStubTensor
+            device = _TorchDevice
+            backends = _TorchBackends()
+            cuda = _TorchCuda()
+            manual_seed = staticmethod(_manual_seed)
+
+        torch = _TorchStub()
+    else:
+        import torch
 from PIL import Image, ImageDraw, ImageFont
 
 import mlx.core as mx
 
 from config import RESULTS_DIR
-from typedefs import TTensor
+
+if TYPE_CHECKING:
+    from typedefs import TTensor
+else:
+    if os.getenv("FG_NO_TORCH_IMPORT") == "1":
+        TTensor = Any
+    else:
+        from typedefs import TTensor
 
 
 class ExtractUniqueColors:
@@ -552,7 +604,9 @@ def create_dirs(path: str) -> None:
         raise RuntimeError(msg, path, e)
 
 
-def np2torch(np_array: NDArray[np.float32], normalize: bool = False) -> torch.Tensor:
+def np2torch(
+    np_array: NDArray[np.float32], normalize: bool = False
+) -> torch.Tensor | NDArray[np.float32]:
     """Convert NumPy array to PyTorch tensor with optional normalization.
 
     Parameters
@@ -585,6 +639,8 @@ def np2torch(np_array: NDArray[np.float32], normalize: bool = False) -> torch.Te
         # (H, W, C) -> (C, H, W)
         arr = np.transpose(arr, (2, 0, 1))
     # For 2D arrays leave as-is (H, W) -> treat as single-channel
+    if not hasattr(torch, "from_numpy"):
+        return arr
     tensor = torch.from_numpy(arr).float()  # type: ignore
     if normalize:
         tensor = norm(tensor)
@@ -911,21 +967,34 @@ def plot_generated_facies(
         return
 
     fake_facies_arr: list[list[np.ndarray]] = []
-    if fake_facies.ndim == 5:
+    ndim = getattr(fake_facies, "ndim", None)
+    if ndim == 5:
         arr = fake_facies
         if not isinstance(arr, np.ndarray):
             arr = tensor2np(arr, denormalize=True)
-        # arr = np.asarray(arr, dtype=np.float32)
         num_real_facies = arr.shape[0]
         num_generated_per_real = arr.shape[1]
         fake_facies_arr = [
             [arr[i, j] for j in range(num_generated_per_real)]
             for i in range(num_real_facies)
         ]
+    elif ndim == 4:
+        arr = fake_facies
+        if not isinstance(arr, np.ndarray):
+            arr = tensor2np(arr, denormalize=True)
+        num_real_facies = arr.shape[0]
+        num_generated_per_real = 1
+        fake_facies_arr = [[arr[i]] for i in range(num_real_facies)]
+    elif ndim == 3:
+        arr = fake_facies
+        if not isinstance(arr, np.ndarray):
+            arr = tensor2np(arr, denormalize=True)
+        num_real_facies = 1
+        num_generated_per_real = 1
+        fake_facies_arr = [[arr]]
     else:
         num_real_facies = int(real_facies.shape[0])
-        num_generated_per_real = int(fake_facies[0].shape[0])
-        fake_facies_arr: list[list[np.ndarray]] = []
+        fake_facies_arr = []
         for ff in fake_facies:
             arr = ff
             if not isinstance(ff, np.ndarray):
@@ -937,6 +1006,10 @@ def plot_generated_facies(
                 )
             else:
                 fake_facies_arr.append(cast(list[np.ndarray], [arr]))
+        if not fake_facies_arr:
+            return
+        num_real_facies = min(num_real_facies, len(fake_facies_arr))
+        num_generated_per_real = max(len(row) for row in fake_facies_arr)
 
     if not isinstance(real_facies, np.ndarray):
         np_real_facies = tensor2np(real_facies, denormalize=True, ceiling=True)
@@ -947,6 +1020,16 @@ def plot_generated_facies(
         np_masks = masks if isinstance(masks, np.ndarray) else tensor2np(masks)
     else:
         np_masks = None
+
+    real_count = int(np_real_facies.shape[0]) if np_real_facies.ndim >= 4 else 1
+    mask_count = (
+        int(np_masks.shape[0])
+        if np_masks is not None and np_masks.ndim >= 3
+        else real_count
+    )
+    num_real_facies = min(num_real_facies, real_count, mask_count)
+    if num_real_facies <= 0:
+        return
 
     # Calculate grid dimensions with spacing and margins
     spacing = 20  # pixels between subplots
@@ -989,12 +1072,45 @@ def plot_generated_facies(
 
     # Extract unique colors from all real facies (do this once for all plots)
     # Instantiate helpers locally so callers can control device/config
-    extractor = ExtractUniqueColors(device=device)
     preprocessor = PreprocessWellMask(device=device)
     quantizer = QuantizeToPureColors(device=device)
 
-    pure_colors: np.ndarray = extractor(np2torch(np_real_facies), 0.01)
-    pure_colors = np.asarray(pure_colors)  # Ensure pure_colors is always a ndarray
+    torch_available = os.getenv("FG_NO_TORCH_IMPORT") != "1" and bool(
+        getattr(torch, "from_numpy", None)
+    )
+    if torch_available:
+        extractor = ExtractUniqueColors(device=device)
+        pure_colors: np.ndarray = extractor(np2torch(np_real_facies), 0.01)
+        pure_colors = np.asarray(pure_colors)
+    else:
+        arr = np.asarray(np_real_facies, dtype=np.float32)
+        if arr.ndim == 3:
+            arr = arr[None, ...]
+        if arr.ndim != 4:
+            pure_colors = np.array(
+                [
+                    [0.0, 0.0, 0.0],
+                    [1.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0],
+                    [0.0, 0.0, 1.0],
+                ],
+                dtype=np.float32,
+            )
+        else:
+            if arr.shape[-1] == 1:
+                arr = np.repeat(arr, 3, axis=-1)
+            elif arr.shape[-1] > 3:
+                arr = arr[..., :3]
+            # Downsample for speed
+            h, w = arr.shape[1], arr.shape[2]
+            step_h = max(1, h // 64)
+            step_w = max(1, w // 64)
+            sampled = arr[:, ::step_h, ::step_w, :]
+            colors = sampled.reshape(-1, 3)
+            tol = 0.01
+            if tol > 0:
+                colors = np.round(colors / tol) * tol
+            pure_colors = np.unique(colors, axis=0)
 
     for i in range(num_real_facies):
         # Preprocess well mask once for this row (reusable for real and all generated facies)
@@ -1073,8 +1189,9 @@ def plot_generated_facies(
         output_img.paste(real_img, (x_offset, y_offset + title_height))
 
         # Generated facies (remaining columns) - use RGB directly without colormap
-        for j in range(num_generated_per_real):
-            gen_arr = fake_facies_arr[i][j]
+        row = fake_facies_arr[i]
+        for j in range(min(num_generated_per_real, len(row))):
+            gen_arr = row[j]
             # Ensure gen_arr is a numpy float array in [0, 1]
             gen_arr_np = np.asarray(gen_arr, dtype=np.float32)
             if gen_arr_np.size == 0:
@@ -1159,6 +1276,36 @@ def plot_generated_facies(
 
     # Save directly
     output_img.save(f"{out_dir}/gen_{stage}_{index}.png", optimize=True)
+
+
+def load_facies_for_plot(
+    height: int,
+    width: int,
+    channels: int,
+    num_real: int,
+) -> np.ndarray:
+    """Load a facies batch for plotting when real data is missing.
+
+    Uses the same cached pyramid helpers as training to fetch a scale that
+    matches the requested spatial resolution. Returns values in [0, 1] and
+    channels-last layout (N, H, W, C).
+    """
+    from datasets.torch.utils import to_facies_pyramids
+
+    scale_list = ((1, height, width, channels),)
+    facies = to_facies_pyramids(scale_list, channels_last=True)
+    if len(facies) == 0:
+        return np.zeros((num_real, height, width, channels), dtype=np.float32)
+
+    arr = facies[0].numpy()
+    if arr.ndim == 3:
+        arr = arr[None, ...]
+    if num_real > 0 and arr.shape[0] > num_real:
+        arr = arr[:num_real]
+
+    arr = (arr + 1.0) / 2.0
+    arr = np.clip(arr, 0.0, 1.0)
+    return arr.astype(np.float32)
 
 
 def get_best_distribution(data: np.ndarray) -> tuple[str, float, tuple[Any, ...]]:

@@ -15,6 +15,7 @@
 #include "custom_layer.h"
 #include <limits.h>
 #include <mlx/c/mlx.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,11 +29,31 @@
 #include "../trainning/mlx_compat.h"
 #include "utils.h"
 
+/**
+ * Create a random normal array matching Python's weight initialization:
+ * weight = mx.random.normal(shape) * std
+ * where std defaults to 0.02
+ */
+static mlx_array mlx_init_conv_weight(const int *shape, int ndim, float std) {
+    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_array result = mlx_array_new();
+
+    /* Generate random normal with mean=0 and scale=std directly
+     * mlx_random_normal signature: (res, shape, ndim, dtype, loc, scale, key, stream) */
+    if (mlx_random_normal(&result, shape, ndim, MLX_FLOAT32, 0.0f, std,
+                          mlx_array_empty, s) != 0) {
+        /* Fallback to zeros if random fails */
+        mlx_zeros(&result, shape, ndim, MLX_FLOAT32, s);
+    }
+
+    mlx_stream_free(s);
+    return result;
+}
+
 struct MLXLeakyReLU {
     float negative_slope;
     /* cached scalar arrays to avoid reallocating per-forward call */
     mlx_array slope_scalar; /* holds negative_slope */
-    mlx_array two_scalar;   /* holds constant 2.0 */
     int has_cached_scalars;
 };
 
@@ -42,9 +63,8 @@ MLXLeakyReLU *mlx_leakyrelu_create(float negative_slope) {
         return NULL;
     m->negative_slope = negative_slope;
     m->has_cached_scalars = 0;
-    /* create scalar caches */
+    /* create scalar cache */
     m->slope_scalar = mlx_array_new_float(negative_slope);
-    m->two_scalar = mlx_array_new_float(2.0f);
     m->has_cached_scalars = 1;
     return m;
 }
@@ -54,14 +74,14 @@ void mlx_leakyrelu_free(MLXLeakyReLU *m) {
         return;
     if (m->has_cached_scalars) {
         mlx_array_free(m->slope_scalar);
-        mlx_array_free(m->two_scalar);
     }
     mlx_free_pod((void **)&m);
 }
 
 mlx_array_t mlx_leakyrelu_forward(MLXLeakyReLU *m, mlx_array_t x) {
-    /* Implement leaky-relu using mlx-c elementwise ops.
-     * out = max(x, x * negative_slope) via (a + b + sqrt((a-b)^2)) / 2
+    /* Implement leaky-relu using mlx_maximum for parity with Python MLX.
+     * out = max(x, x * negative_slope)
+     * Previous implementation used sqrt-based formula which has numerical precision issues.
      */
     if (!m)
         return x;
@@ -69,46 +89,18 @@ mlx_array_t mlx_leakyrelu_forward(MLXLeakyReLU *m, mlx_array_t x) {
     mlx_stream s = mlx_default_cpu_stream_new();
 
     mlx_array scaled = mlx_array_new();
-    mlx_array diff = mlx_array_new();
-    mlx_array diff_sq = mlx_array_new();
-    mlx_array absdiff = mlx_array_new();
-    mlx_array sum = mlx_array_new();
-    mlx_array tmp = mlx_array_new();
     mlx_array out = mlx_array_new();
 
     int err = 0;
 
+    /* scaled = x * negative_slope */
     if (mlx_multiply(&scaled, x, m->slope_scalar, s) != 0) {
         err = 1;
         goto cleanup;
     }
 
-    if (mlx_subtract(&diff, x, scaled, s) != 0) {
-        err = 1;
-        goto cleanup;
-    }
-
-    if (mlx_square(&diff_sq, diff, s) != 0) {
-        err = 1;
-        goto cleanup;
-    }
-
-    if (mlx_sqrt(&absdiff, diff_sq, s) != 0) {
-        err = 1;
-        goto cleanup;
-    }
-
-    if (mlx_add(&sum, x, scaled, s) != 0) {
-        err = 1;
-        goto cleanup;
-    }
-
-    if (mlx_add(&tmp, sum, absdiff, s) != 0) {
-        err = 1;
-        goto cleanup;
-    }
-
-    if (mlx_divide(&out, tmp, m->two_scalar, s) != 0) {
+    /* out = max(x, scaled) - this is the native LeakyReLU operation */
+    if (mlx_maximum(&out, x, scaled, s) != 0) {
         err = 1;
         goto cleanup;
     }
@@ -121,16 +113,6 @@ cleanup:
     /* Free temporaries if they were allocated (ctx==0 indicates empty) */
     if (scaled.ctx)
         mlx_array_free(scaled);
-    if (diff.ctx)
-        mlx_array_free(diff);
-    if (diff_sq.ctx)
-        mlx_array_free(diff_sq);
-    if (absdiff.ctx)
-        mlx_array_free(absdiff);
-    if (sum.ctx)
-        mlx_array_free(sum);
-    if (tmp.ctx)
-        mlx_array_free(tmp);
 
     /* Free the stream we created */
     mlx_stream_free(s);
@@ -254,6 +236,20 @@ void mlx_nn_instancenorm_free(void *handle) {
     mlx_free_pod((void **)&h);
 }
 
+mlx_array *mlx_nn_instancenorm_get_weight(void *handle) {
+    if (!handle)
+        return NULL;
+    mlx_nn_instancenorm *h = (mlx_nn_instancenorm *)handle;
+    return h->weight;
+}
+
+mlx_array *mlx_nn_instancenorm_get_bias(void *handle) {
+    if (!handle)
+        return NULL;
+    mlx_nn_instancenorm *h = (mlx_nn_instancenorm *)handle;
+    return h->bias;
+}
+
 struct MLXConvBlock {
     int use_norm;
     void *conv; /* pointer to mlx_array weight (allocated) */
@@ -288,22 +284,15 @@ MLXConvBlock *mlx_convblock_create(int in_ch, int out_ch, int kernel_size,
     m->in_ch = in_ch;
     m->out_ch = out_ch;
 
-    size_t wcount = (size_t)out_ch * (size_t)kernel_size * (size_t)kernel_size *
-                    (size_t)in_ch;
-    float *wbuf = (float *)calloc(wcount, sizeof(float));
-    if (wbuf) {
-        /* MLX canonical conv-weight layout: (out_ch, KH, KW, in_ch) */
-        int wshape[4] = {out_ch, kernel_size, kernel_size, in_ch};
-        mlx_array w = mlx_array_new_data(wbuf, wshape, 4, MLX_FLOAT32);
-        /* copy made by mlx_array_new_data; free host buffer */
-        free(wbuf);
-        mlx_array *wptr = NULL;
-        if (mlx_alloc_pod((void **)&wptr, sizeof(mlx_array), 1) == 0) {
-            *wptr = w;
-            m->conv = (void *)wptr;
-        } else {
-            mlx_array_free(w);
-        }
+    /* MLX canonical conv-weight layout: (out_ch, KH, KW, in_ch) */
+    int wshape[4] = {out_ch, kernel_size, kernel_size, in_ch};
+    mlx_array w = mlx_init_conv_weight(wshape, 4, 0.02f);
+    mlx_array *wptr = NULL;
+    if (mlx_alloc_pod((void **)&wptr, sizeof(mlx_array), 1) == 0) {
+        *wptr = w;
+        m->conv = (void *)wptr;
+    } else {
+        mlx_array_free(w);
     }
     return m;
 }
@@ -346,8 +335,9 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
         y = x;
     }
 
-    /* Instance normalization (NHWC): normalize across H and W axes */
-    if (m->use_norm) {
+    /* Instance normalization (NHWC): normalize across H and W axes, then apply affine */
+    if (m->use_norm && m->norm) {
+        mlx_nn_instancenorm *norm = (mlx_nn_instancenorm *)m->norm;
         const int axes[] = {1, 2};
         mlx_array mean = mlx_array_new();
         if (mlx_mean_axes(&mean, y, axes, 2, true, s) == 0) {
@@ -364,14 +354,35 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
                             if (mlx_sqrt(&std, var_eps, s) == 0) {
                                 mlx_array y_norm = mlx_array_new();
                                 if (mlx_divide(&y_norm, centered, std, s) == 0) {
-                                    /* replace y with normalized */
-                                    mlx_array_free(y);
-                                    y = y_norm;
+                                    /* Apply affine: y = y_norm * weight + bias */
+                                    if (norm->affine && norm->weight && norm->bias) {
+                                        mlx_array scaled = mlx_array_new();
+                                        if (mlx_multiply(&scaled, y_norm, *norm->weight, s) == 0) {
+                                            mlx_array affined = mlx_array_new();
+                                            if (mlx_add(&affined, scaled, *norm->bias, s) == 0) {
+                                                mlx_array_free(y);
+                                                mlx_array_free(y_norm);
+                                                y = affined;
+                                            } else {
+                                                mlx_array_free(y);
+                                                y = y_norm;
+                                            }
+                                            mlx_array_free(scaled);
+                                        } else {
+                                            mlx_array_free(y);
+                                            y = y_norm;
+                                        }
+                                    } else {
+                                        /* No affine: just use normalized */
+                                        mlx_array_free(y);
+                                        y = y_norm;
+                                    }
                                 }
                                 mlx_array_free(std);
                             }
                             mlx_array_free(var_eps);
                         }
+                        mlx_array_free(eps);
                         mlx_array_free(var);
                     }
                     mlx_array_free(sq);
@@ -384,6 +395,8 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
 
     /* Activation */
     mlx_array activated = mlx_leakyrelu_forward(m->activation, y);
+    if (y.ctx != x.ctx && y.ctx != activated.ctx)
+        mlx_array_free(y);
     return activated;
 }
 
@@ -414,10 +427,15 @@ void mlx_upsample_free(MLXUpsample *m) {
         mlx_free_pod((void **)&m);
 }
 
+/**
+ * Bilinear interpolation resize for NHWC tensors.
+ * Supports any scale factor including non-integer and downsampling.
+ * Matches Python's upsample_linear with align_corners=True.
+ */
 mlx_array_t mlx_upsample_forward(MLXUpsample *m, mlx_array_t x) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     size_t ndim = mlx_array_ndim(x);
     if (ndim != 4)
@@ -428,47 +446,243 @@ mlx_array_t mlx_upsample_forward(MLXUpsample *m, mlx_array_t x) {
     int in_w = shape[2];
     int c = shape[3];
 
-    if (in_h == m->out_h && in_w == m->out_w)
+    int out_h = m->out_h;
+    int out_w = m->out_w;
+
+    if (in_h == out_h && in_w == out_w)
         return x;
 
-    if (m->out_h % in_h != 0 || m->out_w % in_w != 0) {
-        /* Non-integer scale factors not supported by this simple repeat-based
-         * upsample */
-        return x;
-    }
+    /* ALWAYS use bilinear interpolation (align_corners=True) for parity with Python.
+     * Previous implementation used mlx_repeat_axis (nearest-neighbor) for integer
+     * scale factors, but Python's upsample_linear uses bilinear for ALL cases. */
 
-    int scale_h = m->out_h / in_h;
-    int scale_w = m->out_w / in_w;
+    /* Generate scaled indices for height dimension */
+    /* indices_h[i] = i * (in_h - 1) / (out_h - 1) */
+    mlx_array idx_h = mlx_array_new();
+    mlx_arange(&idx_h, 0.0, (double)out_h, 1.0, MLX_FLOAT32, s);
 
-    int tmp_alloc = 0;
-    mlx_array tmp = mlx_array_new();
-    if (scale_h > 1) {
-        if (mlx_repeat_axis(&tmp, x, scale_h, 1, s) != 0) {
-            return x;
-        }
-        tmp_alloc = 1;
-    } else {
-        /* reuse input as temporary holder (no allocation) */
-        tmp = x;
-        tmp_alloc = 0;
-    }
+    mlx_array scale_h_arr = mlx_array_new();
+    double h_scale = (out_h > 1) ? (double)(in_h - 1) / (double)(out_h - 1) : 0.0;
+    mlx_array_set_float32(&scale_h_arr, (float)h_scale);
+
+    mlx_array idx_h_scaled = mlx_array_new();
+    mlx_multiply(&idx_h_scaled, idx_h, scale_h_arr, s);
+    mlx_array_free(idx_h);
+    mlx_array_free(scale_h_arr);
+
+    /* Generate scaled indices for width dimension */
+    mlx_array idx_w = mlx_array_new();
+    mlx_arange(&idx_w, 0.0, (double)out_w, 1.0, MLX_FLOAT32, s);
+
+    mlx_array scale_w_arr = mlx_array_new();
+    double w_scale = (out_w > 1) ? (double)(in_w - 1) / (double)(out_w - 1) : 0.0;
+    mlx_array_set_float32(&scale_w_arr, (float)w_scale);
+
+    mlx_array idx_w_scaled = mlx_array_new();
+    mlx_multiply(&idx_w_scaled, idx_w, scale_w_arr, s);
+    mlx_array_free(idx_w);
+    mlx_array_free(scale_w_arr);
+
+    /* Clip indices to valid range */
+    mlx_array zero_arr = mlx_array_new();
+    mlx_array_set_float32(&zero_arr, 0.0f);
+    mlx_array max_h_arr = mlx_array_new();
+    mlx_array_set_float32(&max_h_arr, (float)(in_h - 1));
+    mlx_array max_w_arr = mlx_array_new();
+    mlx_array_set_float32(&max_w_arr, (float)(in_w - 1));
+
+    mlx_array idx_h_clipped = mlx_array_new();
+    mlx_clip(&idx_h_clipped, idx_h_scaled, zero_arr, max_h_arr, s);
+    mlx_array_free(idx_h_scaled);
+
+    mlx_array idx_w_clipped = mlx_array_new();
+    mlx_clip(&idx_w_clipped, idx_w_scaled, zero_arr, max_w_arr, s);
+    mlx_array_free(idx_w_scaled);
+    mlx_array_free(zero_arr);
+    mlx_array_free(max_h_arr);
+    mlx_array_free(max_w_arr);
+
+    /* Floor and ceil indices */
+    mlx_array idx_h_floor = mlx_array_new();
+    mlx_floor(&idx_h_floor, idx_h_clipped, s);
+    mlx_array idx_h_ceil = mlx_array_new();
+    mlx_ceil(&idx_h_ceil, idx_h_clipped, s);
+
+    mlx_array idx_w_floor = mlx_array_new();
+    mlx_floor(&idx_w_floor, idx_w_clipped, s);
+    mlx_array idx_w_ceil = mlx_array_new();
+    mlx_ceil(&idx_w_ceil, idx_w_clipped, s);
+
+    /* Compute weights */
+    mlx_array weight_h = mlx_array_new();
+    mlx_subtract(&weight_h, idx_h_clipped, idx_h_floor, s);
+    mlx_array weight_h_inv = mlx_array_new();
+    mlx_array one_arr = mlx_array_new();
+    mlx_array_set_float32(&one_arr, 1.0f);
+    mlx_subtract(&weight_h_inv, one_arr, weight_h, s);
+
+    mlx_array weight_w = mlx_array_new();
+    mlx_subtract(&weight_w, idx_w_clipped, idx_w_floor, s);
+    mlx_array weight_w_inv = mlx_array_new();
+    mlx_subtract(&weight_w_inv, one_arr, weight_w, s);
+    mlx_array_free(one_arr);
+    mlx_array_free(idx_h_clipped);
+    mlx_array_free(idx_w_clipped);
+
+    /* Convert indices to int32 for gather */
+    mlx_array idx_h_floor_i = mlx_array_new();
+    mlx_astype(&idx_h_floor_i, idx_h_floor, MLX_INT32, s);
+    mlx_array_free(idx_h_floor);
+    mlx_array idx_h_ceil_i = mlx_array_new();
+    mlx_astype(&idx_h_ceil_i, idx_h_ceil, MLX_INT32, s);
+    mlx_array_free(idx_h_ceil);
+    mlx_array idx_w_floor_i = mlx_array_new();
+    mlx_astype(&idx_w_floor_i, idx_w_floor, MLX_INT32, s);
+    mlx_array_free(idx_w_floor);
+    mlx_array idx_w_ceil_i = mlx_array_new();
+    mlx_astype(&idx_w_ceil_i, idx_w_ceil, MLX_INT32, s);
+    mlx_array_free(idx_w_ceil);
+
+    /* Gather samples at 4 corners using take along axis */
+    /* x shape: (B, in_h, in_w, C) */
+    /* We need to sample at (h_floor, w_floor), (h_floor, w_ceil), (h_ceil, w_floor), (h_ceil, w_ceil) */
+
+    /* First gather along height axis */
+    /* Reshape idx_h_floor_i to (1, out_h, 1, 1) for broadcasting */
+    int idx_h_shape[4] = {1, out_h, 1, 1};
+    mlx_array idx_h_floor_4d = mlx_array_new();
+    mlx_reshape(&idx_h_floor_4d, idx_h_floor_i, idx_h_shape, 4, s);
+    mlx_array_free(idx_h_floor_i);
+    mlx_array idx_h_ceil_4d = mlx_array_new();
+    mlx_reshape(&idx_h_ceil_4d, idx_h_ceil_i, idx_h_shape, 4, s);
+    mlx_array_free(idx_h_ceil_i);
+
+    /* Broadcast to (B, out_h, in_w, C) */
+    int bcast_h_shape[4] = {b, out_h, in_w, c};
+    mlx_array idx_h_floor_bcast = mlx_array_new();
+    mlx_broadcast_to(&idx_h_floor_bcast, idx_h_floor_4d, bcast_h_shape, 4, s);
+    mlx_array_free(idx_h_floor_4d);
+    mlx_array idx_h_ceil_bcast = mlx_array_new();
+    mlx_broadcast_to(&idx_h_ceil_bcast, idx_h_ceil_4d, bcast_h_shape, 4, s);
+    mlx_array_free(idx_h_ceil_4d);
+
+    /* Take along height axis */
+    mlx_array x_hfloor = mlx_array_new();
+    mlx_take_along_axis(&x_hfloor, x, idx_h_floor_bcast, 1, s);
+    mlx_array_free(idx_h_floor_bcast);
+    mlx_array x_hceil = mlx_array_new();
+    mlx_take_along_axis(&x_hceil, x, idx_h_ceil_bcast, 1, s);
+    mlx_array_free(idx_h_ceil_bcast);
+
+    /* Now gather along width axis */
+    int idx_w_shape[4] = {1, 1, out_w, 1};
+    mlx_array idx_w_floor_4d = mlx_array_new();
+    mlx_reshape(&idx_w_floor_4d, idx_w_floor_i, idx_w_shape, 4, s);
+    mlx_array_free(idx_w_floor_i);
+    mlx_array idx_w_ceil_4d = mlx_array_new();
+    mlx_reshape(&idx_w_ceil_4d, idx_w_ceil_i, idx_w_shape, 4, s);
+    mlx_array_free(idx_w_ceil_i);
+
+    /* Broadcast to (B, out_h, out_w, C) */
+    int bcast_w_shape[4] = {b, out_h, out_w, c};
+    mlx_array idx_w_floor_bcast = mlx_array_new();
+    mlx_broadcast_to(&idx_w_floor_bcast, idx_w_floor_4d, bcast_w_shape, 4, s);
+    mlx_array_free(idx_w_floor_4d);
+    mlx_array idx_w_ceil_bcast = mlx_array_new();
+    mlx_broadcast_to(&idx_w_ceil_bcast, idx_w_ceil_4d, bcast_w_shape, 4, s);
+    mlx_array_free(idx_w_ceil_4d);
+
+    /* Take along width axis for all 4 corners */
+    mlx_array x_tl = mlx_array_new(); /* top-left: h_floor, w_floor */
+    mlx_take_along_axis(&x_tl, x_hfloor, idx_w_floor_bcast, 2, s);
+    mlx_array x_tr = mlx_array_new(); /* top-right: h_floor, w_ceil */
+    mlx_take_along_axis(&x_tr, x_hfloor, idx_w_ceil_bcast, 2, s);
+    mlx_array_free(x_hfloor);
+    mlx_array x_bl = mlx_array_new(); /* bottom-left: h_ceil, w_floor */
+    mlx_take_along_axis(&x_bl, x_hceil, idx_w_floor_bcast, 2, s);
+    mlx_array x_br = mlx_array_new(); /* bottom-right: h_ceil, w_ceil */
+    mlx_take_along_axis(&x_br, x_hceil, idx_w_ceil_bcast, 2, s);
+    mlx_array_free(x_hceil);
+    mlx_array_free(idx_w_floor_bcast);
+    mlx_array_free(idx_w_ceil_bcast);
+
+    /* Reshape weights for broadcasting: (1, out_h, 1, 1) and (1, 1, out_w, 1) */
+    int wh_shape[4] = {1, out_h, 1, 1};
+    mlx_array wh = mlx_array_new();
+    mlx_reshape(&wh, weight_h, wh_shape, 4, s);
+    mlx_array_free(weight_h);
+    mlx_array wh_inv = mlx_array_new();
+    mlx_reshape(&wh_inv, weight_h_inv, wh_shape, 4, s);
+    mlx_array_free(weight_h_inv);
+
+    int ww_shape[4] = {1, 1, out_w, 1};
+    mlx_array ww = mlx_array_new();
+    mlx_reshape(&ww, weight_w, ww_shape, 4, s);
+    mlx_array_free(weight_w);
+    mlx_array ww_inv = mlx_array_new();
+    mlx_reshape(&ww_inv, weight_w_inv, ww_shape, 4, s);
+    mlx_array_free(weight_w_inv);
+
+    /* Bilinear interpolation: */
+    /* out = (1-wh)*(1-ww)*x_tl + (1-wh)*ww*x_tr + wh*(1-ww)*x_bl + wh*ww*x_br */
+
+    /* Weight for top-left: (1-wh) * (1-ww) */
+    mlx_array w_tl = mlx_array_new();
+    mlx_multiply(&w_tl, wh_inv, ww_inv, s);
+
+    /* Weight for top-right: (1-wh) * ww */
+    mlx_array w_tr = mlx_array_new();
+    mlx_multiply(&w_tr, wh_inv, ww, s);
+
+    /* Weight for bottom-left: wh * (1-ww) */
+    mlx_array w_bl = mlx_array_new();
+    mlx_multiply(&w_bl, wh, ww_inv, s);
+
+    /* Weight for bottom-right: wh * ww */
+    mlx_array w_br = mlx_array_new();
+    mlx_multiply(&w_br, wh, ww, s);
+
+    mlx_array_free(wh);
+    mlx_array_free(wh_inv);
+    mlx_array_free(ww);
+    mlx_array_free(ww_inv);
+
+    /* Weighted sum */
+    mlx_array term_tl = mlx_array_new();
+    mlx_multiply(&term_tl, w_tl, x_tl, s);
+    mlx_array_free(w_tl);
+    mlx_array_free(x_tl);
+
+    mlx_array term_tr = mlx_array_new();
+    mlx_multiply(&term_tr, w_tr, x_tr, s);
+    mlx_array_free(w_tr);
+    mlx_array_free(x_tr);
+
+    mlx_array term_bl = mlx_array_new();
+    mlx_multiply(&term_bl, w_bl, x_bl, s);
+    mlx_array_free(w_bl);
+    mlx_array_free(x_bl);
+
+    mlx_array term_br = mlx_array_new();
+    mlx_multiply(&term_br, w_br, x_br, s);
+    mlx_array_free(w_br);
+    mlx_array_free(x_br);
+
+    mlx_array sum1 = mlx_array_new();
+    mlx_add(&sum1, term_tl, term_tr, s);
+    mlx_array_free(term_tl);
+    mlx_array_free(term_tr);
+
+    mlx_array sum2 = mlx_array_new();
+    mlx_add(&sum2, term_bl, term_br, s);
+    mlx_array_free(term_bl);
+    mlx_array_free(term_br);
 
     mlx_array out = mlx_array_new();
-    int out_alloc = 0;
-    if (scale_w > 1) {
-        if (mlx_repeat_axis(&out, tmp, scale_w, 2, s) != 0) {
-            if (tmp_alloc)
-                mlx_array_free(tmp);
-            return x;
-        }
-        out_alloc = 1;
-    } else {
-        out = tmp;
-        out_alloc = tmp_alloc;
-    }
+    mlx_add(&out, sum1, sum2, s);
+    mlx_array_free(sum1);
+    mlx_array_free(sum2);
 
-    /* If we used the input as the returned array (no alloc), just return it.
-     * Otherwise return the newly allocated `out` and leave caller to free it. */
     return out;
 }
 
@@ -478,6 +692,8 @@ struct MLXSPADE {
     int hidden_nc;
     int kernel_size;
     int padding;
+    /* InstanceNorm with affine=True to match Python */
+    void *norm;  /* mlx_nn_instancenorm handle */
     /* weight arrays for convs: pointers to mlx_array allocated with
      * mlx_array_new_data */
     mlx_array *mlp_shared_w; /* shape: (hidden_nc, K, K, cond_nc) */
@@ -496,60 +712,46 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
     m->hidden_nc = hidden_nc;
     m->kernel_size = kernel_size;
     m->padding = kernel_size / 2;
+    m->norm = NULL;
     m->mlp_shared_w = NULL;
     m->mlp_gamma_w = NULL;
     m->mlp_beta_w = NULL;
 
-    /* Allocate zero-initialized weights for the three convs */
-    size_t shared_count = (size_t)hidden_nc * kernel_size * kernel_size * cond_nc;
-    float *shared_buf = (float *)calloc(shared_count, sizeof(float));
-    if (shared_buf) {
-        /* canonical: (out_ch=hidden_nc, KH, KW, in_ch=cond_nc) */
-        int sshape[4] = {hidden_nc, kernel_size, kernel_size, cond_nc};
-        mlx_array sw = mlx_array_new_data(shared_buf, sshape, 4, MLX_FLOAT32);
+    /* Create InstanceNorm with affine=True to match Python */
+    m->norm = mlx_nn_instancenorm_create(norm_nc, 1);
 
-        free(shared_buf);
-        mlx_array *swp = NULL;
-        if (mlx_alloc_pod((void **)&swp, sizeof(mlx_array), 1) == 0) {
-            *swp = sw;
-            m->mlp_shared_w = swp;
-        } else {
-            mlx_array_free(sw);
-        }
+    /* Allocate random-initialized weights for the three convs (like Python: random_normal * 0.02) */
+    /* canonical: (out_ch=hidden_nc, KH, KW, in_ch=cond_nc) */
+    int sshape[4] = {hidden_nc, kernel_size, kernel_size, cond_nc};
+    mlx_array sw = mlx_init_conv_weight(sshape, 4, 0.02f);
+    mlx_array *swp = NULL;
+    if (mlx_alloc_pod((void **)&swp, sizeof(mlx_array), 1) == 0) {
+        *swp = sw;
+        m->mlp_shared_w = swp;
+    } else {
+        mlx_array_free(sw);
     }
 
-    size_t gamma_count = (size_t)norm_nc * kernel_size * kernel_size * hidden_nc;
-    float *gamma_buf = (float *)calloc(gamma_count, sizeof(float));
-    if (gamma_buf) {
-        /* canonical: (out_ch=norm_nc, KH, KW, in_ch=hidden_nc) */
-        int gshape[4] = {norm_nc, kernel_size, kernel_size, hidden_nc};
-        mlx_array gw = mlx_array_new_data(gamma_buf, gshape, 4, MLX_FLOAT32);
-
-        free(gamma_buf);
-        mlx_array *gwp = NULL;
-        if (mlx_alloc_pod((void **)&gwp, sizeof(mlx_array), 1) == 0) {
-            *gwp = gw;
-            m->mlp_gamma_w = gwp;
-        } else {
-            mlx_array_free(gw);
-        }
+    /* canonical: (out_ch=norm_nc, KH, KW, in_ch=hidden_nc) */
+    int gshape[4] = {norm_nc, kernel_size, kernel_size, hidden_nc};
+    mlx_array gw = mlx_init_conv_weight(gshape, 4, 0.02f);
+    mlx_array *gwp = NULL;
+    if (mlx_alloc_pod((void **)&gwp, sizeof(mlx_array), 1) == 0) {
+        *gwp = gw;
+        m->mlp_gamma_w = gwp;
+    } else {
+        mlx_array_free(gw);
     }
 
-    size_t beta_count = (size_t)norm_nc * kernel_size * kernel_size * hidden_nc;
-    float *beta_buf = (float *)calloc(beta_count, sizeof(float));
-    if (beta_buf) {
-        /* canonical: (out_ch=norm_nc, KH, KW, in_ch=hidden_nc) */
-        int bshape[4] = {norm_nc, kernel_size, kernel_size, hidden_nc};
-        mlx_array bw = mlx_array_new_data(beta_buf, bshape, 4, MLX_FLOAT32);
-
-        free(beta_buf);
-        mlx_array *bwp = NULL;
-        if (mlx_alloc_pod((void **)&bwp, sizeof(mlx_array), 1) == 0) {
-            *bwp = bw;
-            m->mlp_beta_w = bwp;
-        } else {
-            mlx_array_free(bw);
-        }
+    /* canonical: (out_ch=norm_nc, KH, KW, in_ch=hidden_nc) */
+    int bshape[4] = {norm_nc, kernel_size, kernel_size, hidden_nc};
+    mlx_array bw = mlx_init_conv_weight(bshape, 4, 0.02f);
+    mlx_array *bwp = NULL;
+    if (mlx_alloc_pod((void **)&bwp, sizeof(mlx_array), 1) == 0) {
+        *bwp = bw;
+        m->mlp_beta_w = bwp;
+    } else {
+        mlx_array_free(bw);
     }
     return m;
 }
@@ -557,6 +759,10 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
 void mlx_spade_free(MLXSPADE *m) {
     if (!m)
         return;
+    if (m->norm) {
+        mlx_nn_instancenorm_free(m->norm);
+        m->norm = NULL;
+    }
     if (m->mlp_shared_w) {
         mlx_array_free(*m->mlp_shared_w);
         mlx_free_pod((void **)&m->mlp_shared_w);
@@ -587,37 +793,23 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     int bx = xshape[0], hx = xshape[1], wx = xshape[2], cx = xshape[3];
     int bc = cshape[0], hc = cshape[1], wc = cshape[2], cc = cshape[3];
 
-    /* Upsample conditioning input to x spatial dims if integer scale factor */
+    /* ALWAYS use bilinear upsampling for conditioning input (parity with Python).
+     * Previous implementation used mlx_repeat_axis (nearest-neighbor) for integer
+     * scale factors, but Python's SPADE uses bilinear for ALL cases. */
     mlx_array cond_up = mlx_array_new();
     int cond_up_alloc = 0;
     if (hc == hx && wc == wx) {
         cond_up = conditioning_input;
-    } else if (hx % hc == 0 && wx % wc == 0) {
-        int scale_h = hx / hc;
-        int scale_w = wx / wc;
-        mlx_array tmp = mlx_array_new();
-        if (scale_h > 1) {
-            if (mlx_repeat_axis(&tmp, conditioning_input, scale_h, 1, s) != 0) {
-                return x;
-            }
-        } else {
-            tmp = conditioning_input;
-        }
-        if (scale_w > 1) {
-            if (mlx_repeat_axis(&cond_up, tmp, scale_w, 2, s) != 0) {
-                if (tmp.ctx != conditioning_input.ctx)
-                    mlx_array_free(tmp);
-                return x;
-            }
-            cond_up_alloc = 1;
-            if (tmp.ctx != conditioning_input.ctx)
-                mlx_array_free(tmp);
-        } else {
-            cond_up = tmp;
-        }
     } else {
-        /* non-integer scaling: fallback to using conditioning_input as-is */
-        cond_up = conditioning_input;
+        /* Always use bilinear interpolation to match Python */
+        MLXUpsample *u = mlx_upsample_create(hx, wx, "bilinear", 1);
+        if (u) {
+            cond_up = mlx_upsample_forward(u, conditioning_input);
+            cond_up_alloc = (cond_up.ctx != 0);
+            mlx_upsample_free(u);
+        } else {
+            cond_up = conditioning_input;
+        }
     }
 
     /* If cond_up spatial dims still don't match x, explicitly upsample to x */
@@ -690,7 +882,8 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     mlx_array_free(shared);
     mlx_array_free(shared_act);
 
-    /* instance normalize x across H and W axes */
+    /* Instance normalize x across H and W axes, then apply affine (like Python self.norm) */
+    mlx_nn_instancenorm *norm = (mlx_nn_instancenorm *)m->norm;
     const int axes[] = {1, 2};
     mlx_array mean = mlx_array_new();
     if (mlx_mean_axes(&mean, x, axes, 2, true, s) != 0) {
@@ -760,7 +953,21 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         return x;
     }
 
-    /* out = x_norm * (1 + gamma) + beta */
+    /* Apply affine transformation from InstanceNorm: normalized = x_norm * weight + bias */
+    mlx_array normalized = x_norm;
+    if (norm && norm->affine && norm->weight && norm->bias) {
+        mlx_array affine_scaled = mlx_array_new();
+        if (mlx_multiply(&affine_scaled, x_norm, *norm->weight, s) == 0) {
+            mlx_array affine_out = mlx_array_new();
+            if (mlx_add(&affine_out, affine_scaled, *norm->bias, s) == 0) {
+                mlx_array_free(x_norm);
+                normalized = affine_out;
+            }
+            mlx_array_free(affine_scaled);
+        }
+    }
+
+    /* out = normalized * (1 + gamma) + beta */
     mlx_array one = mlx_array_new_float(1.0f);
     mlx_array one_plus_gamma = mlx_array_new();
     if (mlx_add(&one_plus_gamma, gamma, one, s) != 0) {
@@ -771,7 +978,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(var);
         mlx_array_free(var_eps);
         mlx_array_free(std);
-        mlx_array_free(x_norm);
+        mlx_array_free(normalized);
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
@@ -780,7 +987,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     }
 
     mlx_array scaled = mlx_array_new();
-    if (mlx_multiply(&scaled, x_norm, one_plus_gamma, s) != 0) {
+    if (mlx_multiply(&scaled, normalized, one_plus_gamma, s) != 0) {
         /* cleanup */
         mlx_array_free(mean);
         mlx_array_free(centered);
@@ -788,7 +995,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(var);
         mlx_array_free(var_eps);
         mlx_array_free(std);
-        mlx_array_free(x_norm);
+        mlx_array_free(normalized);
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
@@ -806,7 +1013,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(var);
         mlx_array_free(var_eps);
         mlx_array_free(std);
-        mlx_array_free(x_norm);
+        mlx_array_free(normalized);
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
@@ -823,7 +1030,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     mlx_array_free(var);
     mlx_array_free(var_eps);
     mlx_array_free(std);
-    mlx_array_free(x_norm);
+    mlx_array_free(normalized);
     mlx_array_free(gamma);
     mlx_array_free(beta);
     mlx_array_free(eps);
@@ -856,6 +1063,12 @@ mlx_array *mlx_spade_get_mlp_beta_w(MLXSPADE *m) {
     if (!m)
         return NULL;
     return m->mlp_beta_w ? m->mlp_beta_w : NULL;
+}
+/* SPADE InstanceNorm accessor for AG tracing */
+void *mlx_spade_get_norm(MLXSPADE *m) {
+    if (!m)
+        return NULL;
+    return m->norm;
 }
 
 struct MLXSPADEConvBlock {
@@ -896,21 +1109,15 @@ MLXSPADEConvBlock *mlx_spadeconv_create(int in_ch, int out_ch, int cond_ch,
     m->in_ch = in_ch;
     m->out_ch = out_ch;
 
-    size_t wcount = (size_t)out_ch * (size_t)kernel_size * (size_t)kernel_size *
-                    (size_t)in_ch;
-    float *wbuf = (float *)calloc(wcount, sizeof(float));
-    if (wbuf) {
-        /* MLX canonical conv-weight layout: (out_ch, KH, KW, in_ch) */
-        int wshape[4] = {out_ch, kernel_size, kernel_size, in_ch};
-        mlx_array w = mlx_array_new_data(wbuf, wshape, 4, MLX_FLOAT32);
-        free(wbuf);
-        mlx_array *wptr = NULL;
-        if (mlx_alloc_pod((void **)&wptr, sizeof(mlx_array), 1) == 0) {
-            *wptr = w;
-            m->conv = (void *)wptr;
-        } else {
-            mlx_array_free(w);
-        }
+    /* MLX canonical conv-weight layout: (out_ch, KH, KW, in_ch) */
+    int wshape[4] = {out_ch, kernel_size, kernel_size, in_ch};
+    mlx_array w = mlx_init_conv_weight(wshape, 4, 0.02f);
+    mlx_array *wptr = NULL;
+    if (mlx_alloc_pod((void **)&wptr, sizeof(mlx_array), 1) == 0) {
+        *wptr = w;
+        m->conv = (void *)wptr;
+    } else {
+        mlx_array_free(w);
     }
     return m;
 }
@@ -1008,21 +1215,15 @@ MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
     m->padding_size = padding_size;
     m->kernel_size = kernel_size;
     /* Allocate init conv weights: (num_features, KH, KW, input_channels) */
-    size_t init_count =
-        (size_t)num_features * kernel_size * kernel_size * input_channels;
-    float *init_buf = (float *)calloc(init_count, sizeof(float));
-    if (init_buf) {
-        /* canonical: (out_ch=num_features, KH, KW, in_ch=input_channels) */
-        int ishape[4] = {num_features, kernel_size, kernel_size, input_channels};
-        mlx_array iw = mlx_array_new_data(init_buf, ishape, 4, MLX_FLOAT32);
-        free(init_buf);
-        mlx_array *iwptr = NULL;
-        if (mlx_alloc_pod((void **)&iwptr, sizeof(mlx_array), 1) == 0) {
-            *iwptr = iw;
-            m->init_conv = (void *)iwptr;
-        } else {
-            mlx_array_free(iw);
-        }
+    /* canonical: (out_ch=num_features, KH, KW, in_ch=input_channels) */
+    int ishape[4] = {num_features, kernel_size, kernel_size, input_channels};
+    mlx_array iw = mlx_init_conv_weight(ishape, 4, 0.02f);
+    mlx_array *iwptr = NULL;
+    if (mlx_alloc_pod((void **)&iwptr, sizeof(mlx_array), 1) == 0) {
+        *iwptr = iw;
+        m->init_conv = (void *)iwptr;
+    } else {
+        mlx_array_free(iw);
     }
     if (body_count > 0) {
         m->spade_blocks = NULL;
@@ -1039,29 +1240,23 @@ MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
                 block_features = min_num_features;
             int in_ch = current_features;
             int out_ch = block_features;
-            int block_pad = kernel_size / 2;
+            /* Use padding_size (passed from generator options) to match Python */
             m->spade_blocks[i] = (void *)mlx_spadeconv_create(
-                                     in_ch, out_ch, input_channels, kernel_size, block_pad, 1, 64);
+                                     in_ch, out_ch, input_channels, kernel_size, padding_size, 1, 64);
             current_features = out_ch;
         }
         /* Allocate tail conv weights in MLX canonical layout:
          * (out_ch=output_channels, KH, KW, in_ch=current_features) */
-        size_t tail_count = (size_t)output_channels * kernel_size * kernel_size *
-                            (size_t)current_features;
-        float *tail_buf = (float *)calloc(tail_count, sizeof(float));
-        if (tail_buf) {
-            int tshape[4] = {output_channels, kernel_size, kernel_size,
-                             current_features
-                            };
-            mlx_array tw = mlx_array_new_data(tail_buf, tshape, 4, MLX_FLOAT32);
-            free(tail_buf);
-            mlx_array *twptr = NULL;
-            if (mlx_alloc_pod((void **)&twptr, sizeof(mlx_array), 1) == 0) {
-                *twptr = tw;
-                m->tail_conv = (void *)twptr;
-            } else {
-                mlx_array_free(tw);
-            }
+        int tshape[4] = {output_channels, kernel_size, kernel_size,
+                         current_features
+                        };
+        mlx_array tw = mlx_init_conv_weight(tshape, 4, 0.02f);
+        mlx_array *twptr = NULL;
+        if (mlx_alloc_pod((void **)&twptr, sizeof(mlx_array), 1) == 0) {
+            *twptr = tw;
+            m->tail_conv = (void *)twptr;
+        } else {
+            mlx_array_free(tw);
         }
     }
     m->leaky_relu = mlx_leakyrelu_create(0.2f);
@@ -1098,10 +1293,20 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
         return cond;
     mlx_stream s = mlx_default_cpu_stream_new();
 
+    if (mlx_array_ndim(cond) == 4) {
+        const int *cshape = mlx_array_shape(cond);
+        (void)cshape; /* suppress unused warning */
+    }
+
     mlx_array x = mlx_array_new();
     if (m->init_conv) {
         mlx_array *iw = (mlx_array *)m->init_conv;
-        int pad = m->kernel_size / 2;
+        if (iw->ctx && mlx_array_ndim(*iw) == 4) {
+            const int *iwsh = mlx_array_shape(*iw);
+            (void)iwsh; /* suppress unused warning */
+        }
+        /* Use padding_size (not kernel_size/2) to match Python */
+        int pad = m->padding_size;
         if (safe_mlx_conv2d(&x, cond, *iw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
             return cond;
         }
@@ -1110,6 +1315,7 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
             int x_ndim = mlx_array_ndim(x);
             if (x_ndim == 4) {
                 const int *xsh = mlx_array_shape(x);
+                (void)xsh; /* suppress unused warning */
             }
         }
     } else {
@@ -1137,13 +1343,6 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
             if (!blk)
                 continue;
             mlx_array nx = mlx_spadeconv_forward(blk, x, cond);
-            /* debug: print block output shape */
-            {
-                int nx_ndim = mlx_array_ndim(nx);
-                if (nx_ndim == 4) {
-                    const int *nxsh = mlx_array_shape(nx);
-                }
-            }
             if (x.ctx != nx.ctx)
                 mlx_array_free(x);
             x = nx;
@@ -1154,7 +1353,8 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
     if (m->tail_conv) {
         mlx_array out = mlx_array_new();
         mlx_array *tw = (mlx_array *)m->tail_conv;
-        int pad = m->kernel_size / 2;
+        /* Use padding_size (not kernel_size/2) to match Python */
+        int pad = m->padding_size;
         if (safe_mlx_conv2d(&out, x, *tw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
             if (x.ctx != cond.ctx)
                 mlx_array_free(x);
@@ -1167,13 +1367,6 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
             if (x.ctx != cond.ctx)
                 mlx_array_free(x);
             return cond;
-        }
-        /* debug: print tail output shape */
-        {
-            int ot_ndim = mlx_array_ndim(out_t);
-            if (ot_ndim == 4) {
-                const int *otsh = mlx_array_shape(out_t);
-            }
         }
         mlx_array_free(out);
         if (x.ctx != cond.ctx)
@@ -1301,10 +1494,12 @@ mlx_array_t mlx_scalemodule_forward(MLXScaleModule *m, mlx_array_t x) {
 }
 
 struct MLXSPADEDiscriminator {
-    void *head;
-    void **body;
+    MLXConvBlock *head;  /* head is a MLXConvBlock, not just weights */
+    void **body;         /* array of MLXConvBlock pointers */
     int n_body;
-    void *tail;
+    void *tail;          /* tail conv weight pointer */
+    int kernel_size;
+    int padding_size;
 };
 
 MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
@@ -1319,25 +1514,12 @@ MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
     m->n_body = body_count;
     m->body = NULL;
     m->tail = NULL;
+    m->kernel_size = kernel_size;
+    m->padding_size = padding_size;
 
-    /* Allocate head conv weights: (KH, KW, in_ch=input_channels,
-     * out_ch=num_features) - channels-last */
-    size_t head_count =
-        (size_t)num_features * kernel_size * kernel_size * (size_t)input_channels;
-    float *head_buf = (float *)calloc(head_count, sizeof(float));
-    if (head_buf) {
-        /* canonical: (out_ch=num_features, KH, KW, in_ch=input_channels) */
-        int hshape[4] = {kernel_size, kernel_size, input_channels, num_features};
-        mlx_array hw = mlx_array_new_data(head_buf, hshape, 4, MLX_FLOAT32);
-        free(head_buf);
-        mlx_array *hwptr = NULL;
-        if (mlx_alloc_pod((void **)&hwptr, sizeof(mlx_array), 1) == 0) {
-            *hwptr = hw;
-            m->head = (void *)hwptr;
-        } else {
-            mlx_array_free(hw);
-        }
-    }
+    /* Head is a MLXConvBlock (conv + norm + leakyrelu) matching Python */
+    m->head = mlx_convblock_create(input_channels, num_features, kernel_size,
+                                   padding_size, 1, 1 /* use_norm=True */);
 
     if (body_count > 0) {
         m->body = NULL;
@@ -1346,38 +1528,27 @@ MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
         }
         int current_features = num_features;
         for (int i = 0; i < body_count; ++i) {
-            int denom = (1 << (i + 1));
-            int block_features = num_features / denom;
-            if (block_features < min_num_features)
-                block_features = min_num_features;
-            int in_ch = current_features;
-            int out_ch = block_features;
-            /* Create a SPADE conv block which allocates its own conv weights */
-            m->body[i] = (void *)mlx_spadeconv_create(
-                             in_ch, out_ch, input_channels, kernel_size, padding_size, 1, 64);
+            /* Python: in_ch = max(num_features // (2**i), min_num_features) */
+            int in_ch = num_features >> i;
+            if (in_ch < min_num_features) in_ch = min_num_features;
+            /* Python: out_ch = max(num_features // (2**(i+1)), min_num_features) */
+            int out_ch = num_features >> (i + 1);
+            if (out_ch < min_num_features) out_ch = min_num_features;
+            /* Create a MLXConvBlock (NOT SPADEConvBlock) to match Python */
+            m->body[i] = (void *)mlx_convblock_create(
+                             in_ch, out_ch, kernel_size, padding_size, 1, 1 /* use_norm=True */);
             current_features = out_ch;
         }
-        /* Allocate tail conv weights in MLX layout: (in_ch=current_features, KH,
-         * KW, out_ch=1) This keeps weight memory ordering consistent with other
-         * tail_convs which use [C_in, KH, KW, C_out]. */
-        size_t tail_count =
-            (size_t)current_features * kernel_size * kernel_size * (size_t)1;
-        float *tail_buf = (float *)calloc(tail_count, sizeof(float));
-        if (tail_buf) {
-            /* Store tail weights in canonical MLX layout: (out_ch=1, KH, KW,
-             * in_ch=current_features) This makes weight.last == input_channels so
-             * forward/backward see a consistent layout and avoids runtime transposes
-             * and tape mismatches. */
-            int tshape[4] = {1, kernel_size, kernel_size, current_features};
-            mlx_array tw = mlx_array_new_data(tail_buf, tshape, 4, MLX_FLOAT32);
-            free(tail_buf);
-            mlx_array *twptr = NULL;
-            if (mlx_alloc_pod((void **)&twptr, sizeof(mlx_array), 1) == 0) {
-                *twptr = tw;
-                m->tail = (void *)twptr;
-            } else {
-                mlx_array_free(tw);
-            }
+        /* Allocate tail conv weights: canonical MLX layout (out_ch=1, KH, KW,
+         * in_ch=current_features) */
+        int tshape[4] = {1, kernel_size, kernel_size, current_features};
+        mlx_array tw = mlx_init_conv_weight(tshape, 4, 0.02f);
+        mlx_array *twptr = NULL;
+        if (mlx_alloc_pod((void **)&twptr, sizeof(mlx_array), 1) == 0) {
+            *twptr = tw;
+            m->tail = (void *)twptr;
+        } else {
+            mlx_array_free(tw);
         }
     }
     return m;
@@ -1387,15 +1558,13 @@ void mlx_spadedisc_free(MLXSPADEDiscriminator *m) {
     if (!m)
         return;
     if (m->head) {
-        mlx_array *hw = (mlx_array *)m->head;
-        mlx_array_free(*hw);
-        mlx_free_pod((void **)&hw);
+        mlx_convblock_free(m->head);
         m->head = NULL;
     }
     if (m->body) {
         for (int i = 0; i < m->n_body; ++i) {
             if (m->body[i])
-                mlx_spadeconv_free((MLXSPADEConvBlock *)m->body[i]);
+                mlx_convblock_free((MLXConvBlock *)m->body[i]);
         }
         mlx_free_ptr_array((void ***)&m->body, m->n_body);
     }
@@ -1467,10 +1636,11 @@ mlx_array **mlx_spadedisc_get_parameters(MLXSPADEDiscriminator *m,
     if (!m || !out_count)
         return NULL;
     int total = 0;
-    if (m->head)
+    /* head is now a MLXConvBlock */
+    if (m->head && m->head->conv)
         total++;
     for (int i = 0; i < m->n_body; ++i) {
-        MLXSPADEConvBlock *cb = (MLXSPADEConvBlock *)m->body[i];
+        MLXConvBlock *cb = (MLXConvBlock *)m->body[i];
         if (cb && cb->conv)
             total++;
     }
@@ -1486,10 +1656,10 @@ mlx_array **mlx_spadedisc_get_parameters(MLXSPADEDiscriminator *m,
         return NULL;
     }
     int idx = 0;
-    if (m->head)
-        list[idx++] = (mlx_array *)m->head;
+    if (m->head && m->head->conv)
+        list[idx++] = (mlx_array *)m->head->conv;
     for (int i = 0; i < m->n_body; ++i) {
-        MLXSPADEConvBlock *cb = (MLXSPADEConvBlock *)m->body[i];
+        MLXConvBlock *cb = (MLXConvBlock *)m->body[i];
         if (cb && cb->conv)
             list[idx++] = (mlx_array *)cb->conv;
     }
@@ -1506,9 +1676,9 @@ void mlx_spadedisc_free_parameters_list(mlx_array **list) {
 
 /* Accessors for discriminator internals */
 mlx_array *mlx_spadedisc_get_head_conv(MLXSPADEDiscriminator *m) {
-    if (!m)
+    if (!m || !m->head)
         return NULL;
-    return (mlx_array *)m->head;
+    return (mlx_array *)m->head->conv;
 }
 
 int mlx_spadedisc_get_body_count(MLXSPADEDiscriminator *m) {
@@ -1517,13 +1687,13 @@ int mlx_spadedisc_get_body_count(MLXSPADEDiscriminator *m) {
     return m->n_body;
 }
 
-MLXSPADEConvBlock *mlx_spadedisc_get_body_at(MLXSPADEDiscriminator *m,
-        int idx) {
+MLXConvBlock *mlx_spadedisc_get_body_at(MLXSPADEDiscriminator *m,
+                                        int idx) {
     if (!m)
         return NULL;
     if (idx < 0 || idx >= m->n_body)
         return NULL;
-    return (MLXSPADEConvBlock *)m->body[idx];
+    return (MLXConvBlock *)m->body[idx];
 }
 
 mlx_array *mlx_spadedisc_get_tail_conv(MLXSPADEDiscriminator *m) {
@@ -1535,7 +1705,37 @@ mlx_array *mlx_spadedisc_get_tail_conv(MLXSPADEDiscriminator *m) {
 mlx_array_t mlx_spadedisc_forward(MLXSPADEDiscriminator *m, mlx_array_t x) {
     if (!m)
         return x;
-    return x;
+    mlx_stream s = mlx_default_cpu_stream_new();
+
+    /* Head: MLXConvBlock (conv + norm + leakyrelu) */
+    mlx_array cur = mlx_convblock_forward(m->head, x);
+
+    /* Body: sequence of MLXConvBlocks */
+    for (int i = 0; i < m->n_body; ++i) {
+        MLXConvBlock *blk = (MLXConvBlock *)m->body[i];
+        if (!blk) continue;
+        mlx_array nx = mlx_convblock_forward(blk, cur);
+        if (cur.ctx != x.ctx && cur.ctx != nx.ctx)
+            mlx_array_free(cur);
+        cur = nx;
+    }
+
+    /* Tail: just a conv (no norm, no activation) */
+    if (m->tail) {
+        mlx_array out = mlx_array_new();
+        mlx_array *tw = (mlx_array *)m->tail;
+        if (safe_mlx_conv2d(&out, cur, *tw, 1, 1, m->padding_size, m->padding_size,
+                            1, 1, 1, s) != 0) {
+            if (cur.ctx != x.ctx)
+                mlx_array_free(cur);
+            return x;
+        }
+        if (cur.ctx != x.ctx)
+            mlx_array_free(cur);
+        return out;
+    }
+
+    return cur;
 }
 
 struct MLXColorQuantization {

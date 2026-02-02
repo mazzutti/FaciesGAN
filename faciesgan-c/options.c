@@ -69,6 +69,7 @@ TrainningOptions *mlx_options_new_trainning_defaults(void) {
   o->enable_tensorboard = true;
   o->enable_plot_facies = true;
   o->compile_backend = false;
+  o->use_pybridge_plot = true;  /* Use Python for plotting by default */
   o->wells_mask_columns = NULL;
   o->wells_mask_count = 0;
   return o;

@@ -97,4 +97,9 @@ int mlx_alloc_pod(void **out, size_t elem_size, int n);
 /* Free a POD array allocated with `mlx_alloc_pod`. Sets *out to NULL. */
 void mlx_free_pod(void **out);
 
+/* Global MLX thread-safety mutex. Acquire before ANY mlx operation when
+ * multiple threads may be active, release immediately after. */
+void mlx_global_lock(void);
+void mlx_global_unlock(void);
+
 #endif

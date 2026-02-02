@@ -206,14 +206,12 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
         if not hasattr(self, "batches") or not self.batches:
             return -1
 
-        members = []  # list of (name, bytes)
+        members: list[tuple[str, bytes]] = []  # list of (name, bytes)
         for si, batch in enumerate(self.batches):
             # facies
             for s, a in enumerate(batch.facies):
-                try:
-                    arr = a.numpy() if hasattr(a, "numpy") else np.array(a)
-                except Exception:
-                    arr = np.array(a)
+
+                arr = np.array(a)
                 buf = io.BytesIO()
                 np.save(buf, arr)
                 members.append((f"sample_{si}/facies_{s}.npy", buf.getvalue()))
@@ -221,10 +219,7 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
             # wells
             if len(batch.wells) > 0:
                 for s, a in enumerate(batch.wells):
-                    try:
-                        arr = a.numpy() if hasattr(a, "numpy") else np.array(a)
-                    except Exception:
-                        arr = np.array(a)
+                    arr = np.array(a)
                     buf = io.BytesIO()
                     np.save(buf, arr)
                     members.append((f"sample_{si}/wells_{s}.npy", buf.getvalue()))
@@ -232,10 +227,7 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
             # seismic
             if len(batch.seismic) > 0:
                 for s, a in enumerate(batch.seismic):
-                    try:
-                        arr = a.numpy() if hasattr(a, "numpy") else np.array(a)
-                    except Exception:
-                        arr = np.array(a)
+                    arr = np.array(a)
                     buf = io.BytesIO()
                     np.save(buf, arr)
                     members.append((f"sample_{si}/seismic_{s}.npy", buf.getvalue()))

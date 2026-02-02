@@ -61,9 +61,12 @@ static int process_optional(mlx_vector_array *out_vec,
         /* Diagnostic check: ensure `stacked` is available and sane before
          * appending into the output vector. This helps catch invalid arrays
          * produced by the stacking operation (observed as null internal
-         * pointers when accessed later). */
+         * pointers when accessed later).
+         * NOTE: MLX arrays are lazy - we need to evaluate before checking ndim. */
         {
             bool ok = false;
+            /* Evaluate the array to ensure it's materialized before checking */
+            mlx_array_eval(stacked);
             _mlx_array_is_available(&ok, stacked);
             int ndim = (int)mlx_array_ndim(stacked);
             if (!ok || ndim <= 0) {

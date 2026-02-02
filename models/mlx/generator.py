@@ -7,6 +7,8 @@ import mlx.core as mx
 import mlx.nn as nn  # type: ignore
 
 from models.mlx.custom_layer import (
+    create_conv2d,
+    init_conv_weights,
     MLXColorQuantization,
     MLXConvBlock,
     MLXSPADEGenerator,
@@ -101,7 +103,8 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
         in_noise: mx.array | None = None,
         start_scale: int = 0,
         stop_scale: int | None = None,
-    ) -> mx.array:
+        collect_intermediates: bool = False,
+    ) -> mx.array | tuple[mx.array, dict[int, dict[str, mx.array]]]:
         """Generate facies through progressive pyramid synthesis.
 
         Parameters
@@ -135,6 +138,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
 
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
 
+        intermediates: dict[int, dict[str, mx.array]] = {}
         for index in range(start_scale, stop_scale + 1):
             height, width = out_facie.shape[1:3]
 
@@ -203,9 +207,19 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             except Exception:
                 z_mod = z_in
 
-            out_facie = cast(mx.array, self.gens[index](z_mod)) + out_facie
-        # Apply color quantization to enforce pure colors
+            out_mod = self.gens[index]
+            if collect_intermediates and isinstance(out_mod, MLXSPADEGenerator):
+                out_val, inter = out_mod(z_mod, return_intermediates=True)
+                inter["gen_in"] = z_mod
+                intermediates[index] = inter
+                out_facie = cast(mx.array, out_val) + out_facie
+            else:
+                out_tmp = cast(mx.array, out_mod(z_mod))
+                out_facie = out_tmp + out_facie
+        # Apply color quantization to enforce pure colors.
         out_facie = self.color_quantizer(out_facie)
+        if collect_intermediates:
+            return out_facie, intermediates
         return out_facie
 
     def create_scale(
@@ -273,14 +287,22 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             body_blocks, block_features = build_body()
             body = nn.Sequential(*body_blocks)
 
+            tail_conv = create_conv2d(
+                max(block_features, min_num_features),
+                self.output_channels,
+                self.kernel_size,
+                padding=self.padding_size,
+            )
+            init_conv_weights(tail_conv)
             tail = nn.Sequential(
-                nn.Conv2d(
-                    max(block_features, min_num_features),
-                    self.output_channels,
-                    self.kernel_size,
-                    padding=self.padding_size,
-                ),
+                tail_conv,
                 nn.Tanh(),
             )
 
             self.gens.append(MLXScaleModule(head, body, tail))
+
+    def reset_parameters(self) -> None:
+        for gen in self.gens:
+            reset_fn = getattr(cast(Any, gen), "reset_parameters", None)
+            if reset_fn:
+                reset_fn()

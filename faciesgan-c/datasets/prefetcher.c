@@ -114,6 +114,9 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
                                     int n_seismic, const mlx_stream stream) {
     if (!ib)
         return -1;
+
+    /* NOTE: Caller must hold global MLX lock */
+
     ib->valid = 0;
     ib->is_pyramids = 1;
     ib->facies = mlx_array_new();
@@ -161,12 +164,17 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
     }
     for (int i = 0; i < n_wells; ++i) {
         mlx_array a = wells[i];
+        /* Debug: check input well array (NO eval - not thread-safe) */
+        int input_ndim = (int)mlx_array_ndim(a);
+        (void)input_ndim;
         mlx_array a_copy = mlx_array_new();
         if (stream.ctx) {
-            if (mlx_copy(&a_copy, a, stream) != 0)
+            if (mlx_copy(&a_copy, a, stream) != 0) {
                 mlx_array_set(&a_copy, a);
-        } else
+            }
+        } else {
             mlx_array_set(&a_copy, a);
+        }
         /* ensure vector stores independent buffer */
         {
             mlx_array to_append = mlx_array_new();
@@ -187,104 +195,19 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
         }
     }
 
-    /* If wells were provided but no explicit masks, compute masks like the
-     * Python prefetcher does using MLX ops on the provided stream (vectorized):
-     * masks = greater(sum(abs(wells), axis=channels, keepdims=true), 0)
+    /* NOTE: Mask computation has been moved to the main thread (in the training
+     * loop) to avoid thread-safety issues with MLX. The producer thread only
+     * passes through the wells data, and masks are computed after prefetcher_pop.
+     * See mlx_trainer_api.c for the mask computation logic.
      */
-    if (n_wells > 0 && n_masks == 0) {
-        int nw = mlx_vector_array_size(ib->wells_vec);
-        for (int wi = 0; wi < nw; ++wi) {
-            /* obtain the vector element (tmp_well). Attempt to make a deep copy
-               onto the target stream; if copy succeeds we will free the copy
-               after use. If copy fails, `well` will alias the vector element and
-               must NOT be freed here (to avoid double-free). */
-            mlx_array tmp_well = mlx_array_new();
-            mlx_vector_array_get(&tmp_well, ib->wells_vec, wi);
-            mlx_array well = mlx_array_new();
-            int well_copied = 0;
-            if (stream.ctx) {
-                if (mlx_copy(&well, tmp_well, stream) == 0) {
-                    well_copied = 1; /* we own `well` and should free it later */
-                } else {
-                    /* fallback: use the vector element directly; do not free it */
-                    mlx_array_free(well);
-                    well = tmp_well;
-                    well_copied = 0;
-                }
-            } else {
-                /* CPU stream: operate directly on the vector element */
-                mlx_array_free(well);
-                well = tmp_well;
-                well_copied = 0;
-            }
 
-            /* abs(well) */
-            mlx_array abs_arr = mlx_array_new();
-            if (mlx_abs(&abs_arr, well, stream) != 0) {
-                mlx_array_free(abs_arr);
-                mlx_array_free(well);
-                continue;
-            }
-
-
-            /* sum over channel axis (axis=3 to match Python shape [B,H,W,C])
-               but defensively handle arrays with fewer dims. */
-            int abs_ndim = (int)mlx_array_ndim(abs_arr);
-            if (abs_ndim <= 0) {
-                mlx_array_free(abs_arr);
-                mlx_array_free(well);
-                continue;
-            }
-            int axis = 3;
-            if (axis >= abs_ndim)
-                axis = abs_ndim - 1;
-            mlx_array sum_arr = mlx_array_new();
-            if (mlx_sum_axis(&sum_arr, abs_arr, axis, true, stream) != 0) {
-                mlx_array_free(abs_arr);
-                mlx_array_free(sum_arr);
-                mlx_array_free(well);
-                continue;
-            }
-            mlx_array_free(abs_arr);
-
-            /* zeros like sum_arr */
-            mlx_array zero = mlx_array_new();
-            if (mlx_zeros_like(&zero, sum_arr, stream) != 0) {
-                mlx_array_free(sum_arr);
-                mlx_array_free(zero);
-                mlx_array_free(well);
-                continue;
-            }
-
-            /* mask = greater(sum_arr, zero) */
-            mlx_array mask_arr = mlx_array_new();
-            if (mlx_greater(&mask_arr, sum_arr, zero, stream) == 0) {
-                mlx_array to_append = mlx_array_new();
-                if (stream.ctx) {
-                    if (mlx_copy(&to_append, mask_arr, stream) == 0) {
-                        mlx_vector_array_append_value(ib->masks_vec, to_append);
-                        if (stream.ctx)
-                            mlx_synchronize(stream);
-                        mlx_array_free(mask_arr);
-                    } else {
-                        mlx_array_free(to_append);
-                        mlx_vector_array_append_value(ib->masks_vec, mask_arr);
-                    }
-                } else {
-                    mlx_array_free(to_append);
-                    mlx_vector_array_append_value(ib->masks_vec, mask_arr);
-                }
-            }
-            mlx_array_free(zero);
-            mlx_array_free(sum_arr);
-            if (well_copied) {
-                /* only free the deep copy we created */
-                mlx_array_free(well);
-            }
-        }
-    }
+    /* If explicit masks were provided, store them */
     for (int i = 0; i < n_masks; ++i) {
         mlx_array a = masks[i];
+        /* Skip empty mask arrays - don't append them to the vector */
+        if (!a.ctx) {
+            continue;
+        }
         mlx_array a_copy = mlx_array_new();
         if (stream.ctx) {
             if (mlx_copy(&a_copy, a, stream) != 0)
@@ -339,6 +262,9 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
     }
 
     ib->valid = 1;
+
+    /* NOTE: Caller releases lock */
+
     return 0;
 }
 
@@ -405,22 +331,40 @@ static void *prefetcher_dataloader_producer(void *v) {
     struct MLXDataloader *dl = a->dl;
     PrefetcherHandle ph = a->ph;
     mlx_stream s = a->s;
+    Prefetcher *pref = (Prefetcher *)ph;
 
-
+    /* Loop infinitely (like PyTorch's cycle) until the prefetcher is stopped.
+     * When the dataloader exhausts its samples (rc == 2), reset and continue
+     * to provide data for multiple training iterations/epochs. */
     while (1) {
+        /* Check if the prefetcher has been signaled to stop */
+        pthread_mutex_lock(&pref->mutex);
+        int alive = pref->alive;
+        pthread_mutex_unlock(&pref->mutex);
+        if (!alive)
+            break;
+
         mlx_vector_array facs = mlx_vector_array_new();
         mlx_vector_array wells_out = mlx_vector_array_new();
         mlx_vector_array seis_out = mlx_vector_array_new();
+
+        /* Acquire global MLX lock for ALL MLX operations in this iteration */
+        mlx_global_lock();
         int rc = facies_dataloader_next(dl, &facs, &wells_out, &seis_out, s);
+
         if (rc == 2) {
+            /* End of epoch: reset dataloader and continue cycling */
             mlx_vector_array_free(facs);
             mlx_vector_array_free(wells_out);
             mlx_vector_array_free(seis_out);
-            break;
+            mlx_global_unlock();
+            facies_dataloader_reset(dl);
+            continue;
         } else if (rc != 0) {
             mlx_vector_array_free(facs);
             mlx_vector_array_free(wells_out);
             mlx_vector_array_free(seis_out);
+            mlx_global_unlock();
             break;
         }
 
@@ -447,9 +391,13 @@ static void *prefetcher_dataloader_producer(void *v) {
             if (mlx_alloc_mlx_array_raw(&well_arr, nw) == 0) {
                 for (int i = 0; i < nw; ++i) {
                     mlx_array tmp = mlx_array_new();
-                    if (mlx_vector_array_get(&tmp, wells_out, i) != 0) {
+                    int get_rc = mlx_vector_array_get(&tmp, wells_out, i);
+                    if (get_rc != 0) {
                         mlx_array_free(tmp);
                         tmp = mlx_array_new();
+                    } else {
+                        /* NO eval here - not thread-safe */
+                        int tmp_ndim = (int)mlx_array_ndim(tmp);
                     }
                     well_arr[i] = tmp;
                 }
@@ -473,7 +421,14 @@ static void *prefetcher_dataloader_producer(void *v) {
             }
         }
 
-        /* push into prefetcher (copies into internal buffers/stream) */
+        /* Release lock before pushing to queue (may block) */
+        mlx_global_unlock();
+
+        /* Note: masks are computed from wells inside create_internal_from_mlx,
+         * so we pass NULL for masks here. This ensures consistent mask computation
+         * and avoids issues with empty placeholder arrays. */
+
+        /* push into prefetcher (handles its own MLX lock for create_internal_from_mlx) */
         prefetcher_push_mlx(ph, fac_arr, nsc, well_arr, nw, NULL, 0, sei_arr, ns);
 
         /* Free only container memory; elements may have been moved into
@@ -647,13 +602,18 @@ int prefetcher_push_mlx(PrefetcherHandle h, const mlx_array *facies,
         return -1;
     InternalBatch ib;
     memset(&ib, 0, sizeof(InternalBatch));
+
+    /* MLX operations - acquire lock */
+    mlx_global_lock();
     if (create_internal_from_mlx(&ib, facies, n_facies, wells, n_wells, masks,
                                  n_masks, seismic, n_seismic, p->stream) != 0) {
+        mlx_global_unlock();
         return -1;
     }
+    mlx_global_unlock();
+    /* MLX operations done - lock released */
 
-    /* debug prints removed */
-
+    /* Queue operations - may block waiting for space, must NOT hold MLX lock */
     pthread_mutex_lock(&p->mutex);
     while (p->count == p->capacity && p->alive) {
         pthread_cond_wait(&p->not_full, &p->mutex);
@@ -796,23 +756,19 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
 
     /* allocate arrays aligned to n_scales and fill entries from internal vectors
        where available; otherwise leave empty mlx_array objects */
+    mlx_global_lock(); /* protect all MLX operations from concurrent access */
     int nf = mlx_vector_array_size(ib.facies_vec);
     if (mlx_alloc_mlx_array_raw(&out->facies, n_scales) != 0)
         out->facies = NULL;
     for (int i = 0; i < n_scales; ++i) {
         if (i < nf) {
-            /* get element, then deep-copy it into an independent mlx_array to
-               avoid shared-buffer double-free when freeing the internal vector */
+            /* get element, then set it into output array */
             mlx_array tmp = mlx_array_new();
             mlx_vector_array_get(&tmp, ib.facies_vec, i);
-            mlx_array dst = mlx_array_new();
-            if (mlx_copy(&dst, tmp, p->stream) == 0) {
-                mlx_array_free(tmp);
-                out->facies[i] = dst;
-            } else {
-                /* fallback: use the obtained tmp if copy failed */
-                out->facies[i] = tmp;
-            }
+            /* Use array_set instead of copy to avoid potential stream issues */
+            out->facies[i] = mlx_array_new();
+            mlx_array_set(&out->facies[i], tmp);
+            mlx_array_free(tmp);
         } else {
             out->facies[i] = mlx_array_new();
         }
@@ -841,13 +797,9 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
             if (i < nw) {
                 mlx_array tmp = mlx_array_new();
                 mlx_vector_array_get(&tmp, ib.wells_vec, i);
-                mlx_array dst = mlx_array_new();
-                if (mlx_copy(&dst, tmp, p->stream) == 0) {
-                    mlx_array_free(tmp);
-                    out->wells[i] = dst;
-                } else {
-                    out->wells[i] = tmp;
-                }
+                out->wells[i] = mlx_array_new();
+                mlx_array_set(&out->wells[i], tmp);
+                mlx_array_free(tmp);
             } else {
                 out->wells[i] = mlx_array_new();
             }
@@ -874,13 +826,9 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
             if (i < nm) {
                 mlx_array tmp = mlx_array_new();
                 mlx_vector_array_get(&tmp, ib.masks_vec, i);
-                mlx_array dst = mlx_array_new();
-                if (mlx_copy(&dst, tmp, p->stream) == 0) {
-                    mlx_array_free(tmp);
-                    out->masks[i] = dst;
-                } else {
-                    out->masks[i] = tmp;
-                }
+                out->masks[i] = mlx_array_new();
+                mlx_array_set(&out->masks[i], tmp);
+                mlx_array_free(tmp);
             } else {
                 out->masks[i] = mlx_array_new();
             }
@@ -907,13 +855,9 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
             if (i < ns) {
                 mlx_array tmp = mlx_array_new();
                 mlx_vector_array_get(&tmp, ib.seismic_vec, i);
-                mlx_array dst = mlx_array_new();
-                if (mlx_copy(&dst, tmp, p->stream) == 0) {
-                    mlx_array_free(tmp);
-                    out->seismic[i] = dst;
-                } else {
-                    out->seismic[i] = tmp;
-                }
+                out->seismic[i] = mlx_array_new();
+                mlx_array_set(&out->seismic[i], tmp);
+                mlx_array_free(tmp);
             } else {
                 out->seismic[i] = mlx_array_new();
             }
@@ -937,6 +881,7 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
     mlx_vector_array_free(ib.wells_vec);
     mlx_vector_array_free(ib.masks_vec);
     mlx_vector_array_free(ib.seismic_vec);
+    mlx_global_unlock();
 
     return out;
 }
@@ -1221,6 +1166,10 @@ prefetcher_iterator_next(PrefetcherIteratorHandle it_h) {
     if (it->closed || !it->p) {
         pthread_mutex_unlock(&it->mutex);
         return NULL;
+    }
+    /* If preload is in progress, wait for it to complete */
+    while (it->preload_in_progress) {
+        pthread_cond_wait(&it->cond, &it->mutex);
     }
     /* mark usage */
     it->ref_count++;

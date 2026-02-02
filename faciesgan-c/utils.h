@@ -94,6 +94,50 @@ int mlx_quantize_array(const mlx_array in, mlx_array *out,
 int mlx_apply_well_mask_array(const mlx_array facies, mlx_array *out,
                               const mlx_array mask, const mlx_array well);
 
+/* Save an mlx_array image directly as PNG.
+ * Array should be shape (H,W,C) or (1,H,W,C) with float32 values in [0,1].
+ * Returns 0 on success, -1 on error.
+ */
+int mlx_save_png(const char *path, mlx_array arr);
+
+/* Save fake and real facies side-by-side as a single PNG image.
+ * Both arrays should be (1,H,W,C) or (H,W,C) with float32 values in [0,1].
+ * Creates a visualization with real on left, fake on right.
+ * Returns 0 on success, -1 on error.
+ */
+int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
+                                   mlx_array real);
+
+/* Save facies grid visualization with multiple generated samples.
+ * Creates a grid with rows=batch_size, cols=1+num_fake (real + fakes).
+ * Applies color quantization to the 4-color facies palette.
+ * - fake_samples: array of num_fake mlx_arrays (each: batch x H x W x C)
+ * - real: single mlx_array (batch x H x W x C)
+ * - cell_size: size of each cell in the grid (pixels)
+ * - scale, epoch: used for labeling (reserved for future use)
+ * Returns 0 on success, -1 on error.
+ */
+int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
+                             int num_fake, mlx_array real, int cell_size,
+                             int scale, int epoch);
+
+/* Save facies grid visualization with proper num_real_facies x num_generated_per_real layout.
+ * Creates a grid matching Python's visualization:
+ * - Rows = num_real (randomly selected real facies from batch)
+ * - Cols = 1 (real) + num_gen_per_real (generated samples)
+ * Applies color quantization to the 4-color facies palette.
+ * - all_fakes: array of total_gen mlx_arrays (total_gen = num_real * num_gen_per_real)
+ * - real: single mlx_array (batch x H x W x C)
+ * - selected_indices: array of num_real indices into the batch
+ * - masks: optional mlx_array for well masks (batch x H x W x 1)
+ * Returns 0 on success, -1 on error.
+ */
+int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
+                                int total_gen, mlx_array real,
+                                const int *selected_indices, int num_real,
+                                int num_gen_per_real, int cell_size,
+                                int scale, int epoch, mlx_array masks);
+
 #ifdef __cplusplus
 }
 #endif

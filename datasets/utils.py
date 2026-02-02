@@ -58,10 +58,14 @@ def generate_scales(
         pyramid scale, arranged from coarsest to finest resolution.
     """
     shapes: list[tuple[int, ...]] = []
-    scale_factor = math.pow(
-        options.min_size / (min(options.max_size, options.crop_size)),
-        1 / options.stop_scale,
-    )
+    # Guard against stop_scale == 0 which would cause division by zero.
+    if options.stop_scale <= 0:
+        scale_factor = 1.0
+    else:
+        scale_factor = math.pow(
+            options.min_size / (min(options.max_size, options.crop_size)),
+            1.0 / options.stop_scale,
+        )
     for i in range(options.stop_scale + 1):
         scale = math.pow(scale_factor, options.stop_scale - i)
         out_shape = cast(

@@ -6,6 +6,7 @@
 /* Standard string/memory functions provided by <string.h> */
 #include "custom_layer.h"
 #include "trainning/array_helpers.h"
+#include "trainning/mlx_compat.h"
 #include <limits.h>
 #include <mlx/c/io.h>
 #include <mlx/c/map.h>
@@ -78,6 +79,19 @@ MLXFaciesGAN *mlx_faciesgan_create(int num_layer, int kernel_size,
     m->noise_amps = NULL;
     m->n_noise_amps = 0;
     return m;
+}
+
+int mlx_faciesgan_set_gen_input_channels(MLXFaciesGAN *m, int channels) {
+    if (!m || channels < 1)
+        return -1;
+    m->gen_input_channels = channels;
+    return 0;
+}
+
+int mlx_faciesgan_get_gen_input_channels(MLXFaciesGAN *m) {
+    if (!m)
+        return 3;
+    return m->gen_input_channels;
 }
 
 int mlx_faciesgan_set_num_diversity_samples(MLXFaciesGAN *m, int n) {
@@ -507,6 +521,232 @@ mlx_array_t mlx_faciesgan_generate_fake(MLXFaciesGAN *m,
     return out;
 }
 
+/* ============================================================================
+ * AG (Autodiff Graph) helpers for SPADE Generator forward pass
+ * ============================================================================ */
+
+/* ag_instance_norm: Instance normalization for NHWC layout.
+ * Normalizes over H,W dimensions for each (batch, channel) pair.
+ * out = (x - mean) / sqrt(var + eps) */
+static AGValue *ag_instance_norm(AGValue *x, float eps) {
+    if (!x) return NULL;
+
+    /* Mean over H,W (axes 1,2) keeping dims for broadcast */
+    AGValue *mean_h = ag_sum_axis(x, 1, 1);  /* sum over H, keepdims */
+    ag_register_temp_value(mean_h);
+    AGValue *mean_hw = ag_sum_axis(mean_h, 2, 1);  /* sum over W, keepdims */
+    ag_register_temp_value(mean_hw);
+
+    /* Divide by H*W to get mean */
+    mlx_array *xa = ag_value_array(x);
+    if (!xa) return NULL;
+    const int *xsh = mlx_array_shape(*xa);
+    float hw = (float)(xsh[1] * xsh[2]);
+    AGValue *hw_scale = ag_scalar_float(1.0f / hw);
+    ag_register_temp_value(hw_scale);
+    AGValue *mean = ag_mul(mean_hw, hw_scale);
+    ag_register_temp_value(mean);
+
+    /* x - mean */
+    AGValue *centered = ag_sub(x, mean);
+    ag_register_temp_value(centered);
+
+    /* Variance: mean((x - mean)^2) */
+    AGValue *sq = ag_square(centered);
+    ag_register_temp_value(sq);
+    AGValue *var_h = ag_sum_axis(sq, 1, 1);
+    ag_register_temp_value(var_h);
+    AGValue *var_hw = ag_sum_axis(var_h, 2, 1);
+    ag_register_temp_value(var_hw);
+    AGValue *var = ag_mul(var_hw, hw_scale);
+    ag_register_temp_value(var);
+
+    /* sqrt(var + eps) */
+    AGValue *eps_val = ag_scalar_float(eps);
+    ag_register_temp_value(eps_val);
+    AGValue *var_eps = ag_add(var, eps_val);
+    ag_register_temp_value(var_eps);
+    AGValue *std = ag_sqrt(var_eps);
+    ag_register_temp_value(std);
+
+    /* normalized = centered / std */
+    AGValue *normalized = ag_divide(centered, std);
+    ag_register_temp_value(normalized);
+
+    return normalized;
+}
+
+/* ag_spade_forward: SPADE normalization forward pass.
+ * Input x: features to normalize (N,H,W,C)
+ * Input cond: conditioning input (N,H_cond,W_cond,C_cond)
+ * Upsamples cond to match x spatial dims, then:
+ *   shared = leaky_relu(conv(cond, mlp_shared_w))
+ *   gamma = conv(shared, mlp_gamma_w)
+ *   beta = conv(shared, mlp_beta_w)
+ *   out = instance_norm(x) * (1 + gamma) + beta
+ */
+static AGValue *ag_spade_forward(AGValue *x, AGValue *cond, MLXSPADE *spade) {
+    if (!x || !cond || !spade) return NULL;
+
+    /* Get x spatial dims for upsampling cond */
+    mlx_array *xa = ag_value_array(x);
+    if (!xa || mlx_array_ndim(*xa) != 4) return NULL;
+    const int *xsh = mlx_array_shape(*xa);
+    int target_h = xsh[1];
+    int target_w = xsh[2];
+
+    /* Upsample cond to match x spatial dims */
+    AGValue *cond_up = ag_upsample(cond, target_h, target_w, "linear", 1);
+    ag_register_temp_value(cond_up);
+
+    /* MLP shared: conv + leaky_relu */
+    mlx_array *mlp_shared_w = mlx_spade_get_mlp_shared_w(spade);
+    int spade_pad = mlx_spade_get_padding(spade);
+
+    if (mlp_shared_w) {
+        AGValue *w_shared = ag_value_from_array(mlp_shared_w, 1);
+        ag_register_temp_value(w_shared);
+        AGValue *shared = ag_conv2d(cond_up, w_shared, 1, 1, spade_pad, spade_pad, 1, 1, 1);
+        ag_register_temp_value(shared);
+
+        shared = ag_leaky_relu(shared, 0.2f);
+        ag_register_temp_value(shared);
+
+        /* MLP gamma */
+        mlx_array *mlp_gamma_w = mlx_spade_get_mlp_gamma_w(spade);
+        if (mlp_gamma_w) {
+            AGValue *w_gamma = ag_value_from_array(mlp_gamma_w, 1);
+            ag_register_temp_value(w_gamma);
+            AGValue *gamma = ag_conv2d(shared, w_gamma, 1, 1, spade_pad, spade_pad, 1, 1, 1);
+            ag_register_temp_value(gamma);
+
+            /* MLP beta */
+            mlx_array *mlp_beta_w = mlx_spade_get_mlp_beta_w(spade);
+            if (mlp_beta_w) {
+                AGValue *w_beta = ag_value_from_array(mlp_beta_w, 1);
+                ag_register_temp_value(w_beta);
+                AGValue *beta = ag_conv2d(shared, w_beta, 1, 1, spade_pad, spade_pad, 1, 1, 1);
+                ag_register_temp_value(beta);
+
+                /* Instance normalize x */
+                AGValue *normalized = ag_instance_norm(x, 1e-5f);
+                if (!normalized) return NULL;
+
+                /* Apply affine transformation from InstanceNorm: normalized = normalized * weight + bias */
+                void *norm_handle = mlx_spade_get_norm(spade);
+                if (norm_handle) {
+                    mlx_array *norm_weight = mlx_nn_instancenorm_get_weight(norm_handle);
+                    mlx_array *norm_bias = mlx_nn_instancenorm_get_bias(norm_handle);
+                    if (norm_weight && norm_bias) {
+                        AGValue *nw = ag_value_from_array(norm_weight, 1);
+                        ag_register_temp_value(nw);
+                        AGValue *nb = ag_value_from_array(norm_bias, 1);
+                        ag_register_temp_value(nb);
+                        AGValue *affine_scaled = ag_mul(normalized, nw);
+                        ag_register_temp_value(affine_scaled);
+                        AGValue *affine_out = ag_add(affine_scaled, nb);
+                        ag_register_temp_value(affine_out);
+                        normalized = affine_out;
+                    }
+                }
+
+                /* out = normalized * (1 + gamma) + beta */
+                AGValue *one = ag_scalar_float(1.0f);
+                ag_register_temp_value(one);
+                AGValue *scale = ag_add(one, gamma);
+                ag_register_temp_value(scale);
+                AGValue *scaled = ag_mul(normalized, scale);
+                ag_register_temp_value(scaled);
+                AGValue *out = ag_add(scaled, beta);
+                ag_register_temp_value(out);
+
+                return out;
+            }
+        }
+    }
+
+    /* Fallback: return x unchanged if SPADE weights missing */
+    return x;
+}
+
+/* ag_spadeconv_forward: SPADE ConvBlock forward (SPADE + activation + conv) */
+static AGValue *ag_spadeconv_forward(AGValue *x, AGValue *cond, MLXSPADEConvBlock *block) {
+    if (!x || !block) return NULL;
+
+    /* Get SPADE module */
+    MLXSPADE *spade = mlx_spadeconv_get_spade(block);
+    if (!spade) return x;
+
+    /* Apply SPADE normalization */
+    AGValue *spade_out = ag_spade_forward(x, cond, spade);
+    if (!spade_out) return NULL;
+
+    /* Leaky ReLU activation */
+    AGValue *act = ag_leaky_relu(spade_out, 0.2f);
+    ag_register_temp_value(act);
+
+    /* Convolution */
+    mlx_array *conv_w = mlx_spadeconv_get_conv_weight(block);
+    if (conv_w) {
+        int pad = mlx_spadeconv_get_padding(block);
+        AGValue *w = ag_value_from_array(conv_w, 1);
+        ag_register_temp_value(w);
+        AGValue *out = ag_conv2d(act, w, 1, 1, pad, pad, 1, 1, 1);
+        ag_register_temp_value(out);
+        return out;
+    }
+
+    return act;
+}
+
+/* ag_spadegen_forward: Full SPADE Generator forward pass.
+ * Structure: init_conv -> leaky_relu -> [spade_blocks] -> tail_conv -> tanh */
+static AGValue *ag_spadegen_forward(AGValue *cond, MLXSPADEGenerator *gen, int padding_size) {
+    if (!cond || !gen) return NULL;
+
+    AGValue *x = cond;
+
+    /* Init conv (no padding for FaciesGAN) */
+    mlx_array *init_w = mlx_spadegen_get_init_conv(gen);
+    if (init_w) {
+        AGValue *w = ag_value_from_array(init_w, 1);
+        ag_register_temp_value(w);
+        x = ag_conv2d(x, w, 1, 1, padding_size, padding_size, 1, 1, 1);
+        ag_register_temp_value(x);
+
+        /* Leaky ReLU after init conv */
+        x = ag_leaky_relu(x, 0.2f);
+        ag_register_temp_value(x);
+    }
+
+    /* SPADE blocks */
+    int n_blocks = mlx_spadegen_get_n_blocks(gen);
+    for (int i = 0; i < n_blocks; i++) {
+        MLXSPADEConvBlock *block = mlx_spadegen_get_block_at(gen, i);
+        if (block) {
+            x = ag_spadeconv_forward(x, cond, block);
+            if (!x) return NULL;
+        }
+    }
+
+    /* Tail conv (no padding for FaciesGAN) + tanh */
+    mlx_array *tail_w = mlx_spadegen_get_tail_conv(gen);
+    if (tail_w) {
+        AGValue *w = ag_value_from_array(tail_w, 1);
+        ag_register_temp_value(w);
+        x = ag_conv2d(x, w, 1, 1, padding_size, padding_size, 1, 1, 1);
+        ag_register_temp_value(x);
+
+        /* Tanh activation */
+        x = ag_tanh(x);
+        ag_register_temp_value(x);
+    }
+
+    return x;
+}
+
+/* ============================================================================ */
+
 AGValue *mlx_faciesgan_generator_forward_ag(MLXFaciesGAN *m, AGValue **z_list,
         int z_count, const float *amp,
         int amp_count, AGValue *in_noise,
@@ -523,19 +763,40 @@ AGValue *mlx_faciesgan_generator_forward_ag(MLXFaciesGAN *m, AGValue **z_list,
     if (stop_scale >= n_gens)
         stop_scale = n_gens - 1;
 
-    /* Initialize out_facie: prefer provided `in_noise`, else use first z as base.
-     */
+    /* Calculate full_zero_padding for initializing out_facie */
+    int zero_padding = m->num_layer * (m->kernel_size / 2);
+    int full_zero_padding = 2 * zero_padding;
+
+    /* Initialize out_facie: if in_noise provided, use it.
+     * Otherwise, create zeros with shape (batch, z_h - fzp, z_w - fzp, output_channels)
+     * to match Python semantics. */
     AGValue *out_facie = NULL;
-    if (in_noise)
+    if (in_noise) {
         out_facie = in_noise;
-    else if (z_count > 0 && z_list)
-        out_facie = z_list[0];
+    } else if (z_count > start_scale && z_list && z_list[start_scale]) {
+        /* Create zeros matching Python: (batch, z_h - fzp, z_w - fzp, output_channels) */
+        mlx_array *zarr = ag_value_array(z_list[start_scale]);
+        if (zarr && mlx_array_ndim(*zarr) == 4) {
+            const int *zshape = mlx_array_shape(*zarr);
+            int batch = zshape[0];
+            int h = zshape[1] - full_zero_padding;
+            int w = zshape[2] - full_zero_padding;
+            int c = m->num_img_channels > 0 ? m->num_img_channels : 3;
+            int shape[4] = {batch, h, w, c};
+            mlx_array zeros = mlx_array_new();
+            mlx_stream s = mlx_default_cpu_stream_new();
+            if (mlx_zeros(&zeros, shape, 4, MLX_FLOAT32, s) == 0) {
+                out_facie = ag_value_from_new_array(&zeros, 0);
+                ag_register_temp_value(out_facie);
+                mlx_array_free(zeros);  /* free original after copy */
+            }
+            mlx_stream_free(s);
+        }
+    }
     if (!out_facie)
         return NULL;
 
     /* Progressive multi-scale loop: use AG ops to mirror numeric forward. */
-    int zero_padding = m->num_layer * (m->kernel_size / 2);
-    int full_zero_padding = 2 * zero_padding;
     for (int index = start_scale; index <= stop_scale; ++index) {
         /* If no corresponding z provided, stop progressing. */
         if (!z_list || index >= z_count)
@@ -556,68 +817,115 @@ AGValue *mlx_faciesgan_generator_forward_ag(MLXFaciesGAN *m, AGValue **z_list,
 
         AGValue *z_in = z_list[index];
 
-        /* Optionally scale noise channel by amp */
-        if (amp && amp_count > index && z_in) {
-            AGValue *scale = ag_scalar_float(amp[index]);
-            ag_register_temp_value(scale);
-            AGValue *scaled = ag_mul(z_in, scale);
-            ag_register_temp_value(scaled);
-            z_in = scaled;
+        /* NOTE: For conditioning, z_in has [noise, cond] concatenated.
+         * For non-conditioning, z_in has just noise.
+         * Detect conditioning by checking if z_in last dimension > output_channels. */
+        int has_cond_in_z = 0;
+        mlx_array *z_arr = ag_value_array(z_in);
+        if (z_arr && mlx_array_ndim(*z_arr) == 4) {
+            const int *sh = mlx_array_shape(*z_arr);
+            int out_ch = m->num_img_channels > 0 ? m->num_img_channels : 3;
+            if (sh[3] > out_ch) {
+                has_cond_in_z = 1;
+            }
         }
 
-        /* Pad z_in to match upsampled spatial dims and add */
-        int axes[2] = {1, 2};
-        int low_pad[2] = {zero_padding, zero_padding};
-        int high_pad[2] = {zero_padding, zero_padding};
-        AGValue *padded =
-            ag_pad(ups, axes, 2, low_pad, 2, high_pad, 2, 0.0f, "constant");
-        ag_register_temp_value(padded);
-        if (z_in) {
-            AGValue *zadd = ag_add(z_in, padded);
-            ag_register_temp_value(zadd);
-            z_in = zadd;
+        if (!has_cond_in_z) {
+            /* No conditioning: scale z_in by amp and add padded upsampling */
+            if (amp && amp_count > index && z_in) {
+                AGValue *scale = ag_scalar_float(amp[index]);
+                ag_register_temp_value(scale);
+                AGValue *scaled = ag_mul(z_in, scale);
+                ag_register_temp_value(scaled);
+                z_in = scaled;
+            }
+
+            /* Pad ups to match z spatial dims and add to z_in */
+            int axes[2] = {1, 2};
+            int low_pad[2] = {zero_padding, zero_padding};
+            int high_pad[2] = {zero_padding, zero_padding};
+            AGValue *padded =
+                ag_pad(ups, axes, 2, low_pad, 2, high_pad, 2, 0.0f, "constant");
+            ag_register_temp_value(padded);
+            if (z_in) {
+                AGValue *zadd = ag_add(z_in, padded);
+                ag_register_temp_value(zadd);
+                z_in = zadd;
+            }
+        } else {
+            /* With conditioning: z_in already contains [noise, cond].
+             * Don't add padded upsampling to z_in; the head conv will handle
+             * the 6-channel input. Instead, just scale z_in if needed. */
+            if (amp && amp_count > index && z_in) {
+                AGValue *scale = ag_scalar_float(amp[index]);
+                ag_register_temp_value(scale);
+                AGValue *scaled = ag_mul(z_in, scale);
+                ag_register_temp_value(scaled);
+                z_in = scaled;
+            }
+            /* Note: We skip the padded upsampling addition because z_in
+             * contains conditioning information that needs to stay intact
+             * for the head conv to process properly. */
         }
 
-        AGValue *cur = z_in ? z_in : ups;
+        AGValue *cur = NULL;
 
-        /* Head conv */
-        MLXConvBlock *head = mlx_scale_get_head(m->generator, index);
-        if (head) {
-            mlx_array *wh = mlx_convblock_get_conv_weight(head);
-            if (wh) {
-                AGValue *w_ag = ag_value_from_array(wh, 1);
-                ag_register_temp_value(w_ag);
-                cur = ag_conv2d(cur, w_ag, 1, 1, 1, 1, 1, 1, 1);
+        /* Check if this scale uses SPADE generator */
+        int is_spade = mlx_scale_is_spade(m->generator, index);
+        if (is_spade) {
+            /* SPADE Generator path */
+            MLXSPADEGenerator *spade_gen = mlx_scale_get_spade(m->generator, index);
+            if (spade_gen) {
+                cur = ag_spadegen_forward(z_in, spade_gen, m->padding_size);
+            }
+        } else {
+            /* Standard ConvBlock path */
+            cur = z_in ? z_in : ups;
+
+            /* Head conv */
+            MLXConvBlock *head = mlx_scale_get_head(m->generator, index);
+            if (head) {
+                mlx_array *wh = mlx_convblock_get_conv_weight(head);
+                if (wh) {
+                    AGValue *w_ag = ag_value_from_array(wh, 1);
+                    ag_register_temp_value(w_ag);
+                    cur = ag_conv2d(cur, w_ag, 1, 1, 0, 0, 1, 1, 1);
+                    cur = ag_leaky_relu(cur, 0.2f);
+                    ag_register_temp_value(cur);
+                }
+            }
+
+            /* Body convs */
+            int body_n = mlx_scale_get_body_count(m->generator, index);
+            for (int b = 0; b < body_n; ++b) {
+                MLXConvBlock *cb = mlx_scale_get_body_at(m->generator, index, b);
+                if (!cb)
+                    continue;
+                mlx_array *wb = mlx_convblock_get_conv_weight(cb);
+                if (!wb)
+                    continue;
+                AGValue *wbag = ag_value_from_array(wb, 1);
+                ag_register_temp_value(wbag);
+                cur = ag_conv2d(cur, wbag, 1, 1, 0, 0, 1, 1, 1);
                 cur = ag_leaky_relu(cur, 0.2f);
                 ag_register_temp_value(cur);
             }
-        }
 
-        /* Body convs */
-        int body_n = mlx_scale_get_body_count(m->generator, index);
-        for (int b = 0; b < body_n; ++b) {
-            MLXConvBlock *cb = mlx_scale_get_body_at(m->generator, index, b);
-            if (!cb)
-                continue;
-            mlx_array *wb = mlx_convblock_get_conv_weight(cb);
-            if (!wb)
-                continue;
-            AGValue *wbag = ag_value_from_array(wb, 1);
-            ag_register_temp_value(wbag);
-            cur = ag_conv2d(cur, wbag, 1, 1, 1, 1, 1, 1, 1);
-            cur = ag_leaky_relu(cur, 0.2f);
-            ag_register_temp_value(cur);
-        }
-
-        /* Tail conv */
-        if (mlx_scale_has_tail_conv(m->generator, index)) {
-            mlx_array *wt = mlx_scale_get_tail_conv(m->generator, index);
-            if (wt) {
-                AGValue *wtag = ag_value_from_array(wt, 1);
-                ag_register_temp_value(wtag);
-                cur = ag_conv2d(cur, wtag, 1, 1, 1, 1, 1, 1, 1);
-                ag_register_temp_value(cur);
+            /* Tail conv */
+            if (mlx_scale_has_tail_conv(m->generator, index)) {
+                mlx_array *wt = mlx_scale_get_tail_conv(m->generator, index);
+                if (wt) {
+                    AGValue *wtag = ag_value_from_array(wt, 1);
+                    ag_register_temp_value(wtag);
+                    cur = ag_conv2d(cur, wtag, 1, 1, 0, 0, 1, 1, 1);
+                    ag_register_temp_value(cur);
+                }
             }
+        }
+
+        /* Skip if cur is NULL (SPADE failed) */
+        if (!cur) {
+            continue;
         }
 
         AGValue *new_out = ag_add(cur, ups);
@@ -644,7 +952,7 @@ AGValue *mlx_faciesgan_discriminator_forward_ag(MLXFaciesGAN *m, AGValue *input,
     if (wh) {
         AGValue *w_ag = ag_value_from_array(wh, 1);
         ag_register_temp_value(w_ag);
-        x = ag_conv2d(x, w_ag, 1, 1, 1, 1, 1, 1, 1);
+        x = ag_conv2d(x, w_ag, 1, 1, 0, 0, 1, 1, 1);
         x = ag_leaky_relu(x, 0.2f);
         ag_register_temp_value(x);
     }
@@ -652,20 +960,20 @@ AGValue *mlx_faciesgan_discriminator_forward_ag(MLXFaciesGAN *m, AGValue *input,
     /* Body convs */
     int body_n = mlx_spadedisc_get_body_count(disc);
     for (int b = 0; b < body_n; ++b) {
-        MLXSPADEConvBlock *cb = mlx_spadedisc_get_body_at(disc, b);
+        MLXConvBlock *cb = mlx_spadedisc_get_body_at(disc, b);
         if (!cb)
             continue;
-        mlx_array *wb = mlx_spadeconv_get_conv_weight(cb);
+        mlx_array *wb = mlx_convblock_get_conv_weight(cb);
         if (!wb)
             continue;
         AGValue *wbag = ag_value_from_array(wb, 1);
         ag_register_temp_value(wbag);
-        x = ag_conv2d(x, wbag, 1, 1, 1, 1, 1, 1, 1);
+        x = ag_conv2d(x, wbag, 1, 1, 0, 0, 1, 1, 1);
         x = ag_leaky_relu(x, 0.2f);
         ag_register_temp_value(x);
     }
 
-    /* Tail conv -> scalar output */
+    /* Tail conv -> output (not reduced to scalar; ag_mean is applied in loss) */
     mlx_array *wt = mlx_spadedisc_get_tail_conv(disc);
     if (wt) {
         AGValue *wtag = ag_value_from_array(wt, 1);
@@ -674,14 +982,8 @@ AGValue *mlx_faciesgan_discriminator_forward_ag(MLXFaciesGAN *m, AGValue *input,
         ag_register_temp_value(x);
     }
 
-    /* Reduce spatial/channel dims to a scalar (sum over axes). */
-    AGValue *s = ag_sum_axis(x, 1, 0);
-    ag_register_temp_value(s);
-    s = ag_sum_axis(s, 1, 0);
-    ag_register_temp_value(s);
-    s = ag_sum_axis(s, 1, 0);
-    ag_register_temp_value(s);
-    return s;
+    /* Return spatial output (B,H,W,1); loss uses ag_mean to reduce to scalar. */
+    return x;
 }
 
 AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
@@ -712,6 +1014,7 @@ AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
                                        mlx_array_empty, s2) == 0) {
                     alpha = ag_value_from_new_array(&a, 0);
                     ag_register_temp_value(alpha);
+                    mlx_array_free(a);  /* free original after copy */
                 } else {
                     mlx_array_free(a);
                 }
@@ -772,6 +1075,7 @@ AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
                     AGValue *real_p = ag_value_from_new_array(&padded, 0);
                     ag_register_temp_value(real_p);
                     real = real_p;
+                    mlx_array_free(padded);  /* free original after copy */
                 } else {
                     mlx_array_free(padded);
                 }
@@ -795,14 +1099,8 @@ AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
         return NULL;
     ag_register_temp_value(out);
 
-    /* Reduce to scalar by summing all axes */
-    mlx_array *out_arr = ag_value_array(out);
-    if (!out_arr)
-        return NULL;
-    int out_ndim = (int)mlx_array_ndim(*out_arr);
-    AGValue *sval = out;
-    for (int ax = 0; ax < out_ndim; ++ax)
-        sval = ag_sum_axis(sval, 0, 0);
+    /* Reduce to scalar using ag_sum (matches Python's mx.sum(out)) */
+    AGValue *sval = ag_sum(out);
     ag_register_temp_value(sval);
 
     /* Build create-graph backward to obtain symbolic gradients of `interpolates`
@@ -825,6 +1123,7 @@ AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
     int last_axis = g_ndim - 1;
     AGValue *g_sum = ag_sum_axis(g_sq, last_axis, 0);
     ag_register_temp_value(g_sum);
+
     AGValue *eps = ag_scalar_float(1e-12f);
     ag_register_temp_value(eps);
     AGValue *g_sum_eps = ag_add(g_sum, eps);
@@ -840,28 +1139,20 @@ AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
     AGValue *sq = ag_square(diff);
     ag_register_temp_value(sq);
 
-    /* reduce sq to scalar by summing all axes then divide by number of elements
-     */
-    mlx_array *sq_arr = ag_value_array(sq);
-    if (!sq_arr)
-        return NULL;
-    int sq_ndim = (int)mlx_array_ndim(*sq_arr);
-    AGValue *sum_sq = sq;
-    for (int ax = 0; ax < sq_ndim; ++ax)
-        sum_sq = ag_sum_axis(sum_sq, 0, 0);
-    ag_register_temp_value(sum_sq);
-
-    /* denom = number of elements in sq array (as float) */
-    size_t elems = mlx_array_size(*sq_arr);
-    AGValue *den = ag_scalar_float((float)elems);
-    ag_register_temp_value(den);
-    AGValue *mean = ag_divide(sum_sq, den);
+    /* Use ag_mean to reduce sq to scalar (matches Python's mx.mean) */
+    AGValue *mean = ag_mean(sq);
     ag_register_temp_value(mean);
 
     AGValue *lam = ag_scalar_float(lambda_grad);
     ag_register_temp_value(lam);
     AGValue *pen = ag_mul(mean, lam);
     ag_register_temp_value(pen);
+
+    /* Clear grad_ag pointers on all tape nodes. The GP computation is complete
+     * and we've extracted what we need (grad_interpolates) into the pen computation.
+     * Leaving grad_ag set would cause subsequent ag_backward calls to incorrectly
+     * use create_graph mode for unrelated nodes. */
+    ag_clear_grad_ag_all();
 
     return pen;
 }
@@ -888,21 +1179,8 @@ AGValue *mlx_faciesgan_compute_diversity_loss_ag(MLXFaciesGAN *m,
             AGValue *sq = ag_square(diff);
             ag_register_temp_value(sq);
 
-            /* reduce to scalar sum */
-            mlx_array *arr = ag_value_array(sq);
-            if (!arr)
-                continue;
-            int ndim = (int)mlx_array_ndim(*arr);
-            AGValue *s = sq;
-            for (int ax = 0; ax < ndim; ++ax)
-                s = ag_sum_axis(s, 0, 0);
-            ag_register_temp_value(s);
-
-            /* mean = s / elems */
-            size_t elems = mlx_array_size(*arr);
-            AGValue *den = ag_scalar_float((float)elems);
-            ag_register_temp_value(den);
-            AGValue *mean_sq = ag_divide(s, den);
+            /* Use ag_mean to reduce to scalar (matches Python's mx.mean) */
+            AGValue *mean_sq = ag_mean(sq);
             ag_register_temp_value(mean_sq);
 
             /* approximate exp(-10 * mean_sq) with 1 / (1 + 10 * mean_sq) */
@@ -956,19 +1234,8 @@ AGValue *mlx_faciesgan_compute_masked_loss_ag(MLXFaciesGAN *m, AGValue *fake,
     AGValue *sq = ag_square(diff);
     ag_register_temp_value(sq);
 
-    mlx_array *arr = ag_value_array(sq);
-    if (!arr)
-        return ag_scalar_float(0.0f);
-    int ndim = (int)mlx_array_ndim(*arr);
-    AGValue *s = sq;
-    for (int ax = 0; ax < ndim; ++ax)
-        s = ag_sum_axis(s, 0, 0);
-    ag_register_temp_value(s);
-
-    size_t elems = mlx_array_size(*arr);
-    AGValue *den = ag_scalar_float((float)elems);
-    ag_register_temp_value(den);
-    AGValue *mean = ag_divide(s, den);
+    /* Use ag_mean to reduce to scalar (matches Python's mx.mean) */
+    AGValue *mean = ag_mean(sq);
     ag_register_temp_value(mean);
 
     AGValue *lam = ag_scalar_float(well_loss_penalty);
@@ -1075,6 +1342,7 @@ AGValue *mlx_faciesgan_generator_forward_ag_with_params(
         mlx_free_mlx_array_vals(&zvals, z_count);
 
     AGValue *out_ag = ag_value_from_new_array(&numeric_out, 0);
+    mlx_array_free(numeric_out);  /* free original after copy */
     ag_register_temp_value(out_ag);
 
     /* Collect generator parameter AG wrappers (requires_grad=1). */
@@ -1294,6 +1562,9 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                                     mlx_array **wells_pyramid,
                                     mlx_array **seismic_pyramid, int rec) {
     /* unused parameters in this helper; no-op */
+    (void)indexes;
+    (void)seismic_pyramid;
+    (void)rec;
     if (!m || !out_noises || !out_n)
         return -1;
     if (scale < 0)
@@ -1320,7 +1591,26 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                            ? 1
                            : 0;
         int c = 0;
-        if (m->shapes && m->n_shapes > i) {
+
+        /* When conditioning is present, derive spatial dimensions from the conditioning
+           arrays themselves to ensure compatibility. Otherwise use m->shapes. */
+        if (cond_present && wells_pyramid && wells_pyramid[i]) {
+            const int *cond_shape = mlx_array_shape(*wells_pyramid[i]);
+            if (cond_shape) {
+                batch = cond_shape[0];
+                h = cond_shape[1];
+                w = cond_shape[2];
+                c = m->base_channel;  /* base_channel includes both noise + conditioning */
+            }
+        } else if (cond_present && seismic_pyramid && seismic_pyramid[i]) {
+            const int *cond_shape = mlx_array_shape(*seismic_pyramid[i]);
+            if (cond_shape) {
+                batch = cond_shape[0];
+                h = cond_shape[1];
+                w = cond_shape[2];
+                c = m->base_channel;
+            }
+        } else if (m->shapes && m->n_shapes > i) {
             const int *s0 = &m->shapes[i * 4];
             batch = s0[0];
             h = s0[1];
@@ -1348,22 +1638,56 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
            before any operator= or other methods are invoked. This avoids
            UB when assigning into freshly-allocated memory. */
         *a = mlx_array_new();
-        int shape[4] = {batch, h, w, c};
-        /* base noise */
-        if (mlx_random_normal(a, shape, 4, MLX_FLOAT32, 0.0f, 1.0f, mlx_array_empty,
-                              s) != 0) {
-            /* fallback: create zeros */
-            if (mlx_zeros(a, shape, 4, MLX_FLOAT32, s) != 0) {
-                mlx_free_pod((void **)&a);
-                for (int j = 0; j < n; ++j) {
-                    if (arr[j]) {
-                        mlx_array_free(*arr[j]);
-                        mlx_free_pod((void **)&arr[j]);
+
+        /* NOTE: When conditioning is present, we create noise WITHOUT padding first.
+           After concatenating with conditioning data, we apply padding.
+           When conditioning is NOT present, we include padding directly in noise creation.
+
+           With conditioning: noise_channels = 3, cond_channels = 3, total = 6 after concat
+           Without conditioning: total_channels = gen_input_channels (typically 3)
+        */
+        int final_h, final_w;
+        int noise_only_c = 3;  /* Always 3 channels for pure noise */
+
+        if (cond_present) {
+            /* Create noise with 3 channels and unpadded spatial dims to match conditioning */
+            final_h = h;
+            final_w = w;
+            int noise_shape[4] = {batch, h, w, noise_only_c};
+            if (mlx_random_normal(a, noise_shape, 4, MLX_FLOAT32, 0.0f, 1.0f, mlx_array_empty,
+                                  s) != 0) {
+                if (mlx_zeros(a, noise_shape, 4, MLX_FLOAT32, s) != 0) {
+                    mlx_free_pod((void **)&a);
+                    for (int j = 0; j < n; ++j) {
+                        if (arr[j]) {
+                            mlx_array_free(*arr[j]);
+                            mlx_free_pod((void **)&arr[j]);
+                        }
                     }
+                    mlx_free_mlx_array_ptrs(&arr, n);
+                    mlx_stream_free(s);
+                    return -1;
                 }
-                mlx_free_mlx_array_ptrs(&arr, n);
-                mlx_stream_free(s);
-                return -1;
+            }
+        } else {
+            /* Create noise with padded spatial dims and gen_input_channels (no conditioning case) */
+            final_h = h + 2 * m->padding_size;
+            final_w = w + 2 * m->padding_size;
+            int shape[4] = {batch, final_h, final_w, c};
+            if (mlx_random_normal(a, shape, 4, MLX_FLOAT32, 0.0f, 1.0f, mlx_array_empty,
+                                  s) != 0) {
+                if (mlx_zeros(a, shape, 4, MLX_FLOAT32, s) != 0) {
+                    mlx_free_pod((void **)&a);
+                    for (int j = 0; j < n; ++j) {
+                        if (arr[j]) {
+                            mlx_array_free(*arr[j]);
+                            mlx_free_pod((void **)&arr[j]);
+                        }
+                    }
+                    mlx_free_mlx_array_ptrs(&arr, n);
+                    mlx_stream_free(s);
+                    return -1;
+                }
             }
         }
 
@@ -1376,42 +1700,9 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
             mlx_array idx = mlx_array_new_data(indexes, idx_shape, 1, MLX_INT32);
             mlx_array wells_sel = mlx_array_new();
             mlx_array seismic_sel = mlx_array_new();
-            int wells_ndim = (int)mlx_array_ndim(*wells_pyramid[i]);
-            int seismic_ndim = (int)mlx_array_ndim(*seismic_pyramid[i]);
-            /* Build slice sizes for wells and seismic (axes after axis=0) */
-            int *wells_slice = NULL;
-            int wells_slice_num = 0;
-            if (wells_ndim > 1) {
-                wells_slice_num = wells_ndim - 1;
-                if ((size_t)wells_slice_num > (size_t)INT_MAX) {
-                    wells_slice = (int *)malloc(sizeof(int) * (size_t)wells_slice_num);
-                } else {
-                    if (mlx_alloc_int_array(&wells_slice, wells_slice_num) != 0)
-                        wells_slice = NULL;
-                }
-                const int *w_sh = mlx_array_shape(*wells_pyramid[i]);
-                for (int si = 0; si < wells_slice_num; ++si)
-                    wells_slice[si] = w_sh[si + 1];
-            }
-            int *seis_slice = NULL;
-            int seis_slice_num = 0;
-            if (seismic_ndim > 1) {
-                seis_slice_num = seismic_ndim - 1;
-                if ((size_t)seis_slice_num > (size_t)INT_MAX) {
-                    seis_slice = (int *)malloc(sizeof(int) * (size_t)seis_slice_num);
-                } else {
-                    if (mlx_alloc_int_array(&seis_slice, seis_slice_num) != 0)
-                        seis_slice = NULL;
-                }
-                const int *z_sh = mlx_array_shape(*seismic_pyramid[i]);
-                for (int si = 0; si < seis_slice_num; ++si)
-                    seis_slice[si] = z_sh[si + 1];
-            }
-            if (wells_ndim > 0 && seismic_ndim > 0 &&
-                    mlx_gather_single(&wells_sel, *wells_pyramid[i], idx, 0, wells_slice,
-                                      wells_slice_num, s) == 0 &&
-                    mlx_gather_single(&seismic_sel, *seismic_pyramid[i], idx, 0,
-                                      seis_slice, seis_slice_num, s) == 0) {
+            /* Use mlx_take_axis for proper indexing (equivalent to Python's array[indices]) */
+            if (mlx_take_axis(&wells_sel, *wells_pyramid[i], idx, 0, s) == 0 &&
+                    mlx_take_axis(&seismic_sel, *seismic_pyramid[i], idx, 0, s) == 0) {
                 mlx_vector_array vec = mlx_vector_array_new_data(
                 (const mlx_array[]) {
                     *a, wells_sel, seismic_sel
@@ -1430,35 +1721,15 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                 mlx_array_free(wells_sel);
                 mlx_array_free(seismic_sel);
             }
-            if (wells_slice)
-                mlx_free_int_array(&wells_slice, &wells_slice_num);
-            if (seis_slice)
-                mlx_free_int_array(&seis_slice, &seis_slice_num);
             mlx_array_free(idx);
         } else if (indexes && n_indexes > 0 && wells_pyramid && wells_pyramid[i]) {
             /* build indices array */
             int idx_shape[1] = {n_indexes};
             mlx_array idx = mlx_array_new_data(indexes, idx_shape, 1, MLX_INT32);
             mlx_array cond_sel = mlx_array_new();
-            int cond_ndim = (int)mlx_array_ndim(*wells_pyramid[i]);
-            int *slice_sizes = NULL;
-            int slice_num = 0;
-            if (cond_ndim > 0) {
-                /* pass full shape (all dimensions) to mlx_gather_single */
-                slice_num = cond_ndim;
-                if ((size_t)slice_num > (size_t)INT_MAX) {
-                    slice_sizes = (int *)malloc(sizeof(int) * (size_t)slice_num);
-                } else {
-                    if (mlx_alloc_int_array(&slice_sizes, slice_num) != 0)
-                        slice_sizes = NULL;
-                }
-                const int *sh = mlx_array_shape(*wells_pyramid[i]);
-                for (int si = 0; si < slice_num; ++si)
-                    slice_sizes[si] = sh[si];
-            }
-            if (cond_ndim > 0 &&
-                    mlx_gather_single(&cond_sel, *wells_pyramid[i], idx, 0, slice_sizes,
-                                      slice_num, s) == 0) {
+            /* Use mlx_take_axis for proper indexing (equivalent to Python's well[indexes]) */
+            if (mlx_take_axis(&cond_sel, *wells_pyramid[i], idx, 0, s) == 0) {
+                int cond_sel_ndim = (int)mlx_array_ndim(cond_sel);
                 /* concat noise and cond_sel */
                 mlx_vector_array vec =
                 mlx_vector_array_new_data((const mlx_array[]) {
@@ -1475,35 +1746,17 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                 mlx_vector_array_free(vec);
                 mlx_array_free(cond_sel);
             } else {
-                /* failed to gather: ignore and continue with base noise */
+                /* failed to take: ignore and continue with base noise */
                 mlx_array_free(cond_sel);
             }
             mlx_array_free(idx);
-            if (slice_sizes)
-                mlx_free_int_array(&slice_sizes, &slice_num);
         } else if (indexes && n_indexes > 0 && seismic_pyramid &&
                    seismic_pyramid[i]) {
             int idx_shape[1] = {n_indexes};
             mlx_array idx = mlx_array_new_data(indexes, idx_shape, 1, MLX_INT32);
             mlx_array cond_sel = mlx_array_new();
-            int cond_ndim = (int)mlx_array_ndim(*seismic_pyramid[i]);
-            int *slice_sizes2 = NULL;
-            int slice_num2 = 0;
-            if (cond_ndim > 0) {
-                slice_num2 = cond_ndim;
-                if ((size_t)slice_num2 > (size_t)INT_MAX) {
-                    slice_sizes2 = (int *)malloc(sizeof(int) * (size_t)slice_num2);
-                } else {
-                    if (mlx_alloc_int_array(&slice_sizes2, slice_num2) != 0)
-                        slice_sizes2 = NULL;
-                }
-                const int *sh2 = mlx_array_shape(*seismic_pyramid[i]);
-                for (int si = 0; si < slice_num2; ++si)
-                    slice_sizes2[si] = sh2[si];
-            }
-            if (cond_ndim > 0 &&
-                    mlx_gather_single(&cond_sel, *seismic_pyramid[i], idx, 0,
-                                      slice_sizes2, slice_num2, s) == 0) {
+            /* Use mlx_take_axis for proper indexing (equivalent to Python's seismic[indexes]) */
+            if (mlx_take_axis(&cond_sel, *seismic_pyramid[i], idx, 0, s) == 0) {
                 mlx_vector_array vec =
                 mlx_vector_array_new_data((const mlx_array[]) {
                     *a, cond_sel
@@ -1521,8 +1774,6 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                 mlx_array_free(cond_sel);
             }
             mlx_array_free(idx);
-            if (slice_sizes2)
-                mlx_free_int_array(&slice_sizes2, &slice_num2);
         }
 
         /* Apply padding consistent with Python generate_padding */
@@ -1887,19 +2138,16 @@ int mlx_faciesgan_optimize_discriminator_scales(
                     m, scale, indexes, n_indexes, &gen_noises, &gen_n_noises,
                     wells_pyramid, seismic_pyramid, 0) == 0) {
             if (gen_n_noises > scale && gen_noises[scale]) {
-                /* transfer ownership of the mlx_array into the AGValue wrapper */
+                /* ag_value_from_new_array makes a copy; must free original */
                 noise_in = ag_value_from_new_array(gen_noises[scale], 0);
                 ag_register_temp_value(noise_in);
                 _transferred_noise_idx = scale;
             }
             for (int ni = 0; ni < gen_n_noises; ++ni) {
                 if (gen_noises[ni]) {
-                    if (ni == _transferred_noise_idx) {
-                        mlx_free_pod((void **)&gen_noises[ni]);
-                    } else {
-                        mlx_array_free(*gen_noises[ni]);
-                        mlx_free_pod((void **)&gen_noises[ni]);
-                    }
+                    /* Always free the mlx_array AND the pod wrapper */
+                    mlx_array_free(*gen_noises[ni]);
+                    mlx_free_pod((void **)&gen_noises[ni]);
                 }
             }
             mlx_free_ptr_array((void ***)&gen_noises, gen_n_noises);
@@ -1948,7 +2196,11 @@ int mlx_faciesgan_optimize_discriminator_scales(
         /* Gradient penalty: sample interpolation between real and fake, compute
          * ||grad_x D(x_hat)||_2 and penalize (||.||-1)^2 */
         float gp_lambda = 10.0f;
+        printf("[GP DEBUG] real_in=%p fake=%p\n", (void*)real_in, (void*)fake);
+        fflush(stdout);
         if (real_in && fake) {
+            printf("[GP DEBUG] Entering GP computation\n");
+            fflush(stdout);
             /* eps = 0.5 (broadcastable) for simplicity; production should randomize
              * per-sample */
             AGValue *eps = ag_scalar_float(0.5f);
@@ -1973,36 +2225,42 @@ int mlx_faciesgan_optimize_discriminator_scales(
              * AGValue->grad_ag */
             if (d_interp) {
                 if (mlx_faciesgan_get_use_create_graph_gp()) {
+                    printf("[GP DEBUG] Using create_graph GP\n");
+                    fflush(stdout);
                     ag_backward_create_graph(d_interp);
                     /* interp->grad_ag now holds gradient AGValue */
                     AGValue *g = ag_value_get_grad_ag(interp);
+                    printf("[GP DEBUG] g=%p\n", (void*)g);
+                    fflush(stdout);
                     if (g) {
                         AGValue *g2 = ag_square(g);
                         ag_register_temp_value(g2);
-                        /* sum over H,W,channel axes. Determine shape dims via underlying
-                         * array */
+                        /* Sum over channel axis (last axis) without keepdims to match Python:
+                         * grad_norm = mx.sqrt(mx.sum(mx.square(gradients), axis=-1) + 1e-12) */
                         mlx_array *gar = ag_value_array(g);
                         if (gar) {
                             int ndim = mlx_array_ndim(*gar);
-                            AGValue *s = g2;
-                            /* reduce axes 3,2,1 if present (NHWC) */
-                            for (int ax = ndim - 1; ax >= 1; --ax) {
-                                s = ag_sum_axis(s, ax, 1);
-                                ag_register_temp_value(s);
-                            }
-                            AGValue *std = ag_sqrt(s);
-                            ag_register_temp_value(std);
-                            /* reduce to scalar across batch */
-                            AGValue *norm = std;
-                            for (int ax = 0; ax < 1; ++ax) { /* reduce batch to scalar */
-                                norm = ag_sum_axis(norm, 0, 0);
-                                ag_register_temp_value(norm);
-                            }
-                            AGValue *sub = ag_sub(norm, ag_scalar_float(1.0f));
+                            int last_axis = ndim - 1;  /* channel axis */
+                            printf("[GP DEBUG] g ndim=%d, calling ag_sum_axis with keepdims=0\n", ndim);
+                            fflush(stdout);
+                            AGValue *g_sum = ag_sum_axis(g2, last_axis, 0);
+                            printf("[GP DEBUG] g_sum created\n");
+                            fflush(stdout);
+                            ag_register_temp_value(g_sum);
+                            AGValue *eps = ag_scalar_float(1e-12f);
+                            ag_register_temp_value(eps);
+                            AGValue *g_sum_eps = ag_add(g_sum, eps);
+                            ag_register_temp_value(g_sum_eps);
+                            AGValue *g_norm = ag_sqrt(g_sum_eps);
+                            ag_register_temp_value(g_norm);
+                            /* gradient_penalty = mean(square(g_norm - 1.0)) * lambda */
+                            AGValue *sub = ag_sub(g_norm, ag_scalar_float(1.0f));
                             ag_register_temp_value(sub);
                             AGValue *sq = ag_square(sub);
                             ag_register_temp_value(sq);
-                            AGValue *gp = ag_mul(sq, ag_scalar_float(gp_lambda));
+                            AGValue *mean_sq = ag_mean(sq);
+                            ag_register_temp_value(mean_sq);
+                            AGValue *gp = ag_mul(mean_sq, ag_scalar_float(gp_lambda));
                             ag_register_temp_value(gp);
                             loss = loss ? ag_add(loss, gp) : gp;
                             ag_register_temp_value(loss);
@@ -2043,12 +2301,8 @@ int mlx_faciesgan_optimize_discriminator_scales(
                 continue;
             AGValue *psq = ag_square(p);
             ag_register_temp_value(psq);
-            /* reduce to scalar */
-            mlx_array *arr = ag_value_array(psq);
-            int ndim = (int)mlx_array_ndim(*arr);
-            AGValue *s = psq;
-            for (int ax = 0; ax < ndim; ++ax)
-                s = ag_sum_axis(s, 0, 0);
+            /* reduce to scalar using ag_sum */
+            AGValue *s = ag_sum(psq);
             ag_register_temp_value(s);
             if (!l2_sum)
                 l2_sum = s;
@@ -2126,23 +2380,19 @@ int mlx_faciesgan_optimize_generator_scales(
         AGValue *noise_in = NULL;
         mlx_array **gen_noises = NULL;
         int gen_n_noises = 0;
-        int _transferred_noise_idx = -1;
         if (mlx_faciesgan_get_pyramid_noise(
                     m, scale, indexes, n_indexes, &gen_noises, &gen_n_noises,
                     wells_pyramid, seismic_pyramid, 0) == 0) {
             if (gen_n_noises > scale && gen_noises[scale]) {
+                /* ag_value_from_new_array makes a copy; must free original */
                 noise_in = ag_value_from_new_array(gen_noises[scale], 0);
                 ag_register_temp_value(noise_in);
-                _transferred_noise_idx = scale;
             }
             for (int ni = 0; ni < gen_n_noises; ++ni) {
                 if (gen_noises[ni]) {
-                    if (ni == _transferred_noise_idx) {
-                        mlx_free_pod((void **)&gen_noises[ni]);
-                    } else {
-                        mlx_array_free(*gen_noises[ni]);
-                        mlx_free_pod((void **)&gen_noises[ni]);
-                    }
+                    /* Always free the mlx_array AND the pod wrapper */
+                    mlx_array_free(*gen_noises[ni]);
+                    mlx_free_pod((void **)&gen_noises[ni]);
                 }
             }
             mlx_free_ptr_array((void ***)&gen_noises, gen_n_noises);
@@ -2189,12 +2439,8 @@ int mlx_faciesgan_optimize_generator_scales(
             }
             AGValue *sq = ag_square(diff);
             ag_register_temp_value(sq);
-            /* reduce to scalar */
-            mlx_array *arr = ag_value_array(sq);
-            int ndim = (int)mlx_array_ndim(*arr);
-            AGValue *s = sq;
-            for (int ax = 0; ax < ndim; ++ax)
-                s = ag_sum_axis(s, 0, 0);
+            /* reduce to scalar using ag_sum */
+            AGValue *s = ag_sum(sq);
             ag_register_temp_value(s);
             /* weight reconstruction loss */
             AGValue *w = ag_scalar_float(10.0f);
@@ -2345,8 +2591,6 @@ AGValue *mlx_faciesgan_compute_recovery_loss_ag(
     if (!rec_in || !real || alpha == 0.0f)
         return ag_scalar_float(0.0f);
 
-    /* debug prints removed */
-
     /* If `rec_in` has an extra singleton leading dimension (e.g. shape
        (1,1,H,W,C)) but `real` is (1,H,W,C), squeeze that dimension so
        broadcasting works. */
@@ -2367,6 +2611,7 @@ AGValue *mlx_faciesgan_compute_recovery_loss_ag(
                     AGValue *squeezed = ag_value_from_new_array(&tmp, 0);
                     ag_register_temp_value(squeezed);
                     rec_in = squeezed;
+                    mlx_array_free(tmp);  /* free original after copy */
                 } else {
                     /* reshape failed: free tmp if needed */
                     mlx_array_free(tmp);
@@ -2413,19 +2658,8 @@ AGValue *mlx_faciesgan_compute_recovery_loss_ag(
     AGValue *sq = ag_square(diff);
     ag_register_temp_value(sq);
 
-    mlx_array *arr = ag_value_array(sq);
-    if (!arr)
-        return ag_scalar_float(0.0f);
-    int ndim = (int)mlx_array_ndim(*arr);
-    AGValue *s = sq;
-    for (int ax = 0; ax < ndim; ++ax)
-        s = ag_sum_axis(s, 0, 0);
-    ag_register_temp_value(s);
-
-    size_t elems = mlx_array_size(*arr);
-    AGValue *den = ag_scalar_float((float)elems);
-    ag_register_temp_value(den);
-    AGValue *mean = ag_divide(s, den);
+    /* Use ag_mean to reduce to scalar (matches Python's mx.mean) */
+    AGValue *mean = ag_mean(sq);
     ag_register_temp_value(mean);
 
     AGValue *a = ag_scalar_float(alpha);
@@ -2433,4 +2667,43 @@ AGValue *mlx_faciesgan_compute_recovery_loss_ag(
     AGValue *out = ag_mul(mean, a);
     ag_register_temp_value(out);
     return out;
+}
+
+/* Evaluate all model parameters (parity with Python mx.eval(self.model.state)).
+ * This forces lazy computation graphs to materialize and releases intermediate
+ * arrays, preventing memory accumulation during training.
+ */
+int mlx_faciesgan_eval_all_parameters(MLXFaciesGAN *m) {
+    if (!m)
+        return -1;
+
+    /* Evaluate all generator parameters */
+    if (m->generator) {
+        int gen_n = 0;
+        mlx_array **gen_params = mlx_generator_get_parameters(m->generator, &gen_n);
+        if (gen_params && gen_n > 0) {
+            for (int i = 0; i < gen_n; ++i) {
+                if (gen_params[i] && gen_params[i]->ctx) {
+                    mlx_array_eval(*gen_params[i]);
+                }
+            }
+            mlx_generator_free_parameters_list(gen_params);
+        }
+    }
+
+    /* Evaluate all discriminator parameters */
+    if (m->discriminator) {
+        int disc_n = 0;
+        mlx_array **disc_params = mlx_discriminator_get_parameters(m->discriminator, &disc_n);
+        if (disc_params && disc_n > 0) {
+            for (int i = 0; i < disc_n; ++i) {
+                if (disc_params[i] && disc_params[i]->ctx) {
+                    mlx_array_eval(*disc_params[i]);
+                }
+            }
+            mlx_discriminator_free_parameters_list(disc_params);
+        }
+    }
+
+    return 0;
 }

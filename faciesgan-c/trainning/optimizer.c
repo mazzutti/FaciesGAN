@@ -96,6 +96,27 @@ void mlx_adam_free(MLXOptimizer *opt) {
     mlx_free_pod((void **)&opt);
 }
 
+void mlx_optimizer_eval_state(MLXOptimizer *opt) {
+    if (!opt)
+        return;
+    /* Evaluate all m (first moment) arrays */
+    if (opt->m) {
+        for (int i = 0; i < opt->param_n; ++i) {
+            if (opt->m[i] && opt->m[i]->ctx) {
+                mlx_array_eval(*opt->m[i]);
+            }
+        }
+    }
+    /* Evaluate all v (second moment) arrays */
+    if (opt->v) {
+        for (int i = 0; i < opt->param_n; ++i) {
+            if (opt->v[i] && opt->v[i]->ctx) {
+                mlx_array_eval(*opt->v[i]);
+            }
+        }
+    }
+}
+
 int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
                   int n) {
     if (!opt)

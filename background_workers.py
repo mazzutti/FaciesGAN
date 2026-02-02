@@ -19,7 +19,12 @@ import logging
 import multiprocessing as mp
 import threading
 from concurrent.futures import Future, ProcessPoolExecutor
-from typedefs import TTensor
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from typedefs import TTensor
+else:
+    TTensor = Any
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +45,10 @@ def _save_plot_task(
       - (C, H, W), (B, C, H, W), (B, T, C, H, W) for torch/mx/np
       - (B, H, W, C), (B, T, H, W, C) for np arrays (after conversion)
     """
+    import os
+
+    os.environ["FG_NO_TORCH_IMPORT"] = "1"
+
     # Import locally so the worker process has its own module imports
     from utils import plot_generated_facies
 
@@ -47,6 +56,36 @@ def _save_plot_task(
     # conversions internally as needed.
     plot_generated_facies(
         fake_list, real_arr, stage, index, masks_arr, out_dir, save=True
+    )
+    return True
+
+
+def _save_plot_task_from_npy(
+    fake_path: str,
+    real_path: str,
+    stage: int,
+    index: int,
+    out_dir: str,
+    masks_path: str | None = None,
+) -> bool:
+    """
+    Internal task to load .npy files and save a plot in a background process.
+
+    This keeps numpy loading and plotting off the main training process.
+    """
+    import os
+    import numpy as np
+
+    os.environ["FG_NO_TORCH_IMPORT"] = "1"
+
+    from utils import plot_generated_facies
+
+    fake_arr = np.load(fake_path)
+    real_arr = np.load(real_path)
+    masks_arr = np.load(masks_path) if masks_path else None
+
+    plot_generated_facies(
+        fake_arr, real_arr, stage, index, masks_arr, out_dir, save=True
     )
     return True
 
@@ -180,6 +219,56 @@ class BackgroundWorker:
                 masks,
             )
             # Track and attach callback
+            self._pending.add(fut)
+            fut.add_done_callback(self._on_done)
+            return fut
+
+    def submit_plot_generated_facies_from_npy(
+        self,
+        fake_path: str,
+        real_path: str,
+        stage: int,
+        index: int,
+        out_dir: str,
+        masks_path: str | None = None,
+        wait_if_full: bool = True,
+        timeout: float | None = None,
+    ) -> Future[bool]:
+        """
+        Submit a plot job by passing .npy paths to the process pool.
+
+        This avoids loading numpy arrays in the main training process.
+        """
+        with self._pending_cond:
+            if self._max_pending > 0:
+                if not wait_if_full and len(self._pending) >= self._max_pending:
+                    fut: Future[bool] = Future()
+                    fut.set_result(False)
+                    return fut
+
+                if timeout is None:
+                    while len(self._pending) >= self._max_pending:
+                        self._pending_cond.wait()
+                else:
+                    import time
+
+                    end = time.time() + timeout
+                    while len(self._pending) >= self._max_pending:
+                        remaining = end - time.time()
+                        if remaining <= 0:
+                            fut: Future[bool] = Future()
+                            fut.set_result(False)
+                            return fut
+                        self._pending_cond.wait(timeout=remaining)
+            fut = self._executor.submit(
+                _save_plot_task_from_npy,
+                str(fake_path),
+                str(real_path),
+                int(stage),
+                int(index),
+                str(out_dir),
+                str(masks_path) if masks_path else None,
+            )
             self._pending.add(fut)
             fut.add_done_callback(self._on_done)
             return fut

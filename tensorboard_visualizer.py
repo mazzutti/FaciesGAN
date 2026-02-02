@@ -138,7 +138,11 @@ class TensorBoardVisualizer:
         if epoch % self.update_interval != 0 and epoch != 1:
             return
 
-        if isinstance(scale_metrics, ScaleMetrics):
+        # At runtime `ScaleMetrics` is an alias to `object` to avoid imports,
+        # so `isinstance(..., ScaleMetrics)` will be true for any object
+        # (including plain dicts). Use attribute detection instead to
+        # determine whether we have a typed ScaleMetrics instance.
+        if hasattr(scale_metrics, "as_tuple_of_dicts"):
             flat_metrics: dict[int, dict[str, float]] = {
                 i: metrics
                 for i, metrics in enumerate(scale_metrics.as_tuple_of_dicts())

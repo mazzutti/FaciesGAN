@@ -51,6 +51,7 @@ struct AGNode {
     AGValue *output;
     /* op-specific extras */
     int stride0, stride1, pad0, pad1, dil0, dil1, groups;
+    int axis;  /* axis for sum_axis */
 };
 
 /* simple tape as list */
@@ -76,17 +77,174 @@ void ag_register_temp_value(AGValue *v) {
     temp_push(v);
 }
 
+/* Helper: reduce gradient contribution to match target shape for broadcasting.
+ * If contrib has more dimensions or larger sizes than target, sum over the
+ * excess dimensions to produce a gradient matching target's shape. */
+static AGValue *reduce_to_shape(AGValue *contrib, AGValue *target) {
+    if (!contrib || !target)
+        return contrib;
+    if (!contrib->arr.ctx || !target->arr.ctx)
+        return contrib;
+
+    int contrib_ndim = mlx_array_ndim(contrib->arr);
+    int target_ndim = mlx_array_ndim(target->arr);
+    const int *contrib_shape = mlx_array_shape(contrib->arr);
+    const int *target_shape = mlx_array_shape(target->arr);
+
+    if (!contrib_shape || !target_shape)
+        return contrib;
+
+    /* If shapes match, no reduction needed */
+    if (contrib_ndim == target_ndim) {
+        int same = 1;
+        for (int i = 0; i < contrib_ndim; i++) {
+            if (contrib_shape[i] != target_shape[i]) {
+                same = 0;
+                break;
+            }
+        }
+        if (same)
+            return contrib;
+    }
+
+    /* Need to reduce contrib to match target shape.
+     * Sum over leading dimensions if contrib has more dims,
+     * and sum over dimensions where target is smaller (broadcast dims). */
+    AGValue *result = contrib;
+
+    /* First, if contrib has more dimensions, sum over leading axes */
+    while (mlx_array_ndim(result->arr) > target_ndim) {
+        AGValue *reduced = ag_sum_axis(result, 0, 0);  /* sum & drop leading axis */
+        ag_register_temp_value(reduced);
+        result = reduced;
+    }
+
+    /* Now both have same ndim, reduce where target dim is 1 but contrib dim > 1,
+     * or where target shape is smaller. */
+    const int *result_shape = mlx_array_shape(result->arr);
+    int result_ndim = mlx_array_ndim(result->arr);
+
+    /* Align from the right: compare corresponding dims */
+    for (int i = result_ndim - 1; i >= 0; i--) {
+        int target_idx = target_ndim - (result_ndim - i);
+        if (target_idx < 0) {
+            /* This axis doesn't exist in target, sum over it */
+            AGValue *reduced = ag_sum_axis(result, i, 0);
+            ag_register_temp_value(reduced);
+            result = reduced;
+            result_shape = mlx_array_shape(result->arr);
+            result_ndim = mlx_array_ndim(result->arr);
+            i = result_ndim;  /* restart from the end */
+            continue;
+        }
+        if (target_shape[target_idx] == 1 && result_shape[i] > 1) {
+            /* Target was broadcast on this axis, sum and keep dim */
+            AGValue *reduced = ag_sum_axis(result, i, 1);
+            ag_register_temp_value(reduced);
+            result = reduced;
+            result_shape = mlx_array_shape(result->arr);
+        }
+    }
+
+    return result;
+}
+
 /* Helper: accumulate AGValue contributions into target->grad_ag (target may be
- * NULL). */
+ * NULL). Handles shape reduction for broadcasting. */
 static void accumulate_into_ag(AGValue *target, AGValue *contrib) {
     if (!contrib)
         return;
     if (!target)
         return;
+
+    /* Reduce contrib to match target's shape if needed for broadcasting */
+    AGValue *reduced_contrib = reduce_to_shape(contrib, target);
+
     if (!target->grad_ag) {
-        target->grad_ag = contrib;
+        target->grad_ag = reduced_contrib;
     } else {
-        AGValue *sum = ag_add(target->grad_ag, contrib);
+        /* Before adding, ensure both grad_ag and reduced_contrib have compatible shapes.
+         * If they don't match (e.g., one is 3D, other is 4D), we need to broadcast
+         * one of them to match the other. Use the LARGER shape as the target. */
+        int grad_ndim = mlx_array_ndim(target->grad_ag->arr);
+        int contrib_ndim = mlx_array_ndim(reduced_contrib->arr);
+
+        AGValue *grad_to_add = target->grad_ag;
+        AGValue *contrib_to_add = reduced_contrib;
+
+        if (grad_ndim != contrib_ndim) {
+            mlx_stream s = mlx_default_cpu_stream_new();
+
+            if (contrib_ndim > grad_ndim) {
+                /* Broadcast grad_ag to match contrib shape */
+                const int *contrib_shape = mlx_array_shape(reduced_contrib->arr);
+                mlx_array grad_arr = target->grad_ag->arr;
+
+                /* Expand dims at end to match ndim */
+                for (int i = grad_ndim; i < contrib_ndim; i++) {
+                    mlx_array tmp = mlx_array_new();
+                    mlx_expand_dims(&tmp, grad_arr, -1, s);
+                    if (grad_arr.ctx != target->grad_ag->arr.ctx)
+                        mlx_array_free(grad_arr);
+                    grad_arr = tmp;
+                }
+
+                int expanded_ndim = mlx_array_ndim(grad_arr);
+                const int *expanded_shape = mlx_array_shape(grad_arr);
+                fprintf(stderr, "  after expand: ndim=%d shape=", expanded_ndim);
+                for (int i = 0; i < expanded_ndim; i++) fprintf(stderr, "%d ", expanded_shape[i]);
+                fprintf(stderr, "\n  target shape=");
+                for (int i = 0; i < contrib_ndim; i++) fprintf(stderr, "%d ", contrib_shape[i]);
+                fprintf(stderr, "\n");
+
+                mlx_array bcast = mlx_array_new();
+                if (mlx_broadcast_to(&bcast, grad_arr, contrib_shape, contrib_ndim, s) == 0) {
+                    grad_to_add = ag_value_from_new_array(&bcast, 0);
+                    ag_register_temp_value(grad_to_add);
+                    mlx_array_free(bcast);  /* free original after copy */
+                } else {
+                    fprintf(stderr, "  broadcast FAILED!\n");
+                }
+                if (grad_arr.ctx != target->grad_ag->arr.ctx)
+                    mlx_array_free(grad_arr);
+            } else {
+                /* Broadcast contrib to match grad_ag shape */
+                const int *grad_shape = mlx_array_shape(target->grad_ag->arr);
+                mlx_array contrib_arr = reduced_contrib->arr;
+
+                fprintf(stderr, "  expanding contrib from %d to %d dims\n", contrib_ndim, grad_ndim);
+
+                for (int i = contrib_ndim; i < grad_ndim; i++) {
+                    mlx_array tmp = mlx_array_new();
+                    mlx_expand_dims(&tmp, contrib_arr, -1, s);
+                    if (contrib_arr.ctx != reduced_contrib->arr.ctx)
+                        mlx_array_free(contrib_arr);
+                    contrib_arr = tmp;
+                }
+
+                int expanded_ndim = mlx_array_ndim(contrib_arr);
+                const int *expanded_shape = mlx_array_shape(contrib_arr);
+                fprintf(stderr, "  after expand: ndim=%d shape=", expanded_ndim);
+                for (int i = 0; i < expanded_ndim; i++) fprintf(stderr, "%d ", expanded_shape[i]);
+                fprintf(stderr, "\n  target shape=");
+                for (int i = 0; i < grad_ndim; i++) fprintf(stderr, "%d ", grad_shape[i]);
+                fprintf(stderr, "\n");
+
+                mlx_array bcast = mlx_array_new();
+                if (mlx_broadcast_to(&bcast, contrib_arr, grad_shape, grad_ndim, s) == 0) {
+                    contrib_to_add = ag_value_from_new_array(&bcast, 0);
+                    ag_register_temp_value(contrib_to_add);
+                    mlx_array_free(bcast);  /* free original after copy */
+                } else {
+                    fprintf(stderr, "  broadcast FAILED!\n");
+                }
+                if (contrib_arr.ctx != reduced_contrib->arr.ctx)
+                    mlx_array_free(contrib_arr);
+            }
+            mlx_stream_free(s);
+        }
+
+        AGValue *sum = ag_add(grad_to_add, contrib_to_add);
         ag_register_temp_value(sum);
         target->grad_ag = sum;
     }
@@ -164,14 +322,9 @@ void ag_value_free(AGValue *v) {
                 temp_values[i] = NULL;
         }
     }
-    /* Explicitly report and perform frees so we can trace which buffer is
-       released prior to kernel aborts. */
+    /* Free gradient array if it exists */
     if (v->grad.ctx) {
-        void *gctx = v->grad.ctx;
-        /* DEBUG MITIGATION: skip freeing grad buffer to detect premature free/reuse
-             bugs. This leaks memory. If crash disappears, premature free of grad
-             buffers is the likely cause and we should fix ownership semantics. */
-        /* grad free intentionally omitted for mitigation/debugging earlier; no debug prints */
+        mlx_array_free(v->grad);
     }
     if (v->owns_arr && v->arr.ctx) {
         void *actx2 = v->arr.ctx;
@@ -186,11 +339,19 @@ void ag_value_free(AGValue *v) {
 void ag_reset_tape(void) {
     if (!tape)
         return;
-    /* Free AGNode entries and their input arrays */
+    /* Free AGNode entries, their outputs, and their input arrays */
     for (size_t i = 0; i < tape_size; ++i) {
         AGNode *n = tape[i];
         if (!n)
             continue;
+        /* Free the output AGValue created by this operation.
+         * This is critical: each ag_ operation allocates an AGValue with
+         * owns_arr=1, meaning it owns its underlying mlx_array. If we don't
+         * free it here, the array leaks every batch. */
+        if (n->output) {
+            ag_value_free(n->output);
+            n->output = NULL;
+        }
         if (n->inputs)
             free(n->inputs);
         free(n);
@@ -221,6 +382,9 @@ mlx_array *ag_value_array(AGValue *v) {
 AGValue *ag_scalar_float(float f) {
     mlx_array a = mlx_array_new_float(f);
     AGValue *v = ag_value_from_new_array(&a, 0);
+    /* Free the original array - ag_value_from_new_array made a copy via mlx_copy
+     * which increments the reference count. We need to release our local reference. */
+    mlx_array_free(a);
     return v;
 }
 
@@ -320,7 +484,21 @@ void ag_zero_grad_all(void) {
     }
 }
 
-/* Backward implementations for ops */
+/* Clear all grad_ag pointers on the tape (for after create-graph backward) */
+void ag_clear_grad_ag_all(void) {
+    for (size_t i = 0; i < tape_size; ++i) {
+        AGNode *n = tape[i];
+        if (n->output) {
+            n->output->grad_ag = NULL;
+        }
+        for (int j = 0; j < n->n_inputs; ++j) {
+            AGValue *iv = n->inputs[j];
+            if (iv) {
+                iv->grad_ag = NULL;
+            }
+        }
+    }
+}/* Backward implementations for ops */
 /* helper: accumulate src into dst (dst += src). dst is pointer to mlx_array
    variable. If dst is empty, copy src into it. */
 static int accumulate_into(mlx_array *dst, const mlx_array src,
@@ -333,15 +511,76 @@ static int accumulate_into(mlx_array *dst, const mlx_array src,
     mlx_array tmp = mlx_array_new();
     int r = mlx_add(&tmp, *dst, src, s);
     if (r != 0) {
-        mlx_array_free(tmp);
+        detach_and_free(tmp);
         return r;
     }
     /* Copy result into dst and free the temporary to avoid leaks. */
     int rc = mlx_copy(dst, tmp, s);
     if (s.ctx)
         mlx_synchronize(s);
-    mlx_array_free(tmp);
+    detach_and_free(tmp);
     return rc;
+}
+
+/* Helper to reduce gradient to match a target shape (numeric version).
+ * This is needed when backward through broadcast ops like add/mul where
+ * one operand was broadcast to match the other. */
+static mlx_array reduce_to_target_shape(mlx_array src, const mlx_array target, mlx_stream s) {
+    int src_ndim = mlx_array_ndim(src);
+    int tgt_ndim = mlx_array_ndim(target);
+    const int *src_sh = mlx_array_shape(src);
+    const int *tgt_sh = mlx_array_shape(target);
+
+    /* If shapes already match, return src as-is */
+    int match = (src_ndim == tgt_ndim);
+    if (match) {
+        for (int i = 0; i < src_ndim; i++) {
+            if (src_sh[i] != tgt_sh[i]) {
+                match = 0;
+                break;
+            }
+        }
+    }
+    if (match) return src;
+
+    mlx_array reduced = mlx_array_new();
+    mlx_copy(&reduced, src, s);
+
+    /* First, sum over leading axes if src has more dims */
+    while (mlx_array_ndim(reduced) > tgt_ndim) {
+        mlx_array tmp = mlx_array_new();
+        mlx_sum_axis(&tmp, reduced, 0, false, s);
+        mlx_array_free(reduced);
+        reduced = tmp;
+    }
+
+    /* Now both have same ndim, sum where tgt dim is smaller or 1.
+     * We need to be careful: after reducing with keepdims=0, ndim changes
+     * and axis indices shift. Use a while loop and restart when needed. */
+    int changed = 1;
+    while (changed) {
+        changed = 0;
+        int r_ndim = mlx_array_ndim(reduced);
+        const int *r_sh = mlx_array_shape(reduced);
+
+        /* Compare from right (trailing dims) */
+        for (int i = 0; i < r_ndim && i < tgt_ndim; i++) {
+            int ri = r_ndim - 1 - i;   /* index in reduced, from right */
+            int ti = tgt_ndim - 1 - i;  /* index in target, from right */
+            if (tgt_sh[ti] < r_sh[ri]) {
+                /* Need to reduce this axis. If tgt_sh[ti] == 1, keepdims=1 */
+                int keepdims = (tgt_sh[ti] == 1);
+                mlx_array tmp = mlx_array_new();
+                mlx_sum_axis(&tmp, reduced, ri, keepdims, s);
+                mlx_array_free(reduced);
+                reduced = tmp;
+                changed = 1;
+                break;  /* restart the check with new shape */
+            }
+        }
+    }
+
+    return reduced;
 }
 
 static void bw_add(AGNode *node) {
@@ -363,8 +602,13 @@ static void bw_add(AGNode *node) {
     ensure_grad(a);
     ensure_grad(b);
     mlx_stream s = mlx_default_cpu_stream_new();
-    accumulate_into(&a->grad, out->grad, s);
-    accumulate_into(&b->grad, out->grad, s);
+    /* Reduce gradients if broadcast was used in forward */
+    mlx_array grad_a = reduce_to_target_shape(out->grad, a->arr, s);
+    mlx_array grad_b = reduce_to_target_shape(out->grad, b->arr, s);
+    accumulate_into(&a->grad, grad_a, s);
+    accumulate_into(&b->grad, grad_b, s);
+    if (grad_a.ctx != out->grad.ctx) mlx_array_free(grad_a);
+    if (grad_b.ctx != out->grad.ctx) mlx_array_free(grad_b);
     mlx_stream_free(s);
 }
 
@@ -426,14 +670,20 @@ static void bw_mul(AGNode *node) {
     mlx_stream s = mlx_default_cpu_stream_new();
     mlx_array tmp = mlx_array_new();
     if (mlx_multiply(&tmp, out->grad, b->arr, s) == 0) {
-        accumulate_into(&a->grad, tmp, s);
+        /* Reduce tmp to match a's shape before accumulating */
+        mlx_array reduced = reduce_to_target_shape(tmp, a->arr, s);
+        accumulate_into(&a->grad, reduced, s);
+        if (reduced.ctx != tmp.ctx) mlx_array_free(reduced);
     }
     mlx_array tmp2 = mlx_array_new();
     if (mlx_multiply(&tmp2, out->grad, a->arr, s) == 0) {
-        accumulate_into(&b->grad, tmp2, s);
+        /* Reduce tmp2 to match b's shape before accumulating */
+        mlx_array reduced = reduce_to_target_shape(tmp2, b->arr, s);
+        accumulate_into(&b->grad, reduced, s);
+        if (reduced.ctx != tmp2.ctx) mlx_array_free(reduced);
     }
-    mlx_array_free(tmp);
-    mlx_array_free(tmp2);
+    detach_and_free(tmp);
+    detach_and_free(tmp2);
     mlx_stream_free(s);
 }
 
@@ -469,10 +719,10 @@ static void bw_tanh(AGNode *node) {
     mlx_array tmp2 = mlx_array_new();
     mlx_multiply(&tmp2, tmp, out->grad, s);
     accumulate_into(&a->grad, tmp2, s);
-    mlx_array_free(out_sq);
-    mlx_array_free(tmp);
-    mlx_array_free(tmp2);
-    mlx_array_free(one);
+    detach_and_free(out_sq);
+    detach_and_free(tmp);
+    detach_and_free(tmp2);
+    detach_and_free(one);
     mlx_stream_free(s);
 }
 
@@ -504,9 +754,9 @@ static void bw_square(AGNode *node) {
     mlx_array tmp2 = mlx_array_new();
     mlx_multiply(&tmp2, tmp, out->grad, s);
     accumulate_into(&a->grad, tmp2, s);
-    mlx_array_free(tmp);
-    mlx_array_free(tmp2);
-    mlx_array_free(two);
+    detach_and_free(tmp);
+    detach_and_free(tmp2);
+    detach_and_free(two);
     mlx_stream_free(s);
 }
 
@@ -515,17 +765,51 @@ static void bw_sum_axis(AGNode *node) {
     AGValue *a = node->inputs[0];
     if (!out)
         return;
+
+    int reduced_axis = node->axis;  /* axis that was reduced (normalized positive) */
+
     if (out->grad_ag) {
         /* For create-graph, we must broadcast the gradient to the input shape.
-           Implement by creating an ones-like AGValue matching `a` and multiplying.
+         * When sum_axis was called with keepdims=0, the output has fewer dims
+         * than the input. We need to expand_dims on the reduced axis before
+         * broadcasting to restore the proper alignment.
          */
         AGValue *grad_ag = out->grad_ag;
-        if (a) {
-            AGValue *ones = ag_ones_like(a);
-            ag_register_temp_value(ones);
-            AGValue *tiled = ag_mul(grad_ag, ones);
-            ag_register_temp_value(tiled);
-            accumulate_into_ag(a, tiled);
+        if (a && a->arr.ctx) {
+            int in_ndim = mlx_array_ndim(a->arr);
+            int out_ndim = mlx_array_ndim(out->arr);
+
+            AGValue *expanded = grad_ag;
+            /* If output has fewer dims, we need to expand dims at the axis that was reduced */
+            if (out_ndim < in_ndim) {
+                mlx_stream s = mlx_default_cpu_stream_new();
+                mlx_array grad_arr = grad_ag->arr;
+
+                /* Expand at the CORRECT axis that was reduced */
+                mlx_array tmp = mlx_array_new();
+                mlx_expand_dims(&tmp, grad_arr, reduced_axis, s);
+                grad_arr = tmp;
+
+                const int *in_shape = mlx_array_shape(a->arr);
+
+                /* Now broadcast to input shape */
+                mlx_array bcast = mlx_array_new();
+                if (mlx_broadcast_to(&bcast, grad_arr, in_shape, in_ndim, s) == 0) {
+                    expanded = ag_value_from_new_array(&bcast, 0);
+                    ag_register_temp_value(expanded);
+                    mlx_array_free(bcast);  /* free original after copy */
+                }
+                if (grad_arr.ctx != grad_ag->arr.ctx)
+                    mlx_array_free(grad_arr);
+                mlx_stream_free(s);
+            } else {
+                /* keepdims was 1, just multiply with ones */
+                AGValue *ones = ag_ones_like(a);
+                ag_register_temp_value(ones);
+                expanded = ag_mul(grad_ag, ones);
+                ag_register_temp_value(expanded);
+            }
+            accumulate_into_ag(a, expanded);
         }
         return;
     }
@@ -533,11 +817,117 @@ static void bw_sum_axis(AGNode *node) {
         return;
     ensure_grad(a);
     mlx_stream s = mlx_default_cpu_stream_new();
+
+    /* Numeric backward: broadcast out->grad to a->arr shape.
+     * If out has fewer dims than input (keepdims=0 was used), we need to
+     * expand dims first at the reduced axis before broadcasting. */
+    int in_ndim = (int)mlx_array_ndim(a->arr);
+    int out_ndim = (int)mlx_array_ndim(out->arr);
+    const int *in_shape = mlx_array_shape(a->arr);
+
+    mlx_array grad_to_broadcast = out->grad;
+    int need_free_expanded = 0;
+
+    if (out_ndim < in_ndim) {
+        /* Expand dims at the CORRECT axis that was reduced */
+        mlx_array tmp = mlx_array_new();
+        if (mlx_expand_dims(&tmp, out->grad, reduced_axis, s) != 0) {
+            mlx_stream_free(s);
+            return;
+        }
+        grad_to_broadcast = tmp;
+        need_free_expanded = 1;
+    }
+
     mlx_array tiled = mlx_array_new();
-    if (mlx_broadcast_to(&tiled, out->grad, mlx_array_shape(a->arr),
-                         mlx_array_ndim(a->arr), s) == 0) {
+    if (mlx_broadcast_to(&tiled, grad_to_broadcast, in_shape, in_ndim, s) == 0) {
         accumulate_into(&a->grad, tiled, s);
-        mlx_array_free(tiled);
+        detach_and_free(tiled);
+    }
+    if (need_free_expanded) {
+        mlx_array_free(grad_to_broadcast);
+    }
+    mlx_stream_free(s);
+}
+
+/* Backward for ag_mean: grad_out / size broadcast to input shape. */
+static void bw_mean(AGNode *node) {
+    AGValue *out = node->output;
+    AGValue *a = node->inputs[0];
+    if (!out || !a)
+        return;
+    mlx_stream s = mlx_default_cpu_stream_new();
+    /* Compute total element count (size) of the input */
+    size_t ndim = mlx_array_ndim(a->arr);
+    const int *shape = mlx_array_shape(a->arr);
+    size_t size = 1;
+    for (size_t i = 0; i < ndim; ++i)
+        size *= (size_t)shape[i];
+
+    if (out->grad_ag) {
+        /* Create-graph mode: (grad_out / size) broadcast to input shape. */
+        AGValue *sz = ag_scalar_float((float)size);
+        ag_register_temp_value(sz);
+        AGValue *grad_scaled = ag_divide(out->grad_ag, sz);
+        ag_register_temp_value(grad_scaled);
+        AGValue *ones = ag_ones_like(a);
+        ag_register_temp_value(ones);
+        AGValue *bcast = ag_mul(grad_scaled, ones);
+        ag_register_temp_value(bcast);
+        accumulate_into_ag(a, bcast);
+        mlx_stream_free(s);
+        return;
+    }
+    if (!out->grad.ctx) {
+        mlx_stream_free(s);
+        return;
+    }
+    ensure_grad(a);
+    /* Compute grad/size and broadcast to input shape */
+    mlx_array sz_arr = mlx_array_new_float((float)size);
+    mlx_array scaled = mlx_array_new();
+    mlx_divide(&scaled, out->grad, sz_arr, s);
+    mlx_array tiled = mlx_array_new();
+    if (mlx_broadcast_to(&tiled, scaled, shape, ndim, s) == 0) {
+        accumulate_into(&a->grad, tiled, s);
+        detach_and_free(tiled);
+    }
+    detach_and_free(scaled);
+    detach_and_free(sz_arr);
+    mlx_stream_free(s);
+}
+
+/* Backward for ag_sum: broadcast grad (ones) to input shape.
+ * grad_input = grad_output * ones_like(input) = grad_output broadcast to input shape */
+static void bw_sum(AGNode *node) {
+    AGValue *out = node->output;
+    AGValue *a = node->inputs[0];
+    if (!out || !a)
+        return;
+    mlx_stream s = mlx_default_cpu_stream_new();
+    size_t ndim = mlx_array_ndim(a->arr);
+    const int *shape = mlx_array_shape(a->arr);
+
+    if (out->grad_ag) {
+        /* Create-graph mode: broadcast grad_out to input shape. */
+        AGValue *ones = ag_ones_like(a);
+        ag_register_temp_value(ones);
+        AGValue *bcast = ag_mul(out->grad_ag, ones);
+        ag_register_temp_value(bcast);
+        accumulate_into_ag(a, bcast);
+        mlx_stream_free(s);
+        return;
+    }
+    if (!out->grad.ctx) {
+        mlx_stream_free(s);
+        return;
+    }
+    ensure_grad(a);
+    /* Broadcast grad to input shape */
+    mlx_array tiled = mlx_array_new();
+    if (mlx_broadcast_to(&tiled, out->grad, shape, ndim, s) == 0) {
+        accumulate_into(&a->grad, tiled, s);
+        detach_and_free(tiled);
     }
     mlx_stream_free(s);
 }
@@ -562,7 +952,7 @@ static void bw_transpose(AGNode *node) {
     mlx_array tmp = mlx_array_new();
     mlx_transpose(&tmp, out->grad, s);
     accumulate_into(&a->grad, tmp, s);
-    mlx_array_free(tmp);
+    detach_and_free(tmp);
     mlx_stream_free(s);
 }
 
@@ -601,15 +991,15 @@ static void bw_matmul(AGNode *node) {
     mlx_array tmp = mlx_array_new();
     mlx_matmul(&tmp, out->grad, b_t, s);
     accumulate_into(&a->grad, tmp, s);
-    mlx_array_free(tmp);
+    detach_and_free(tmp);
     mlx_array a_t = mlx_array_new();
     mlx_transpose(&a_t, a->arr, s);
     mlx_array tmp2 = mlx_array_new();
     mlx_matmul(&tmp2, a_t, out->grad, s);
     accumulate_into(&b->grad, tmp2, s);
-    mlx_array_free(tmp2);
-    mlx_array_free(a_t);
-    mlx_array_free(b_t);
+    detach_and_free(tmp2);
+    detach_and_free(a_t);
+    detach_and_free(b_t);
     mlx_stream_free(s);
 }
 
@@ -655,7 +1045,7 @@ static void bw_divide(AGNode *node) {
     if (mlx_divide(&tmp, out->grad, b->arr, s) == 0) {
         accumulate_into(&a->grad, tmp, s);
     }
-    mlx_array_free(tmp);
+    detach_and_free(tmp);
 
     /* db += - out_grad * a / (b*b) */
     mlx_array bb = mlx_array_new();
@@ -668,14 +1058,14 @@ static void bw_divide(AGNode *node) {
                 mlx_array tmp4 = mlx_array_new_float(-1.0f);
                 mlx_multiply(&neg, tmp3, tmp4, s);
                 accumulate_into(&b->grad, neg, s);
-                mlx_array_free(neg);
-                mlx_array_free(tmp4);
+                detach_and_free(neg);
+                detach_and_free(tmp4);
             }
-            mlx_array_free(tmp3);
+            detach_and_free(tmp3);
         }
-        mlx_array_free(tmp2);
+        detach_and_free(tmp2);
     }
-    mlx_array_free(bb);
+    detach_and_free(bb);
     mlx_stream_free(s);
 }
 
@@ -709,11 +1099,11 @@ static void bw_sqrt(AGNode *node) {
         mlx_array tmp2 = mlx_array_new();
         if (mlx_divide(&tmp2, tmp, out->arr, s) == 0) {
             accumulate_into(&a->grad, tmp2, s);
-            mlx_array_free(tmp2);
+            detach_and_free(tmp2);
         }
-        mlx_array_free(tmp);
+        detach_and_free(tmp);
     }
-    mlx_array_free(half);
+    detach_and_free(half);
     mlx_stream_free(s);
 }
 
@@ -731,7 +1121,17 @@ static void bw_conv2d(AGNode *node) {
      * conv_transpose */
     if (out->grad_ag) {
         if (input) {
-            AGValue *wv = ag_value_from_array(&weight->arr, 0);
+            /* MLX conv backward for input: wt_trans = swapaxes(wt, 0, -1)
+             * This converts weight from (out_ch, KH, KW, in_ch) to (in_ch, KH, KW, out_ch)
+             * matching Python MLX's Convolution::vjp behavior */
+            mlx_stream s = mlx_default_cpu_stream_new();
+            mlx_array wt_trans = mlx_array_new();
+            int axes[4] = {3, 1, 2, 0}; /* swap axis 0 and 3 (last) */
+            mlx_transpose_axes(&wt_trans, weight->arr, axes, 4, s);
+            mlx_stream_free(s);
+
+            AGValue *wv = ag_value_from_new_array(&wt_trans, 0);
+            mlx_array_free(wt_trans);  /* free original after copy */
             ag_register_temp_value(wv);
             AGValue *d_in = ag_conv_transpose2d(
                                 out->grad_ag, wv, node->stride0, node->stride1, node->pad0,
@@ -780,7 +1180,7 @@ static void bw_conv2d(AGNode *node) {
                     wsh = mlx_array_shape(use_warr);
                 } else {
                     /* transpose failed: free trans and fall through to skip */
-                    mlx_array_free(trans);
+                    detach_and_free(trans);
                 }
             }
             /* If transpose wasn't used (or failed), and channels still mismatch,
@@ -794,7 +1194,7 @@ static void bw_conv2d(AGNode *node) {
                 if (trans_used) {
                     if (s.ctx)
                         mlx_synchronize(s);
-                    mlx_array_free(trans);
+                    detach_and_free(trans);
                 }
                 mlx_stream_free(s);
                 return;
@@ -807,7 +1207,7 @@ static void bw_conv2d(AGNode *node) {
     accumulate_into(&input->grad, tmp_in, s);
     if (s.ctx)
         mlx_synchronize(s);
-    mlx_array_free(tmp_in);
+    detach_and_free(tmp_in);
     /* d_weight: placeholder - set zeros (implementation pending im2col-based
      * accumulation) */
     if (!weight->grad.ctx) {
@@ -901,7 +1301,7 @@ static void bw_conv_transpose(AGNode *node) {
                     node->pad0, node->pad1, node->dil0, node->dil1, node->groups,
                     s);
     accumulate_into(&input->grad, tmp_in, s);
-    mlx_array_free(tmp_in);
+    detach_and_free(tmp_in);
     /* d_weight: placeholder zeroing then simple accumulation similar to bw_conv2d
      */
     if (!weight->grad.ctx) {
@@ -973,14 +1373,20 @@ static void bw_upsample(AGNode *node) {
     AGValue *in = node->inputs[0];
     if (!out)
         return;
-    /* create_graph path: best-effort broadcast (not exact sum over tiles) */
+    /* create_graph path: downsample gradient back to input shape */
     if (out->grad_ag) {
-        if (in) {
-            AGValue *ones = ag_ones_like(in);
-            ag_register_temp_value(ones);
-            AGValue *tiled = ag_mul(out->grad_ag, ones);
-            ag_register_temp_value(tiled);
-            accumulate_into_ag(in, tiled);
+        if (in && in->arr.ctx) {
+            /* Get input shape to determine target size for downsampling */
+            const int *in_shape = mlx_array_shape(in->arr);
+            if (in_shape) {
+                int target_h = in_shape[1];
+                int target_w = in_shape[2];
+                /* Use ag_upsample to resize gradient to input shape
+                 * (downsample if out > in, upsample if out < in) */
+                AGValue *resized_grad = ag_upsample(out->grad_ag, target_h, target_w, "linear", 1);
+                ag_register_temp_value(resized_grad);
+                accumulate_into_ag(in, resized_grad);
+            }
         }
         return;
     }
@@ -990,7 +1396,11 @@ static void bw_upsample(AGNode *node) {
     /* numeric backward: sum over repeat blocks to produce input grad */
     mlx_stream s = mlx_default_cpu_stream_new();
     const int *in_shape = mlx_array_shape(in->arr);
-    const int *out_shape = mlx_array_shape(out->arr);
+    const int *out_shape = mlx_array_shape(out->grad);  /* Use out->grad shape, not out->arr */
+    if (!in_shape || !out_shape) {
+        mlx_stream_free(s);
+        return;
+    }
     int N = in_shape[0];
     int H_in = in_shape[1];
     int W_in = in_shape[2];
@@ -1002,14 +1412,19 @@ static void bw_upsample(AGNode *node) {
     /* Only perform numeric upsample accumulation if host buffers are available.
      */
     bool ok_out3 = false, ok_in3 = false;
-    if (_mlx_array_is_available(&ok_out3, out->grad) == 0 && ok_out3 &&
-            _mlx_array_is_available(&ok_in3, in->arr) == 0 && ok_in3) {
+    int r1 = _mlx_array_is_available(&ok_out3, out->grad);
+    int r2 = _mlx_array_is_available(&ok_in3, in->arr);
+    if (r1 == 0 && ok_out3 && r2 == 0 && ok_in3) {
         float *in_grad = NULL;
         if (!in->grad.ctx) {
             mlx_zeros_like(&in->grad, in->arr, s);
         }
         in_grad = (float *)mlx_array_data_float32(in->grad);
         const float *outg = mlx_array_data_float32(out->grad);
+        if (!in_grad || !outg) {
+            mlx_stream_free(s);
+            return;
+        }
         size_t in_total = (size_t)N * H_in * W_in * C;
         for (size_t i = 0; i < in_total; ++i)
             in_grad[i] = 0.0f;
@@ -1085,11 +1500,11 @@ AGValue *ag_pad(AGValue *a, const int *axes, int n_axes, const int *low_pad,
     if (mlx_pad(&res, a->arr, (int *)axes, n_axes, (int *)low_pad, low_len,
                 (int *)high_pad, high_len, padval, mode ? mode : "constant",
                 s) != 0) {
-        mlx_array_free(padval);
+        detach_and_free(padval);
         mlx_stream_free(s);
         return NULL;
     }
-    mlx_array_free(padval);
+    detach_and_free(padval);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
     n->backward = NULL;
@@ -1191,6 +1606,7 @@ static AGValue *make_unary(AGValue *a, int requires_grad, backward_fn bw,
 AGValue *ag_add(AGValue *a, AGValue *b) {
     if (!a || !b)
         return NULL;
+
     mlx_array res = mlx_array_new();
     mlx_stream s = mlx_default_cpu_stream_new();
     mlx_add(&res, a->arr, b->arr, s);
@@ -1252,6 +1668,7 @@ AGValue *ag_mul(AGValue *a, AGValue *b) {
     out->arr = res;
     out->requires_grad = a->requires_grad || b->requires_grad;
     out->creator = n;
+    out->owns_arr = 1;
     n->output = out;
     tape_push(n);
     return out;
@@ -1306,10 +1723,60 @@ AGValue *ag_sum_axis(AGValue *a, int axis, int keepdims) {
         return NULL;
     mlx_array res = mlx_array_new();
     mlx_stream s = mlx_default_cpu_stream_new();
+    /* Normalize negative axis to positive */
+    int in_ndim = (int)mlx_array_ndim(a->arr);
+    int norm_axis = axis < 0 ? in_ndim + axis : axis;
     mlx_sum_axis(&res, a->arr, axis, keepdims, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
     n->backward = bw_sum_axis;
+    n->axis = norm_axis;  /* store which axis was reduced */
+    n->n_inputs = 1;
+    n->inputs = calloc(1, sizeof(AGValue *));
+    n->inputs[0] = a;
+    AGValue *out = calloc(1, sizeof(AGValue));
+    out->arr = res;
+    out->requires_grad = a->requires_grad;
+    out->creator = n;
+    out->owns_arr = 1;
+    n->output = out;
+    tape_push(n);
+    return out;
+}
+
+AGValue *ag_mean(AGValue *a) {
+    if (!a)
+        return NULL;
+    mlx_array res = mlx_array_new();
+    mlx_stream s = mlx_default_cpu_stream_new();
+    /* mlx_mean with keepdims=false reduces all elements to a scalar */
+    mlx_mean(&res, a->arr, false, s);
+    mlx_stream_free(s);
+    AGNode *n = calloc(1, sizeof(AGNode));
+    n->backward = bw_mean;
+    n->n_inputs = 1;
+    n->inputs = calloc(1, sizeof(AGValue *));
+    n->inputs[0] = a;
+    AGValue *out = calloc(1, sizeof(AGValue));
+    out->arr = res;
+    out->requires_grad = a->requires_grad;
+    out->creator = n;
+    out->owns_arr = 1;
+    n->output = out;
+    tape_push(n);
+    return out;
+}
+
+AGValue *ag_sum(AGValue *a) {
+    if (!a)
+        return NULL;
+    mlx_array res = mlx_array_new();
+    mlx_stream s = mlx_default_cpu_stream_new();
+    /* mlx_sum with keepdims=false reduces all elements to a scalar */
+    mlx_sum(&res, a->arr, false, s);
+    mlx_stream_free(s);
+    AGNode *n = calloc(1, sizeof(AGNode));
+    n->backward = bw_sum;
     n->n_inputs = 1;
     n->inputs = calloc(1, sizeof(AGValue *));
     n->inputs[0] = a;
@@ -1339,6 +1806,7 @@ AGValue *ag_transpose(AGValue *a) {
     out->arr = res;
     out->requires_grad = a->requires_grad;
     out->creator = n;
+    out->owns_arr = 1;
     n->output = out;
     tape_push(n);
     return out;
@@ -1472,22 +1940,6 @@ AGValue *ag_conv_transpose2d(AGValue *input, AGValue *weight, int stride0,
                              int dil1, int out_pad0, int out_pad1, int groups) {
     if (!input || !weight)
         return NULL;
-    /* debug: print input/weight shapes and conv_transpose params to trace channel
-     * sizes */
-    if (input->arr.ctx && weight->arr.ctx) {
-        const int *in_sh = mlx_array_shape(input->arr);
-        const int *w_sh = mlx_array_shape(weight->arr);
-        int in_nd = mlx_array_ndim(input->arr);
-        int w_nd = mlx_array_ndim(weight->arr);
-        if (in_sh && w_sh)
-            fprintf(stderr,
-                    "[ag_conv_transpose_call] in_nd=%d in_sh=(%d,%d,%d,%d) w_nd=%d "
-                    "w_sh=(%d,%d,%d,%d) stride=(%d,%d) pad=(%d,%d) dil=(%d,%d) "
-                    "out_pad=(%d,%d) groups=%d\n",
-                    in_nd, in_sh[0], in_sh[1], in_sh[2], in_sh[3], w_nd, w_sh[0],
-                    w_sh[1], w_sh[2], w_sh[3], stride0, stride1, pad0, pad1, dil0,
-                    dil1, out_pad0, out_pad1, groups);
-    }
     mlx_array res = mlx_array_new();
     mlx_stream s = mlx_default_cpu_stream_new();
     mlx_conv_transpose2d(&res, input->arr, weight->arr, stride0, stride1, pad0,
@@ -1524,6 +1976,7 @@ AGValue *ag_ones_like(AGValue *a) {
     mlx_ones_like(&res, a->arr, s);
     mlx_stream_free(s);
     AGValue *out = ag_value_from_new_array(&res, 0);
+    mlx_array_free(res);  /* free original after copy */
     return out;
 }
 
@@ -1545,6 +1998,16 @@ AGValue *ag_upsample(AGValue *a, int out_h, int out_w, const char *mode,
         /* fallback: return copy of input */
         mlx_copy(&res, in_arr, s);
     }
+
+    /* Check if upsample returned the same array as input (identity case).
+     * If so, create a deep copy to ensure separate ownership. */
+    int same_array = (res.ctx == in_arr.ctx);
+    if (same_array) {
+        mlx_array copy = mlx_array_new();
+        mlx_copy(&copy, res, s);
+        res = copy;
+    }
+
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
     n->backward = bw_upsample;
@@ -1577,13 +2040,11 @@ int ag_backward(AGValue *output) {
         AGNode *n = tape[i];
         if (!n)
             continue;
-        /* debug logging removed */
         if (n->backward)
             n->backward(n);
     }
     return 0;
 }
-
 int ag_backward_create_graph(AGValue *output) {
     if (!output)
         return -1;
@@ -1594,6 +2055,7 @@ int ag_backward_create_graph(AGValue *output) {
     mlx_ones_like(&res, output->arr, s);
     mlx_stream_free(s);
     AGValue *one = ag_value_from_new_array(&res, 0);
+    mlx_array_free(res);  /* free original after copy */
     ag_register_temp_value(one);
     output->grad_ag = one;
     /* traverse tape in reverse order and call backward which will build AG ops

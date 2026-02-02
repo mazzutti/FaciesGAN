@@ -2,7 +2,7 @@ import mlx.nn as nn  # type: ignore
 import mlx.core as mx
 
 from models.discriminator import Discriminator
-from typing import cast
+from typing import Any, cast
 
 from models.mlx.custom_layer import MLXSPADEDiscriminator
 
@@ -78,3 +78,9 @@ class MLXDiscriminator(Discriminator[mx.array, nn.Module], nn.Module):
             input_channels=self.input_channels,
         )
         self.discs.append(spade_gen)
+
+    def reset_parameters(self) -> None:
+        for disc in self.discs:
+            reset_fn = getattr(cast(Any, disc), "reset_parameters", None)
+            if reset_fn:
+                reset_fn()

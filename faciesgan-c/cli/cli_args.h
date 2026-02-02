@@ -6,6 +6,7 @@
 
 typedef struct CLIArgs {
   char *input_path;
+  char *output_path;
   int manual_seed;
   int stop_scale;
   int num_img_channels;
@@ -61,6 +62,7 @@ void CLIArgs_free(CLIArgs *args);
 
 /* Helper setters */
 void CLIArgs_set_input_path(CLIArgs *args, const char *path);
+void CLIArgs_set_output_path(CLIArgs *args, const char *path);
 int CLIArgs_add_well_mask_column(CLIArgs *args, int col);
 
 /* Parse argc/argv into CLIArgs. Return 0 on success, 1 on error, 2 when

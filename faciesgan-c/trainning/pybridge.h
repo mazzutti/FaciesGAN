@@ -15,6 +15,10 @@ int pybridge_close_visualizer(void);
 int pybridge_create_background_worker(int max_workers, int max_pending);
 int pybridge_background_pending_count(void);
 int pybridge_shutdown_background_worker(int wait);
+int pybridge_submit_plot_generated_facies(const char *fake_path,
+        const char *real_path, int stage,
+        int index, const char *out_dir,
+        const char *masks_path);
 
 #ifdef __cplusplus
 }

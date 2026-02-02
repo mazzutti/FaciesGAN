@@ -24,8 +24,8 @@ void mlx_faciesgan_free(MLXFaciesGAN *m);
 MLXDiscriminator *mlx_faciesgan_build_discriminator(MLXFaciesGAN *m);
 MLXGenerator *mlx_faciesgan_build_generator(MLXFaciesGAN *m);
 int mlx_faciesgan_create_generator_scale(MLXFaciesGAN *m, int scale,
-                                         int num_features,
-                                         int min_num_features);
+        int num_features,
+        int min_num_features);
 
 /* Inference */
 mlx_array_t mlx_faciesgan_generate_fake(MLXFaciesGAN *m,
@@ -54,34 +54,38 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                                     mlx_array **wells_pyramid,
                                     mlx_array **seismic_pyramid, int rec);
 
+/* Configure generator input channels (noise + wells + seismic conditioning). */
+int mlx_faciesgan_set_gen_input_channels(MLXFaciesGAN *m, int channels);
+int mlx_faciesgan_get_gen_input_channels(MLXFaciesGAN *m);
+
 /* Configure diversity sample count used by C-side metrics collection. */
 int mlx_faciesgan_set_num_diversity_samples(MLXFaciesGAN *m, int n);
 int mlx_faciesgan_get_num_diversity_samples(MLXFaciesGAN *m);
 
 /* AG-aware forwards (lightweight wrappers / plumbing). */
 AGValue *mlx_faciesgan_generator_forward_ag(MLXFaciesGAN *m, AGValue **z_list,
-                                            int z_count, const float *amp,
-                                            int amp_count, AGValue *in_noise,
-                                            int start_scale, int stop_scale);
+        int z_count, const float *amp,
+        int amp_count, AGValue *in_noise,
+        int start_scale, int stop_scale);
 
 AGValue *mlx_faciesgan_discriminator_forward_ag(MLXFaciesGAN *m, AGValue *input,
-                                                int scale);
+        int scale);
 
 /* AG wrapper to compute WGAN-GP gradient penalty (returns AGValue* scalar). */
 AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
-                                                   AGValue *real, AGValue *fake,
-                                                   int scale,
-                                                   float lambda_grad);
+        AGValue *real, AGValue *fake,
+        int scale,
+        float lambda_grad);
 
 /* AG variants of utility losses (return AGValue* scalar). */
 AGValue *mlx_faciesgan_compute_diversity_loss_ag(MLXFaciesGAN *m,
-                                                 AGValue **fake_samples,
-                                                 int n_samples,
-                                                 float lambda_diversity);
+        AGValue **fake_samples,
+        int n_samples,
+        float lambda_diversity);
 AGValue *mlx_faciesgan_compute_masked_loss_ag(MLXFaciesGAN *m, AGValue *fake,
-                                              AGValue *real, AGValue *well,
-                                              AGValue *mask,
-                                              float well_loss_penalty);
+        AGValue *real, AGValue *well,
+        AGValue *mask,
+        float well_loss_penalty);
 AGValue *mlx_faciesgan_compute_recovery_loss_ag(
     MLXFaciesGAN *m, const int *indexes, int n_indexes, int scale,
     AGValue *rec_in, AGValue *real, mlx_array **wells_pyramid,
@@ -99,10 +103,10 @@ AGValue *mlx_faciesgan_generator_forward_ag_with_params(
 
 /* Helpers: collect grads from AGValue param lists and apply optimizer steps. */
 int mlx_faciesgan_optimize_generator_from_ag(MLXFaciesGAN *m, MLXOptimizer *opt,
-                                             AGValue **params, int n);
+        AGValue **params, int n);
 int mlx_faciesgan_optimize_discriminator_from_ag(MLXFaciesGAN *m,
-                                                 MLXOptimizer *opt,
-                                                 AGValue **params, int n);
+        MLXOptimizer *opt,
+        AGValue **params, int n);
 int mlx_faciesgan_train_step_from_ag(MLXFaciesGAN *m, MLXOptimizer *opt_g,
                                      AGValue **gen_params, int gen_n,
                                      MLXOptimizer *opt_d, AGValue **disc_params,
@@ -121,11 +125,11 @@ int mlx_faciesgan_get_noise_amps(MLXFaciesGAN *m, float **out_amps, int *out_n);
 int mlx_faciesgan_save_generator_state(MLXFaciesGAN *m, const char *scale_path,
                                        int scale);
 int mlx_faciesgan_save_discriminator_state(MLXFaciesGAN *m,
-                                           const char *scale_path, int scale);
+        const char *scale_path, int scale);
 int mlx_faciesgan_load_generator_state(MLXFaciesGAN *m, const char *scale_path,
                                        int scale);
 int mlx_faciesgan_load_discriminator_state(MLXFaciesGAN *m,
-                                           const char *scale_path, int scale);
+        const char *scale_path, int scale);
 int mlx_faciesgan_save_shape(MLXFaciesGAN *m, const char *scale_path,
                              int scale);
 int mlx_faciesgan_load_shape(MLXFaciesGAN *m, const char *scale_path,
@@ -155,9 +159,9 @@ int mlx_faciesgan_optimize_generator_scales(
    mlx_array_free() when done.
 */
 int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
-                                         mlx_array **fake_samples,
-                                         int n_samples, float lambda_diversity,
-                                         mlx_array **out_loss);
+        mlx_array **fake_samples,
+        int n_samples, float lambda_diversity,
+        mlx_array **out_loss);
 
 int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
                                       const mlx_array *real,
@@ -176,6 +180,11 @@ int mlx_faciesgan_compute_recovery_loss(
    fallback. Default is create-graph (1). */
 void mlx_faciesgan_set_use_create_graph_gp(int use);
 int mlx_faciesgan_get_use_create_graph_gp(void);
+
+/* Evaluate all model parameters (parity with Python mx.eval(self.model.state)).
+   This forces lazy computation graphs to materialize and releases intermediate
+   arrays, preventing memory accumulation during training. */
+int mlx_faciesgan_eval_all_parameters(MLXFaciesGAN *m);
 
 #ifdef __cplusplus
 }

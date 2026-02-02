@@ -328,58 +328,66 @@ def main() -> None:
     # Optionally run the trainer under the PyTorch profiler and export traces.
     # MPS backend uses a different profiler API (torch.mps.profiler) that
     # generates OS Signpost traces viewable in Xcode Instruments.
-    if getattr(options, "use_profiler", False):
-        if device.type == "mps":
-            # Use MPS-specific profiler for Apple Silicon GPUs
-            print("Starting MPS profiler (use Xcode Instruments to view traces)...")
-            print(
-                "Note: Launch Xcode Instruments with the Logging tool before starting training"
-            )
-            try:
-                torch.mps.profiler.start(mode="interval", wait_until_completed=False)  # type: ignore
-                trainer.train()
-                torch.mps.profiler.stop()  # type: ignore
-                print("MPS profiler stopped. Opening Xcode Instruments...")
-                # Attempt to open Xcode Instruments
-                import subprocess
-
+    try:
+        if getattr(options, "use_profiler", False):
+            if device.type == "mps":
+                # Use MPS-specific profiler for Apple Silicon GPUs
+                print("Starting MPS profiler (use Xcode Instruments to view traces)...")
+                print(
+                    "Note: Launch Xcode Instruments with the Logging tool before starting training"
+                )
                 try:
-                    subprocess.run(["open", "-a", "Instruments"], check=False)
-                except Exception as open_err:
-                    print(f"Could not automatically open Instruments: {open_err}")
-                    print(
-                        "Please open Xcode Instruments > Logging tool manually to view OS Signpost traces."
-                    )
-            except Exception as e:
-                print(f"Warning: MPS profiler error: {e}")
-                trainer.train()
-        else:
-            # Use standard torch.profiler for CPU/CUDA
-            try:
-                from torch.profiler import ProfilerActivity  # type: ignore
-                from torch.profiler import profile
-            except Exception:
-                print("Warning: PyTorch profiler not available in this environment.")
-                trainer.train()
-            else:
-                trace_file = os.path.join(options.output_path, "profiler_trace.json")
-                activities = [ProfilerActivity.CPU]
-                if torch.cuda.is_available():
-                    activities.append(ProfilerActivity.CUDA)
-
-                with profile(
-                    activities=activities, record_shapes=True, profile_memory=True
-                ) as prof:
+                    torch.mps.profiler.start(mode="interval", wait_until_completed=False)  # type: ignore
                     trainer.train()
+                    torch.mps.profiler.stop()  # type: ignore
+                    print("MPS profiler stopped. Opening Xcode Instruments...")
+                    # Attempt to open Xcode Instruments
+                    import subprocess
 
-                try:
-                    prof.export_chrome_trace(trace_file)
-                    print(f"Profiler trace saved to: {trace_file}")
-                    print("View in Chrome at: chrome://tracing")
+                    try:
+                        subprocess.run(["open", "-a", "Instruments"], check=False)
+                    except Exception as open_err:
+                        print(f"Could not automatically open Instruments: {open_err}")
+                        print(
+                            "Please open Xcode Instruments > Logging tool manually to view OS Signpost traces."
+                        )
                 except Exception as e:
-                    print(f"Could not export profiler trace: {e}")
-    else:
-        trainer.train()
+                    print(f"Warning: MPS profiler error: {e}")
+                    trainer.train()
+            else:
+                # Use standard torch.profiler for CPU/CUDA
+                try:
+                    from torch.profiler import ProfilerActivity  # type: ignore
+                    from torch.profiler import profile
+                except Exception:
+                    print("Warning: PyTorch profiler not available in this environment.")
+                    trainer.train()
+                else:
+                    trace_file = os.path.join(options.output_path, "profiler_trace.json")
+                    activities = [ProfilerActivity.CPU]
+                    if torch.cuda.is_available():
+                        activities.append(ProfilerActivity.CUDA)
+
+                    with profile(
+                        activities=activities, record_shapes=True, profile_memory=True
+                    ) as prof:
+                        trainer.train()
+
+                    try:
+                        prof.export_chrome_trace(trace_file)
+                        print(f"Profiler trace saved to: {trace_file}")
+                        print("View in Chrome at: chrome://tracing")
+                    except Exception as e:
+                        print(f"Could not export profiler trace: {e}")
+        else:
+            trainer.train()
+    finally:
+        try:
+            from background_workers import BackgroundWorker
+
+            BackgroundWorker().shutdown(wait=True)
+        except Exception:
+            pass
 
     print("\n" + "=" * 60)
     print("TRAINING COMPLETED SUCCESSFULLY")

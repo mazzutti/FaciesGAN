@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
 project(FaciesGAN_MLXC LANGUAGES C CXX)
 
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 # Export compile commands for IDEs (e.g. VSCode/C++ Intellisense)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Export compile_commands.json for editor integration")
 
@@ -78,7 +81,6 @@ target_include_directories(custom_layer
     ${PROJECT_SOURCE_DIR}/faciesgan-c/models
     ${PROJECT_SOURCE_DIR}/faciesgan-c
 )
-
 
 target_include_directories(custom_layer PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c/third_party)
 

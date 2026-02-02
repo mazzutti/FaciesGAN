@@ -1,5 +1,9 @@
 from collections.abc import Callable
 import os
+import sys
+import random
+import json
+import numpy as np
 from typing import Any, Iterator, cast
 
 import mlx.core as mx
@@ -68,6 +72,18 @@ class MLXTrainer(
         self.compile_backend = options.compile_backend
         self._compiled_optimization_step = None
         super().__init__(options, fine_tuning, checkpoint_path)
+
+        # Set MLX random seed for reproducibility if manual_seed is set
+        if hasattr(options, "manual_seed") and options.manual_seed is not None:
+            try:
+                mx.random.seed(options.manual_seed)
+                np.random.seed(options.manual_seed)
+                random.seed(options.manual_seed)
+                reset_fn = getattr(self.model, "reset_parameters", None)
+                if reset_fn:
+                    reset_fn()
+            except Exception as e:
+                print(f"Warning: Could not set MLX random seed: {e}")
 
         # Container to hold results - must be part of outputs for compile
         self._optimization_results: list[tuple[IterableMetrics[mx.array], ...]] = []
@@ -284,14 +300,19 @@ class MLXTrainer(
             ``scales`` is the tuple of pyramid scales present in the dataset.
         """
         dataset = MLXPyramidsDataset(self.options, channels_last=True)
+        selected_indices: list[int]
         if len(self.options.wells_mask_columns) > 0:
-            sel = [int(i) for i in self.options.wells_mask_columns]
-            dataset.batches = [dataset.batches[i] for i in sel]
+            selected_indices = [int(i) for i in self.options.wells_mask_columns]
+            dataset.batches = [dataset.batches[i] for i in selected_indices]
         elif self.options.num_train_pyramids < len(dataset):
             idxs = mx.random.permutation(mx.arange(len(dataset)))[  # type: ignore
                 : self.options.num_train_pyramids
             ]
-            dataset.batches = [dataset.batches[int(i)] for i in idxs]  # type: ignore
+            selected_indices = [int(i) for i in idxs]  # type: ignore
+            dataset.batches = [dataset.batches[i] for i in selected_indices]
+        else:
+            selected_indices = list(range(len(dataset.batches)))
+
         return dataset, dataset.scales
 
     def load_model(self, scale: int) -> None:
@@ -644,6 +665,18 @@ class MLXTrainer(
         )
         real_facies_tensor = real_facies[idx_list]
 
+        # Save generated facies as .npy for comparison with C version
+        import os
+
+        gen_denorm = utils.mlx2np(generated_facies, denormalize=True)
+        npy_path = os.path.join(results_path, f"scale_{scale}_epoch_{epoch}_fake.npy")
+        np.save(npy_path, gen_denorm)
+        real_denorm = utils.mlx2np(real_facies_tensor, denormalize=True)
+        real_npy_path = os.path.join(
+            results_path, f"scale_{scale}_epoch_{epoch}_real.npy"
+        )
+        np.save(real_npy_path, real_denorm)
+
         if self.enable_plot_facies:
             bw.submit_plot_generated_facies(
                 utils.mlx2np(facies_tensor, denormalize=True),
@@ -666,35 +699,86 @@ class MLXTrainer(
         filename constants from :mod:`config`.
         """
         os.makedirs(scale_path, exist_ok=True)
-        # Create a dump of optimizer states for debugging (non-fatal)
+
+        def _flatten_state(prefix: str, obj: object, out: dict[str, object]) -> None:
+            """Recursively flatten optimizer/scheduler state into numpy-serializable arrays.
+
+            Keys are produced as `prefix.key...` for nested dicts/lists.
+            """
+            if isinstance(obj, mx.array):
+                out[prefix] = np.array(obj)
+                return
+            if isinstance(obj, np.ndarray):
+                out[prefix] = obj
+                return
+            if isinstance(obj, (int, float, bool, str)):
+                if isinstance(obj, float):
+                    out[prefix] = np.array(obj, dtype=np.float32)
+                else:
+                    out[prefix] = np.array(obj)
+                return
+            if isinstance(obj, dict):
+                for k, v in obj.items():  # type: ignore
+                    nk = f"{prefix}.{k}" if prefix else str(k)  # type: ignore
+                    _flatten_state(nk, v, out)  # type: ignore
+                return
+            if isinstance(obj, (list, tuple)):
+                for i, v in enumerate(obj):  # type: ignore
+                    nk = f"{prefix}.{i}" if prefix else str(i)
+                    _flatten_state(nk, v, out)  # type: ignore
+                return
+            # Fallback: try to convert to numpy, else stringify
+            try:
+                out[prefix] = np.array(obj)
+            except Exception:
+                out[prefix] = np.array(str(obj))
+
+        # Prepare and save generator optimizer state
         try:
-            mx.savez(  # type: ignore
-                os.path.join(scale_path, OPT_G_FILE),
-                **generator_optimizer.state,  # type: ignore
+            gen_flat: dict[str, object] = {}
+            _flatten_state("", getattr(generator_optimizer, "state", {}), gen_flat)
+            # mx.savez expects keyword args mapping names to arrays; ensure keys are valid
+            np.savez(
+                os.path.join(scale_path, OPT_G_FILE.replace(".pth", ".npz")), **gen_flat  # type: ignore
             )
         except Exception as e:
             print(f"Failed to save generator optimizer state: {e}")
 
+        # Prepare and save discriminator optimizer state
         try:
-            mx.savez(  # type: ignore
-                os.path.join(scale_path, OPT_D_FILE),
-                **discriminator_optimizer.state,  # type: ignore
+            disc_flat: dict[str, object] = {}
+            _flatten_state("", getattr(discriminator_optimizer, "state", {}), disc_flat)
+            np.savez(
+                os.path.join(scale_path, OPT_D_FILE.replace(".pth", ".npz")),
+                **disc_flat,  # type: ignore
             )
         except Exception as e:
             print(f"Failed to save discriminator optimizer state: {e}")
 
+        # Prepare and save generator scheduler state
         try:
-            mx.savez(  # type: ignore
-                os.path.join(scale_path, SCH_G_FILE),
-                **generator_scheduler.state_dict(),
+            schg_flat: dict[str, object] = {}
+            _flatten_state(
+                "", getattr(generator_scheduler, "state_dict", lambda: {})(), schg_flat  # type: ignore
+            )
+            np.savez(
+                os.path.join(scale_path, SCH_G_FILE.replace(".pth", ".npz")),
+                **schg_flat,  # type: ignore
             )
         except Exception as e:
             print(f"Failed to save generator scheduler state: {e}")
 
+        # Prepare and save discriminator scheduler state
         try:
-            mx.savez(  # type: ignore
-                os.path.join(scale_path, SCH_D_FILE),
-                **discriminator_scheduler.state_dict(),
+            schd_flat: dict[str, object] = {}
+            _flatten_state(
+                "",
+                getattr(discriminator_scheduler, "state_dict", lambda: {})(),  # type: ignore
+                schd_flat,
+            )
+            np.savez(
+                os.path.join(scale_path, SCH_D_FILE.replace(".pth", ".npz")),
+                **schd_flat,  # type: ignore
             )
         except Exception as e:
             print(f"Failed to save discriminator scheduler state: {e}")

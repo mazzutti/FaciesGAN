@@ -1,0 +1,11 @@
+To ensure full parity between the C and Python (MLX) training loops, you should:
+
+Match all random seeds and initialization routines (weights, data shuffling, etc.).
+Ensure both versions use the same data preprocessing and batching logic.
+Verify that all hyperparameters (learning rate, optimizer, batch size, etc.) are identical.
+Confirm that the model architectures and layer implementations are mathematically equivalent.
+Check for differences in numerical precision (float32 vs float64, etc.).
+Compare loss calculations and backpropagation steps for consistency.
+Log intermediate values (weights, gradients, losses) at each step in both versions and compare them.
+Use the same order of operations and avoid any nondeterministic behavior (e.g., parallelism, threading).
+If possible, write unit tests that run both versions on the same small batch and compare outputs step by step.

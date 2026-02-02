@@ -42,7 +42,8 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
         return 0;
     }
 
-    /* gather previous-scale entries by indexes */
+    /* gather previous-scale entries by indexes using mlx_take_axis
+     * which preserves shape better than mlx_gather_single */
     if (!facies_pyramid[scale - 1] || !facies_pyramid[scale])
         return -1;
     if (!indexes || n_indexes <= 0)
@@ -51,32 +52,13 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
     int idx_shape[1] = {n_indexes};
     mlx_array idx = mlx_array_new_data(indexes, idx_shape, 1, MLX_INT32);
     mlx_array sel = mlx_array_new();
-    /* Build trailing slice sizes for gather (axes after axis=0) */
-    int fac_nd = (int)mlx_array_ndim(*facies_pyramid[scale - 1]);
-    int *slice_sizes = NULL;
-    int slice_num = 0;
-    if (fac_nd > 0) {
-        slice_num = fac_nd;
-        if (mlx_alloc_int_array(&slice_sizes, slice_num) != 0) {
-            mlx_array_free(idx);
-            mlx_stream_free(s);
-            return -1;
-        }
-        const int *sh = mlx_array_shape(*facies_pyramid[scale - 1]);
-        for (int si = 0; si < slice_num; ++si)
-            slice_sizes[si] = sh[si];
-    }
-    if (mlx_gather_single(&sel, *facies_pyramid[scale - 1], idx, 0, slice_sizes,
-                          slice_num, s) != 0) {
+    /* Use mlx_take_axis to select indices along batch axis (axis=0) */
+    if (mlx_take_axis(&sel, *facies_pyramid[scale - 1], idx, 0, s) != 0) {
         mlx_array_free(idx);
-        if (slice_sizes)
-            mlx_free_int_array(&slice_sizes, &slice_num);
         mlx_stream_free(s);
         return -1;
     }
     mlx_array_free(idx);
-    if (slice_sizes)
-        mlx_free_int_array(&slice_sizes, &slice_num);
 
     /* upsample to match target spatial dims */
     const int *shape = mlx_array_shape(*facies_pyramid[scale]);
@@ -123,6 +105,9 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     if (scale < 0)
         return -1;
 
+    /* Acquire global MLX lock for all MLX operations in this function */
+    mlx_global_lock();
+
     /* if noise amps already set up to this scale, nothing to do */
     float *amps = NULL;
     int n_amps = 0;
@@ -130,6 +115,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         if (amps) {
             if (n_amps > scale) {
                 mlx_free_float_buf(&amps, &n_amps);
+                mlx_global_unlock();
                 return 0;
             }
             mlx_free_float_buf(&amps, &n_amps);
@@ -146,8 +132,10 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     int n_noises = 0;
     if (mlx_faciesgan_get_pyramid_noise(m, scale, indexes, n_indexes, &noises,
                                         &n_noises, wells_pyramid, seismic_pyramid,
-                                        0) != 0)
+                                        0) != 0) {
+        mlx_global_unlock();
         return -1;
+    }
 
     /* obtain amplitude list for generation (will be freed) */
     float *use_amps = NULL;
@@ -156,6 +144,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         /* fallback to ones */
         if (mlx_alloc_float_buf(&use_amps, scale + 1) != 0) {
             mlx_free_mlx_array_ptrs(&noises, n_noises);
+            mlx_global_unlock();
             return -1;
         }
         for (int i = 0; i < scale + 1; ++i)
@@ -172,6 +161,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
             mlx_free_mlx_array_ptrs(&noises, n_noises);
             if (use_amps)
                 mlx_free_float_buf(&use_amps, &use_n);
+            mlx_global_unlock();
             return -1;
         }
         for (int i = 0; i < n_noises; ++i) {
@@ -277,16 +267,19 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
+        mlx_global_unlock();
         return -1;
     }
     if (created_real_pad)
         mlx_array_free(real_to_use);
     mlx_array sq = mlx_array_new();
-    if (mlx_square(&sq, diff, s) != 0) {
+    int sq_rc = mlx_square(&sq, diff, s);
+    if (sq_rc != 0) {
         mlx_array_free(diff);
         mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
+        mlx_global_unlock();
         return -1;
     }
     mlx_array_free(diff);
@@ -297,6 +290,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
+        mlx_global_unlock();
         return -1;
     }
     mlx_array_free(sq);
@@ -307,6 +301,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
+        mlx_global_unlock();
         return -1;
     }
     mlx_array_free(mean);
@@ -339,6 +334,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
+        mlx_global_unlock();
         return -1;
     }
     /* try to read existing amps to preserve previous values */
@@ -361,5 +357,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     mlx_stream_free(s);
     mlx_array_free(fake);
     mlx_array_free(in_noise);
+
+    mlx_global_unlock();
     return res;
 }

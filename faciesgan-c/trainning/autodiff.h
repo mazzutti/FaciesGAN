@@ -36,6 +36,10 @@ AGValue *ag_mul(AGValue *a, AGValue *b);
 AGValue *ag_tanh(AGValue *a);
 AGValue *ag_square(AGValue *a);
 AGValue *ag_sum_axis(AGValue *a, int axis, int keepdims);
+/* Mean over all elements, returns scalar. Backward broadcasts grad/size to input shape. */
+AGValue *ag_mean(AGValue *a);
+/* Sum over all elements, returns scalar. Backward broadcasts grad (ones) to input shape. */
+AGValue *ag_sum(AGValue *a);
 AGValue *ag_transpose(AGValue *a);
 AGValue *ag_matmul(AGValue *a, AGValue *b);
 AGValue *ag_divide(AGValue *a, AGValue *b);
@@ -67,6 +71,10 @@ int ag_backward(AGValue *output);
 /* Utility: zero gradients, get grad array pointer (caller owns copy) */
 mlx_array *ag_value_get_grad(AGValue *v);
 void ag_zero_grad_all(void);
+
+/* Clear all grad_ag pointers (call after create-graph backward to allow
+   subsequent regular backwards on the same tape). */
+void ag_clear_grad_ag_all(void);
 
 /* Return AGValue representing symbolic gradient produced by create_graph pass.
 	Caller must not free the returned AGValue (it's owned by tape temporaries). */

@@ -12,5 +12,10 @@ logs/**
 output/generated
 build/
 build_dbg/
+build-asan/
+tools/
+!tools/gen_mlx_cache.py
+scripts/
 results/**
 **/events.out.tfevents*
+

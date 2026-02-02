@@ -39,6 +39,14 @@ mlx_base_manager_create_with_faciesgan(const TrainningOptions *opts) {
     if (opts->num_diversity_samples > 0)
         mlx_faciesgan_set_num_diversity_samples(fg, opts->num_diversity_samples);
 
+    /* Configure generator input channels to include wells/seismic conditioning */
+    int gen_input_ch = opts->noise_channels;
+    if (opts->use_wells)
+        gen_input_ch += opts->num_img_channels;
+    if (opts->use_seismic)
+        gen_input_ch += opts->num_img_channels;
+    mlx_faciesgan_set_gen_input_channels(fg, gen_input_ch);
+
     MLXBaseManagerCallbacks cbs = {0};
     cbs.build_generator = fg_build_generator;
     cbs.build_discriminator = fg_build_discriminator;

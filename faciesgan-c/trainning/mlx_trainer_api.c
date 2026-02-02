@@ -82,7 +82,8 @@ int MLXTrainer_setup_optimizers_impl(MLXTrainer *trainer, const int *scales,
 int MLXTrainer_load_model_impl(MLXTrainer *trainer, int scale,
                                const char *checkpoint_dir);
 int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
-        int epoch, const char *results_path);
+        int epoch, const char *results_path, mlx_array real_facies,
+        mlx_array masks);
 void *MLXTrainer_get_model_ctx_impl(MLXTrainer *trainer);
 int MLXTrainer_get_shapes_flat_impl(MLXTrainer *t, int **out_shapes,
                                     int *out_n);
@@ -217,12 +218,13 @@ int MLXTrainer_load_model(MLXTrainer *trainer, int scale,
     return MLXTrainer_load_model_impl(trainer, scale, checkpoint_dir);
 }
 int MLXTrainer_save_generated_facies(MLXTrainer *trainer, int scale, int epoch,
-                                     const char *results_path) {
+                                     const char *results_path, mlx_array real_facies,
+                                     mlx_array masks) {
     if (trainer && trainer->ops && trainer->ops->save_generated_facies)
         return trainer->ops->save_generated_facies(trainer, scale, epoch,
-                results_path);
+                results_path, real_facies, masks);
     return MLXTrainer_save_generated_facies_impl(trainer, scale, epoch,
-            results_path);
+            results_path, real_facies, masks);
 }
 
 void *MLXTrainer_get_model_ctx(MLXTrainer *trainer) {
@@ -271,6 +273,21 @@ MLXTrainer *MLXTrainer_new(const TrainningOptions *opts, int fine_tuning,
     if (mlx_alloc_pod((void **)&trainer, sizeof(MLXTrainer), 1) != 0)
         return NULL;
     memset(trainer, 0, sizeof(*trainer));
+
+    /* Configure MLX memory management (parity with Python Trainer):
+     * Set memory limit to 48GB and use GPU device by default. */
+    size_t mem_limit_result = 0;
+    size_t mem_limit = 48UL * 1024UL * 1024UL * 1024UL;  /* 48GB */
+    mlx_set_memory_limit(&mem_limit_result, mem_limit);
+    fprintf(stderr, "MLX Metal Configuration:\n");
+    fprintf(stderr, "  Memory limit: %.1f GB\n", (double)mem_limit_result / (1024.0 * 1024.0 * 1024.0));
+
+    /* Set MLX random seed for reproducibility (parity with Python mx.random.seed) */
+    if (opts->manual_seed >= 0) {
+        mlx_random_seed((uint64_t)opts->manual_seed);
+        fprintf(stderr, "  Random seed: %d\n", opts->manual_seed);
+    }
+
     /* attach default ops vtable so callers can use trainer->ops->... if
      * desired. The ops struct references the existing function-based API so
      * this is a non-invasive, backward-compatible enhancement. */
@@ -1112,6 +1129,29 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
         }
     }
 
+    /* Evaluate all model parameters (parity with Python mx.eval(self.model.state)).
+     * This forces lazy computation graphs to materialize and releases intermediate
+     * arrays, preventing memory accumulation. */
+    mlx_faciesgan_eval_all_parameters(trainer->model);
+
+    /* Evaluate optimizer state arrays (m, v momentum) to materialize computation
+     * graphs and prevent memory accumulation - same as Python evaluating optimizer
+     * state after each step. */
+    for (int sc = 0; sc < trainer->n_scales; ++sc) {
+        if (trainer->gen_opts && trainer->gen_opts[sc])
+            mlx_optimizer_eval_state(trainer->gen_opts[sc]);
+        if (trainer->disc_opts && trainer->disc_opts[sc])
+            mlx_optimizer_eval_state(trainer->disc_opts[sc]);
+    }
+
+    /* Synchronize and clear Metal cache after each optimization step to avoid
+     * accumulating resources (command buffers/encoders) and hitting the
+     * Metal resource limit. */
+    mlx_stream sync_s = mlx_default_cpu_stream_new();
+    mlx_synchronize(sync_s);
+    mlx_clear_cache();
+    mlx_stream_free(sync_s);
+
     mlx_results_free(res);
     if (tmp_wells)
         mlx_free_ptr_array((void ***)&tmp_wells, need_n);
@@ -1143,40 +1183,443 @@ int MLXTrainer_load_model_impl(MLXTrainer *trainer, int scale,
 }
 
 int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
-        int epoch, const char *results_path) {
+        int epoch, const char *results_path, mlx_array real_facies,
+        mlx_array masks) {
     if (!trainer || !results_path)
         return -1;
-    /* Generate noises and call numeric forward (similar to train_utils.c) */
-    mlx_array **noises = NULL;
-    int n_noises = 0;
-    if (mlx_faciesgan_get_pyramid_noise(trainer->model, scale, NULL, 0, &noises,
-                                        &n_noises, NULL, NULL, 0) != 0)
-        return -1;
 
-    /* use default amplitudes (all ones) */
-    float *use_amps = NULL;
-    if (mlx_alloc_float_buf(&use_amps, scale + 1) != 0) {
-        mlx_free_mlx_array_ptrs(&noises, n_noises);
+    /* Use options from trainer (respects CLI args) */
+    const int num_real = trainer->num_real_facies > 0
+                         ? trainer->num_real_facies : 5;
+    const int num_gen_per_real = trainer->num_generated_per_real > 0
+                                 ? trainer->num_generated_per_real : 5;
+    const int cell_size = 128; /* Cell size in grid visualization */
+
+    mlx_stream s = mlx_default_cpu_stream_new();
+
+    /* Get batch size from real_facies */
+    int real_ndim = mlx_array_ndim(real_facies);
+    const int *real_shape = mlx_array_shape(real_facies);
+    int batch_size = (real_ndim == 4) ? real_shape[0] : 1;
+
+    /* Select num_real random indices from batch (like Python: indexes = randint(batch_size, (num_real_facies,))) */
+    int *selected_indices = (int *)malloc(num_real * sizeof(int));
+    if (!selected_indices) {
+        mlx_stream_free(s);
         return -1;
     }
-    for (int i = 0; i < scale + 1; ++i)
-        use_amps[i] = 1.0f;
+    for (int i = 0; i < num_real; i++) {
+        selected_indices[i] = rand() % batch_size;
+    }
 
-    mlx_array in_noise = mlx_array_new();
-    mlx_array_t fake = mlx_faciesgan_generate_fake(
-                           trainer->model, (const mlx_array *)noises, n_noises, use_amps, scale + 1,
-                           in_noise, scale, scale);
+    /* Total number of generated samples = num_real * num_gen_per_real */
+    int total_gen = num_real * num_gen_per_real;
 
-    /* free noises */
-    mlx_free_mlx_array_ptrs(&noises, n_noises);
-    mlx_free_float_buf(&use_amps, NULL);
+    /* Allocate array to store all fake samples (one per generation) */
+    mlx_array *all_fakes = (mlx_array *)malloc(total_gen * sizeof(mlx_array));
+    if (!all_fakes) {
+        free(selected_indices);
+        mlx_stream_free(s);
+        return -1;
+    }
+    for (int i = 0; i < total_gen; i++)
+        all_fakes[i] = mlx_array_new();
 
-    char fname[PATH_MAX];
-    snprintf(fname, PATH_MAX, "%s/scale_%d_epoch_%d.npy", results_path, scale,
-             epoch);
-    int rc = mlx_save(fname, fake);
-    mlx_array_free(fake);
-    mlx_array_free(in_noise);
+    /* Generate total_gen fake samples with different noise */
+    for (int gen_idx = 0; gen_idx < total_gen; gen_idx++) {
+        /* Generate new random noises for each sample */
+        mlx_array **noises = NULL;
+        int n_noises = 0;
+        if (mlx_faciesgan_get_pyramid_noise(trainer->model, scale, NULL, 0, &noises,
+                                            &n_noises, NULL, NULL, 0) != 0) {
+            /* Clean up on error */
+            for (int j = 0; j < gen_idx; j++)
+                mlx_array_free(all_fakes[j]);
+            free(all_fakes);
+            free(selected_indices);
+            mlx_stream_free(s);
+            return -1;
+        }
+
+        /* use default amplitudes (all ones) */
+        float *use_amps = NULL;
+        if (mlx_alloc_float_buf(&use_amps, scale + 1) != 0) {
+            mlx_free_mlx_array_ptrs(&noises, n_noises);
+            for (int j = 0; j < gen_idx; j++)
+                mlx_array_free(all_fakes[j]);
+            free(all_fakes);
+            free(selected_indices);
+            mlx_stream_free(s);
+            return -1;
+        }
+        for (int i = 0; i < scale + 1; ++i)
+            use_amps[i] = 1.0f;
+
+        /* Convert pointer array to contiguous mlx_array values */
+        mlx_array *zvals = NULL;
+        if (n_noises > 0) {
+            if (mlx_alloc_mlx_array_vals(&zvals, n_noises) != 0) {
+                mlx_free_mlx_array_ptrs(&noises, n_noises);
+                mlx_free_float_buf(&use_amps, NULL);
+                for (int j = 0; j < gen_idx; j++)
+                    mlx_array_free(all_fakes[j]);
+                free(all_fakes);
+                free(selected_indices);
+                mlx_stream_free(s);
+                return -1;
+            }
+            for (int j = 0; j < n_noises; ++j)
+                zvals[j] = *noises[j];
+        }
+
+        mlx_array in_noise = mlx_array_new();
+        mlx_array_t fake = mlx_faciesgan_generate_fake(
+                               trainer->model, zvals, n_noises, use_amps, scale + 1,
+                               in_noise, scale, scale);
+
+        /* IMPORTANT: Evaluate the fake array BEFORE freeing noise inputs!
+         * MLX uses lazy evaluation, so the computation graph references the noise
+         * arrays. If we free them before evaluation, we get zeros/garbage. */
+        mlx_array_eval(fake);
+        mlx_synchronize(s);
+
+        /* Now safe to free noises */
+        mlx_free_mlx_array_ptrs(&noises, n_noises);
+        if (zvals)
+            free(zvals);
+        mlx_free_float_buf(&use_amps, NULL);
+
+        /* Clamp to [-1, 1] */
+        mlx_array fake_clamped = mlx_array_new();
+        if (mlx_clamp(&fake_clamped, fake, -1.0f, 1.0f, s) == 0) {
+            mlx_array_free(fake);
+            fake = fake_clamped;
+        }
+
+        /* Denormalize from [-1, 1] to [0, 1]: (x + 1) / 2 */
+        mlx_array one = mlx_array_new_float(1.0f);
+        mlx_array two = mlx_array_new_float(2.0f);
+        mlx_array fake_plus_one = mlx_array_new();
+        mlx_array fake_denorm = mlx_array_new();
+        if (mlx_add(&fake_plus_one, fake, one, s) == 0) {
+            if (mlx_divide(&fake_denorm, fake_plus_one, two, s) == 0) {
+                mlx_array_free(fake);
+                fake = fake_denorm;
+            } else {
+                mlx_array_free(fake_denorm);
+            }
+            mlx_array_free(fake_plus_one);
+        }
+        mlx_array_free(one);
+        mlx_array_free(two);
+        mlx_array_free(in_noise);
+
+        all_fakes[gen_idx] = fake;
+    }
+
+    /* Build path to match Python: output_path/<scale>/real_x_generated_facies/ */
+    char scale_results_path[PATH_MAX];
+    snprintf(scale_results_path, PATH_MAX, "%s/%d/real_x_generated_facies", results_path, scale);
+    mlx_create_dirs(scale_results_path);
+
+    int rc = 0;
+
+    /* Denormalize real_facies for both paths */
+    mlx_array real_denorm = mlx_array_new();
+    if (real_facies.ctx != NULL) {
+        mlx_array real_plus_one = mlx_array_new();
+        mlx_array one2 = mlx_array_new_float(1.0f);
+        mlx_array two2 = mlx_array_new_float(2.0f);
+        if (mlx_add(&real_plus_one, real_facies, one2, s) == 0) {
+            mlx_divide(&real_denorm, real_plus_one, two2, s);
+            mlx_array_free(real_plus_one);
+        }
+        mlx_array_free(one2);
+        mlx_array_free(two2);
+    }
+
+    /* Check if we should use Python bridge for plotting (matches matplotlib fonts) */
+    if (trainer->opts.use_pybridge_plot && real_facies.ctx != NULL) {
+        /* Build 5D fake array: (num_real, num_gen_per_real, H, W, C) */
+        int fake_h = 1, fake_w = 1, fake_c = 3;
+        if (total_gen > 0 && all_fakes[0].ctx != NULL) {
+            int fndim = mlx_array_ndim(all_fakes[0]);
+            const int *fshape = mlx_array_shape(all_fakes[0]);
+            if (fndim == 4) {
+                fake_h = fshape[1];
+                fake_w = fshape[2];
+                fake_c = fshape[3];
+            } else if (fndim == 3) {
+                fake_h = fshape[0];
+                fake_w = fshape[1];
+                fake_c = fshape[2];
+            }
+        }
+
+        /* Create 5D array by stacking: (num_real, num_gen_per_real, H, W, C) */
+        int shape_5d[5] = {num_real, num_gen_per_real, fake_h, fake_w, fake_c};
+        mlx_array fake_5d = mlx_array_new();
+        if (mlx_zeros(&fake_5d, shape_5d, 5, MLX_FLOAT32, s) == 0) {
+            /* Copy each fake into the 5D array */
+            for (int ri = 0; ri < num_real; ri++) {
+                for (int gi = 0; gi < num_gen_per_real; gi++) {
+                    int idx = ri * num_gen_per_real + gi;
+                    if (idx < total_gen && all_fakes[idx].ctx != NULL) {
+                        /* Extract the first sample if batched (B, H, W, C) -> (H, W, C) */
+                        mlx_array sample = all_fakes[idx];
+                        int sndim = mlx_array_ndim(sample);
+                        if (sndim == 4) {
+                            /* Slice first element from batch dimension */
+                            mlx_array sliced = mlx_array_new();
+                            int starts[4] = {0, 0, 0, 0};
+                            int stops[4] = {1, fake_h, fake_w, fake_c};
+                            int strides[4] = {1, 1, 1, 1};
+                            if (mlx_slice(&sliced, sample, starts, 4, stops, 4, strides, 4, s) == 0) {
+                                /* Squeeze batch dimension (axis 0) */
+                                mlx_array squeezed = mlx_array_new();
+                                if (mlx_squeeze_axis(&squeezed, sliced, 0, s) == 0) {
+                                    /* Insert into 5D array at position [ri, gi, :, :, :] */
+                                    int ins_starts[5] = {ri, gi, 0, 0, 0};
+                                    int ins_stops[5] = {ri + 1, gi + 1, fake_h, fake_w, fake_c};
+                                    int ins_strides[5] = {1, 1, 1, 1, 1};
+                                    /* Expand squeezed to 5D for assignment: (H,W,C) -> (1,1,H,W,C) */
+                                    mlx_array exp1 = mlx_array_new();
+                                    mlx_array exp2 = mlx_array_new();
+                                    if (mlx_expand_dims(&exp1, squeezed, 0, s) == 0 &&
+                                            mlx_expand_dims(&exp2, exp1, 0, s) == 0) {
+                                        /* Use slice_update to place data into the 5D array */
+                                        mlx_array updated = mlx_array_new();
+                                        if (mlx_slice_update(&updated, fake_5d, exp2,
+                                                             ins_starts, 5, ins_stops, 5, ins_strides, 5, s) == 0) {
+                                            mlx_array_free(fake_5d);
+                                            fake_5d = updated;
+                                        } else {
+                                            mlx_array_free(updated);
+                                        }
+                                        mlx_array_free(exp1);
+                                        mlx_array_free(exp2);
+                                    } else {
+                                        mlx_array_free(exp1);
+                                        mlx_array_free(exp2);
+                                    }
+                                    mlx_array_free(squeezed);
+                                } else {
+                                    mlx_array_free(squeezed);
+                                }
+                                mlx_array_free(sliced);
+                            } else {
+                                mlx_array_free(sliced);
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Evaluate the 5D array before saving */
+            mlx_array_eval(fake_5d);
+            mlx_synchronize(s);
+
+            /* Save NPY files for pybridge */
+            char fake_npy_path[PATH_MAX];
+            char real_npy_path[PATH_MAX];
+            char masks_npy_path[PATH_MAX];
+            snprintf(fake_npy_path, PATH_MAX, "%s/_tmp_fake_%d_%d.npy", scale_results_path, scale, epoch);
+            snprintf(real_npy_path, PATH_MAX, "%s/_tmp_real_%d_%d.npy", scale_results_path, scale, epoch);
+            snprintf(masks_npy_path, PATH_MAX, "%s/_tmp_masks_%d_%d.npy", scale_results_path, scale, epoch);
+
+            /* Save fake array */
+            if (mlx_save(fake_npy_path, fake_5d) == 0) {
+                /* Save real array (use selected_indices to create subset) */
+                int rndim = mlx_array_ndim(real_denorm);
+                const int *rshape = mlx_array_shape(real_denorm);
+                int real_h = (rndim >= 2) ? rshape[1] : 1;
+                int real_w = (rndim >= 3) ? rshape[2] : 1;
+                int real_c = (rndim >= 4) ? rshape[3] : 3;
+
+                /* Create subset of real facies using selected_indices */
+                int sub_shape[4] = {num_real, real_h, real_w, real_c};
+                mlx_array real_subset = mlx_array_new();
+                if (mlx_zeros(&real_subset, sub_shape, 4, MLX_FLOAT32, s) == 0) {
+                    for (int ri = 0; ri < num_real; ri++) {
+                        int idx = selected_indices[ri];
+                        /* Slice real_denorm[idx:idx+1, :, :, :] */
+                        mlx_array sliced = mlx_array_new();
+                        int starts[4] = {idx, 0, 0, 0};
+                        int stops[4] = {idx + 1, real_h, real_w, real_c};
+                        int strides[4] = {1, 1, 1, 1};
+                        if (mlx_slice(&sliced, real_denorm, starts, 4, stops, 4, strides, 4, s) == 0) {
+                            /* Insert into real_subset at position [ri, :, :, :] */
+                            int ins_starts[4] = {ri, 0, 0, 0};
+                            int ins_stops[4] = {ri + 1, real_h, real_w, real_c};
+                            int ins_strides[4] = {1, 1, 1, 1};
+                            mlx_array updated = mlx_array_new();
+                            if (mlx_slice_update(&updated, real_subset, sliced,
+                                                 ins_starts, 4, ins_stops, 4, ins_strides, 4, s) == 0) {
+                                mlx_array_free(real_subset);
+                                real_subset = updated;
+                            } else {
+                                mlx_array_free(updated);
+                            }
+                            mlx_array_free(sliced);
+                        } else {
+                            mlx_array_free(sliced);
+                        }
+                    }
+
+                    mlx_array_eval(real_subset);
+                    mlx_synchronize(s);
+
+                    if (mlx_save(real_npy_path, real_subset) == 0) {
+                        /* Save masks if present */
+                        const char *masks_path_arg = NULL;
+                        if (masks.ctx != NULL) {
+                            /* Create subset of masks using selected_indices
+                             * Masks can be 3D (B, H, W) or 4D (B, H, W, 1) */
+                            int mndim = mlx_array_ndim(masks);
+                            const int *mshape = mlx_array_shape(masks);
+
+                            /* Determine mask dimensions based on actual shape */
+                            if (mndim == 4) {
+                                /* 4D mask: (B, H, W, C) - typically (B, H, W, 1) */
+                                int mask_h = mshape[1];
+                                int mask_w = mshape[2];
+                                int mask_c = mshape[3];
+
+                                int msub_shape[4] = {num_real, mask_h, mask_w, mask_c};
+                                mlx_array masks_subset = mlx_array_new();
+                                if (mlx_zeros(&masks_subset, msub_shape, 4, MLX_FLOAT32, s) == 0) {
+                                    for (int ri = 0; ri < num_real; ri++) {
+                                        int idx = selected_indices[ri];
+                                        mlx_array sliced = mlx_array_new();
+                                        int starts[4] = {idx, 0, 0, 0};
+                                        int stops[4] = {idx + 1, mask_h, mask_w, mask_c};
+                                        int strides[4] = {1, 1, 1, 1};
+                                        if (mlx_slice(&sliced, masks, starts, 4, stops, 4, strides, 4, s) == 0) {
+                                            int ins_starts[4] = {ri, 0, 0, 0};
+                                            int ins_stops[4] = {ri + 1, mask_h, mask_w, mask_c};
+                                            int ins_strides[4] = {1, 1, 1, 1};
+                                            mlx_array updated = mlx_array_new();
+                                            if (mlx_slice_update(&updated, masks_subset, sliced,
+                                                                 ins_starts, 4, ins_stops, 4, ins_strides, 4, s) == 0) {
+                                                mlx_array_free(masks_subset);
+                                                masks_subset = updated;
+                                            } else {
+                                                mlx_array_free(updated);
+                                            }
+                                            mlx_array_free(sliced);
+                                        } else {
+                                            mlx_array_free(sliced);
+                                        }
+                                    }
+
+                                    mlx_array_eval(masks_subset);
+                                    mlx_synchronize(s);
+
+                                    if (mlx_save(masks_npy_path, masks_subset) == 0) {
+                                        masks_path_arg = masks_npy_path;
+                                    }
+                                    mlx_array_free(masks_subset);
+                                } else {
+                                    mlx_array_free(masks_subset);
+                                }
+                            } else if (mndim == 3) {
+                                /* 3D mask: (B, H, W) */
+                                int mask_h = mshape[1];
+                                int mask_w = mshape[2];
+
+                                int msub_shape[3] = {num_real, mask_h, mask_w};
+                                mlx_array masks_subset = mlx_array_new();
+                                if (mlx_zeros(&masks_subset, msub_shape, 3, MLX_FLOAT32, s) == 0) {
+                                    for (int ri = 0; ri < num_real; ri++) {
+                                        int idx = selected_indices[ri];
+                                        /* Slice masks[idx:idx+1, :, :] */
+                                        mlx_array sliced = mlx_array_new();
+                                        int starts[3] = {idx, 0, 0};
+                                        int stops[3] = {idx + 1, mask_h, mask_w};
+                                        int strides[3] = {1, 1, 1};
+                                        if (mlx_slice(&sliced, masks, starts, 3, stops, 3, strides, 3, s) == 0) {
+                                            int ins_starts[3] = {ri, 0, 0};
+                                            int ins_stops[3] = {ri + 1, mask_h, mask_w};
+                                            int ins_strides[3] = {1, 1, 1};
+                                            mlx_array updated = mlx_array_new();
+                                            if (mlx_slice_update(&updated, masks_subset, sliced,
+                                                                 ins_starts, 3, ins_stops, 3, ins_strides, 3, s) == 0) {
+                                                mlx_array_free(masks_subset);
+                                                masks_subset = updated;
+                                            } else {
+                                                mlx_array_free(updated);
+                                            }
+                                            mlx_array_free(sliced);
+                                        } else {
+                                            mlx_array_free(sliced);
+                                        }
+                                    }
+
+                                    mlx_array_eval(masks_subset);
+                                    mlx_synchronize(s);
+
+                                    if (mlx_save(masks_npy_path, masks_subset) == 0) {
+                                        masks_path_arg = masks_npy_path;
+                                    }
+                                    mlx_array_free(masks_subset);
+                                } else {
+                                    mlx_array_free(masks_subset);
+                                }
+                            } /* end 3D mask handling */
+                        } /* end masks.ctx != NULL */
+
+                        /* Call pybridge to generate the plot with matplotlib fonts */
+                        rc = pybridge_submit_plot_generated_facies(
+                                 fake_npy_path, real_npy_path, scale, epoch,
+                                 scale_results_path, masks_path_arg) ? 0 : -1;
+
+                        if (rc == 0) {
+                        } else {
+                            /* Fall through to C rendering below */
+                        }
+                    }
+                    mlx_array_free(real_subset);
+                }
+            }
+            mlx_array_free(fake_5d);
+        } else {
+            mlx_array_free(fake_5d);
+        }
+
+        /* If pybridge succeeded, skip C rendering */
+        if (rc == 0) {
+            goto cleanup;
+        }
+        /* Otherwise fall through to C rendering */
+        rc = 0; /* Reset for C rendering attempt */
+    }
+
+    /* Save grid PNG with C rendering (bitmap font) */
+    if (real_facies.ctx != NULL && real_denorm.ctx != NULL) {
+        char png_path[PATH_MAX];
+        snprintf(png_path, PATH_MAX, "%s/gen_%d_%d.png", scale_results_path, scale, epoch);
+        rc = mlx_save_facies_grid_png_v2(png_path, all_fakes, total_gen,
+                                         real_denorm, selected_indices, num_real,
+                                         num_gen_per_real, cell_size, scale, epoch, masks);
+        if (rc == 0) {
+        } else {
+        }
+    } else if (real_facies.ctx == NULL) {
+        /* No real facies, save first fake sample as standalone PNG */
+        char png_path[PATH_MAX];
+        snprintf(png_path, PATH_MAX, "%s/gen_%d_%d_fake.png", scale_results_path, scale, epoch);
+        rc = mlx_save_png(png_path, all_fakes[0]);
+    }
+
+cleanup:
+    /* Clean up */
+    mlx_array_free(real_denorm);
+    for (int i = 0; i < total_gen; i++)
+        mlx_array_free(all_fakes[i]);
+    free(all_fakes);
+    free(selected_indices);
+
+    mlx_stream_free(s);
     return rc;
 }
 
@@ -1492,8 +1935,9 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     if (opts->enable_tensorboard) {
         pybridge_create_visualizer(
             n_scales, opts->output_path ? opts->output_path : ".", NULL, 1);
-        pybridge_create_background_worker(2, 32);
     }
+    /* Always create background worker for PNG plotting */
+    pybridge_create_background_worker(2, 32);
 
     /* Build an explicit contiguous list of scale indices (0..n_scales-1)
      * to mirror Python trainer behavior where scales are integer indices.
@@ -1534,7 +1978,13 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         n_scales);
     int batches = 0;
     int max_batches = opts->num_iter > 0 ? opts->num_iter : INT_MAX;
+    size_t mem_before_first = 0;
     while (batches < max_batches) {
+        /* Memory tracking: measure before batch */
+        size_t mem_before = 0;
+        mlx_get_active_memory(&mem_before);
+        if (batches == 0) mem_before_first = mem_before;
+
         PrefetchedPyramidsBatch *pb = prefetcher_iterator_next(pit);
         if (!pb)
             break; /* finished */
@@ -1543,10 +1993,107 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         mlx_array **fac_pyr = pb->facies_ptrs;
         mlx_array **well_pyr = pb->wells_ptrs;
         mlx_array **seis_pyr = pb->seismic_ptrs;
+        mlx_array **mask_pyr = pb->masks_ptrs;
+
+        /* Evaluate lazy arrays to ensure ndim is available for downstream ops */
+        mlx_global_lock(); /* protect all MLX operations */
+        for (int i = 0; i < nsc; ++i) {
+            if (fac_pyr && fac_pyr[i])
+                mlx_array_eval(*fac_pyr[i]);
+            if (well_pyr && well_pyr[i])
+                mlx_array_eval(*well_pyr[i]);
+            if (seis_pyr && seis_pyr[i])
+                mlx_array_eval(*seis_pyr[i]);
+            if (mask_pyr && mask_pyr[i])
+                mlx_array_eval(*mask_pyr[i]);
+        }
+
+        /* Compute masks from wells on main thread (thread-safe MLX ops).
+         * masks = greater(sum(abs(wells), axis=channels, keepdims=true), 0)
+         * This was previously done in the producer thread but caused crashes
+         * due to MLX thread-safety issues. */
+        mlx_array **computed_masks = NULL;
+        int n_computed_masks = 0;
+        if (well_pyr && nsc > 0 && (!mask_pyr || !mask_pyr[0] || !(*mask_pyr[0]).ctx)) {
+            computed_masks = (mlx_array **)calloc((size_t)nsc, sizeof(mlx_array *));
+            if (computed_masks) {
+                mlx_stream mask_s = mlx_default_cpu_stream_new();
+                for (int wi = 0; wi < nsc; ++wi) {
+                    if (!well_pyr[wi] || !(*well_pyr[wi]).ctx) {
+                        computed_masks[wi] = NULL;
+                        continue;
+                    }
+                    mlx_array well = *well_pyr[wi];
+                    int well_ndim = (int)mlx_array_ndim(well);
+                    if (well_ndim <= 0) {
+                        computed_masks[wi] = NULL;
+                        continue;
+                    }
+
+                    /* abs(well) */
+                    mlx_array abs_arr = mlx_array_new();
+                    if (mlx_abs(&abs_arr, well, mask_s) != 0) {
+                        mlx_array_free(abs_arr);
+                        computed_masks[wi] = NULL;
+                        continue;
+                    }
+
+                    /* sum over channel axis (axis=3 for BHWC format) */
+                    int axis = (well_ndim >= 4) ? 3 : (well_ndim - 1);
+                    mlx_array sum_arr = mlx_array_new();
+                    if (mlx_sum_axis(&sum_arr, abs_arr, axis, true, mask_s) != 0) {
+                        mlx_array_free(abs_arr);
+                        mlx_array_free(sum_arr);
+                        computed_masks[wi] = NULL;
+                        continue;
+                    }
+                    mlx_array_free(abs_arr);
+
+                    /* zeros like sum_arr */
+                    mlx_array zero = mlx_array_new();
+                    if (mlx_zeros_like(&zero, sum_arr, mask_s) != 0) {
+                        mlx_array_free(sum_arr);
+                        mlx_array_free(zero);
+                        computed_masks[wi] = NULL;
+                        continue;
+                    }
+
+                    /* mask = greater(sum_arr, zero) */
+                    mlx_array *mask_ptr = (mlx_array *)malloc(sizeof(mlx_array));
+                    if (!mask_ptr) {
+                        mlx_array_free(sum_arr);
+                        mlx_array_free(zero);
+                        computed_masks[wi] = NULL;
+                        continue;
+                    }
+                    *mask_ptr = mlx_array_new();
+                    if (mlx_greater(mask_ptr, sum_arr, zero, mask_s) != 0) {
+                        mlx_array_free(*mask_ptr);
+                        free(mask_ptr);
+                        mlx_array_free(sum_arr);
+                        mlx_array_free(zero);
+                        computed_masks[wi] = NULL;
+                        continue;
+                    }
+                    mlx_array_free(sum_arr);
+                    mlx_array_free(zero);
+
+                    /* Evaluate immediately on main thread */
+                    mlx_array_eval(*mask_ptr);
+                    computed_masks[wi] = mask_ptr;
+                    n_computed_masks++;
+                }
+                mlx_stream_free(mask_s);
+            }
+        }
+
+        /* Use computed masks if we created them, otherwise use prefetched masks */
+        mlx_array **effective_mask_pyr = (computed_masks && n_computed_masks > 0) ? computed_masks : mask_pyr;
 
         int batch_n = (int)opts->batch_size;
         int *indexes = NULL;
         if (mlx_alloc_int_array(&indexes, batch_n) != 0) {
+            mlx_global_unlock();
             if (pb)
                 prefetcher_free_pyramids(pb);
             return -1;
@@ -1575,15 +2122,55 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
             }
         }
 
+        /* Pre-sync and clear before optimization step to prevent Metal resource
+         * accumulation when many arrays are created during gradient computation */
+        mlx_synchronize(s);
+        mlx_clear_cache();
+
         int step_rc = MLXTrainer_optimization_step(
                           trainer, indexes, batch_n, fac_pyr, nsc, rec_pyr, nsc, well_pyr,
                           well_pyr ? nsc : 0, NULL, 0, seis_pyr, seis_pyr ? nsc : 0,
                           scale_idxs, act);
 
+        /* Keep a copy of all scales' real facies and masks for visualization before freeing batch */
+        mlx_array *real_facies_all_scales = NULL;
+        mlx_array *masks_all_scales = NULL;
+        if (fac_pyr && nsc > 0) {
+            real_facies_all_scales = (mlx_array *)calloc(nsc, sizeof(mlx_array));
+            masks_all_scales = (mlx_array *)calloc(nsc, sizeof(mlx_array));
+            if (real_facies_all_scales && masks_all_scales) {
+                mlx_stream copy_s = mlx_default_cpu_stream_new();
+                for (int sc = 0; sc < nsc; ++sc) {
+                    real_facies_all_scales[sc] = mlx_array_new();
+                    masks_all_scales[sc] = mlx_array_new();
+                    if (fac_pyr[sc]) {
+                        mlx_copy(&real_facies_all_scales[sc], *fac_pyr[sc], copy_s);
+                    }
+                    /* Use effective_mask_pyr which may be computed_masks or prefetched masks */
+                    if (effective_mask_pyr && effective_mask_pyr[sc]) {
+                        mlx_copy(&masks_all_scales[sc], *effective_mask_pyr[sc], copy_s);
+                    }
+                }
+                mlx_stream_free(copy_s);
+            }
+        }
+
         /* Now that we've consumed pb and created owned copies, free the
          * prefetched batch so the prefetcher can reuse its buffers. */
         if (pb)
             prefetcher_free_pyramids(pb);
+
+        /* Free computed masks (created on main thread) */
+        if (computed_masks) {
+            for (int cm = 0; cm < nsc; ++cm) {
+                if (computed_masks[cm]) {
+                    mlx_array_free(*computed_masks[cm]);
+                    free(computed_masks[cm]);
+                }
+            }
+            free(computed_masks);
+            computed_masks = NULL;
+        }
 
         /* free rec pyramids */
         if (rec_pyr) {
@@ -1614,11 +2201,62 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         pybridge_update_visualizer_from_json(batches, metrics,
                                              batches * opts->batch_size);
 
+        /* Memory tracking: measure after batch and print leak */
+        mlx_synchronize(s);
+        mlx_clear_cache();
+        size_t mem_after = 0;
+        mlx_get_active_memory(&mem_after);
+        /* Cast to signed to handle negative differences (memory freed) */
+        double leak_gb = (double)((int64_t)mem_after - (int64_t)mem_before) / (1024.0 * 1024.0 * 1024.0);
+        double total_gb = (double)mem_after / (1024.0 * 1024.0 * 1024.0);
+        double cumul_gb = (double)((int64_t)mem_after - (int64_t)mem_before_first) / (1024.0 * 1024.0 * 1024.0);
+        fprintf(stderr, "[MEM] batch=%d: before=%.3fGB after=%.3fGB leak=%.3fGB cumulative=%.3fGB\n",
+                batches, (double)mem_before / (1024.0*1024.0*1024.0), total_gb, leak_gb, cumul_gb);
+
         batches++;
 
-        if (batches % opts->save_interval == 0) {
-            MLXTrainer_save_generated_facies(
-                trainer, 0, batches, opts->output_path ? opts->output_path : ".");
+        /* Release MLX lock before save operations which are mostly I/O
+         * and before looping to get next batch */
+        mlx_global_unlock();
+
+        /* Save policy matches Python:
+         * - Save at intervals (batches % save_interval == 0)
+         * - Save on last epoch (batches == max_batches)
+         * - Skip first epoch unless num_iter == 1 */
+        int is_save_interval = (batches % opts->save_interval == 0);
+        int is_last_epoch = (batches == max_batches);
+        int not_first_or_single = (batches != 1 || max_batches == 1);
+        int should_save = (is_save_interval || is_last_epoch) && not_first_or_single;
+
+        if (should_save) {
+            const char *spath = opts->output_path ? opts->output_path : ".";
+            /* Save generated facies for ALL active scales (matching Python behavior) */
+            for (int sc = 0; sc < n_scales; ++sc) {
+                mlx_array real_for_scale = (real_facies_all_scales && sc < nsc)
+                                           ? real_facies_all_scales[sc]
+                                           : mlx_array_new();
+                mlx_array mask_for_scale = (masks_all_scales && sc < nsc)
+                                           ? masks_all_scales[sc]
+                                           : mlx_array_new();
+                int save_rc = MLXTrainer_save_generated_facies(
+                                  trainer, sc, batches, spath, real_for_scale, mask_for_scale);
+            }
+        }
+
+        /* Free saved real facies and masks copies for all scales */
+        if (real_facies_all_scales) {
+            for (int sc = 0; sc < nsc; ++sc) {
+                mlx_array_free(real_facies_all_scales[sc]);
+            }
+            free(real_facies_all_scales);
+            real_facies_all_scales = NULL;
+        }
+        if (masks_all_scales) {
+            for (int sc = 0; sc < nsc; ++sc) {
+                mlx_array_free(masks_all_scales[sc]);
+            }
+            free(masks_all_scales);
+            masks_all_scales = NULL;
         }
     }
 
@@ -1631,6 +2269,9 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     /* Do not destroy the trainer here; ownership/deallocation is the caller's
      * responsibility (avoids double-free when callers also destroy). */
     pybridge_close_visualizer();
+    /* Shutdown background worker and wait for pending tasks (e.g., pybridge
+     * plot submissions) to complete before exiting. */
+    pybridge_shutdown_background_worker(1);
     /* If a batch prefetcher/iterator were created, stop producers and
      * destroy iterator/prefetcher to avoid leaving background threads
      * running after trainer teardown. Use `prefetcher_stop` to join

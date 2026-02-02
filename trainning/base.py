@@ -769,9 +769,9 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             self.log_epoch(progress, writers[scale], epoch, g, d)
 
         # Save generated facies at intervals
-        if (
-            epoch % self.save_interval == 0 or epoch == self.num_iter - 1
-        ) and epoch != 0:
+        if (epoch % self.save_interval == 0 or epoch == self.num_iter - 1) and (
+            epoch != 0 or self.num_iter == 1
+        ):
             for scale in scales:
                 self.save_generated_facies(
                     scale,

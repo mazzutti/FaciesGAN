@@ -1,7 +1,34 @@
 #include "array_helpers.h"
 #include <string.h>
+#include <pthread.h>
 
 #include <stdio.h>
+
+/* Global MLX mutex for thread safety - using recursive mutex to allow
+ * nested locking from the same thread (e.g., generator_forward inside
+ * init_rec_noise_and_amp) */
+static pthread_mutex_t g_mlx_mutex;
+static pthread_once_t g_mlx_mutex_once = PTHREAD_ONCE_INIT;
+static _Atomic int g_lock_depth = 0;
+
+static void init_mlx_mutex(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_mlx_mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+void mlx_global_lock(void) {
+    pthread_once(&g_mlx_mutex_once, init_mlx_mutex);
+    pthread_mutex_lock(&g_mlx_mutex);
+    g_lock_depth++;
+}
+
+void mlx_global_unlock(void) {
+    g_lock_depth--;
+    pthread_mutex_unlock(&g_mlx_mutex);
+}
 
 int mlx_copy_float_array(float **out, int *out_n, const float *src, int n) {
     if (!out || !out_n)

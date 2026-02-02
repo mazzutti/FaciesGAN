@@ -13,6 +13,7 @@
       "redirectOutput": true,
       "env": {
         "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
+        "PYTHONEXECUTABLE": "${workspaceFolder}/.venv/bin/python",
         "VIRTUAL_ENV": "${workspaceFolder}/.venv",
         "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}",
         "FG_INSTRUMENT_LOKY": "1",
@@ -30,7 +31,7 @@
         "--num-workers",
         "0",
         "--num-iter",
-        "1",
+        "100",
         "--num-parallel-scales",
         "7",
         "--discriminator-steps",
@@ -86,7 +87,7 @@
         "--num-workers",
         "0",
         "--num-iter",
-        "1",
+        "100",
         "--num-parallel-scales",
         "7",
         "--discriminator-steps",
@@ -111,7 +112,8 @@
       "env": {
         "NUM_STEPS": "200",
         "OUTPUT_PATH": "${workspaceFolder}/results/",
-        "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build-asan/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
+        "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
+        "PYTHONEXECUTABLE": "${workspaceFolder}/.venv/bin/python",
         "VIRTUAL_ENV": "${workspaceFolder}/.venv",
         "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
       },

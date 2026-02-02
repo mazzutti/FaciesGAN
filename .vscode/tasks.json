@@ -1,34 +1,77 @@
 {
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "prepare-parallel-dumps",
-      "type": "shell",
-      "presentation": { "reveal": "always", "panel": "shared" },
-      "problemMatcher": [],
-      "command": "bash",
-      "args": [
-        "-g",
-        "-lc",
-        "EPOCH=$(date +%s) && echo \"FG_C_DUMP_DIR=\\\"${PWD}/dumps/c_run_${EPOCH}\\\"\" > ${PWD}/.env && echo \"FG_PY_DUMP_DIR=\\\"${PWD}/dumps/py_run_${EPOCH}\\\"\" >> ${PWD}/.env && echo \"OUTPUT_PATH=${PWD}/results/\" >> ${PWD}/.env && echo \"PYTHONPATH=${PWD}/.venv/lib/python3.13/site-packages:${PWD}/build/_deps/mlx-src/python:${PWD}/mlx-c/python\" >> ${PWD}/.env && echo \"VIRTUAL_ENV=${PWD}/.venv\" >> ${PWD}/.env && echo \"PATH=${PWD}/.venv/bin:${env:PATH}\" >> ${PWD}/.env && echo Created .env with epoch ${EPOCH}"
-      ]
-    },
-    {
-      "label": "CMake Configure (Debug)",
-      "type": "shell",
-      "command": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug",
-      "problemMatcher": []
-    },
-    {
-      "label": "Build FaciesGAN",
-      "type": "shell",
-      "command": "cmake --build build -- -j4",
-      "dependsOn": ["CMake Configure (Debug)"],
-      "group": {
-        "kind": "build",
-        "isDefault": true
-      },
-      "problemMatcher": ["$gcc"]
-    }
-  ]
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "prepare-parallel-dumps",
+			"type": "shell",
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared"
+			},
+			"problemMatcher": [],
+			"command": "bash",
+			"args": [
+				"-g",
+				"-lc",
+				"EPOCH=$(date +%s) && echo \"FG_C_DUMP_DIR=\\\"${PWD}/dumps/c_run_${EPOCH}\\\"\" > ${PWD}/.env && echo \"FG_PY_DUMP_DIR=\\\"${PWD}/dumps/py_run_${EPOCH}\\\"\" >> ${PWD}/.env && echo \"OUTPUT_PATH=${PWD}/results/\" >> ${PWD}/.env && echo \"PYTHONPATH=${PWD}/.venv/lib/python3.13/site-packages:${PWD}/build/_deps/mlx-src/python:${PWD}/mlx-c/python\" >> ${PWD}/.env && echo \"VIRTUAL_ENV=${PWD}/.venv\" >> ${PWD}/.env && echo \"PATH=${PWD}/.venv/bin:${env:PATH}\" >> ${PWD}/.env && echo Created .env with epoch ${EPOCH}"
+			]
+		},
+		{
+			"label": "CMake Configure (Debug)",
+			"type": "shell",
+			"command": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug",
+			"problemMatcher": []
+		},
+		{
+			"label": "Build FaciesGAN",
+			"type": "shell",
+			"command": "cmake --build build -- -j4",
+			"dependsOn": [
+				"CMake Configure (Debug)"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			},
+			"problemMatcher": [
+				"$gcc"
+			]
+		},
+		{
+			"label": "rebuild-faciesgan",
+			"type": "shell",
+			"command": "cmake",
+			"args": [
+				"--build",
+				"/Users/mazzutti/POSDOC/Experimentos/FaciesGAN/build",
+				"--",
+				"-j4"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"group": "build"
+		},
+		{
+			"label": "py-parity-log",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"FG_PARITY_DUMP_EACH_STEP=1 FG_PARITY_DUMP_ACTIVATIONS=1 FG_PARITY_DEBUG_INIT=1 /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/.venv/bin/python /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/main.py --use-mlx --input-path /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/data --manual-seed 0 --num-iter 1 --num-train-pyramids 1 --num-parallel-scales 1 --stop-scale 0 --num-workers 0 --batch-size 1 --no-tensorboard --no-plot-facies > /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/results/py/py_init_log.txt 2>&1"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		},
+		{
+			"label": "c-parity-log",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"FG_PARITY_DUMP_EACH_STEP=1 FG_PARITY_DUMP_ACTIVATIONS=1 FG_PARITY_DEBUG_INIT=1 FACIESGAN_ALLOW_ARRAY_EVAL=1 /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/build/faciesgan --input-path /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/data --output-path /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/results/c/ --manual-seed 0 --num-train-pyramids 1 --batch-size 1 --num-workers 0 --num-iter 1 --num-parallel-scales 1 --stop-scale 0 --no-tensorboard > /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/results/c/c_init_log.txt 2>&1"
+			],
+			"isBackground": false,
+			"problemMatcher": []
+		}
+	]
 }

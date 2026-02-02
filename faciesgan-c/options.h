@@ -64,6 +64,7 @@ typedef struct TrainningOptions {
   bool enable_tensorboard;
   bool enable_plot_facies;
   bool compile_backend;
+  bool use_pybridge_plot;  /* Use Python bridge for image plotting (matches Python font) */
 } TrainningOptions;
 
 typedef struct ResumeOptions {

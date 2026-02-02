@@ -1,10 +1,12 @@
 import os
+import numpy as np
 from typing import Any, cast
 
 import math
 
 import mlx.core as mx
 import mlx.nn as nn  # type: ignore
+import mlx.utils as mlx_utils
 from mlx.optimizers import Optimizer  # type: ignore
 
 
@@ -61,6 +63,18 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         self.compile_backend = compile_backend
         self.setup_framework()
         self._gp_counter = 0
+
+    def reset_parameters(self) -> None:
+        gens = getattr(self.generator, "gens", [])
+        discs = getattr(self.discriminator, "discs", [])
+        n = min(len(gens), len(discs))
+        for idx in range(n):
+            gen_reset = getattr(gens[idx], "reset_parameters", None)
+            if gen_reset:
+                gen_reset()
+            disc_reset = getattr(discs[idx], "reset_parameters", None)
+            if disc_reset:
+                disc_reset()
 
     def __call__(
         self, *args: Any, **kwds: Any
@@ -207,10 +221,14 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         )
         fake = self.generate_fake(noises, scale)
 
+        outputs: dict[str, mx.array] = {}
+
         def compute_metrics(params: dict[str, Any]) -> mx.array:
             cast(MLXDiscriminator, self.discriminator.discs[scale]).update(params)  # type: ignore
-            metrics.real = -self.discriminator(scale, real).mean()
-            metrics.fake = self.discriminator(scale, fake).mean()
+            outputs["d_real"] = self.discriminator(scale, real)
+            outputs["d_fake"] = self.discriminator(scale, fake)
+            metrics.real = -outputs["d_real"].mean()
+            metrics.fake = outputs["d_fake"].mean()
             metrics.gp = self.compute_gradient_penalty(scale, real, fake)
             return metrics.real + metrics.fake + metrics.gp
 
@@ -263,12 +281,15 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         well = wells_pyramid.get(scale, None)
         mask = masks_pyramid.get(scale, None)
 
+        outputs: dict[str, mx.array] = {}
+
         def compute_metrics(params: dict[str, Any]) -> mx.array:
             self.generator.gens[scale].update(params)  # type: ignore
             fake_samples = self.generate_diverse_samples(
                 indexes, scale, wells_pyramid, seismic_pyramid
             )
             fake = fake_samples[0]
+            outputs["fake"] = fake
 
             metrics.fake = self.compute_adversarial_loss(scale, fake)
 
@@ -295,6 +316,22 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         metrics.total, gradients = mx.value_and_grad(compute_metrics)(params)  # type: ignore
 
         return metrics, cast(dict[str, Any], gradients)
+
+    def generate_diverse_samples(
+        self,
+        indexes: list[int],
+        scale: int,
+        wells_pyramid: dict[int, mx.array] = {},
+        seismic_pyramid: dict[int, mx.array] = {},
+    ) -> list[mx.array]:
+        samples: list[mx.array] = []
+        for i in range(self.num_diversity_samples):
+            noises = self.get_pyramid_noise(
+                scale, indexes, wells_pyramid, seismic_pyramid
+            )
+            amps = self.get_noise_aplitude(scale)
+            samples.append(self.generator(noises, amps, stop_scale=scale))
+        return samples
 
     def optimize_discriminator(
         self,
@@ -779,7 +816,8 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
 
             z = utils.generate_noise((*shape, self.gen_input_channels), num_samp=batch)
 
-        return self.generate_padding(z, value=0)
+        z = self.generate_padding(z, value=0)
+        return z
 
     def generate_padding(self, z: mx.array, value: int = 0) -> mx.array:
         """Pad the input tensor with zeros or a specified value.
@@ -936,6 +974,39 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             path = os.path.join(scale_path, D_FILE.replace(".pth", ".npz"))
             self.discriminator.discs[scale].save_weights(path)
 
+    def save_discriminator_state_c_compat(self, scale_path: str, scale: int) -> None:
+        """Save discriminator weights in C-compatible safetensors format.
+
+        Parameters
+        ----------
+        scale_path : str
+            Output directory.
+        scale : int
+            Scale index.
+        """
+        if scale >= len(self.discriminator.discs):
+            return
+        try:
+            ref_path = os.path.join(scale_path, D_FILE.replace(".pth", ".npz"))
+            c_map: dict[str, mx.array] = {}
+            if os.path.exists(ref_path):
+                loaded = mx.load(ref_path)
+                if isinstance(loaded, dict) and loaded:
+                    c_map = {str(k): v for k, v in loaded.items()}
+            if not c_map:
+                params = self.discriminator.discs[scale].parameters()
+                flat = mlx_utils.tree_flatten(params)
+                if not flat:
+                    return
+                if isinstance(flat[0], tuple) and len(flat[0]) == 2:
+                    c_map = {str(k): v for k, v in flat}
+                else:
+                    c_map = {f"param_{i:06d}": v for i, v in enumerate(flat)}
+            path = os.path.join(scale_path, "discriminator.safetensors")
+            mx.save_safetensors(path, c_map)
+        except Exception:
+            return
+
     def save_generator_state(self, scale_path: str, scale: int) -> None:
         """Save generator weights to disk.
 
@@ -950,6 +1021,39 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             # MLX requires .npz or .safetensors extension
             path = os.path.join(scale_path, G_FILE.replace(".pth", ".npz"))
             self.generator.gens[scale].save_weights(path)
+
+    def save_generator_state_c_compat(self, scale_path: str, scale: int) -> None:
+        """Save generator weights in C-compatible safetensors format.
+
+        Parameters
+        ----------
+        scale_path : str
+            Output directory.
+        scale : int
+            Scale index.
+        """
+        if scale >= len(self.generator.gens):
+            return
+        try:
+            ref_path = os.path.join(scale_path, G_FILE.replace(".pth", ".npz"))
+            c_map: dict[str, mx.array] = {}
+            if os.path.exists(ref_path):
+                loaded = mx.load(ref_path)
+                if isinstance(loaded, dict) and loaded:
+                    c_map = {str(k): v for k, v in loaded.items()}
+            if not c_map:
+                params = self.generator.gens[scale].parameters()
+                flat = mlx_utils.tree_flatten(params)
+                if not flat:
+                    return
+                if isinstance(flat[0], tuple) and len(flat[0]) == 2:
+                    c_map = {str(k): v for k, v in flat}
+                else:
+                    c_map = {f"param_{i:06d}": v for i, v in enumerate(flat)}
+            path = os.path.join(scale_path, "generator.safetensors")
+            mx.save_safetensors(path, c_map)
+        except Exception:
+            return
 
     def save_shape(self, scale_path: str, scale: int) -> None:
         """Save shape metadata to disk.

@@ -1,7 +1,33 @@
-from typing import Literal, cast
+from typing import Any, Literal, cast
 import mlx.core as mx
 import mlx.nn as nn  # type: ignore
 import mlx.nn.layers.upsample as upsample  # type: ignore
+
+
+def _init_conv_weights(conv: nn.Conv2d, std: float = 0.02) -> None:
+    weight = getattr(conv, "weight", None)
+    if weight is not None:
+        conv.weight = mx.random.normal(weight.shape) * std  # type: ignore
+    bias = getattr(conv, "bias", None)
+    if bias is not None:
+        conv.bias = mx.zeros(bias.shape)  # type: ignore
+
+
+def _init_instance_norm(norm: nn.InstanceNorm) -> None:
+    weight = getattr(norm, "weight", None)
+    if weight is not None:
+        norm.weight = mx.ones(weight.shape)  # type: ignore
+    bias = getattr(norm, "bias", None)
+    if bias is not None:
+        norm.bias = mx.zeros(bias.shape)  # type: ignore
+
+
+def create_conv2d(*args: Any, **kwargs: Any) -> nn.Conv2d:
+    return nn.Conv2d(*args, **kwargs)
+
+
+def init_conv_weights(conv: nn.Conv2d, std: float = 0.02) -> None:
+    _init_conv_weights(conv, std)
 
 
 class MLXLeakyReLU(nn.LeakyReLU):
@@ -56,10 +82,12 @@ class MLXConvBlock(nn.Module):
             stride=stride,
             padding=padding,
         )
+        _init_conv_weights(self.conv)
 
         # Only initialize norm if requested
         if self.use_norm:
             self.norm = nn.InstanceNorm(dims=out_channels, affine=True)
+            _init_instance_norm(self.norm)
         # self.norm = nn.BatchNorm(num_features=out_channels)
         self.activation = MLXLeakyReLU(negative_slope=0.2)
 
@@ -69,6 +97,11 @@ class MLXConvBlock(nn.Module):
             x = self.norm(x)
         x = cast(mx.array, self.activation(x))
         return x
+
+    def reset_parameters(self) -> None:
+        _init_conv_weights(self.conv)
+        if self.use_norm:
+            _init_instance_norm(self.norm)
 
 
 class MLXUpsample(nn.Module):
@@ -154,6 +187,7 @@ class MLXSPADE(nn.Module):
 
         # MLX InstanceNorm works on (B, H, W, C)
         self.norm = nn.InstanceNorm(dims=norm_nc, affine=True)
+        _init_instance_norm(self.norm)
 
         padding = kernel_size // 2
 
@@ -166,6 +200,9 @@ class MLXSPADE(nn.Module):
             ),
             MLXLeakyReLU(0.2),
         )
+        for layer in self.mlp_shared.layers:  # type: ignore
+            if isinstance(layer, nn.Conv2d):
+                _init_conv_weights(layer)
 
         self.mlp_gamma = nn.Conv2d(
             hidden_nc, norm_nc, kernel_size=kernel_size, padding=padding
@@ -173,11 +210,21 @@ class MLXSPADE(nn.Module):
         self.mlp_beta = nn.Conv2d(
             hidden_nc, norm_nc, kernel_size=kernel_size, padding=padding
         )
+        _init_conv_weights(self.mlp_gamma)
+        _init_conv_weights(self.mlp_beta)
         # Cache of upsample layers keyed by target (height, width).
         # We create them lazily on first use to avoid re-allocating
         # Upsample modules on every forward call. Optionally the caller
         # can provide a list of targets to preallocate common sizes.
         self._upsample_cache: dict[tuple[int, ...], nn.Module] = {}
+
+    def reset_parameters(self) -> None:
+        _init_instance_norm(self.norm)
+        for layer in self.mlp_shared.layers:  # type: ignore
+            if isinstance(layer, nn.Conv2d):
+                _init_conv_weights(layer)
+        _init_conv_weights(self.mlp_gamma)
+        _init_conv_weights(self.mlp_beta)
 
     def ensure_upsample(
         self,
@@ -207,7 +254,9 @@ class MLXSPADE(nn.Module):
         conditioning_input: mx.array,
         mode: Literal["linear"] = "linear",
         align_corners: bool = True,
-    ) -> mx.array:
+        return_intermediates: bool = False,
+    ) -> mx.array | tuple[mx.array, dict[str, mx.array]]:
+        intermediates: dict[str, mx.array] = {}
         activated_input = cast(
             mx.array,
             self.ensure_upsample(
@@ -221,6 +270,11 @@ class MLXSPADE(nn.Module):
         beta = self.mlp_beta(activated_input)
         normalized = self.norm(x)
         out = normalized * (1 + gamma) + beta
+        if return_intermediates:
+            intermediates["gamma"] = gamma
+            intermediates["beta"] = beta
+            intermediates["normed"] = normalized
+            return out, intermediates
         return out
 
 
@@ -265,13 +319,35 @@ class MLXSPADEConvBlock(nn.Module):
             stride=stride,
             padding=padding,
         )
+        _init_conv_weights(self.conv)
         self.activation = MLXLeakyReLU(negative_slope=0.2)
 
-    def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
-        x = self.spade(x, cond)
-        x = cast(mx.array, self.activation(x))
-        x = self.conv(x)
-        return x
+    def __call__(
+        self, x: mx.array, cond: mx.array, return_intermediates: bool = False
+    ) -> mx.array | tuple[mx.array, dict[str, mx.array]]:
+        intermediates: dict[str, mx.array] = {}
+        if return_intermediates:
+            spade_out, spade_inter = self.spade(
+                x, cond, return_intermediates=True
+            )
+            intermediates["spade"] = spade_out
+            intermediates["gamma"] = spade_inter["gamma"]
+            intermediates["beta"] = spade_inter["beta"]
+            intermediates["normed"] = spade_inter["normed"]
+        else:
+            spade_out = self.spade(x, cond)
+        act_out = cast(mx.array, self.activation(spade_out))
+        if return_intermediates:
+            intermediates["act"] = act_out
+        conv_out = self.conv(act_out)
+        if return_intermediates:
+            intermediates["conv"] = conv_out
+            return conv_out, intermediates
+        return conv_out
+
+    def reset_parameters(self) -> None:
+        self.spade.reset_parameters()
+        _init_conv_weights(self.conv)
 
 
 class MLXSPADEGenerator(nn.Module):
@@ -319,6 +395,7 @@ class MLXSPADEGenerator(nn.Module):
             kernel_size=kernel_size,
             padding=padding_size,
         )
+        _init_conv_weights(self.init_conv)
 
         current_features = num_features
         spade_blocks: list[MLXSPADEConvBlock] = []
@@ -347,21 +424,49 @@ class MLXSPADEGenerator(nn.Module):
             stride=1,
             padding=padding_size,
         )
+        _init_conv_weights(self.tail_conv)
         self.leaky_relu = MLXLeakyReLU(negative_slope=0.2)
         self.activation = nn.Tanh()
 
-    def __call__(self, cond: mx.array) -> mx.array:
+    def __call__(
+        self, cond: mx.array, return_intermediates: bool = False
+    ) -> mx.array | tuple[mx.array, dict[str, mx.array]]:
+        intermediates: dict[str, mx.array] = {}
         # Initial feature extraction
         x = self.init_conv(cond)
         x = cast(mx.array, self.leaky_relu(x))
+        if return_intermediates:
+            intermediates["gen_init"] = x
 
-        for block in self.spade_blocks.layers:  # type: ignore
-            x = cast(mx.array, block(x, cond))
+        for i, block in enumerate(self.spade_blocks.layers):  # type: ignore
+            if return_intermediates:
+                out, inter = block(x, cond, return_intermediates=True)
+                x = cast(mx.array, out)
+                intermediates[f"gen_block_{i}"] = x
+                intermediates[f"gen_block_{i}_spade"] = inter["spade"]
+                intermediates[f"gen_block_{i}_gamma"] = inter["gamma"]
+                intermediates[f"gen_block_{i}_beta"] = inter["beta"]
+                intermediates[f"gen_block_{i}_normed"] = inter["normed"]
+                intermediates[f"gen_block_{i}_act"] = inter["act"]
+                intermediates[f"gen_block_{i}_conv"] = inter["conv"]
+            else:
+                x = cast(mx.array, block(x, cond))
 
         # Final output layer
         tail = self.tail_conv(x)
         out = cast(mx.array, self.activation(tail))
+        if return_intermediates:
+            intermediates["gen_tail"] = out
+            return out, intermediates
         return out
+
+    def reset_parameters(self) -> None:
+        _init_conv_weights(self.init_conv)
+        for block in self.spade_blocks.layers:  # type: ignore
+            reset_fn = getattr(cast(Any, block), "reset_parameters", None)
+            if reset_fn:
+                reset_fn()
+        _init_conv_weights(self.tail_conv)
 
 
 class MLXScaleModule(nn.Module):
@@ -387,6 +492,18 @@ class MLXScaleModule(nn.Module):
         x = cast(mx.array, self.body(x))
         x = cast(mx.array, self.tail(x))
         return x
+
+    def reset_parameters(self) -> None:
+        head_reset = getattr(cast(Any, self.head), "reset_parameters", None)
+        if head_reset:
+            head_reset()
+        for layer in self.body.layers:  # type: ignore
+            reset_fn = getattr(cast(Any, layer), "reset_parameters", None)
+            if reset_fn:
+                reset_fn()
+        for layer in self.tail.layers:  # type: ignore
+            if isinstance(layer, nn.Conv2d):
+                _init_conv_weights(layer)
 
 
 class MLXSPADEDiscriminator(nn.Module):
@@ -449,11 +566,38 @@ class MLXSPADEDiscriminator(nn.Module):
         self.tail = nn.Conv2d(
             output_channels, 1, kernel_size=kernel_size, stride=1, padding=padding_size
         )
+        _init_conv_weights(self.tail)
 
     def __call__(self, x: mx.array) -> mx.array:
         x = self.head(x)
         x = cast(mx.array, self.body(x))
         return self.tail(x)
+
+    def forward_with_intermediates(self, x: mx.array) -> dict[str, Any]:
+        head_out = self.head(x)
+        body_outs: list[mx.array] = []
+        cur = head_out
+        layers = getattr(self.body, "layers", None)
+        if layers is None:
+            try:
+                layers = list(self.body)  # type: ignore[arg-type]
+            except Exception:
+                layers = []
+        for block in layers:  # type: ignore[assignment]
+            cur = cast(mx.array, block(cur))
+            body_outs.append(cur)
+        tail_out = self.tail(cur)
+        return {"head": head_out, "body": body_outs, "tail": tail_out}
+
+    def reset_parameters(self) -> None:
+        head_reset = getattr(cast(Any, self.head), "reset_parameters", None)
+        if head_reset:
+            head_reset()
+        for block in self.body.layers:  # type: ignore
+            reset_fn = getattr(cast(Any, block), "reset_parameters", None)
+            if reset_fn:
+                reset_fn()
+        _init_conv_weights(self.tail)
 
 
 class MLXColorQuantization(nn.Module):
