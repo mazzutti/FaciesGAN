@@ -1,5 +1,4 @@
 import os
-import numpy as np
 from typing import Any, cast
 
 import math
@@ -988,9 +987,9 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             return
         try:
             ref_path = os.path.join(scale_path, D_FILE.replace(".pth", ".npz"))
-            c_map: dict[str, mx.array] = {}
+            c_map: dict[str, Any] = {}
             if os.path.exists(ref_path):
-                loaded = mx.load(ref_path)
+                loaded = mx.load(ref_path)  # type: ignore
                 if isinstance(loaded, dict) and loaded:
                     c_map = {str(k): v for k, v in loaded.items()}
             if not c_map:
@@ -1003,7 +1002,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 else:
                     c_map = {f"param_{i:06d}": v for i, v in enumerate(flat)}
             path = os.path.join(scale_path, "discriminator.safetensors")
-            mx.save_safetensors(path, c_map)
+            mx.save_safetensors(path, c_map)  # type: ignore
         except Exception:
             return
 
@@ -1038,7 +1037,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             ref_path = os.path.join(scale_path, G_FILE.replace(".pth", ".npz"))
             c_map: dict[str, mx.array] = {}
             if os.path.exists(ref_path):
-                loaded = mx.load(ref_path)
+                loaded = mx.load(ref_path)  # type: ignore
                 if isinstance(loaded, dict) and loaded:
                     c_map = {str(k): v for k, v in loaded.items()}
             if not c_map:
@@ -1051,7 +1050,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 else:
                     c_map = {f"param_{i:06d}": v for i, v in enumerate(flat)}
             path = os.path.join(scale_path, "generator.safetensors")
-            mx.save_safetensors(path, c_map)
+            mx.save_safetensors(path, c_map)  # type: ignore
         except Exception:
             return
 

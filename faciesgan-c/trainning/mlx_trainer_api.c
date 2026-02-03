@@ -67,17 +67,17 @@ static size_t mlx_get_process_rss_bytes(void) {
 /* Helper: print epoch metrics table matching Python's handle_epoch_end format.
  * Prints at epochs 0, 49, 99, etc. (every 50 epochs) and the last epoch.
  * This provides a visual match to the Python training output. */
-static void print_epoch_metrics_table(int batch_id, int total_batches, 
-                                       int epoch, int num_iter, int n_scales,
-                                       const double *g_totals, const double *g_advs,
-                                       const double *g_recs, const double *g_wells,
-                                       const double *g_divs, const double *d_totals,
-                                       const double *d_reals, const double *d_fakes,
-                                       const double *d_gps) {
+static void print_epoch_metrics_table(int batch_id, int total_batches,
+                                      int epoch, int num_iter, int n_scales,
+                                      const double *g_totals, const double *g_advs,
+                                      const double *g_recs, const double *g_wells,
+                                      const double *g_divs, const double *d_totals,
+                                      const double *d_reals, const double *d_fakes,
+                                      const double *d_gps) {
     /* Check if we should print: epoch % 50 == 0 or epoch == 0 or epoch == num_iter - 1 */
     int should_print = ((epoch + 1) % 50 == 0) || (epoch == 0) || (epoch == num_iter - 1);
     if (!should_print || n_scales <= 0) return;
-    
+
     /* Clear the current line (progress bar may have left content) before printing table */
     printf("\r%120s\r", "");
     printf("  Batch [%d/%d] Epoch [%4d/%d]\n", batch_id + 1, total_batches, epoch + 1, num_iter);
@@ -89,7 +89,7 @@ static void print_epoch_metrics_table(int batch_id, int total_batches,
     printf("  \u251c");
     for (int i = 0; i < 99; ++i) printf("\u2500");
     printf("\u2524\n");
-    
+
     for (int sc = 0; sc < n_scales; ++sc) {
         printf("  \u2502 %5d \u2502 %8.3f \u2502 %7.3f \u2502 %7.3f \u2502 %7.3f \u2502 %7.3f \u2502 %8.3f \u2502 %7.3f \u2502 %7.3f \u2502 %7.3f \u2502\n",
                sc,
@@ -357,7 +357,7 @@ MLXTrainer *MLXTrainer_new(const TrainningOptions *opts, int fine_tuning,
     printf("============================================================\n\n");
 
     fprintf(stderr, "MLX Configuration:\n");
-    
+
     /* Configure MLX memory management (parity with Python Trainer):
      * Set memory limit to 48GB and use GPU device by default. */
     size_t mem_limit_result = 0;
@@ -797,11 +797,15 @@ int MLXTrainer_setup_optimizers_impl(MLXTrainer *trainer, const int *scales,
         new_disc_opts[sc] = mlx_adam_create(trainer->opts.lr_d, trainer->opts.beta1, 0.999f, 1e-8f);
         /* schedulers: multistep with single milestone (lr_decay) */
         int milestones[1] = {trainer->opts.lr_decay};
+        /* Must convert double to float before passing to scheduler (double→float*
+         * reinterpret cast produces garbage!) */
+        float init_lr_g = (float)trainer->opts.lr_g;
+        float init_lr_d = (float)trainer->opts.lr_d;
         new_gen_scheds[sc] = mlx_scheduler_multistep_create_with_init(
-                                 milestones, 1, trainer->opts.gamma, (const float *)&trainer->opts.lr_g,
+                                 milestones, 1, trainer->opts.gamma, &init_lr_g,
                                  1);
         new_disc_scheds[sc] = mlx_scheduler_multistep_create_with_init(
-                                  milestones, 1, trainer->opts.gamma, (const float *)&trainer->opts.lr_d,
+                                  milestones, 1, trainer->opts.gamma, &init_lr_d,
                                   1);
         /* attach scheduler and optimizer so LR updates propagate */
         if (new_gen_opts[sc] && new_gen_scheds[sc]) {
@@ -1089,7 +1093,10 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
     if (!trainer)
         return -1;
 
-    MLXResults *res = NULL;
+    /* Get step counts from options (Python: discriminator_steps, generator_steps) */
+    int disc_steps = trainer->opts.discriminator_steps > 0 ? trainer->opts.discriminator_steps : 3;
+    int gen_steps = trainer->opts.generator_steps > 0 ? trainer->opts.generator_steps : 3;
+
     /* Ensure optional per-scale pyramid pointer arrays are at least as large
      * as the maximum active scale index referenced. Some call sites (the
      * prefetcher) produce arrays sized to the number of parallel scales; the
@@ -1182,147 +1189,141 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
         }
     }
 
-    int rc = mlx_faciesgan_collect_metrics_and_grads(
+    int rc = 0;
+    int overall = 0;
+    MLXResults *res = NULL;
+
+    /* ======== DISCRIMINATOR OPTIMIZATION LOOP (disc_steps iterations) ========
+     * Matches Python: for _ in range(self.discriminator_steps): ...
+     * Each iteration: compute D gradients with fresh forward pass, apply D update */
+    for (int d_step = 0; d_step < disc_steps; ++d_step) {
+        rc = mlx_faciesgan_collect_metrics_and_grads_native(
                  trainer->model, indexes, n_indexes,
                  san_active ? san_active : active_scales, n_active_scales,
                  facies_arg, rec_arg, wells_arg, masks_arg,
                  seismic_arg, trainer->opts.lambda_diversity,
                  trainer->opts.well_loss_penalty, trainer->opts.alpha,
                  trainer->opts.lambda_grad, &res);
-    /* Diagnostics: dump active_scales and configured trainer shapes so we can
-     * correlate any unexpected scale IDs with the configured shapes. */
-    /* diagnostics handled via logging above when needed */
-    /* free temporary sanitized active scales copy if we created one */
-    if (san_active) {
-        int _tmpn = n_active_scales;
-        mlx_free_int_array(&san_active, &_tmpn);
-        san_active = NULL;
-    }
-    /* Debug: report collection outcome */
-    if (rc != 0 || !res) {
-
-        if (res)
-            mlx_results_free(res);
-        if (tmp_wells)
-            mlx_free_ptr_array((void ***)&tmp_wells, need_n);
-        if (tmp_facies)
-            mlx_free_ptr_array((void ***)&tmp_facies, need_n);
-        if (tmp_seismic)
-            mlx_free_ptr_array((void ***)&tmp_seismic, need_n);
-        if (tmp_masks)
-            mlx_free_ptr_array((void ***)&tmp_masks, need_n);
-        if (tmp_rec)
-            mlx_free_ptr_array((void ***)&tmp_rec, need_n);
-        return -1;
-    }
-
-    /* Dump collected scale results for correlation with active_scales */
-    if (rc != 0 || !res) {
-        if (res)
-            mlx_results_free(res);
-        if (tmp_wells)
-            mlx_free_ptr_array((void ***)&tmp_wells, need_n);
-        if (tmp_facies)
-            mlx_free_ptr_array((void ***)&tmp_facies, need_n);
-        if (tmp_seismic)
-            mlx_free_ptr_array((void ***)&tmp_seismic, need_n);
-        if (tmp_masks)
-            mlx_free_ptr_array((void ***)&tmp_masks, need_n);
-        if (tmp_rec)
-            mlx_free_ptr_array((void ***)&tmp_rec, need_n);
-        return -1;
-    }
-
-    /* For each active scale: step schedulers (auto) then apply optimizer steps
-     * using collected grads. This mirrors the Python Trainer per-scale logic. */
-    int overall = 0;
-    for (int i = 0; i < res->n_scales; ++i) {
-        MLXScaleResults *sr = &res->scales[i];
-        int sc = sr->scale;
-
-        /* Store metrics for this scale into trainer arrays for later printing.
-         * The metrics are stored in MLXScaleMetrics: fake (g_adv), well, div, rec, total.
-         * We need to evaluate the mlx_array to get the scalar value. */
-        if (sc >= 0 && sc < trainer->n_scales && trainer->last_g_total) {
-            /* Helper macro to extract scalar value from mlx_array */
-            #define EXTRACT_SCALAR(arr_ptr) \
-                ((arr_ptr) && (arr_ptr)->ctx ? ({ \
-                    float val = 0.0f; \
-                    mlx_array_item_float32(&val, *(arr_ptr)); \
-                    (double)val; \
-                }) : 0.0)
-            
-            /* Generator metrics */
-            trainer->last_g_adv[sc] = EXTRACT_SCALAR(sr->metrics.fake);
-            trainer->last_g_well[sc] = EXTRACT_SCALAR(sr->metrics.well);
-            trainer->last_g_div[sc] = EXTRACT_SCALAR(sr->metrics.div);
-            trainer->last_g_rec[sc] = EXTRACT_SCALAR(sr->metrics.rec);
-            trainer->last_g_total[sc] = EXTRACT_SCALAR(sr->metrics.total);
-            
-            /* Discriminator metrics - now stored separately in struct */
-            trainer->last_d_real[sc] = EXTRACT_SCALAR(sr->metrics.d_real);
-            trainer->last_d_fake[sc] = EXTRACT_SCALAR(sr->metrics.d_fake);
-            trainer->last_d_gp[sc] = EXTRACT_SCALAR(sr->metrics.d_gp);
-            trainer->last_d_total[sc] = EXTRACT_SCALAR(sr->metrics.d_total);
-            
-            #undef EXTRACT_SCALAR
+        if (rc != 0 || !res) {
+            if (res) mlx_results_free(res);
+            res = NULL;
+            continue;
         }
 
-        /* Step schedulers (advance by one) if present */
+        /* Apply ONLY discriminator gradients this iteration */
+        for (int i = 0; i < res->n_scales; ++i) {
+            MLXScaleResults *sr = &res->scales[i];
+            int sc = sr->scale;
+
+            /* Store discriminator metrics on first D step for logging */
+            if (d_step == 0 && sc >= 0 && sc < trainer->n_scales && trainer->last_d_total) {
+#define EXTRACT_SCALAR(arr_ptr) \
+                    ((arr_ptr) && (arr_ptr)->ctx ? ({ \
+                        float val = 0.0f; \
+                        mlx_array_item_float32(&val, *(arr_ptr)); \
+                        (double)val; \
+                    }) : 0.0)
+                trainer->last_d_real[sc] = EXTRACT_SCALAR(sr->metrics.d_real);
+                trainer->last_d_fake[sc] = EXTRACT_SCALAR(sr->metrics.d_fake);
+                trainer->last_d_gp[sc] = EXTRACT_SCALAR(sr->metrics.d_gp);
+                trainer->last_d_total[sc] = EXTRACT_SCALAR(sr->metrics.d_total);
+#undef EXTRACT_SCALAR
+            }
+
+            /* Apply discriminator grads using scale-specific function */
+            if (sr->disc_n > 0 && sr->disc_grads && trainer->disc_opts &&
+                    trainer->disc_opts[sc]) {
+                int r = mlx_faciesgan_apply_sgd_to_discriminator_for_scale(
+                            trainer->model, trainer->disc_opts[sc], sr->disc_grads, sr->disc_n, sc);
+                if (r != 0) overall = -1;
+            }
+        }
+
+        /* Eval and sync after each D step to force weight updates */
+        mlx_faciesgan_eval_all_parameters(trainer->model);
+        for (int sc = 0; sc < trainer->n_scales; ++sc) {
+            if (trainer->disc_opts && trainer->disc_opts[sc])
+                mlx_optimizer_eval_state(trainer->disc_opts[sc]);
+        }
+
+        mlx_results_free(res);
+        res = NULL;
+    }
+
+    /* ======== GENERATOR OPTIMIZATION LOOP (gen_steps iterations) ========
+     * Matches Python: for _ in range(self.generator_steps): ...
+     * Each iteration: compute G gradients with fresh forward pass, apply G update */
+    for (int g_step = 0; g_step < gen_steps; ++g_step) {
+        rc = mlx_faciesgan_collect_metrics_and_grads_native(
+                 trainer->model, indexes, n_indexes,
+                 san_active ? san_active : active_scales, n_active_scales,
+                 facies_arg, rec_arg, wells_arg, masks_arg,
+                 seismic_arg, trainer->opts.lambda_diversity,
+                 trainer->opts.well_loss_penalty, trainer->opts.alpha,
+                 trainer->opts.lambda_grad, &res);
+        if (rc != 0 || !res) {
+            if (res) mlx_results_free(res);
+            res = NULL;
+            continue;
+        }
+
+        /* Apply ONLY generator gradients this iteration */
+        for (int i = 0; i < res->n_scales; ++i) {
+            MLXScaleResults *sr = &res->scales[i];
+            int sc = sr->scale;
+
+            /* Store generator metrics on first G step for logging */
+            if (g_step == 0 && sc >= 0 && sc < trainer->n_scales && trainer->last_g_total) {
+#define EXTRACT_SCALAR(arr_ptr) \
+                    ((arr_ptr) && (arr_ptr)->ctx ? ({ \
+                        float val = 0.0f; \
+                        mlx_array_item_float32(&val, *(arr_ptr)); \
+                        (double)val; \
+                    }) : 0.0)
+                trainer->last_g_adv[sc] = EXTRACT_SCALAR(sr->metrics.fake);
+                trainer->last_g_well[sc] = EXTRACT_SCALAR(sr->metrics.well);
+                trainer->last_g_div[sc] = EXTRACT_SCALAR(sr->metrics.div);
+                trainer->last_g_rec[sc] = EXTRACT_SCALAR(sr->metrics.rec);
+                trainer->last_g_total[sc] = EXTRACT_SCALAR(sr->metrics.total);
+#undef EXTRACT_SCALAR
+            }
+
+            /* Apply generator grads using scale-specific function */
+            if (sr->gen_n > 0 && sr->gen_grads && trainer->gen_opts &&
+                    trainer->gen_opts[sc]) {
+                int r = mlx_faciesgan_apply_sgd_to_generator_for_scale(
+                            trainer->model, trainer->gen_opts[sc], sr->gen_grads, sr->gen_n, sc);
+                if (r != 0) overall = -1;
+            }
+        }
+
+        /* Eval and sync after each G step to force weight updates */
+        mlx_faciesgan_eval_all_parameters(trainer->model);
+        for (int sc = 0; sc < trainer->n_scales; ++sc) {
+            if (trainer->gen_opts && trainer->gen_opts[sc])
+                mlx_optimizer_eval_state(trainer->gen_opts[sc]);
+        }
+
+        mlx_results_free(res);
+        res = NULL;
+    }
+
+    /* Step schedulers once per epoch (not per D/G step) */
+    for (int ai = 0; ai < n_active_scales; ++ai) {
+        int sc = san_active ? san_active[ai] : active_scales[ai];
         if (trainer->gen_scheds && trainer->gen_scheds[sc])
             mlx_scheduler_step_auto(trainer->gen_scheds[sc],
                                     trainer->gen_opts ? trainer->gen_opts[sc] : NULL);
         if (trainer->disc_scheds && trainer->disc_scheds[sc])
             mlx_scheduler_step_auto(trainer->disc_scheds[sc],
-                                    trainer->disc_opts ? trainer->disc_opts[sc]
-                                    : NULL);
-
-        /* Apply generator grads */
-        if (sr->gen_n > 0 && sr->gen_grads && trainer->gen_opts &&
-                trainer->gen_opts[sc]) {
-            int r = mlx_faciesgan_apply_sgd_to_generator(
-                        trainer->model, trainer->gen_opts[sc], sr->gen_grads, sr->gen_n);
-            if (r != 0) {
-                overall = -1;
-            } else {
-                ;
-            }
-        } else if (sr->gen_n <= 0 || !sr->gen_grads) {
-            ;
-        } else if (!trainer->gen_opts || !trainer->gen_opts[sc]) {
-            ;
-        }
-
-        /* Apply discriminator grads */
-        if (sr->disc_n > 0 && sr->disc_grads && trainer->disc_opts &&
-                trainer->disc_opts[sc]) {
-            int r = mlx_faciesgan_apply_sgd_to_discriminator(
-                        trainer->model, trainer->disc_opts[sc], sr->disc_grads, sr->disc_n);
-            if (r != 0) {
-                overall = -1;
-            } else {
-                ;
-            }
-        } else if (sr->disc_n <= 0 || !sr->disc_grads) {
-            ;
-        } else if (!trainer->disc_opts || !trainer->disc_opts[sc]) {
-            ;
-        }
+                                    trainer->disc_opts ? trainer->disc_opts[sc] : NULL);
     }
 
-    /* Evaluate all model parameters (parity with Python mx.eval(self.model.state)).
-     * This forces lazy computation graphs to materialize and releases intermediate
-     * arrays, preventing memory accumulation. */
-    mlx_faciesgan_eval_all_parameters(trainer->model);
-
-    /* Evaluate optimizer state arrays (m, v momentum) to materialize computation
-     * graphs and prevent memory accumulation - same as Python evaluating optimizer
-     * state after each step. */
-    for (int sc = 0; sc < trainer->n_scales; ++sc) {
-        if (trainer->gen_opts && trainer->gen_opts[sc])
-            mlx_optimizer_eval_state(trainer->gen_opts[sc]);
-        if (trainer->disc_opts && trainer->disc_opts[sc])
-            mlx_optimizer_eval_state(trainer->disc_opts[sc]);
+    /* Free sanitized active scales copy if we created one */
+    if (san_active) {
+        int _tmpn = n_active_scales;
+        mlx_free_int_array(&san_active, &_tmpn);
+        san_active = NULL;
     }
 
     /* Synchronize and clear Metal cache after each optimization step to avoid
@@ -1333,7 +1334,6 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
     mlx_clear_cache();
     mlx_stream_free(sync_s);
 
-    mlx_results_free(res);
     if (tmp_wells)
         mlx_free_ptr_array((void ***)&tmp_wells, need_n);
     if (tmp_facies)
@@ -2171,7 +2171,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     /* Training loop: consume prepared pyramids from prefetcher iterator */
     mlx_stream s = mlx_default_gpu_stream_new();
     prefetcher_iterator_preload(pit);
-    
+
     /* Print training scales banner (parity with Python Trainer.train) */
     printf("\n============================================================\n");
     printf("Training scales (");
@@ -2192,16 +2192,16 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
 #endif
     const char *clear_cache_env = getenv("MLX_MEM_CLEAR_CACHE");
     /* Default to clearing cache unless explicitly disabled (0 or false) */
-    bool clear_cache = !clear_cache_env || 
+    bool clear_cache = !clear_cache_env ||
                        !(strcmp(clear_cache_env, "0") == 0 ||
                          strcmp(clear_cache_env, "false") == 0);
-    
+
     /* Set a cache limit to prevent unbounded GPU memory growth.
      * This limits how much memory MLX keeps in its cache for reuse. */
     size_t cache_limit_result = 0;
     size_t cache_limit = 512 * 1024 * 1024;  /* 512 MB cache limit */
     mlx_set_cache_limit(&cache_limit_result, cache_limit);
-    
+
     while (batches < max_batches) {
 #ifdef FG_MEM_DEBUG
         /* Memory tracking: measure before batch */
@@ -2231,9 +2231,9 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         /* Evaluate lazy arrays in batch (matches Python mx.eval pattern) */
         mlx_global_lock(); /* protect all MLX operations */
         /* update progress bar (show current batch index) */
-    #ifdef FG_PROGRESS
+#ifdef FG_PROGRESS
         fg_progress_update((size_t)batches);
-    #endif
+#endif
         mlx_vector_array pyr_vec = mlx_vector_array_new();
         for (int i = 0; i < nsc; ++i) {
             if (fac_pyr && fac_pyr[i])
@@ -2369,8 +2369,8 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
 
         int step_rc = MLXTrainer_optimization_step(
                           trainer, indexes, batch_n, fac_pyr, nsc, rec_pyr, nsc, well_pyr,
-                          well_pyr ? nsc : 0, NULL, 0, seis_pyr, seis_pyr ? nsc : 0,
-                          scale_idxs, act);
+                          well_pyr ? nsc : 0, effective_mask_pyr, effective_mask_pyr ? nsc : 0,
+                          seis_pyr, seis_pyr ? nsc : 0, scale_idxs, act);
 
         /* Print metrics table at specific intervals (parity with Python handle_epoch_end) */
         print_epoch_metrics_table(
@@ -2524,11 +2524,11 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         double rss_before_mb = (double)rss_before / (1024.0 * 1024.0);
         double rss_after_mb = (double)rss_after / (1024.0 * 1024.0);
         fprintf(stderr,
-            "[MEM] batch=%d: before=%.2fMB after=%.2fMB leak=%.2fMB cumulative=%.2fMB "
-            "(active %.2f->%.2f MB, cache %.2f->%.2f MB, peak %.2f MB, rss %.2f->%.2f MB)\n",
-            batches, before_mb, total_mb, leak_mb, cumul_mb,
-            before_active_mb, after_active_mb, before_cache_mb, after_cache_mb,
-            peak_mb, rss_before_mb, rss_after_mb);
+                "[MEM] batch=%d: before=%.2fMB after=%.2fMB leak=%.2fMB cumulative=%.2fMB "
+                "(active %.2f->%.2f MB, cache %.2f->%.2f MB, peak %.2f MB, rss %.2f->%.2f MB)\n",
+                batches, before_mb, total_mb, leak_mb, cumul_mb,
+                before_active_mb, after_active_mb, before_cache_mb, after_cache_mb,
+                peak_mb, rss_before_mb, rss_after_mb);
 #endif
 
         batches++;

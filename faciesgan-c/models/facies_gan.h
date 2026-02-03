@@ -9,7 +9,6 @@ extern "C" {
 #endif
 
 typedef struct MLXFaciesGAN MLXFaciesGAN;
-typedef struct AGValue AGValue;
 typedef struct MLXOptimizer MLXOptimizer;
 
 /* Lifecycle */
@@ -58,59 +57,12 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
 int mlx_faciesgan_set_gen_input_channels(MLXFaciesGAN *m, int channels);
 int mlx_faciesgan_get_gen_input_channels(MLXFaciesGAN *m);
 
+/* Get number of image channels (facies categories). */
+int mlx_faciesgan_get_num_img_channels(MLXFaciesGAN *m);
+
 /* Configure diversity sample count used by C-side metrics collection. */
 int mlx_faciesgan_set_num_diversity_samples(MLXFaciesGAN *m, int n);
 int mlx_faciesgan_get_num_diversity_samples(MLXFaciesGAN *m);
-
-/* AG-aware forwards (lightweight wrappers / plumbing). */
-AGValue *mlx_faciesgan_generator_forward_ag(MLXFaciesGAN *m, AGValue **z_list,
-        int z_count, const float *amp,
-        int amp_count, AGValue *in_noise,
-        int start_scale, int stop_scale);
-
-AGValue *mlx_faciesgan_discriminator_forward_ag(MLXFaciesGAN *m, AGValue *input,
-        int scale);
-
-/* AG wrapper to compute WGAN-GP gradient penalty (returns AGValue* scalar). */
-AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
-        AGValue *real, AGValue *fake,
-        int scale,
-        float lambda_grad);
-
-/* AG variants of utility losses (return AGValue* scalar). */
-AGValue *mlx_faciesgan_compute_diversity_loss_ag(MLXFaciesGAN *m,
-        AGValue **fake_samples,
-        int n_samples,
-        float lambda_diversity);
-AGValue *mlx_faciesgan_compute_masked_loss_ag(MLXFaciesGAN *m, AGValue *fake,
-        AGValue *real, AGValue *well,
-        AGValue *mask,
-        float well_loss_penalty);
-AGValue *mlx_faciesgan_compute_recovery_loss_ag(
-    MLXFaciesGAN *m, const int *indexes, int n_indexes, int scale,
-    AGValue *rec_in, AGValue *real, mlx_array **wells_pyramid,
-    mlx_array **seismic_pyramid, float alpha);
-
-/* AG-forward variants that also return a malloc'd array of AGValue* parameter
-   wrappers (caller must free the array and values as appropriate). */
-AGValue *mlx_faciesgan_discriminator_forward_ag_with_params(
-    MLXFaciesGAN *m, AGValue *input, int scale, AGValue ***out_params,
-    int *out_n_params);
-AGValue *mlx_faciesgan_generator_forward_ag_with_params(
-    MLXFaciesGAN *m, AGValue **z_list, int z_count, const float *amp,
-    int amp_count, AGValue *in_noise, int start_scale, int stop_scale,
-    AGValue ***out_params, int *out_n_params);
-
-/* Helpers: collect grads from AGValue param lists and apply optimizer steps. */
-int mlx_faciesgan_optimize_generator_from_ag(MLXFaciesGAN *m, MLXOptimizer *opt,
-        AGValue **params, int n);
-int mlx_faciesgan_optimize_discriminator_from_ag(MLXFaciesGAN *m,
-        MLXOptimizer *opt,
-        AGValue **params, int n);
-int mlx_faciesgan_train_step_from_ag(MLXFaciesGAN *m, MLXOptimizer *opt_g,
-                                     AGValue **gen_params, int gen_n,
-                                     MLXOptimizer *opt_d, AGValue **disc_params,
-                                     int disc_n);
 
 /* Helpers to configure per-scale shapes/noise used by C training loop. */
 int mlx_faciesgan_set_shapes(MLXFaciesGAN *m, const int *shapes, int n_scales);

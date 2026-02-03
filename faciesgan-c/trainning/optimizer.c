@@ -103,7 +103,7 @@ void mlx_optimizer_eval_state(MLXOptimizer *opt) {
     /* Batch evaluate all optimizer state arrays using mlx_eval() for better
        performance. This mirrors Python's mx.eval(optimizer.state) pattern. */
     mlx_vector_array vec = mlx_vector_array_new();
-    
+
     /* Collect all m (first moment) arrays */
     if (opt->m) {
         for (int i = 0; i < opt->param_n; ++i) {
@@ -120,7 +120,7 @@ void mlx_optimizer_eval_state(MLXOptimizer *opt) {
             }
         }
     }
-    
+
     /* Batch evaluate all optimizer state at once */
     if (mlx_vector_array_size(vec) > 0) {
         mlx_eval(vec);
@@ -148,7 +148,7 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
     /* determine effective LR: prefer attached scheduler if present */
     float effective_lr = opt->lr;
     if (opt->attached_scheduler) {
-        float tmp_lr[4];
+        float tmp_lr[4] = {0.0f, 0.0f, 0.0f, 0.0f};  /* Initialize to avoid garbage */
         int got = mlx_scheduler_lr_for_step(opt->attached_scheduler, opt->step,
                                             tmp_lr, 1);
         if (got > 0)
@@ -183,6 +183,15 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
     if (opt->weight_decay != 0.0f) {
         mlx_array_free(decay_scale_arr);
         decay_scale_arr = mlx_array_new_float(opt->lr * opt->weight_decay);
+    }
+
+    /* Force eval of all gradients before using them to ensure lazy computations
+     * are materialized. This is critical for MLX's lazy evaluation model. */
+    /* Force eval of all gradients in-place before using them. */
+    for (int i = 0; i < n; ++i) {
+        if (grads[i] && grads[i]->ctx) {
+            mlx_array_eval(*grads[i]);
+        }
     }
 
     for (int i = 0; i < n; ++i) {
@@ -375,7 +384,13 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
             mlx_array_free(new_p);
             continue;
         }
+        /* Evaluate new_p before overwriting p to ensure the lazy computation
+         * graph is materialized. Otherwise, new_p might still reference the
+         * old p value and get invalidated when we overwrite p. */
+        mlx_array_eval(new_p);
+
         mlx_array_set(p, new_p);
+
         mlx_array_free(new_p);
         mlx_array_free(update);
     }

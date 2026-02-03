@@ -445,7 +445,7 @@ class MLXScaleModule(nn.Module):
         self.tail = tail
 
     def __call__(self, x: mx.array) -> mx.array:
-        x = cast(mx.array, self.head(x))
+        x = self.head(x)
         x = cast(mx.array, self.body(x))
         x = cast(mx.array, self.tail(x))
         return x

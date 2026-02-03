@@ -1,13 +1,15 @@
 #include "train_step.h"
 #include "array_helpers.h"
-#include "autodiff.h"
 #include "base_manager.h"
 #include "discriminator.h"
 #include "generator.h"
+#include "mlx_native_grad.h"
 #include "optimizer.h"
 #include "train_utils.h"
 #include <mlx/c/transforms.h>
+#include <math.h>
 #include <stdlib.h>
+#include <string.h>
 
 /* Batch evaluate multiple arrays using mlx_eval() for better performance.
    This mirrors Python's mx.eval(list_of_arrays) which evaluates all arrays
@@ -51,6 +53,31 @@ int mlx_faciesgan_apply_sgd_to_generator(MLXFaciesGAN *m, MLXOptimizer *opt,
     return r;
 }
 
+/* Scale-specific version that gets parameters for only one scale */
+int mlx_faciesgan_apply_sgd_to_generator_for_scale(MLXFaciesGAN *m, MLXOptimizer *opt,
+        mlx_array **grads, int n, int scale) {
+    if (!m || !opt)
+        return -1;
+    MLXGenerator *g = mlx_faciesgan_build_generator(m);
+    if (!g)
+        return -1;
+    int param_n = 0;
+    mlx_array **params = mlx_generator_get_parameters_for_scale(g, scale, &param_n);
+    if (!params || param_n == 0) {
+        if (params)
+            mlx_generator_free_parameters_list(params);
+        return -1;
+    }
+    if (n != param_n) {
+        mlx_generator_free_parameters_list(params);
+        return -1;
+    }
+
+    int r = mlx_adam_step(opt, params, grads, param_n);
+    mlx_generator_free_parameters_list(params);
+    return r;
+}
+
 int mlx_faciesgan_apply_sgd_to_discriminator(MLXFaciesGAN *m, MLXOptimizer *opt,
         mlx_array **grads, int n) {
     if (!m || !opt)
@@ -71,6 +98,35 @@ int mlx_faciesgan_apply_sgd_to_discriminator(MLXFaciesGAN *m, MLXOptimizer *opt,
     }
     int r = mlx_adam_step(opt, params, grads, param_n);
     mlx_discriminator_free_parameters_list(params);
+    return r;
+}
+
+/* Scale-specific version that gets parameters for only one scale */
+int mlx_faciesgan_apply_sgd_to_discriminator_for_scale(MLXFaciesGAN *m, MLXOptimizer *opt,
+        mlx_array **grads, int n, int scale) {
+    if (!m || !opt)
+        return -1;
+    MLXDiscriminator *d = mlx_faciesgan_build_discriminator(m);
+    if (!d)
+        return -1;
+    void *disc_ptr = mlx_discriminator_get_disc_ptr(d, scale);
+    if (!disc_ptr)
+        return -1;
+    MLXSPADEDiscriminator *spade_disc = (MLXSPADEDiscriminator *)disc_ptr;
+    int param_n = 0;
+    mlx_array **params = mlx_spadedisc_get_parameters(spade_disc, &param_n);
+    if (!params || param_n == 0) {
+        if (params)
+            mlx_spadedisc_free_parameters_list(params);
+        return -1;
+    }
+    if (n != param_n) {
+        mlx_spadedisc_free_parameters_list(params);
+        return -1;
+    }
+
+    int r = mlx_adam_step(opt, params, grads, param_n);
+    mlx_spadedisc_free_parameters_list(params);
     return r;
 }
 
@@ -120,636 +176,6 @@ int mlx_base_train_step(MLXBaseManager *mgr, MLXOptimizer *opt_g,
         return -1;
     return mlx_faciesgan_train_step(fg, opt_g, gen_grads, gen_n, opt_d,
                                     disc_grads, disc_n);
-}
-
-int mlx_base_apply_sgd_to_generator_from_ag(MLXBaseManager *mgr,
-        MLXOptimizer *opt, AGValue **params,
-        int n) {
-    if (!mgr || !opt)
-        return -1;
-    if (!params || n <= 0)
-        return -1;
-    mlx_array **grads = NULL;
-    if (ag_collect_grads(params, n, &grads) != 0)
-        return -1;
-    int res = mlx_base_apply_sgd_to_generator(mgr, opt, grads, n);
-    /* free collected grads */
-    for (int i = 0; i < n; ++i) {
-        if (grads[i]) {
-            mlx_array_free(*grads[i]);
-            mlx_free_pod((void **)&grads[i]);
-        }
-    }
-    mlx_free_ptr_array((void ***)&grads, n);
-    return res;
-}
-
-int mlx_base_apply_sgd_to_discriminator_from_ag(MLXBaseManager *mgr,
-        MLXOptimizer *opt,
-        AGValue **params, int n) {
-    if (!mgr || !opt)
-        return -1;
-    if (!params || n <= 0)
-        return -1;
-    mlx_array **grads = NULL;
-    if (ag_collect_grads(params, n, &grads) != 0)
-        return -1;
-    int res = mlx_base_apply_sgd_to_discriminator(mgr, opt, grads, n);
-    for (int i = 0; i < n; ++i) {
-        if (grads[i]) {
-            mlx_array_free(*grads[i]);
-            mlx_free_pod((void **)&grads[i]);
-        }
-    }
-    mlx_free_ptr_array((void ***)&grads, n);
-    return res;
-}
-
-int mlx_base_train_step_from_ag(MLXBaseManager *mgr, MLXOptimizer *opt_g,
-                                AGValue **gen_params, int gen_n,
-                                MLXOptimizer *opt_d, AGValue **disc_params,
-                                int disc_n) {
-    if (!mgr)
-        return -1;
-    int rg = 0, rd = 0;
-    if (opt_g)
-        rg = mlx_base_apply_sgd_to_generator_from_ag(mgr, opt_g, gen_params, gen_n);
-    if (opt_d)
-        rd = mlx_base_apply_sgd_to_discriminator_from_ag(mgr, opt_d, disc_params,
-             disc_n);
-    if ((opt_g && rg != 0) || (opt_d && rd != 0))
-        return -1;
-    return 0;
-}
-
-int mlx_faciesgan_collect_metrics_and_grads(
-    MLXFaciesGAN *m, const int *indexes, int n_indexes,
-    const int *active_scales, int n_active_scales, mlx_array **facies_pyramid,
-    mlx_array **rec_in_pyramid, mlx_array **wells_pyramid,
-    mlx_array **masks_pyramid, mlx_array **seismic_pyramid,
-    float lambda_diversity, float well_loss_penalty, float alpha,
-    float lambda_grad, MLXResults **out_results) {
-    if (!m || !out_results)
-        return -1;
-
-    MLXResults *res = NULL;
-    if (mlx_alloc_pod((void **)&res, sizeof(MLXResults), 1) != 0)
-        return -1;
-    res->n_scales = n_active_scales;
-    res->scales =
-        (MLXScaleResults *)calloc(n_active_scales, sizeof(MLXScaleResults));
-    if (!res->scales) {
-        mlx_free_pod((void **)&res);
-        return -1;
-    }
-
-    for (int si = 0; si < n_active_scales; ++si) {
-        int scale = active_scales[si];
-        MLXScaleResults *sr = &res->scales[si];
-        sr->scale = scale;
-        sr->gen_grads = NULL;
-        sr->gen_n = 0;
-        sr->disc_grads = NULL;
-        sr->disc_n = 0;
-        sr->metrics.fake = NULL;
-        sr->metrics.well = NULL;
-        sr->metrics.div = NULL;
-        sr->metrics.rec = NULL;
-        sr->metrics.total = NULL;
-
-        if (!facies_pyramid || !facies_pyramid[scale])
-            continue;
-
-        /* Prepare AG parameters for generator */
-        int gen_param_n = 0;
-        mlx_array **gen_params_list = NULL;
-        /* get parameters from generator instance */
-        MLXGenerator *g = mlx_faciesgan_build_generator(m);
-        if (!g)
-            continue;
-        gen_params_list = mlx_generator_get_parameters(g, &gen_param_n);
-        if (!gen_params_list || gen_param_n == 0) {
-            if (gen_params_list)
-                mlx_generator_free_parameters_list(gen_params_list);
-            continue;
-        }
-
-        AGValue **gen_params_ag = NULL;
-        if (mlx_alloc_ptr_array((void ***)&gen_params_ag, gen_param_n) != 0) {
-            mlx_generator_free_parameters_list(gen_params_list);
-            continue;
-        }
-        for (int p = 0; p < gen_param_n; ++p) {
-            gen_params_ag[p] = ag_value_from_array(gen_params_list[p], 1);
-        }
-        mlx_generator_free_parameters_list(gen_params_list);
-
-        /* Build fake via AG using current noise pyramid (all scales up to current)
-         * matching Python semantics: generator(get_pyramid_noise(scale,...), ...) */
-        mlx_array **gen_noises = NULL;
-        int gen_n_noises = 0;
-        if (mlx_faciesgan_get_pyramid_noise(
-                    m, scale, indexes, n_indexes, &gen_noises, &gen_n_noises,
-                    wells_pyramid, seismic_pyramid, 0) != 0) {
-            /* Failed to get noise pyramid */
-            for (int p = 0; p < gen_param_n; ++p) {
-                if (gen_params_ag[p])
-                    ag_value_free(gen_params_ag[p]);
-            }
-            mlx_free_ptr_array((void ***)&gen_params_ag, gen_param_n);
-            continue;
-        }
-
-        /* Convert noise arrays to AGValues for differentiation */
-        AGValue **z_list = NULL;
-        int z_count = gen_n_noises;
-        if (mlx_alloc_ptr_array((void ***)&z_list, z_count) != 0) {
-            for (int ni = 0; ni < gen_n_noises; ++ni) {
-                if (gen_noises[ni]) {
-                    mlx_array_free(*gen_noises[ni]);
-                    mlx_free_pod((void **)&gen_noises[ni]);
-                }
-            }
-            mlx_free_ptr_array((void ***)&gen_noises, gen_n_noises);
-            for (int p = 0; p < gen_param_n; ++p) {
-                if (gen_params_ag[p])
-                    ag_value_free(gen_params_ag[p]);
-            }
-            mlx_free_ptr_array((void ***)&gen_params_ag, gen_param_n);
-            continue;
-        }
-        for (int ni = 0; ni < z_count; ++ni) {
-            if (gen_noises[ni]) {
-                /* ag_value_from_new_array makes a copy; must free original */
-                z_list[ni] = ag_value_from_new_array(gen_noises[ni], 0);
-                ag_register_temp_value(z_list[ni]);
-                /* Free the original mlx_array after copy was made */
-                mlx_array_free(*gen_noises[ni]);
-                mlx_free_pod((void **)&gen_noises[ni]);
-            } else {
-                z_list[ni] = NULL;
-            }
-        }
-        /* Free the container array */
-        mlx_free_ptr_array((void ***)&gen_noises, gen_n_noises);
-
-        /* Build amplitude array: use noise_amps[0..scale-1] + 1.0 for current scale */
-        float *amp = NULL;
-        int amp_count = scale + 1;
-        if (mlx_alloc_float_buf(&amp, amp_count) == 0) {
-            float *noise_amps = NULL;
-            int n_amps = 0;
-            mlx_faciesgan_get_noise_amps(m, &noise_amps, &n_amps);
-            for (int ai = 0; ai < amp_count; ++ai) {
-                if (ai < n_amps && noise_amps)
-                    amp[ai] = noise_amps[ai];
-                else
-                    amp[ai] = 1.0f;  /* default amplitude for current scale */
-            }
-            if (noise_amps)
-                mlx_free_float_buf(&noise_amps, &n_amps);
-        }
-
-        AGValue *fake = mlx_faciesgan_generator_forward_ag(m, z_list, z_count,
-                        amp, amp_count, NULL, 0, scale);
-
-        /* Free amplitude array */
-        if (amp) {
-            mlx_free_float_buf(&amp, &amp_count);
-        }
-        /* Free z_list container (elements are registered temps, freed by ag_reset_tape) */
-        if (z_list) {
-            mlx_free_ptr_array((void ***)&z_list, z_count);
-        }
-
-        AGValue *real = ag_value_from_array(facies_pyramid[scale], 0);
-        ag_register_temp_value(real);  /* Register to ensure cleanup */
-
-        /* Discriminator forward and loss */
-        AGValue *d_real = mlx_faciesgan_discriminator_forward_ag(m, real, scale);
-        AGValue *d_fake = NULL;
-        if (fake) {
-            d_fake = mlx_faciesgan_discriminator_forward_ag(m, fake, scale);
-        }
-
-        AGValue *disc_loss = NULL;
-        AGValue *disc_real_comp = NULL;  /* -mean(d_real) for metrics */
-        AGValue *disc_fake_comp = NULL;  /* mean(d_fake) for metrics */
-        AGValue *disc_gp_comp = NULL;    /* gradient penalty for metrics */
-        if (d_real && d_fake) {
-            /* Python does: metrics.real = -outputs["d_real"].mean()
-                            metrics.fake = outputs["d_fake"].mean()
-                            return metrics.real + metrics.fake + metrics.gp
-               i.e. -mean(d_real) + mean(d_fake) + gp */
-            AGValue *mean_real = ag_mean(d_real);
-            ag_register_temp_value(mean_real);
-            AGValue *mean_fake = ag_mean(d_fake);
-            ag_register_temp_value(mean_fake);
-            /* -mean_real + mean_fake */
-            AGValue *neg_one = ag_scalar_float(-1.0f);
-            ag_register_temp_value(neg_one);
-            AGValue *neg_real = ag_mul(neg_one, mean_real);
-            ag_register_temp_value(neg_real);
-            disc_loss = ag_add(neg_real, mean_fake);
-            ag_register_temp_value(disc_loss);
-            /* Store components for metrics */
-            disc_real_comp = neg_real;  /* -mean(d_real) */
-            disc_fake_comp = mean_fake; /* mean(d_fake) */
-        }
-
-        /* Add gradient penalty */
-        if (d_real && d_fake) {
-            AGValue *gp = mlx_faciesgan_compute_gradient_penalty_ag(
-                              m, real, fake, scale, lambda_grad);
-            if (gp) {
-                ag_register_temp_value(gp);
-                disc_gp_comp = gp; /* Store for metrics */
-                disc_loss = disc_loss ? ag_add(disc_loss, gp) : gp;
-                ag_register_temp_value(disc_loss);
-            }
-        }
-
-        /* Backprop discriminator loss to collect discriminator grads */
-        if (disc_loss) {
-            ag_backward(disc_loss);
-            /* collect discriminator params and grads */
-            int disc_param_n = 0;
-            mlx_array **disc_params_list = NULL;
-            MLXDiscriminator *d = mlx_faciesgan_build_discriminator(m);
-            if (d) {
-                disc_params_list = mlx_discriminator_get_parameters(d, &disc_param_n);
-            }
-            if (disc_params_list && disc_param_n > 0) {
-                AGValue **disc_params_ag = NULL;
-                if (mlx_alloc_ptr_array((void ***)&disc_params_ag, disc_param_n) == 0) {
-                    for (int p = 0; p < disc_param_n; ++p) {
-                        disc_params_ag[p] = ag_value_from_array(disc_params_list[p], 1);
-                    }
-                }
-                mlx_discriminator_free_parameters_list(disc_params_list);
-                mlx_array **disc_grads = NULL;
-                if (ag_collect_grads(disc_params_ag, disc_param_n, &disc_grads) == 0) {
-                    sr->disc_grads = disc_grads;
-                    sr->disc_n = disc_param_n;
-                }
-                for (int p = 0; p < disc_param_n; ++p)
-                    ag_value_free(disc_params_ag[p]);
-                mlx_free_ptr_array((void ***)&disc_params_ag, disc_param_n);
-            }
-        }
-
-        /* Generator loss components: keep individual AGValue pointers so
-           we can both build the total loss and record per-component metrics. */
-        AGValue *gen_loss = NULL;
-        AGValue *adv_comp = NULL;
-        AGValue *masked_comp = NULL;
-        AGValue *rec_comp = NULL;
-        AGValue *div_comp = NULL;
-        if (d_fake) {
-            /* adversarial component: -mean(d_fake) to match Python semantics */
-            AGValue *mean_fake = ag_mean(d_fake);
-            ag_register_temp_value(mean_fake);
-            AGValue *neg = ag_scalar_float(-1.0f);
-            ag_register_temp_value(neg);
-            AGValue *adv = ag_mul(neg, mean_fake);
-            ag_register_temp_value(adv);
-            gen_loss = adv;
-            adv_comp = adv;
-        }
-
-        /* masked loss */
-        if (fake && facies_pyramid[scale] && masks_pyramid &&
-                masks_pyramid[scale]) {
-            AGValue *real_ag = ag_value_from_array(facies_pyramid[scale], 0);
-            ag_register_temp_value(real_ag);
-            AGValue *mask_ag = ag_value_from_array(masks_pyramid[scale], 0);
-            ag_register_temp_value(mask_ag);
-            AGValue *well_ag = NULL;
-            if (wells_pyramid && wells_pyramid[scale]) {
-                well_ag = ag_value_from_array(wells_pyramid[scale], 0);
-                ag_register_temp_value(well_ag);
-            }
-            AGValue *masked = mlx_faciesgan_compute_masked_loss_ag(
-                                  m, fake, real_ag, well_ag, mask_ag, well_loss_penalty);
-            if (masked) {
-                ag_register_temp_value(masked);
-                masked_comp = masked;
-                gen_loss = gen_loss ? ag_add(gen_loss, masked) : masked;
-                ag_register_temp_value(gen_loss);
-            }
-        }
-
-        /* recovery loss: if rec_in_pyramid not provided, compute it from
-         * facies_pyramid */
-        {
-            mlx_array *tmp_rec = NULL;
-            int tmp_computed = 0;
-            mlx_array *use_rec = NULL;
-            if (facies_pyramid && facies_pyramid[scale]) {
-                if (rec_in_pyramid && rec_in_pyramid[scale]) {
-                    use_rec = rec_in_pyramid[scale];
-                } else {
-                    if (mlx_compute_rec_input(scale, indexes, n_indexes, facies_pyramid,
-                                              &tmp_rec) == 0 &&
-                            tmp_rec) {
-                        use_rec = tmp_rec;
-                        tmp_computed = 1;
-                    }
-                }
-            }
-
-            if (use_rec && facies_pyramid[scale]) {
-                /* if we computed a temporary rec_in, initialize rec noise amp */
-                if (tmp_computed) {
-                    /* best-effort: compute noise amp and set on model */
-                    mlx_init_rec_noise_and_amp(m, scale, indexes, n_indexes,
-                                               facies_pyramid[scale], wells_pyramid,
-                                               seismic_pyramid);
-                }
-                AGValue *rec_in_ag = NULL;
-                if (tmp_computed) {
-                    /* ag_value_from_new_array makes a copy; must free original */
-                    rec_in_ag = ag_value_from_new_array(tmp_rec, 0);
-                } else {
-                    rec_in_ag = ag_value_from_array(use_rec, 0);
-                }
-                ag_register_temp_value(rec_in_ag);
-                AGValue *real_ag = ag_value_from_array(facies_pyramid[scale], 0);
-                ag_register_temp_value(real_ag);
-                AGValue *recv = mlx_faciesgan_compute_recovery_loss_ag(
-                                    m, indexes, n_indexes, scale, rec_in_ag, real_ag, wells_pyramid,
-                                    seismic_pyramid, alpha);
-                if (recv) {
-                    ag_register_temp_value(recv);
-                    rec_comp = recv;
-                    gen_loss = gen_loss ? ag_add(gen_loss, recv) : recv;
-                    ag_register_temp_value(gen_loss);
-                }
-            }
-
-            if (tmp_computed && tmp_rec) {
-                /* Free the original mlx_array after copy was made */
-                mlx_array_free(*tmp_rec);
-                mlx_free_pod((void **)&tmp_rec);
-            }
-        }
-
-        /* diversity: generate multiple samples and compute diversity loss (AG) */
-        int n_div = 0;
-        if (lambda_diversity > 0.0f) {
-            n_div = mlx_faciesgan_get_num_diversity_samples(m);
-            if (n_div < 1)
-                n_div = 1;
-        }
-        if (n_div > 1) {
-            AGValue **fake_samples = NULL;
-            if (mlx_alloc_ptr_array((void ***)&fake_samples, n_div) == 0) {
-                for (int di = 0; di < n_div; ++di)
-                    fake_samples[di] = NULL;
-                for (int di = 0; di < n_div; ++di) {
-                    mlx_array **tmp_noises = NULL;
-                    int tmp_n = 0;
-                    if (mlx_faciesgan_get_pyramid_noise(
-                                m, scale, indexes, n_indexes, &tmp_noises, &tmp_n,
-                                wells_pyramid, seismic_pyramid, 0) == 0) {
-                        /* Convert noise arrays to AGValues for diversity sample */
-                        AGValue **tmp_z_list = NULL;
-                        int tmp_z_count = tmp_n;
-                        if (mlx_alloc_ptr_array((void ***)&tmp_z_list, tmp_z_count) == 0) {
-                            for (int ni = 0; ni < tmp_z_count; ++ni) {
-                                if (tmp_noises[ni]) {
-                                    /* ag_value_from_new_array makes a copy; must free original */
-                                    tmp_z_list[ni] = ag_value_from_new_array(tmp_noises[ni], 0);
-                                    ag_register_temp_value(tmp_z_list[ni]);
-                                    /* Free original mlx_array after copy */
-                                    mlx_array_free(*tmp_noises[ni]);
-                                    mlx_free_pod((void **)&tmp_noises[ni]);
-                                } else {
-                                    tmp_z_list[ni] = NULL;
-                                }
-                            }
-                            mlx_free_ptr_array((void ***)&tmp_noises, tmp_n);
-
-                            /* Build amplitude array for diversity sample */
-                            float *tmp_amp = NULL;
-                            int tmp_amp_count = scale + 1;
-                            if (mlx_alloc_float_buf(&tmp_amp, tmp_amp_count) == 0) {
-                                float *noise_amps_tmp = NULL;
-                                int n_amps_tmp = 0;
-                                mlx_faciesgan_get_noise_amps(m, &noise_amps_tmp, &n_amps_tmp);
-                                for (int ai = 0; ai < tmp_amp_count; ++ai) {
-                                    if (ai < n_amps_tmp && noise_amps_tmp)
-                                        tmp_amp[ai] = noise_amps_tmp[ai];
-                                    else
-                                        tmp_amp[ai] = 1.0f;
-                                }
-                                if (noise_amps_tmp)
-                                    mlx_free_float_buf(&noise_amps_tmp, &n_amps_tmp);
-                            }
-
-                            AGValue *f = mlx_faciesgan_generator_forward_ag(
-                                             m, tmp_z_list, tmp_z_count, tmp_amp, tmp_amp_count,
-                                             NULL, 0, scale);
-                            if (f)
-                                ag_register_temp_value(f);
-                            fake_samples[di] = f;
-
-                            if (tmp_amp) {
-                                mlx_free_float_buf(&tmp_amp, &tmp_amp_count);
-                            }
-                            /* z_list elements are registered as temps, only free container */
-                            mlx_free_ptr_array((void ***)&tmp_z_list, tmp_z_count);
-                        } else {
-                            /* Failed to allocate z_list, cleanup tmp_noises */
-                            for (int ni = 0; ni < tmp_n; ++ni) {
-                                if (tmp_noises[ni]) {
-                                    mlx_array_free(*tmp_noises[ni]);
-                                    mlx_free_pod((void **)&tmp_noises[ni]);
-                                }
-                            }
-                            mlx_free_ptr_array((void ***)&tmp_noises, tmp_n);
-                        }
-                    }
-                }
-                /* compute diversity AG loss */
-                div_comp = mlx_faciesgan_compute_diversity_loss_ag(
-                               m, fake_samples, n_div, lambda_diversity);
-                if (div_comp) {
-                    ag_register_temp_value(div_comp);
-                    gen_loss = gen_loss ? ag_add(gen_loss, div_comp) : div_comp;
-                    ag_register_temp_value(gen_loss);
-                }
-                /* Do not free `fake_samples` AGValue entries here — they are
-                 * registered as temporaries and must stay alive until the
-                 * backward pass completes. Free only the container. */
-                mlx_free_ptr_array((void ***)&fake_samples, n_div);
-            }
-        }
-        /* Backprop generator loss and collect grads */
-        if (gen_loss) {
-            ag_backward(gen_loss);
-            mlx_array **gen_grads = NULL;
-            if (ag_collect_grads(gen_params_ag, gen_param_n, &gen_grads) == 0) {
-                sr->gen_grads = gen_grads;
-                sr->gen_n = gen_param_n;
-            }
-            for (int p = 0; p < gen_param_n; ++p)
-                ag_value_free(gen_params_ag[p]);
-            mlx_free_ptr_array((void ***)&gen_params_ag, gen_param_n);
-            /* defer resetting/freeing the tape until after we extract scalar
-               metrics below so AGValue temporaries remain valid while we
-               inspect/evaluate them */
-        }
-
-        /* Store scalar metrics by evaluating AGValue components where available.
-           Use batch_eval_arrays to evaluate all metrics in a single call,
-           matching Python's mx.eval(state_list) pattern for efficiency. */
-        {
-            /* Collect all metric arrays for batch evaluation */
-            mlx_array metric_arrays[5];
-            int metric_count = 0;
-            mlx_array *adv_arr = adv_comp ? ag_value_array(adv_comp) : NULL;
-            mlx_array *masked_arr = masked_comp ? ag_value_array(masked_comp) : NULL;
-            mlx_array *div_arr = div_comp ? ag_value_array(div_comp) : NULL;
-            mlx_array *rec_arr = rec_comp ? ag_value_array(rec_comp) : NULL;
-            mlx_array *loss_arr = gen_loss ? ag_value_array(gen_loss) : NULL;
-
-            if (adv_arr && adv_arr->ctx)
-                metric_arrays[metric_count++] = *adv_arr;
-            if (masked_arr && masked_arr->ctx)
-                metric_arrays[metric_count++] = *masked_arr;
-            if (div_arr && div_arr->ctx)
-                metric_arrays[metric_count++] = *div_arr;
-            if (rec_arr && rec_arr->ctx)
-                metric_arrays[metric_count++] = *rec_arr;
-            if (loss_arr && loss_arr->ctx)
-                metric_arrays[metric_count++] = *loss_arr;
-
-            /* Batch evaluate all metrics at once */
-            if (metric_count > 0)
-                batch_eval_arrays(metric_arrays, metric_count);
-
-            /* Now copy the evaluated arrays to the result structure */
-            if (adv_arr) {
-                mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *adv_arr) == 0) {
-                    sr->metrics.fake = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.fake, sizeof(mlx_array), 1) == 0)
-                        *sr->metrics.fake = tmp;
-                } else {
-                    mlx_array_free(tmp);
-                }
-            }
-            if (masked_arr) {
-                mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *masked_arr) == 0) {
-                    sr->metrics.well = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.well, sizeof(mlx_array), 1) == 0)
-                        *sr->metrics.well = tmp;
-                } else {
-                    mlx_array_free(tmp);
-                }
-            }
-            if (div_arr) {
-                mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *div_arr) == 0) {
-                    sr->metrics.div = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.div, sizeof(mlx_array), 1) == 0)
-                        *sr->metrics.div = tmp;
-                } else {
-                    mlx_array_free(tmp);
-                }
-            }
-            if (rec_arr) {
-                mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *rec_arr) == 0) {
-                    sr->metrics.rec = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.rec, sizeof(mlx_array), 1) == 0)
-                        *sr->metrics.rec = tmp;
-                } else {
-                    mlx_array_free(tmp);
-                }
-            }
-            if (loss_arr) {
-                mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *loss_arr) == 0) {
-                    sr->metrics.total = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.total, sizeof(mlx_array), 1) == 0)
-                        *sr->metrics.total = tmp;
-                } else {
-                    mlx_array_free(tmp);
-                }
-            }
-
-            /* Store discriminator metrics (d_real, d_fake, d_gp, d_total) */
-            mlx_array *d_real_arr = disc_real_comp ? ag_value_array(disc_real_comp) : NULL;
-            mlx_array *d_fake_arr = disc_fake_comp ? ag_value_array(disc_fake_comp) : NULL;
-            mlx_array *d_gp_arr = disc_gp_comp ? ag_value_array(disc_gp_comp) : NULL;
-            mlx_array *d_total_arr = disc_loss ? ag_value_array(disc_loss) : NULL;
-
-            /* Batch evaluate discriminator metrics */
-            mlx_array disc_metric_arrays[4];
-            int disc_metric_count = 0;
-            if (d_real_arr && d_real_arr->ctx)
-                disc_metric_arrays[disc_metric_count++] = *d_real_arr;
-            if (d_fake_arr && d_fake_arr->ctx)
-                disc_metric_arrays[disc_metric_count++] = *d_fake_arr;
-            if (d_gp_arr && d_gp_arr->ctx)
-                disc_metric_arrays[disc_metric_count++] = *d_gp_arr;
-            if (d_total_arr && d_total_arr->ctx)
-                disc_metric_arrays[disc_metric_count++] = *d_total_arr;
-            if (disc_metric_count > 0)
-                batch_eval_arrays(disc_metric_arrays, disc_metric_count);
-
-            /* Copy to result structure */
-            if (d_real_arr) {
-                mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *d_real_arr) == 0) {
-                    sr->metrics.d_real = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.d_real, sizeof(mlx_array), 1) == 0)
-                        *sr->metrics.d_real = tmp;
-                } else {
-                    mlx_array_free(tmp);
-                }
-            }
-            if (d_fake_arr) {
-                mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *d_fake_arr) == 0) {
-                    sr->metrics.d_fake = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.d_fake, sizeof(mlx_array), 1) == 0)
-                        *sr->metrics.d_fake = tmp;
-                } else {
-                    mlx_array_free(tmp);
-                }
-            }
-            if (d_gp_arr) {
-                mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *d_gp_arr) == 0) {
-                    sr->metrics.d_gp = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.d_gp, sizeof(mlx_array), 1) == 0)
-                        *sr->metrics.d_gp = tmp;
-                } else {
-                    mlx_array_free(tmp);
-                }
-            }
-            if (d_total_arr) {
-                mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *d_total_arr) == 0) {
-                    sr->metrics.d_total = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.d_total, sizeof(mlx_array), 1) == 0)
-                        *sr->metrics.d_total = tmp;
-                } else {
-                    mlx_array_free(tmp);
-                }
-            }
-        }
-        /* All metric extraction and grad collection for this scale complete; free
-           temporaries and reset the AG tape now. */
-        ag_reset_tape();
-    }
-
-    *out_results = res;
-    return 0;
 }
 
 void mlx_results_free(MLXResults *res) {
@@ -815,4 +241,283 @@ void mlx_results_free(MLXResults *res) {
     }
     free(res->scales);
     mlx_free_pod((void **)&res);
+}
+
+/* ============================================================================
+ * Native Grad Training Functions
+ *
+ * These use MLX's built-in value_and_grad instead of our custom AG autodiff.
+ * This is more reliable and properly computes weight gradients.
+ * ============================================================================ */
+
+int mlx_faciesgan_collect_metrics_and_grads_native(
+    MLXFaciesGAN *m, const int *indexes, int n_indexes,
+    const int *active_scales, int n_active_scales, mlx_array **facies_pyramid,
+    mlx_array **rec_in_pyramid, mlx_array **wells_pyramid,
+    mlx_array **masks_pyramid, mlx_array **seismic_pyramid,
+    float lambda_diversity, float well_loss_penalty, float alpha,
+    float lambda_grad, MLXResults **out_results) {
+
+    if (!m || !out_results)
+        return -1;
+
+    MLXResults *res = NULL;
+    if (mlx_alloc_pod((void **)&res, sizeof(MLXResults), 1) != 0)
+        return -1;
+    res->n_scales = n_active_scales;
+    res->scales =
+        (MLXScaleResults *)calloc(n_active_scales, sizeof(MLXScaleResults));
+    if (!res->scales) {
+        mlx_free_pod((void **)&res);
+        return -1;
+    }
+
+    mlx_stream stream = mlx_default_gpu_stream_new();
+
+    for (int si = 0; si < n_active_scales; ++si) {
+        int scale = active_scales[si];
+        MLXScaleResults *sr = &res->scales[si];
+        sr->scale = scale;
+        sr->gen_grads = NULL;
+        sr->gen_n = 0;
+        sr->disc_grads = NULL;
+        sr->disc_n = 0;
+        memset(&sr->metrics, 0, sizeof(sr->metrics));
+
+        if (!facies_pyramid || !facies_pyramid[scale])
+            continue;
+
+        mlx_array *real = facies_pyramid[scale];
+        mlx_array *wells = wells_pyramid ? wells_pyramid[scale] : NULL;
+        mlx_array *masks = masks_pyramid ? masks_pyramid[scale] : NULL;
+        mlx_array *seismic = seismic_pyramid ? seismic_pyramid[scale] : NULL;
+        mlx_array *rec_in = rec_in_pyramid ? rec_in_pyramid[scale] : NULL;
+
+        /* === Generate fake for discriminator training ===
+         * We need a detached fake sample (no grad tracking) for disc training */
+        MLXGenerator *gen = mlx_faciesgan_build_generator(m);
+        if (!gen) continue;
+
+        /* Generate noise for this scale */
+        mlx_array **gen_noises_ptr = NULL;
+        int gen_n_noises = 0;
+        if (mlx_faciesgan_get_pyramid_noise(
+                    m, scale, indexes, n_indexes, &gen_noises_ptr, &gen_n_noises,
+                    wells_pyramid, seismic_pyramid, 0) != 0) {
+            continue;
+        }
+
+        /* Convert mlx_array** to flat mlx_array* for generator forward */
+        mlx_array *gen_noises = malloc(gen_n_noises * sizeof(mlx_array));
+        if (!gen_noises) {
+            for (int ni = 0; ni < gen_n_noises; ++ni) {
+                if (gen_noises_ptr[ni]) {
+                    mlx_array_free(*gen_noises_ptr[ni]);
+                    mlx_free_pod((void **)&gen_noises_ptr[ni]);
+                }
+            }
+            mlx_free_ptr_array((void ***)&gen_noises_ptr, gen_n_noises);
+            continue;
+        }
+        for (int ni = 0; ni < gen_n_noises; ++ni) {
+            gen_noises[ni] = gen_noises_ptr[ni] ? *gen_noises_ptr[ni] : (mlx_array) {
+                0
+            };
+        }
+
+        /* Build amplitude array */
+        float *amp = NULL;
+        int amp_count = scale + 1;
+        if (mlx_alloc_float_buf(&amp, amp_count) == 0) {
+            float *noise_amps = NULL;
+            int n_amps = 0;
+            mlx_faciesgan_get_noise_amps(m, &noise_amps, &n_amps);
+            for (int ai = 0; ai < amp_count; ++ai) {
+                if (ai < n_amps && noise_amps)
+                    amp[ai] = noise_amps[ai];
+                else
+                    amp[ai] = 1.0f;
+            }
+            if (noise_amps) mlx_free_float_buf(&noise_amps, &n_amps);
+        } else {
+            for (int ni = 0; ni < gen_n_noises; ++ni) {
+                if (gen_noises_ptr[ni]) {
+                    mlx_array_free(*gen_noises_ptr[ni]);
+                    mlx_free_pod((void **)&gen_noises_ptr[ni]);
+                }
+            }
+            mlx_free_ptr_array((void ***)&gen_noises_ptr, gen_n_noises);
+            free(gen_noises);
+            continue;
+        }
+
+        /* Generate fake (detached - just forward pass, no grad tracking) */
+        mlx_array fake = mlx_generator_forward(gen, gen_noises, gen_n_noises,
+        amp, amp_count, (mlx_array) {
+            0
+        },
+        0, scale);
+
+        /* Evaluate fake to materialize it before using in discriminator */
+        if (fake.ctx) {
+            mlx_array_eval(fake);
+        }
+
+        /* === Discriminator training step using native grad === */
+        if (fake.ctx) {
+            mlx_array disc_loss = {0};
+            mlx_array **disc_grads = NULL;
+            int disc_n = 0;
+            mlx_array d_real = {0}, d_fake = {0}, d_gp = {0};
+
+            int disc_rc = mlx_native_compute_disc_loss_and_grads(
+                              m, scale, real, &fake, lambda_grad,
+                              &disc_loss, &disc_grads, &disc_n,
+                              &d_real, &d_fake, &d_gp);
+
+            if (disc_rc == 0 && disc_n > 0) {
+                sr->disc_grads = disc_grads;
+                sr->disc_n = disc_n;
+
+                /* Store disc loss as total metric */
+                if (disc_loss.ctx) {
+                    mlx_array_eval(disc_loss);
+                    sr->metrics.d_total = malloc(sizeof(mlx_array));
+                    if (sr->metrics.d_total) {
+                        *sr->metrics.d_total = disc_loss;
+                    } else {
+                        mlx_array_free(disc_loss);
+                    }
+                }
+
+                /* Store individual discriminator metrics */
+                if (d_real.ctx) {
+                    mlx_array_eval(d_real);
+                    sr->metrics.d_real = malloc(sizeof(mlx_array));
+                    if (sr->metrics.d_real) {
+                        *sr->metrics.d_real = d_real;
+                    } else {
+                        mlx_array_free(d_real);
+                    }
+                }
+                if (d_fake.ctx) {
+                    mlx_array_eval(d_fake);
+                    sr->metrics.d_fake = malloc(sizeof(mlx_array));
+                    if (sr->metrics.d_fake) {
+                        *sr->metrics.d_fake = d_fake;
+                    } else {
+                        mlx_array_free(d_fake);
+                    }
+                }
+                if (d_gp.ctx) {
+                    mlx_array_eval(d_gp);
+                    sr->metrics.d_gp = malloc(sizeof(mlx_array));
+                    if (sr->metrics.d_gp) {
+                        *sr->metrics.d_gp = d_gp;
+                    } else {
+                        mlx_array_free(d_gp);
+                    }
+                }
+            } else {
+                if (disc_grads) mlx_native_free_grads(disc_grads, disc_n);
+                mlx_array_free(disc_loss);
+                mlx_array_free(d_real);
+                mlx_array_free(d_fake);
+                mlx_array_free(d_gp);
+            }
+        }
+
+        /* === Generator training step using native grad === */
+        {
+            mlx_array gen_loss = {0};
+            mlx_array **gen_grads = NULL;
+            int gen_n = 0;
+            mlx_array g_adv = {0}, g_well = {0}, g_div = {0}, g_rec = {0};
+
+            int gen_rc = mlx_native_compute_gen_loss_and_grads(
+                             m, scale, gen_noises, gen_n_noises, amp, amp_count,
+                             real, wells, masks, rec_in,
+                             (int *)indexes, n_indexes, wells_pyramid, seismic_pyramid,
+                             lambda_diversity, well_loss_penalty, alpha,
+                             &gen_loss, &gen_grads, &gen_n,
+                             &g_adv, &g_well, &g_div, &g_rec);
+
+            if (gen_rc == 0 && gen_n > 0) {
+                sr->gen_grads = gen_grads;
+                sr->gen_n = gen_n;
+
+                /* Store gen loss as total metric */
+                if (gen_loss.ctx) {
+                    mlx_array_eval(gen_loss);
+                    sr->metrics.total = malloc(sizeof(mlx_array));
+                    if (sr->metrics.total) {
+                        *sr->metrics.total = gen_loss;
+                    } else {
+                        mlx_array_free(gen_loss);
+                    }
+                }
+
+                /* Store individual generator metrics */
+                if (g_adv.ctx) {
+                    mlx_array_eval(g_adv);
+                    sr->metrics.fake = malloc(sizeof(mlx_array));
+                    if (sr->metrics.fake) {
+                        *sr->metrics.fake = g_adv;
+                    } else {
+                        mlx_array_free(g_adv);
+                    }
+                }
+                if (g_well.ctx) {
+                    mlx_array_eval(g_well);
+                    sr->metrics.well = malloc(sizeof(mlx_array));
+                    if (sr->metrics.well) {
+                        *sr->metrics.well = g_well;
+                    } else {
+                        mlx_array_free(g_well);
+                    }
+                }
+                if (g_div.ctx) {
+                    mlx_array_eval(g_div);
+                    sr->metrics.div = malloc(sizeof(mlx_array));
+                    if (sr->metrics.div) {
+                        *sr->metrics.div = g_div;
+                    } else {
+                        mlx_array_free(g_div);
+                    }
+                }
+                if (g_rec.ctx) {
+                    mlx_array_eval(g_rec);
+                    sr->metrics.rec = malloc(sizeof(mlx_array));
+                    if (sr->metrics.rec) {
+                        *sr->metrics.rec = g_rec;
+                    } else {
+                        mlx_array_free(g_rec);
+                    }
+                }
+            } else {
+                if (gen_grads) mlx_native_free_grads(gen_grads, gen_n);
+                mlx_array_free(gen_loss);
+                mlx_array_free(g_adv);
+                mlx_array_free(g_well);
+                mlx_array_free(g_div);
+                mlx_array_free(g_rec);
+            }
+        }
+
+        /* Cleanup noise arrays */
+        for (int ni = 0; ni < gen_n_noises; ++ni) {
+            if (gen_noises_ptr[ni]) {
+                mlx_array_free(*gen_noises_ptr[ni]);
+                mlx_free_pod((void **)&gen_noises_ptr[ni]);
+            }
+        }
+        mlx_free_ptr_array((void ***)&gen_noises_ptr, gen_n_noises);
+        free(gen_noises);
+        if (amp) mlx_free_float_buf(&amp, &amp_count);
+        mlx_array_free(fake);
+    }
+
+    mlx_stream_free(stream);
+    *out_results = res;
+    return 0;
 }

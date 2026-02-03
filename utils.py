@@ -1080,7 +1080,7 @@ def plot_generated_facies(
     )
     if torch_available:
         extractor = ExtractUniqueColors(device=device)
-        pure_colors: np.ndarray = extractor(np2torch(np_real_facies), 0.01)
+        pure_colors: np.ndarray = extractor(np2torch(np_real_facies), 0.01)  # type: ignore
         pure_colors = np.asarray(pure_colors)
     else:
         arr = np.asarray(np_real_facies, dtype=np.float32)

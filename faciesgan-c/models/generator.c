@@ -561,6 +561,76 @@ mlx_array **mlx_generator_get_parameters(MLXGenerator *m, int *out_count) {
     return list;
 }
 
+/* Get parameters for a specific scale only (used when training one scale at a time) */
+mlx_array **mlx_generator_get_parameters_for_scale(MLXGenerator *m, int scale_index, int *out_count) {
+    if (!m || !out_count || scale_index < 0 || scale_index >= m->n_gens)
+        return NULL;
+
+    struct ScaleModule *sm = (struct ScaleModule *)m->gens[scale_index];
+    if (!sm) {
+        *out_count = 0;
+        return NULL;
+    }
+
+    /* Count parameters for this scale */
+    int total = 0;
+    if (sm->is_spade && sm->spade) {
+        int t = 0;
+        mlx_array **tmp = mlx_spadegen_get_parameters(sm->spade, &t);
+        if (tmp) {
+            total = t;
+            mlx_spadegen_free_parameters_list(tmp);
+        }
+    } else {
+        mlx_array *hw = mlx_convblock_get_conv_weight(sm->head);
+        if (hw) total++;
+        if (sm->body) {
+            for (int b = 0; b < sm->n_body; ++b) {
+                mlx_array *bw = mlx_convblock_get_conv_weight(sm->body[b]);
+                if (bw) total++;
+            }
+        }
+        if (sm->tail_conv) total++;
+    }
+
+    if (total == 0) {
+        *out_count = 0;
+        return NULL;
+    }
+
+    mlx_array **list = NULL;
+    if (mlx_alloc_pod((void **)&list, sizeof(mlx_array *), total) != 0) {
+        *out_count = 0;
+        return NULL;
+    }
+    memset(list, 0, sizeof(mlx_array *) * total);
+
+    int idx = 0;
+    if (sm->is_spade && sm->spade) {
+        int t = 0;
+        mlx_array **tmp = mlx_spadegen_get_parameters(sm->spade, &t);
+        if (tmp) {
+            for (int j = 0; j < t; ++j) {
+                list[idx++] = tmp[j];
+            }
+            mlx_spadegen_free_parameters_list(tmp);
+        }
+    } else {
+        mlx_array *hw = mlx_convblock_get_conv_weight(sm->head);
+        if (hw) list[idx++] = hw;
+        if (sm->body) {
+            for (int b = 0; b < sm->n_body; ++b) {
+                mlx_array *bw = mlx_convblock_get_conv_weight(sm->body[b]);
+                if (bw) list[idx++] = bw;
+            }
+        }
+        if (sm->tail_conv) list[idx++] = (mlx_array *)sm->tail_conv;
+    }
+
+    *out_count = idx;
+    return list;
+}
+
 void mlx_generator_free_parameters_list(mlx_array **list) {
     if (list)
         mlx_free_pod((void **)&list);

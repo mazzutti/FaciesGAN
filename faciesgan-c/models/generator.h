@@ -60,6 +60,8 @@ mlx_array *mlx_scale_get_tail_conv(MLXGenerator *m, int index);
 /* Parameter collection helpers */
 /* Returns a malloc'd array of mlx_array* pointers and sets out_count. Caller must free the returned array (but not the arrays themselves). */
 mlx_array **mlx_generator_get_parameters(MLXGenerator *m, int *out_count);
+/* Returns parameters for a specific scale only (for scale-by-scale training) */
+mlx_array **mlx_generator_get_parameters_for_scale(MLXGenerator *m, int scale_index, int *out_count);
 void mlx_generator_free_parameters_list(mlx_array **list);
 
 #ifdef __cplusplus

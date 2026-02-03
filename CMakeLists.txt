@@ -89,7 +89,7 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/trainning/scheduler.c
   faciesgan-c/trainning/array_helpers.c
   faciesgan-c/trainning/train_manager.c
-  faciesgan-c/trainning/autodiff.c
+  faciesgan-c/trainning/mlx_native_grad.c
   faciesgan-c/trainning/python_entry.c
   faciesgan-c/trainning/train_utils.c
   faciesgan-c/trainning/mlx_compat.c
