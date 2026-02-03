@@ -1628,8 +1628,25 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
             snprintf(real_npy_path, PATH_MAX, "%s/scale_%d_epoch_%d_real.npy", scale_results_path, scale, epoch);
             snprintf(masks_npy_path, PATH_MAX, "%s/scale_%d_epoch_%d_masks.npy", scale_results_path, scale, epoch);
 
-            /* Save fake array */
+            /* Save fake array for plotting: keep the 5D layout
+             * (num_real, num_gen_per_real, H, W, C) so `plot_generated_facies`
+             * which expects a 5D grid receives the intended layout. Additionally
+             * save a flattened 4D copy (N, H, W, C) for parity comparisons. */
             if (mlx_save(fake_npy_path, fake_5d) == 0) {
+                /* Also attempt to save a flattened version for parity checks */
+                if (mlx_array_ndim(fake_5d) == 5) {
+                    int flat_n = num_real * num_gen_per_real;
+                    int new_shape[4] = {flat_n, fake_h, fake_w, fake_c};
+                    mlx_array fake_flat = mlx_array_new();
+                    if (mlx_reshape(&fake_flat, fake_5d, new_shape, 4, s) == 0) {
+                        char fake_flat_path[PATH_MAX];
+                        snprintf(fake_flat_path, PATH_MAX, "%s/scale_%d_epoch_%d_fake_flat.npy", scale_results_path, scale, epoch);
+                        (void)mlx_save(fake_flat_path, fake_flat);
+                        mlx_array_free(fake_flat);
+                    } else {
+                        mlx_array_free(fake_flat);
+                    }
+                }
                 /* Save real array (use selected_indices to create subset) */
                 int rndim = mlx_array_ndim(real_denorm);
                 const int *rshape = mlx_array_shape(real_denorm);
