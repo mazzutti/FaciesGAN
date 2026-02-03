@@ -9,7 +9,13 @@
     "**/__pycache__": true,
     "**/.pytest_cache": true,
     "results/": true,
-    ".cache/": true
+    ".cache/": true,
+    "build/": true,
+    "build_dbg/": true,
+    "mlx-c/": true,
+    "build-asan/": true,
+    "tools/": true,
+    "scripts/": true
   },
   "files.exclude": {
     "**/__pycache__": true,
@@ -21,7 +27,13 @@
     "**/__pycache__": true,
     "**/.pytest_cache": true,
     "results/": true,
-    ".cache/": true
+    ".cache/": true,
+    "build/": true,
+    "build_dbg/": true,
+    "mlx-c/": true,
+    "build-asan/": true,
+    "tools/": true,
+    "scripts/": true
   },
   "python.analysis.exclude": [
     "**/.venv/**",
@@ -35,7 +47,8 @@
     "mlx-c/",
     "build-asan/",
     "tools/",
-    "scripts/"
+    "scripts/",
+    "data/"
   ],
   "editor.defaultFormatter": "ms-python.black-formatter",
   "python.analysis.enableTroubleshootMissingImports": true,

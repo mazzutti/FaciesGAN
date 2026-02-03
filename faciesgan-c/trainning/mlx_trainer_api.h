@@ -105,6 +105,16 @@ typedef struct MLXTrainer {
     MLXPyramidsDataset *dataset;
     struct MLXDataloader *data_loader;
     int num_of_batchs;
+    /* Last computed metrics for logging (per-scale arrays, length = n_scales) */
+    double *last_g_total;
+    double *last_g_adv;
+    double *last_g_rec;
+    double *last_g_well;
+    double *last_g_div;
+    double *last_d_total;
+    double *last_d_real;
+    double *last_d_fake;
+    double *last_d_gp;
     /* Optional ops/vtable for OO-like instance methods. If NULL, callers can
      * continue to use the MLXTrainer_* functions declared in this header. */
     MLXTrainerOps *ops;

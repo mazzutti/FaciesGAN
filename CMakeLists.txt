@@ -36,6 +36,14 @@ if(ENABLE_FG_MEM_DEBUG)
   add_compile_definitions(FG_MEM_DEBUG)
 endif()
 
+# Option to enable the small C progress bar (fg_progress)
+option(ENABLE_FG_PROGRESS "Enable FaciesGAN C progress bar (fg_progress)" ON)
+
+if(ENABLE_FG_PROGRESS)
+  message(STATUS "FaciesGAN progress: enabled (FG_PROGRESS defined)")
+  add_compile_definitions(FG_PROGRESS)
+endif()
+
 
 # Optionally set MLXC_DIR to point to the installed mlx-c package config
 if(NOT DEFINED MLXC_DIR)
@@ -222,6 +230,10 @@ target_sources(faciesgan PRIVATE faciesgan-c/cli/cli_args.c)
 target_sources(faciesgan PRIVATE faciesgan-c/cli/cli_help.c)
 target_sources(faciesgan PRIVATE faciesgan-c/cli/cli_defs.c)
 
+if(ENABLE_FG_PROGRESS)
+  target_sources(faciesgan PRIVATE faciesgan-c/trainning/progress.c)
+endif()
+
 # Build C-native trainer
 # (old `c_trainer.c` removed; functionality provided by `mlx_trainer_api.c`)
 target_include_directories(faciesgan PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c)
@@ -322,6 +334,7 @@ install(FILES faciesgan-c/trainning/logger.h DESTINATION ${CMAKE_INSTALL_INCLUDE
 install(FILES faciesgan-c/trainning/scheduler.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES faciesgan-c/trainning/train_manager.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(FILES faciesgan-c/trainning/train_utils.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
+install(FILES faciesgan-c/trainning/progress.h DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 
 install(TARGETS facies_prefetcher
   LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}

@@ -333,6 +333,9 @@ int mlx_faciesgan_collect_metrics_and_grads(
         }
 
         AGValue *disc_loss = NULL;
+        AGValue *disc_real_comp = NULL;  /* -mean(d_real) for metrics */
+        AGValue *disc_fake_comp = NULL;  /* mean(d_fake) for metrics */
+        AGValue *disc_gp_comp = NULL;    /* gradient penalty for metrics */
         if (d_real && d_fake) {
             /* Python does: metrics.real = -outputs["d_real"].mean()
                             metrics.fake = outputs["d_fake"].mean()
@@ -349,6 +352,9 @@ int mlx_faciesgan_collect_metrics_and_grads(
             ag_register_temp_value(neg_real);
             disc_loss = ag_add(neg_real, mean_fake);
             ag_register_temp_value(disc_loss);
+            /* Store components for metrics */
+            disc_real_comp = neg_real;  /* -mean(d_real) */
+            disc_fake_comp = mean_fake; /* mean(d_fake) */
         }
 
         /* Add gradient penalty */
@@ -357,6 +363,7 @@ int mlx_faciesgan_collect_metrics_and_grads(
                               m, real, fake, scale, lambda_grad);
             if (gp) {
                 ag_register_temp_value(gp);
+                disc_gp_comp = gp; /* Store for metrics */
                 disc_loss = disc_loss ? ag_add(disc_loss, gp) : gp;
                 ag_register_temp_value(disc_loss);
             }
@@ -673,6 +680,68 @@ int mlx_faciesgan_collect_metrics_and_grads(
                     mlx_array_free(tmp);
                 }
             }
+
+            /* Store discriminator metrics (d_real, d_fake, d_gp, d_total) */
+            mlx_array *d_real_arr = disc_real_comp ? ag_value_array(disc_real_comp) : NULL;
+            mlx_array *d_fake_arr = disc_fake_comp ? ag_value_array(disc_fake_comp) : NULL;
+            mlx_array *d_gp_arr = disc_gp_comp ? ag_value_array(disc_gp_comp) : NULL;
+            mlx_array *d_total_arr = disc_loss ? ag_value_array(disc_loss) : NULL;
+
+            /* Batch evaluate discriminator metrics */
+            mlx_array disc_metric_arrays[4];
+            int disc_metric_count = 0;
+            if (d_real_arr && d_real_arr->ctx)
+                disc_metric_arrays[disc_metric_count++] = *d_real_arr;
+            if (d_fake_arr && d_fake_arr->ctx)
+                disc_metric_arrays[disc_metric_count++] = *d_fake_arr;
+            if (d_gp_arr && d_gp_arr->ctx)
+                disc_metric_arrays[disc_metric_count++] = *d_gp_arr;
+            if (d_total_arr && d_total_arr->ctx)
+                disc_metric_arrays[disc_metric_count++] = *d_total_arr;
+            if (disc_metric_count > 0)
+                batch_eval_arrays(disc_metric_arrays, disc_metric_count);
+
+            /* Copy to result structure */
+            if (d_real_arr) {
+                mlx_array tmp = mlx_array_new();
+                if (mlx_array_set(&tmp, *d_real_arr) == 0) {
+                    sr->metrics.d_real = NULL;
+                    if (mlx_alloc_pod((void **)&sr->metrics.d_real, sizeof(mlx_array), 1) == 0)
+                        *sr->metrics.d_real = tmp;
+                } else {
+                    mlx_array_free(tmp);
+                }
+            }
+            if (d_fake_arr) {
+                mlx_array tmp = mlx_array_new();
+                if (mlx_array_set(&tmp, *d_fake_arr) == 0) {
+                    sr->metrics.d_fake = NULL;
+                    if (mlx_alloc_pod((void **)&sr->metrics.d_fake, sizeof(mlx_array), 1) == 0)
+                        *sr->metrics.d_fake = tmp;
+                } else {
+                    mlx_array_free(tmp);
+                }
+            }
+            if (d_gp_arr) {
+                mlx_array tmp = mlx_array_new();
+                if (mlx_array_set(&tmp, *d_gp_arr) == 0) {
+                    sr->metrics.d_gp = NULL;
+                    if (mlx_alloc_pod((void **)&sr->metrics.d_gp, sizeof(mlx_array), 1) == 0)
+                        *sr->metrics.d_gp = tmp;
+                } else {
+                    mlx_array_free(tmp);
+                }
+            }
+            if (d_total_arr) {
+                mlx_array tmp = mlx_array_new();
+                if (mlx_array_set(&tmp, *d_total_arr) == 0) {
+                    sr->metrics.d_total = NULL;
+                    if (mlx_alloc_pod((void **)&sr->metrics.d_total, sizeof(mlx_array), 1) == 0)
+                        *sr->metrics.d_total = tmp;
+                } else {
+                    mlx_array_free(tmp);
+                }
+            }
         }
         /* All metric extraction and grad collection for this scale complete; free
            temporaries and reset the AG tape now. */
@@ -707,6 +776,23 @@ void mlx_results_free(MLXResults *res) {
         if (sr->metrics.total) {
             mlx_array_free(*sr->metrics.total);
             mlx_free_pod((void **)&sr->metrics.total);
+        }
+        /* Free discriminator metrics */
+        if (sr->metrics.d_real) {
+            mlx_array_free(*sr->metrics.d_real);
+            mlx_free_pod((void **)&sr->metrics.d_real);
+        }
+        if (sr->metrics.d_fake) {
+            mlx_array_free(*sr->metrics.d_fake);
+            mlx_free_pod((void **)&sr->metrics.d_fake);
+        }
+        if (sr->metrics.d_gp) {
+            mlx_array_free(*sr->metrics.d_gp);
+            mlx_free_pod((void **)&sr->metrics.d_gp);
+        }
+        if (sr->metrics.d_total) {
+            mlx_array_free(*sr->metrics.d_total);
+            mlx_free_pod((void **)&sr->metrics.d_total);
         }
         if (sr->gen_grads) {
             for (int g = 0; g < sr->gen_n; ++g) {

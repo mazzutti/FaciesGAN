@@ -39,11 +39,17 @@ extern "C"
     /* Metrics & gradient packaging structures ---------------------------------*/
     typedef struct MLXScaleMetrics
     {
-        mlx_array *fake;  /* scalar */
-        mlx_array *well;  /* scalar */
-        mlx_array *div;   /* scalar */
-        mlx_array *rec;   /* scalar */
-        mlx_array *total; /* scalar */
+        /* Generator metrics */
+        mlx_array *fake;  /* scalar - g_adv (adversarial) */
+        mlx_array *well;  /* scalar - g_well (masked loss) */
+        mlx_array *div;   /* scalar - g_div (diversity) */
+        mlx_array *rec;   /* scalar - g_rec (recovery) */
+        mlx_array *total; /* scalar - g_total */
+        /* Discriminator metrics */
+        mlx_array *d_real;  /* scalar - -mean(d_real) */
+        mlx_array *d_fake;  /* scalar - mean(d_fake) */
+        mlx_array *d_gp;    /* scalar - gradient penalty */
+        mlx_array *d_total; /* scalar - d_real + d_fake + d_gp */
     } MLXScaleMetrics;
 
     typedef struct MLXScaleResults
