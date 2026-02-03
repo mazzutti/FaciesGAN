@@ -86,7 +86,7 @@ mlx_array_t mlx_leakyrelu_forward(MLXLeakyReLU *m, mlx_array_t x) {
     if (!m)
         return x;
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     mlx_array scaled = mlx_array_new();
     mlx_array out = mlx_array_new();
@@ -320,7 +320,7 @@ void mlx_convblock_free(MLXConvBlock *m) {
 mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* If conv weights are present, run conv; otherwise pass-through */
     mlx_array y = mlx_array_new();
@@ -783,7 +783,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
                               int align_corners) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* Expect NHWC */
     if (mlx_array_ndim(x) != 4 || mlx_array_ndim(conditioning_input) != 4)
@@ -1140,7 +1140,7 @@ mlx_array_t mlx_spadeconv_forward(MLXSPADEConvBlock *m, mlx_array_t x,
                                   mlx_array_t cond) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* 1) SPADE modulation */
     mlx_array y = mlx_spade_forward(m->spade, x, cond, "linear", 1);
@@ -1291,7 +1291,7 @@ void mlx_spadegen_free(MLXSPADEGenerator *m) {
 mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
     if (!m)
         return cond;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     if (mlx_array_ndim(cond) == 4) {
         const int *cshape = mlx_array_shape(cond);
@@ -1705,7 +1705,7 @@ mlx_array *mlx_spadedisc_get_tail_conv(MLXSPADEDiscriminator *m) {
 mlx_array_t mlx_spadedisc_forward(MLXSPADEDiscriminator *m, mlx_array_t x) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* Head: MLXConvBlock (conv + norm + leakyrelu) */
     mlx_array cur = mlx_convblock_forward(m->head, x);
@@ -1777,13 +1777,31 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         return x;
 
     /* Use default CPU stream */
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_array pure = mlx_array_new();
+    mlx_array neg2 = mlx_array_new();
+    mlx_array temp_arr = mlx_array_new();
+    mlx_array neg = mlx_array_new();
+
+#define CLEANUP_RETURN(ret)                                                    \
+    do {                                                                       \
+        if (pure.ctx)                                                         \
+            mlx_array_free(pure);                                             \
+        if (neg2.ctx)                                                         \
+            mlx_array_free(neg2);                                             \
+        if (temp_arr.ctx)                                                     \
+            mlx_array_free(temp_arr);                                         \
+        if (neg.ctx)                                                          \
+            mlx_array_free(neg);                                              \
+        mlx_stream_free(s);                                                   \
+        return (ret);                                                         \
+    } while (0)
 
     /* Read shape: expect NHWC (b,h,w,c) */
     size_t ndim = mlx_array_ndim(x);
     if (ndim != 4) {
         /* unsupported shape: return input as-is */
-        return x;
+        CLEANUP_RETURN(x);
     }
     const int *shape = mlx_array_shape(x);
     int b = shape[0];
@@ -1798,40 +1816,40 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
     flat_shape[1] = c;
     mlx_array flat = mlx_array_new();
     if (mlx_reshape(&flat, x, flat_shape, 2, s) != 0) {
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     /* x_norm = sum(x_flat**2, axis=1, keepdims=True) */
     mlx_array x_sq = mlx_array_new();
     if (mlx_square(&x_sq, flat, s) != 0) {
         mlx_array_free(flat);
-        return x;
+        CLEANUP_RETURN(x);
     }
     mlx_array x_norm = mlx_array_new();
     if (mlx_sum_axis(&x_norm, x_sq, 1, true, s) != 0) {
         mlx_array_free(flat);
         mlx_array_free(x_sq);
-        return x;
+        CLEANUP_RETURN(x);
     }
     mlx_array_free(x_sq);
 
     /* pure_colors as an mlx array (K, c) where K=4 */
     int pc_shape[2] = {4, c};
-    mlx_array pure = mlx_array_new_data(m->pure_colors, pc_shape, 2, MLX_FLOAT32);
+    pure = mlx_array_new_data(m->pure_colors, pc_shape, 2, MLX_FLOAT32);
 
     /* c_norm = sum(pure**2, axis=1, keepdims=True) */
     mlx_array pure_sq = mlx_array_new();
     if (mlx_square(&pure_sq, pure, s) != 0) {
         mlx_array_free(flat);
         mlx_array_free(x_norm);
-        return x;
+        CLEANUP_RETURN(x);
     }
     mlx_array c_norm = mlx_array_new();
     if (mlx_sum_axis(&c_norm, pure_sq, 1, true, s) != 0) {
         mlx_array_free(flat);
         mlx_array_free(x_norm);
         mlx_array_free(pure_sq);
-        return x;
+        CLEANUP_RETURN(x);
     }
     mlx_array_free(pure_sq);
 
@@ -1841,7 +1859,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(flat);
         mlx_array_free(x_norm);
         mlx_array_free(c_norm);
-        return x;
+        CLEANUP_RETURN(x);
     }
     mlx_array prod = mlx_array_new();
     if (mlx_matmul(&prod, flat, pure_t, s) != 0) {
@@ -1849,7 +1867,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(x_norm);
         mlx_array_free(c_norm);
         mlx_array_free(pure_t);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     /* distances = x_norm + c_norm.T - 2 * prod */
@@ -1860,11 +1878,11 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(c_norm);
         mlx_array_free(pure_t);
         mlx_array_free(prod);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     /* neg2 = scalar -2.0 */
-    mlx_array neg2 = mlx_array_new_float(-2.0f);
+    neg2 = mlx_array_new_float(-2.0f);
     mlx_array neg2prod = mlx_array_new();
     if (mlx_multiply(&neg2prod, prod, neg2, s) != 0) {
         mlx_array_free(flat);
@@ -1873,7 +1891,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(pure_t);
         mlx_array_free(prod);
         mlx_array_free(c_norm_t);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     mlx_array tmp = mlx_array_new();
@@ -1886,7 +1904,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(prod);
         mlx_array_free(c_norm_t);
         mlx_array_free(neg2prod);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     mlx_array distances = mlx_array_new();
@@ -1900,7 +1918,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(c_norm_t);
         mlx_array_free(neg2prod);
         mlx_array_free(tmp);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     /* If not training: nearest neighbor assignment
@@ -1957,7 +1975,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
                     mlx_array_free(neg2prod);
                     mlx_array_free(tmp);
                     mlx_array_free(distances);
-                    return out;
+                    CLEANUP_RETURN(out);
                 }
             }
         }
@@ -1967,7 +1985,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
      * weights = softmax(-distances / temperature, axis=-1)
      * quantized = weights @ pure  -> shape (N, c)
      */
-    mlx_array temp_arr = mlx_array_new_float(m->temperature);
+    temp_arr = mlx_array_new_float(m->temperature);
     mlx_array div = mlx_array_new();
     if (mlx_divide(&div, distances, temp_arr, s) != 0) {
         /* fallback */
@@ -1980,10 +1998,10 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(neg2prod);
         mlx_array_free(tmp);
         mlx_array_free(distances);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
-    mlx_array neg = mlx_array_new_float(-1.0f);
+    neg = mlx_array_new_float(-1.0f);
     mlx_array scaled = mlx_array_new();
     if (mlx_multiply(&scaled, div, neg, s) != 0) {
         mlx_array_free(flat);
@@ -1996,7 +2014,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(tmp);
         mlx_array_free(div);
         mlx_array_free(distances);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     mlx_array weights = mlx_array_new();
@@ -2012,7 +2030,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(div);
         mlx_array_free(scaled);
         mlx_array_free(distances);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     /* quant_flat = weights @ pure  (N, c) */
@@ -2030,7 +2048,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(scaled);
         mlx_array_free(weights);
         mlx_array_free(distances);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     int outshape[4] = {b, h, w, c};
@@ -2049,7 +2067,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         mlx_array_free(weights);
         mlx_array_free(quant_flat);
         mlx_array_free(distances);
-        return x;
+        CLEANUP_RETURN(x);
     }
 
     /* cleanup temporaries */
@@ -2067,5 +2085,5 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
     mlx_array_free(quant_flat);
     mlx_array_free(distances);
 
-    return out;
+    CLEANUP_RETURN(out);
 }

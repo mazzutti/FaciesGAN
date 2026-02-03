@@ -14,6 +14,7 @@
 #include <limits.h>
 #include <mlx/c/array.h>
 #include <mlx/c/ops.h>
+#include <mlx/c/transforms.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -728,7 +729,7 @@ int mlx_save_png(const char *path, mlx_array arr) {
     if (!path)
         return -1;
 
-    /* Evaluate array to ensure data is available */
+    /* Evaluate array to ensure data is available - use CPU stream for I/O */
     mlx_stream s = mlx_default_cpu_stream_new();
     mlx_array_eval(arr);
     mlx_synchronize(s);
@@ -819,10 +820,13 @@ int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
     if (!path)
         return -1;
 
-    /* Evaluate arrays */
+    /* Evaluate arrays in batch - use CPU stream for I/O */
     mlx_stream s = mlx_default_cpu_stream_new();
-    mlx_array_eval(fake);
-    mlx_array_eval(real);
+    mlx_vector_array vec = mlx_vector_array_new();
+    mlx_vector_array_append_value(vec, fake);
+    mlx_vector_array_append_value(vec, real);
+    mlx_eval(vec);
+    mlx_vector_array_free(vec);
     mlx_synchronize(s);
 
     /* Get dimensions - both should be same shape */
@@ -1212,12 +1216,15 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
     if (!path || !fake_samples || num_fake <= 0)
         return -1;
 
-    /* Evaluate arrays */
+    /* Evaluate arrays in batch - use CPU stream for I/O */
     mlx_stream s = mlx_default_cpu_stream_new();
-    mlx_array_eval(real);
+    mlx_vector_array vec = mlx_vector_array_new();
+    mlx_vector_array_append_value(vec, real);
     for (int i = 0; i < num_fake; i++) {
-        mlx_array_eval(fake_samples[i]);
+        mlx_vector_array_append_value(vec, fake_samples[i]);
     }
+    mlx_eval(vec);
+    mlx_vector_array_free(vec);
     mlx_synchronize(s);
 
     /* Get dimensions from real array */
@@ -1391,12 +1398,15 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
     if (!path || !all_fakes || total_gen <= 0 || !selected_indices || num_real <= 0)
         return -1;
 
-    /* Evaluate arrays */
+    /* Evaluate arrays in batch - use CPU stream for I/O */
     mlx_stream s = mlx_default_cpu_stream_new();
-    mlx_array_eval(real);
+    mlx_vector_array vec = mlx_vector_array_new();
+    mlx_vector_array_append_value(vec, real);
     for (int i = 0; i < total_gen; i++) {
-        mlx_array_eval(all_fakes[i]);
+        mlx_vector_array_append_value(vec, all_fakes[i]);
     }
+    mlx_eval(vec);
+    mlx_vector_array_free(vec);
     mlx_synchronize(s);
 
     /* Get dimensions from real array */

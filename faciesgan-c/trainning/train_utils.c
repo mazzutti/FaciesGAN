@@ -17,7 +17,7 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
         return -1;
 
     /* create a default CPU stream for MLX ops and ensure it's freed */
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* scale 0 -> zeros_like(real) */
     if (scale == 0) {
@@ -77,12 +77,10 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
     }
     mlx_array up = mlx_upsample_forward(u, sel);
     mlx_upsample_free(u);
-
-    /* free intermediate selection if different from result */
-    /* Don't free `sel` here: some backends create `up` as a view
-       referencing `sel`'s storage. Freeing `sel` can cause a
-       use-after-free when `up` is later used. Let the caller
-       (or higher-level cleanup) release these arrays. */
+    
+    /* Free the intermediate selection array - mlx_upsample_forward creates
+       a new output array, so `sel` is no longer needed. */
+    mlx_array_free(sel);
 
     mlx_array *res = NULL;
     if (mlx_alloc_pod((void **)&res, sizeof(mlx_array), 1) != 0) {
@@ -170,7 +168,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
                double-free when both containers are freed. Prefer a deep copy via
                `mlx_copy` onto a CPU stream; fall back to `mlx_array_set` if copy
                fails. */
-            mlx_stream _s = mlx_default_cpu_stream_new();
+            mlx_stream _s = mlx_default_gpu_stream_new();
             mlx_array tmp_dst = mlx_array_new();
             if (mlx_copy(&tmp_dst, *noises[i], _s) == 0) {
                 /* replace the initially-allocated element with the copied value */
@@ -187,11 +185,14 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         /* Ensure none of the zvals are empty -- replace empty entries with zeros */
         for (int i = 0; i < n_noises; ++i) {
             if (mlx_array_ndim(zvals[i]) == 0) {
-                mlx_stream _s = mlx_default_cpu_stream_new();
+                mlx_stream _s = mlx_default_gpu_stream_new();
                 int shape0[4] = {1, 32, 32, 1};
                 mlx_array tmp = mlx_array_new();
                 if (mlx_zeros(&tmp, shape0, 4, MLX_FLOAT32, _s) == 0) {
+                    mlx_array_free(zvals[i]);  /* free old empty array before replacing */
                     zvals[i] = tmp;
+                } else {
+                    mlx_array_free(tmp);  /* free tmp if zeros failed */
                 }
                 mlx_stream_free(_s);
             }
@@ -210,10 +211,13 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
             const int *rshape = mlx_array_shape(*real);
             if (rshape) {
                 int osh[4] = {rshape[0], rshape[1], rshape[2], rshape[3]};
-                mlx_stream _s = mlx_default_cpu_stream_new();
+                mlx_stream _s = mlx_default_gpu_stream_new();
                 mlx_array tmp = mlx_array_new();
                 if (mlx_zeros(&tmp, osh, 4, MLX_FLOAT32, _s) == 0) {
+                    mlx_array_free(in_noise);  /* free original empty before replacing */
                     in_noise = tmp;
+                } else {
+                    mlx_array_free(tmp);  /* free tmp if zeros failed */
                 }
                 mlx_stream_free(_s);
             }
@@ -232,7 +236,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         mlx_free_float_buf(&use_amps, &use_n);
 
     /* compute rmse = sqrt(mean((fake - real)^2)) */
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* Ensure `real` matches `fake` spatial dims by padding `real` symmetrically
        when needed. Use the padded copy for subtraction to compute RMSE. */
     const int *fshape = mlx_array_shape(fake);

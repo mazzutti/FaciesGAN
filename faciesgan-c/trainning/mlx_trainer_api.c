@@ -28,6 +28,7 @@
 #include <mlx/c/ops.h>
 #include <mlx/c/random.h>
 #include <mlx/c/stream.h>
+#include <mlx/c/transforms.h>
 #include <mlx/c/vector.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -35,8 +36,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>
+#else
+#include <sys/resource.h>
+#endif
 #include <time.h>
 #include <unistd.h>
+
+static size_t mlx_get_process_rss_bytes(void) {
+#if defined(__APPLE__)
+    struct task_basic_info info;
+    mach_msg_type_number_t count = TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&info,
+                  &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    return (size_t)info.resident_size;
+#else
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) {
+        return 0;
+    }
+    /* Linux reports ru_maxrss in KB; convert to bytes. */
+    return (size_t)ru.ru_maxrss * 1024ULL;
+#endif
+}
 
 /* Forward declarations for implementation functions (end in _impl).
  * These hold the original implementation bodies and will be referenced
@@ -274,13 +299,22 @@ MLXTrainer *MLXTrainer_new(const TrainningOptions *opts, int fine_tuning,
         return NULL;
     memset(trainer, 0, sizeof(*trainer));
 
+    fprintf(stderr, "MLX Configuration:\n");
+    
     /* Configure MLX memory management (parity with Python Trainer):
      * Set memory limit to 48GB and use GPU device by default. */
     size_t mem_limit_result = 0;
     size_t mem_limit = 48UL * 1024UL * 1024UL * 1024UL;  /* 48GB */
     mlx_set_memory_limit(&mem_limit_result, mem_limit);
-    fprintf(stderr, "MLX Metal Configuration:\n");
     fprintf(stderr, "  Memory limit: %.1f GB\n", (double)mem_limit_result / (1024.0 * 1024.0 * 1024.0));
+
+    /* Check device type being used - should be GPU if Metal is available */
+    mlx_device default_dev = mlx_device_new();
+    mlx_get_default_device(&default_dev);
+    mlx_device_type dev_type;
+    mlx_device_get_type(&dev_type, default_dev);
+    fprintf(stderr, "  Default device: %s\n", dev_type == MLX_GPU ? "GPU" : "CPU");
+    mlx_device_free(default_dev);
 
     /* Set MLX random seed for reproducibility (parity with Python mx.random.seed) */
     if (opts->manual_seed >= 0) {
@@ -759,7 +793,7 @@ MLXTrainer_create_batch_iterator_impl(MLXTrainer *trainer,
         }
     }
     int qcap = 4;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* scales and n_scales are used below when creating prefetcher */
 
     PrefetcherHandle ph =
@@ -774,7 +808,7 @@ MLXTrainer_create_batch_iterator_impl(MLXTrainer *trainer,
     /* Start the centralized prefetcher producer thread which will read from
      * the dataloader and push into the prefetcher. The helper detaches the
      * thread and will free the provided stream when finished. */
-    mlx_stream prod_stream = mlx_default_cpu_stream_new();
+    mlx_stream prod_stream = mlx_default_gpu_stream_new();
     if (prefetcher_start_from_dataloader(ph, dl, prod_stream) != 0) {
         if (prod_stream.ctx)
             mlx_stream_free(prod_stream);
@@ -863,22 +897,26 @@ int MLXTrainer_generate_visualization_samples_impl(
         }
 
         /* Convert pointer array to contiguous mlx_array values expected by the
-         * generator forward wrapper. */
+         * generator forward wrapper. We use mlx_alloc_mlx_array_raw to avoid
+         * creating empty arrays that we'd need to free before overwriting. */
         mlx_array *zvals = NULL;
+        int zvals_count = n_noises;
         if (n_noises > 0) {
-            if (mlx_alloc_mlx_array_vals(&zvals, n_noises) != 0) {
+            zvals = (mlx_array *)malloc(sizeof(mlx_array) * (size_t)n_noises);
+            if (!zvals) {
                 mlx_free_mlx_array_ptrs(&noises, n_noises);
                 if (use_amps)
                     mlx_free_float_buf(&use_amps, &use_n);
                 out[i] = NULL;
                 continue;
             }
-            for (int j = 0; j < n_noises; ++j)
+            for (int j = 0; j < n_noises; ++j) {
                 zvals[j] = *noises[j];
+            }
             /* Ensure none of the zvals are empty; replace empties with zeros. */
             for (int j = 0; j < n_noises; ++j) {
                 if (mlx_array_ndim(zvals[j]) == 0) {
-                    mlx_stream _s = mlx_default_cpu_stream_new();
+                    mlx_stream _s = mlx_default_gpu_stream_new();
                     int shape0[4] = {
                         1, trainer->opts.crop_size > 0 ? trainer->opts.crop_size : 32,
                         trainer->opts.crop_size > 0 ? trainer->opts.crop_size : 32,
@@ -888,27 +926,45 @@ int MLXTrainer_generate_visualization_samples_impl(
                     };
                     mlx_array tmp = mlx_array_new();
                     if (mlx_zeros(&tmp, shape0, 4, MLX_FLOAT32, _s) == 0) {
+                        mlx_array_free(zvals[j]);  /* free the empty array */
                         zvals[j] = tmp;
+                    } else {
+                        mlx_array_free(tmp);
                     }
                     mlx_stream_free(_s);
                 }
             }
+            /* Free the noises container (pointer wrappers) but NOT the arrays,
+             * since ownership transferred to zvals */
+            for (int j = 0; j < n_noises; ++j) {
+                if (noises[j]) {
+                    free(noises[j]);  /* free mlx_array* struct, not its content */
+                }
+            }
+            free(noises);
+            noises = NULL;
         }
 
         /* pick an initial in_noise: prefer first noise when present */
         mlx_array in_noise = mlx_array_new();
-        if (n_noises > 0)
+        if (zvals && zvals_count > 0)
             in_noise = zvals[0];
-        /* local variables used above */
+
         mlx_array fake =
-            mlx_faciesgan_generate_fake(trainer->model, zvals, n_noises, use_amps,
+            mlx_faciesgan_generate_fake(trainer->model, zvals, zvals_count, use_amps,
                                         use_n, in_noise, scale, scale);
 
-        mlx_free_mlx_array_ptrs(&noises, n_noises);
-        if (zvals)
-            mlx_free_mlx_array_vals(&zvals, n_noises);
+        /* Free zvals (which now owns the array data) */
+        if (zvals) {
+            for (int j = 0; j < zvals_count; ++j) {
+                mlx_array_free(zvals[j]);
+            }
+            free(zvals);
+            zvals = NULL;
+        }
         if (use_amps)
             mlx_free_float_buf(&use_amps, &use_n);
+
         mlx_array *p = NULL;
         if (mlx_alloc_pod((void **)&p, sizeof(mlx_array), 1) != 0) {
             mlx_array_free(fake);
@@ -1147,7 +1203,7 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
     /* Synchronize and clear Metal cache after each optimization step to avoid
      * accumulating resources (command buffers/encoders) and hitting the
      * Metal resource limit. */
-    mlx_stream sync_s = mlx_default_cpu_stream_new();
+    mlx_stream sync_s = mlx_default_gpu_stream_new();
     mlx_synchronize(sync_s);
     mlx_clear_cache();
     mlx_stream_free(sync_s);
@@ -1195,7 +1251,7 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
                                  ? trainer->num_generated_per_real : 5;
     const int cell_size = 128; /* Cell size in grid visualization */
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_cpu_stream_new();  /* I/O needs CPU stream */
 
     /* Get batch size from real_facies */
     int real_ndim = mlx_array_ndim(real_facies);
@@ -1255,10 +1311,13 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
         for (int i = 0; i < scale + 1; ++i)
             use_amps[i] = 1.0f;
 
-        /* Convert pointer array to contiguous mlx_array values */
+        /* Convert pointer array to contiguous mlx_array values.
+         * Transfer ownership from noises to zvals. */
         mlx_array *zvals = NULL;
+        int zvals_count = n_noises;
         if (n_noises > 0) {
-            if (mlx_alloc_mlx_array_vals(&zvals, n_noises) != 0) {
+            zvals = (mlx_array *)malloc(sizeof(mlx_array) * (size_t)n_noises);
+            if (!zvals) {
                 mlx_free_mlx_array_ptrs(&noises, n_noises);
                 mlx_free_float_buf(&use_amps, NULL);
                 for (int j = 0; j < gen_idx; j++)
@@ -1268,13 +1327,23 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
                 mlx_stream_free(s);
                 return -1;
             }
-            for (int j = 0; j < n_noises; ++j)
+            for (int j = 0; j < n_noises; ++j) {
                 zvals[j] = *noises[j];
+            }
+            /* Free the noises container (pointer wrappers) but NOT the arrays,
+             * since ownership transferred to zvals */
+            for (int j = 0; j < n_noises; ++j) {
+                if (noises[j]) {
+                    free(noises[j]);  /* free mlx_array* struct, not its content */
+                }
+            }
+            free(noises);
+            noises = NULL;
         }
 
         mlx_array in_noise = mlx_array_new();
         mlx_array_t fake = mlx_faciesgan_generate_fake(
-                               trainer->model, zvals, n_noises, use_amps, scale + 1,
+                               trainer->model, zvals, zvals_count, use_amps, scale + 1,
                                in_noise, scale, scale);
 
         /* IMPORTANT: Evaluate the fake array BEFORE freeing noise inputs!
@@ -1283,10 +1352,17 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
         mlx_array_eval(fake);
         mlx_synchronize(s);
 
-        /* Now safe to free noises */
-        mlx_free_mlx_array_ptrs(&noises, n_noises);
-        if (zvals)
+        /* Free in_noise now that it's no longer needed */
+        mlx_array_free(in_noise);
+
+        /* Now safe to free zvals (which owns the array data) */
+        if (zvals) {
+            for (int j = 0; j < zvals_count; ++j) {
+                mlx_array_free(zvals[j]);
+            }
             free(zvals);
+            zvals = NULL;
+        }
         mlx_free_float_buf(&use_amps, NULL);
 
         /* Clamp to [-1, 1] */
@@ -1752,7 +1828,7 @@ int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
         for (int sc = 0; sc < num_scales; ++sc) {
             int shape[3] = {height, width, channels};
             mlx_array a = mlx_array_new();
-            mlx_stream s = mlx_default_cpu_stream_new();
+            mlx_stream s = mlx_default_gpu_stream_new();
             if (mlx_random_normal(&a, shape, 3, MLX_FLOAT32, 0.0f, 1.0f,
                                   mlx_array_empty, s) != 0) {
                 mlx_zeros(&a, shape, 3, MLX_FLOAT32, s);
@@ -1804,7 +1880,7 @@ int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
     pybridge_create_visualizer(num_scales, ".", NULL, 1);
     pybridge_create_background_worker(2, 32);
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     int batch_idx = 0;
     while (1) {
@@ -1968,7 +2044,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     }
 
     /* Training loop: consume prepared pyramids from prefetcher iterator */
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     prefetcher_iterator_preload(pit);
     /* Debug: indicate we've entered the training loop */
     fprintf(
@@ -1978,12 +2054,36 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         n_scales);
     int batches = 0;
     int max_batches = opts->num_iter > 0 ? opts->num_iter : INT_MAX;
+#ifdef FG_MEM_DEBUG
     size_t mem_before_first = 0;
+#endif
+    const char *clear_cache_env = getenv("MLX_MEM_CLEAR_CACHE");
+    /* Default to clearing cache unless explicitly disabled (0 or false) */
+    bool clear_cache = !clear_cache_env || 
+                       !(strcmp(clear_cache_env, "0") == 0 ||
+                         strcmp(clear_cache_env, "false") == 0);
+    
+    /* Set a cache limit to prevent unbounded GPU memory growth.
+     * This limits how much memory MLX keeps in its cache for reuse. */
+    size_t cache_limit_result = 0;
+    size_t cache_limit = 512 * 1024 * 1024;  /* 512 MB cache limit */
+    mlx_set_cache_limit(&cache_limit_result, cache_limit);
+    
     while (batches < max_batches) {
+#ifdef FG_MEM_DEBUG
         /* Memory tracking: measure before batch */
-        size_t mem_before = 0;
-        mlx_get_active_memory(&mem_before);
+        size_t mem_before_active = 0;
+        size_t mem_before_cache = 0;
+        size_t mem_before_peak = 0;
+        size_t rss_before = 0;
+        mlx_get_active_memory(&mem_before_active);
+        mlx_get_cache_memory(&mem_before_cache);
+        mlx_get_peak_memory(&mem_before_peak);
+        size_t mem_before = mem_before_active + mem_before_cache;
+        rss_before = mlx_get_process_rss_bytes();
         if (batches == 0) mem_before_first = mem_before;
+        mlx_reset_peak_memory();
+#endif
 
         PrefetchedPyramidsBatch *pb = prefetcher_iterator_next(pit);
         if (!pb)
@@ -1995,18 +2095,21 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         mlx_array **seis_pyr = pb->seismic_ptrs;
         mlx_array **mask_pyr = pb->masks_ptrs;
 
-        /* Evaluate lazy arrays to ensure ndim is available for downstream ops */
+        /* Evaluate lazy arrays in batch (matches Python mx.eval pattern) */
         mlx_global_lock(); /* protect all MLX operations */
+        mlx_vector_array pyr_vec = mlx_vector_array_new();
         for (int i = 0; i < nsc; ++i) {
             if (fac_pyr && fac_pyr[i])
-                mlx_array_eval(*fac_pyr[i]);
+                mlx_vector_array_append_value(pyr_vec, *fac_pyr[i]);
             if (well_pyr && well_pyr[i])
-                mlx_array_eval(*well_pyr[i]);
+                mlx_vector_array_append_value(pyr_vec, *well_pyr[i]);
             if (seis_pyr && seis_pyr[i])
-                mlx_array_eval(*seis_pyr[i]);
+                mlx_vector_array_append_value(pyr_vec, *seis_pyr[i]);
             if (mask_pyr && mask_pyr[i])
-                mlx_array_eval(*mask_pyr[i]);
+                mlx_vector_array_append_value(pyr_vec, *mask_pyr[i]);
         }
+        mlx_eval(pyr_vec);
+        mlx_vector_array_free(pyr_vec);
 
         /* Compute masks from wells on main thread (thread-safe MLX ops).
          * masks = greater(sum(abs(wells), axis=channels, keepdims=true), 0)
@@ -2017,7 +2120,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         if (well_pyr && nsc > 0 && (!mask_pyr || !mask_pyr[0] || !(*mask_pyr[0]).ctx)) {
             computed_masks = (mlx_array **)calloc((size_t)nsc, sizeof(mlx_array *));
             if (computed_masks) {
-                mlx_stream mask_s = mlx_default_cpu_stream_new();
+                mlx_stream mask_s = mlx_default_gpu_stream_new();
                 for (int wi = 0; wi < nsc; ++wi) {
                     if (!well_pyr[wi] || !(*well_pyr[wi]).ctx) {
                         computed_masks[wi] = NULL;
@@ -2139,7 +2242,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
             real_facies_all_scales = (mlx_array *)calloc(nsc, sizeof(mlx_array));
             masks_all_scales = (mlx_array *)calloc(nsc, sizeof(mlx_array));
             if (real_facies_all_scales && masks_all_scales) {
-                mlx_stream copy_s = mlx_default_cpu_stream_new();
+                mlx_stream copy_s = mlx_default_gpu_stream_new();
                 for (int sc = 0; sc < nsc; ++sc) {
                     real_facies_all_scales[sc] = mlx_array_new();
                     masks_all_scales[sc] = mlx_array_new();
@@ -2201,31 +2304,13 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         pybridge_update_visualizer_from_json(batches, metrics,
                                              batches * opts->batch_size);
 
-        /* Memory tracking: measure after batch and print leak */
-        mlx_synchronize(s);
-        mlx_clear_cache();
-        size_t mem_after = 0;
-        mlx_get_active_memory(&mem_after);
-        /* Cast to signed to handle negative differences (memory freed) */
-        double leak_gb = (double)((int64_t)mem_after - (int64_t)mem_before) / (1024.0 * 1024.0 * 1024.0);
-        double total_gb = (double)mem_after / (1024.0 * 1024.0 * 1024.0);
-        double cumul_gb = (double)((int64_t)mem_after - (int64_t)mem_before_first) / (1024.0 * 1024.0 * 1024.0);
-        fprintf(stderr, "[MEM] batch=%d: before=%.3fGB after=%.3fGB leak=%.3fGB cumulative=%.3fGB\n",
-                batches, (double)mem_before / (1024.0*1024.0*1024.0), total_gb, leak_gb, cumul_gb);
-
-        batches++;
-
-        /* Release MLX lock before save operations which are mostly I/O
-         * and before looping to get next batch */
-        mlx_global_unlock();
-
         /* Save policy matches Python:
          * - Save at intervals (batches % save_interval == 0)
          * - Save on last epoch (batches == max_batches)
          * - Skip first epoch unless num_iter == 1 */
-        int is_save_interval = (batches % opts->save_interval == 0);
-        int is_last_epoch = (batches == max_batches);
-        int not_first_or_single = (batches != 1 || max_batches == 1);
+        int is_save_interval = ((batches + 1) % opts->save_interval == 0);
+        int is_last_epoch = ((batches + 1) == max_batches);
+        int not_first_or_single = ((batches + 1) != 1 || max_batches == 1);
         int should_save = (is_save_interval || is_last_epoch) && not_first_or_single;
 
         if (should_save) {
@@ -2239,11 +2324,12 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
                                            ? masks_all_scales[sc]
                                            : mlx_array_new();
                 int save_rc = MLXTrainer_save_generated_facies(
-                                  trainer, sc, batches, spath, real_for_scale, mask_for_scale);
+                                  trainer, sc, batches + 1, spath, real_for_scale, mask_for_scale);
+                (void)save_rc;
             }
         }
 
-        /* Free saved real facies and masks copies for all scales */
+        /* Free saved real facies and masks copies for all scales BEFORE memory measurement */
         if (real_facies_all_scales) {
             for (int sc = 0; sc < nsc; ++sc) {
                 mlx_array_free(real_facies_all_scales[sc]);
@@ -2258,6 +2344,47 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
             free(masks_all_scales);
             masks_all_scales = NULL;
         }
+
+        /* Sync and clear cache for memory management */
+        mlx_synchronize(s);
+        if (clear_cache) {
+            mlx_clear_cache();
+        }
+#ifdef FG_MEM_DEBUG
+        /* Memory tracking: measure after ALL batch cleanup including array frees */
+        size_t mem_after_active = 0;
+        size_t mem_after_cache = 0;
+        size_t mem_after_peak = 0;
+        size_t rss_after = 0;
+        mlx_get_active_memory(&mem_after_active);
+        mlx_get_cache_memory(&mem_after_cache);
+        mlx_get_peak_memory(&mem_after_peak);
+        size_t mem_after = mem_after_active + mem_after_cache;
+        rss_after = mlx_get_process_rss_bytes();
+        /* Cast to signed to handle negative differences (memory freed) */
+        double leak_mb = (double)((int64_t)mem_after - (int64_t)mem_before) / (1024.0 * 1024.0);
+        double total_mb = (double)mem_after / (1024.0 * 1024.0);
+        double before_mb = (double)mem_before / (1024.0 * 1024.0);
+        double cumul_mb = (double)((int64_t)mem_after - (int64_t)mem_before_first) / (1024.0 * 1024.0);
+        double before_active_mb = (double)mem_before_active / (1024.0 * 1024.0);
+        double before_cache_mb = (double)mem_before_cache / (1024.0 * 1024.0);
+        double after_active_mb = (double)mem_after_active / (1024.0 * 1024.0);
+        double after_cache_mb = (double)mem_after_cache / (1024.0 * 1024.0);
+        double peak_mb = (double)mem_after_peak / (1024.0 * 1024.0);
+        double rss_before_mb = (double)rss_before / (1024.0 * 1024.0);
+        double rss_after_mb = (double)rss_after / (1024.0 * 1024.0);
+        fprintf(stderr,
+            "[MEM] batch=%d: before=%.2fMB after=%.2fMB leak=%.2fMB cumulative=%.2fMB "
+            "(active %.2f->%.2f MB, cache %.2f->%.2f MB, peak %.2f MB, rss %.2f->%.2f MB)\n",
+            batches, before_mb, total_mb, leak_mb, cumul_mb,
+            before_active_mb, after_active_mb, before_cache_mb, after_cache_mb,
+            peak_mb, rss_before_mb, rss_after_mb);
+#endif
+
+        batches++;
+
+        /* Release MLX lock before looping to get next batch */
+        mlx_global_unlock();
     }
 
     mlx_stream_free(s);

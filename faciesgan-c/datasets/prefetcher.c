@@ -101,7 +101,7 @@ PrefetcherHandle prefetcher_create(int max_queue, int device_index,
         p->stream = mlx_stream_new_device(p->device);
         p->use_device = 1;
     } else {
-        p->stream = mlx_default_cpu_stream_new();
+        p->stream = mlx_default_gpu_stream_new();
         p->use_device = 0;
     }
     return (PrefetcherHandle)p;

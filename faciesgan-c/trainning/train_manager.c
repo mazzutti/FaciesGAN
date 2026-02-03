@@ -156,11 +156,22 @@ int mlx_faciesgan_train_manager(MLXBaseManager *mgr, MLXOptimizer *opt_g,
 
                             /* invoke python packer to create generator.npz in scale_dir */
                             char cmd[PATH_MAX * 2];
+                            const char *venv = getenv("VIRTUAL_ENV");
+                            char venv_py[PATH_MAX];
+                            const char *py_exec = "python3";
+                            if (access(".venv/bin/python", X_OK) == 0) {
+                                py_exec = ".venv/bin/python";
+                            } else if (venv && venv[0]) {
+                                snprintf(venv_py, sizeof(venv_py), "%s/bin/python", venv);
+                                if (access(venv_py, X_OK) == 0) {
+                                    py_exec = venv_py;
+                                }
+                            }
                             snprintf(cmd, sizeof(cmd),
-                                     "python3 "
+                                     "%s "
                                      "'/Users/mazzutti/POSDOC/Experimentos/FaciesGAN/"
                                      "trainning/mlx-c/pack_scale_npz.py' '%s'",
-                                     scale_dir);
+                                     py_exec, scale_dir);
                             /* swallow return code; best-effort */
                             system(cmd);
                         }

@@ -6,14 +6,26 @@
 #include "generator.h"
 #include "optimizer.h"
 #include "train_utils.h"
+#include <mlx/c/transforms.h>
 #include <stdlib.h>
 
-/* Wrapper for mlx_array_eval. Always evaluates to force computation and
-   release resources. This is critical for memory management in MLX - without
-   eval, the computation graph keeps growing and Metal resources accumulate.
+/* Batch evaluate multiple arrays using mlx_eval() for better performance.
+   This mirrors Python's mx.eval(list_of_arrays) which evaluates all arrays
+   in a single batch, allowing MLX to optimize the computation graph and
+   memory allocation across all arrays.
 */
-static int safe_mlx_array_eval(mlx_array a) {
-    return mlx_array_eval(a);
+static int batch_eval_arrays(mlx_array *arrays, int n) {
+    if (!arrays || n <= 0)
+        return 0;
+    mlx_vector_array vec = mlx_vector_array_new();
+    for (int i = 0; i < n; ++i) {
+        if (arrays[i].ctx) {
+            mlx_vector_array_append_value(vec, arrays[i]);
+        }
+    }
+    int rc = mlx_eval(vec);
+    mlx_vector_array_free(vec);
+    return rc;
 }
 
 int mlx_faciesgan_apply_sgd_to_generator(MLXFaciesGAN *m, MLXOptimizer *opt,
@@ -311,6 +323,7 @@ int mlx_faciesgan_collect_metrics_and_grads(
         }
 
         AGValue *real = ag_value_from_array(facies_pyramid[scale], 0);
+        ag_register_temp_value(real);  /* Register to ensure cleanup */
 
         /* Discriminator forward and loss */
         AGValue *d_real = mlx_faciesgan_discriminator_forward_ag(m, real, scale);
@@ -581,76 +594,80 @@ int mlx_faciesgan_collect_metrics_and_grads(
                inspect/evaluate them */
         }
 
-        /* Store scalar metrics by evaluating AGValue components where available */
-        if (adv_comp) {
-            mlx_array *arr = ag_value_array(adv_comp);
-            if (arr) {
-                safe_mlx_array_eval(*arr);
+        /* Store scalar metrics by evaluating AGValue components where available.
+           Use batch_eval_arrays to evaluate all metrics in a single call,
+           matching Python's mx.eval(state_list) pattern for efficiency. */
+        {
+            /* Collect all metric arrays for batch evaluation */
+            mlx_array metric_arrays[5];
+            int metric_count = 0;
+            mlx_array *adv_arr = adv_comp ? ag_value_array(adv_comp) : NULL;
+            mlx_array *masked_arr = masked_comp ? ag_value_array(masked_comp) : NULL;
+            mlx_array *div_arr = div_comp ? ag_value_array(div_comp) : NULL;
+            mlx_array *rec_arr = rec_comp ? ag_value_array(rec_comp) : NULL;
+            mlx_array *loss_arr = gen_loss ? ag_value_array(gen_loss) : NULL;
+
+            if (adv_arr && adv_arr->ctx)
+                metric_arrays[metric_count++] = *adv_arr;
+            if (masked_arr && masked_arr->ctx)
+                metric_arrays[metric_count++] = *masked_arr;
+            if (div_arr && div_arr->ctx)
+                metric_arrays[metric_count++] = *div_arr;
+            if (rec_arr && rec_arr->ctx)
+                metric_arrays[metric_count++] = *rec_arr;
+            if (loss_arr && loss_arr->ctx)
+                metric_arrays[metric_count++] = *loss_arr;
+
+            /* Batch evaluate all metrics at once */
+            if (metric_count > 0)
+                batch_eval_arrays(metric_arrays, metric_count);
+
+            /* Now copy the evaluated arrays to the result structure */
+            if (adv_arr) {
                 mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *arr) == 0) {
+                if (mlx_array_set(&tmp, *adv_arr) == 0) {
                     sr->metrics.fake = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.fake, sizeof(mlx_array), 1) ==
-                            0)
+                    if (mlx_alloc_pod((void **)&sr->metrics.fake, sizeof(mlx_array), 1) == 0)
                         *sr->metrics.fake = tmp;
                 } else {
                     mlx_array_free(tmp);
                 }
             }
-        }
-        if (masked_comp) {
-            mlx_array *arr = ag_value_array(masked_comp);
-            if (arr) {
-                safe_mlx_array_eval(*arr);
+            if (masked_arr) {
                 mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *arr) == 0) {
+                if (mlx_array_set(&tmp, *masked_arr) == 0) {
                     sr->metrics.well = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.well, sizeof(mlx_array), 1) ==
-                            0)
+                    if (mlx_alloc_pod((void **)&sr->metrics.well, sizeof(mlx_array), 1) == 0)
                         *sr->metrics.well = tmp;
                 } else {
                     mlx_array_free(tmp);
                 }
             }
-        }
-        if (div_comp) {
-            mlx_array *arr = ag_value_array(div_comp);
-            if (arr) {
-                safe_mlx_array_eval(*arr);
+            if (div_arr) {
                 mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *arr) == 0) {
+                if (mlx_array_set(&tmp, *div_arr) == 0) {
                     sr->metrics.div = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.div, sizeof(mlx_array), 1) ==
-                            0)
+                    if (mlx_alloc_pod((void **)&sr->metrics.div, sizeof(mlx_array), 1) == 0)
                         *sr->metrics.div = tmp;
                 } else {
                     mlx_array_free(tmp);
                 }
             }
-        }
-        if (rec_comp) {
-            mlx_array *arr = ag_value_array(rec_comp);
-            if (arr) {
-                safe_mlx_array_eval(*arr);
+            if (rec_arr) {
                 mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *arr) == 0) {
+                if (mlx_array_set(&tmp, *rec_arr) == 0) {
                     sr->metrics.rec = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.rec, sizeof(mlx_array), 1) ==
-                            0)
+                    if (mlx_alloc_pod((void **)&sr->metrics.rec, sizeof(mlx_array), 1) == 0)
                         *sr->metrics.rec = tmp;
                 } else {
                     mlx_array_free(tmp);
                 }
             }
-        }
-        if (gen_loss) {
-            mlx_array *arr = ag_value_array(gen_loss);
-            if (arr) {
-                safe_mlx_array_eval(*arr);
+            if (loss_arr) {
                 mlx_array tmp = mlx_array_new();
-                if (mlx_array_set(&tmp, *arr) == 0) {
+                if (mlx_array_set(&tmp, *loss_arr) == 0) {
                     sr->metrics.total = NULL;
-                    if (mlx_alloc_pod((void **)&sr->metrics.total, sizeof(mlx_array),
-                                      1) == 0)
+                    if (mlx_alloc_pod((void **)&sr->metrics.total, sizeof(mlx_array), 1) == 0)
                         *sr->metrics.total = tmp;
                 } else {
                     mlx_array_free(tmp);

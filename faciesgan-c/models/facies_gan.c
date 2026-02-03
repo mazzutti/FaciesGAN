@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <mlx/c/io.h>
 #include <mlx/c/map.h>
+#include <mlx/c/transforms.h>
 #include <trainning/autodiff.h>
 #include <trainning/train_step.h>
 
@@ -123,7 +124,7 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
     }
 
     /* Use CPU stream for numeric ops */
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* Determine element count from first sample */
     mlx_array *first = fake_samples[0];
@@ -302,7 +303,7 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
         return 0;
     }
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     mlx_array fmasked = mlx_array_new();
     mlx_array rmasked = mlx_array_new();
@@ -395,10 +396,29 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
 void mlx_faciesgan_free(MLXFaciesGAN *m) {
     if (!m)
         return;
+    if (m->generator) {
+        mlx_generator_free(m->generator);
+        m->generator = NULL;
+    }
+    if (m->discriminator) {
+        mlx_discriminator_free(m->discriminator);
+        m->discriminator = NULL;
+    }
     if (m->shapes)
         mlx_free_int_array(&m->shapes, &m->n_shapes);
     if (m->noise_amps)
         mlx_free_float_buf(&m->noise_amps, NULL);
+    if (m->wells) {
+        for (int i = 0; i < m->n_wells; ++i) {
+            if (m->wells[i]) {
+                mlx_array_free(*m->wells[i]);
+                mlx_free_pod((void **)&m->wells[i]);
+            }
+        }
+        mlx_free_pod((void **)&m->wells);
+        m->wells = NULL;
+        m->n_wells = 0;
+    }
     mlx_free_pod((void **)&m);
 }
 
@@ -784,7 +804,7 @@ AGValue *mlx_faciesgan_generator_forward_ag(MLXFaciesGAN *m, AGValue **z_list,
             int c = m->num_img_channels > 0 ? m->num_img_channels : 3;
             int shape[4] = {batch, h, w, c};
             mlx_array zeros = mlx_array_new();
-            mlx_stream s = mlx_default_cpu_stream_new();
+            mlx_stream s = mlx_default_gpu_stream_new();
             if (mlx_zeros(&zeros, shape, 4, MLX_FLOAT32, s) == 0) {
                 out_facie = ag_value_from_new_array(&zeros, 0);
                 ag_register_temp_value(out_facie);
@@ -1009,7 +1029,7 @@ AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
                 mlx_array a = mlx_array_new();
                 mlx_array low = mlx_array_new_float(0.0f);
                 mlx_array high = mlx_array_new_float(1.0f);
-                mlx_stream s2 = mlx_default_cpu_stream_new();
+                mlx_stream s2 = mlx_default_gpu_stream_new();
                 if (mlx_random_uniform(&a, low, high, shape, 4, MLX_FLOAT32,
                                        mlx_array_empty, s2) == 0) {
                     alpha = ag_value_from_new_array(&a, 0);
@@ -1068,7 +1088,7 @@ AGValue *mlx_faciesgan_compute_gradient_penalty_ag(MLXFaciesGAN *m,
                 int high_pad[2] = {high_h, high_w};
                 mlx_array pad_zero = mlx_array_new_float(0.0f);
                 mlx_array padded = mlx_array_new();
-                mlx_stream s2 = mlx_default_cpu_stream_new();
+                mlx_stream s2 = mlx_default_gpu_stream_new();
                 if (mlx_pad(&padded, *rarr2, axes_pad, 2, low_pad, 2, high_pad, 2,
                             pad_zero, "constant", s2) == 0) {
                     /* wrap padded real as new AGValue and use it instead of original */
@@ -1306,10 +1326,11 @@ AGValue *mlx_faciesgan_generator_forward_ag_with_params(
         return NULL;
     }
 
-    /* Prepare z input arrays (non-owning copies of AGValue arrays). */
+    /* Prepare z input arrays (non-owning shallow copies of AGValue arrays). */
     mlx_array *zvals = NULL;
     if (z_count > 0 && z_list) {
-        if (mlx_alloc_mlx_array_vals(&zvals, z_count) != 0) {
+        zvals = (mlx_array *)malloc(sizeof(mlx_array) * (size_t)z_count);
+        if (!zvals) {
             if (out_params)
                 *out_params = NULL;
             if (out_n_params)
@@ -1338,8 +1359,19 @@ AGValue *mlx_faciesgan_generator_forward_ag_with_params(
         mlx_generator_forward(m->generator, (const mlx_array *)zvals, z_count,
                               amp, amp_count, in_arr, start_scale, stop_scale);
 
-    if (zvals)
-        mlx_free_mlx_array_vals(&zvals, z_count);
+    /* Free only the container, not the arrays inside (they're owned by z_list AGValues) */
+    if (zvals) {
+        /* Free any empty arrays we created (ctx from mlx_array_new when a was NULL) */
+        for (int i = 0; i < z_count; ++i) {
+            mlx_array *a = ag_value_array(z_list[i]);
+            if (!a) {
+                /* This was an empty array we created, safe to free */
+                mlx_array_free(zvals[i]);
+            }
+        }
+        free(zvals);
+        zvals = NULL;
+    }
 
     AGValue *out_ag = ag_value_from_new_array(&numeric_out, 0);
     mlx_array_free(numeric_out);  /* free original after copy */
@@ -1622,7 +1654,7 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
             /* Fallback defaults: base_channel vs gen_input_channels */
             c = cond_present ? m->base_channel : m->gen_input_channels;
         }
-        mlx_stream s = mlx_default_cpu_stream_new();
+        mlx_stream s = mlx_default_gpu_stream_new();
         mlx_array *a = NULL;
         if (mlx_alloc_pod((void **)&a, sizeof(mlx_array), 1) != 0) {
             for (int j = 0; j < n; ++j) {
@@ -1884,7 +1916,7 @@ int mlx_faciesgan_load_generator_state(MLXFaciesGAN *m, const char *scale_path,
     char file[1024];
     snprintf(file, sizeof(file), "%s/generator.npz", scale_path);
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_map_string_to_array map;
     mlx_map_string_to_string meta;
     if (mlx_load_safetensors(&map, &meta, file, s) != 0) {
@@ -1928,7 +1960,7 @@ int mlx_faciesgan_load_discriminator_state(MLXFaciesGAN *m,
     char file[1024];
     snprintf(file, sizeof(file), "%s/discriminator.npz", scale_path);
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_map_string_to_array map;
     mlx_map_string_to_string meta;
     if (mlx_load_safetensors(&map, &meta, file, s) != 0) {
@@ -1997,7 +2029,7 @@ int mlx_faciesgan_load_shape(MLXFaciesGAN *m, const char *scale_path,
     char file[1024];
     snprintf(file, sizeof(file), "%s/shape.npz", scale_path);
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_map_string_to_array map;
     mlx_map_string_to_string meta;
     if (mlx_load_safetensors(&map, &meta, file, s) != 0) {
@@ -2520,7 +2552,7 @@ int mlx_faciesgan_compute_recovery_loss(
     }
 
     /* Compute simple numeric MSE between rec_in and real, then scale by alpha. */
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array diff = mlx_array_new();
     if (mlx_subtract(&diff, rec_in, real, s) != 0) {
         mlx_stream_free(s);
@@ -2604,7 +2636,7 @@ AGValue *mlx_faciesgan_compute_recovery_loss_ag(
             /* handle the pattern discovered in logs: rec_in ndim==5 and
                a singleton second axis */
             if (r_nd == 5 && r_sh && r_sh[1] == 1 && s_nd == 4) {
-                mlx_stream _s = mlx_default_cpu_stream_new();
+                mlx_stream _s = mlx_default_gpu_stream_new();
                 mlx_array tmp = mlx_array_new();
                 int new_shape[4] = {r_sh[0], r_sh[2], r_sh[3], r_sh[4]};
                 if (mlx_reshape(&tmp, *rarr, new_shape, 4, _s) == 0) {
@@ -2672,38 +2704,46 @@ AGValue *mlx_faciesgan_compute_recovery_loss_ag(
 /* Evaluate all model parameters (parity with Python mx.eval(self.model.state)).
  * This forces lazy computation graphs to materialize and releases intermediate
  * arrays, preventing memory accumulation during training.
+ * Uses batched mlx_eval() to match Python's mx.eval([generator.state, discriminator.state]).
  */
 int mlx_faciesgan_eval_all_parameters(MLXFaciesGAN *m) {
     if (!m)
         return -1;
 
-    /* Evaluate all generator parameters */
+    /* Collect all parameters into a single vector for batched eval */
+    mlx_vector_array param_vec = mlx_vector_array_new();
+
+    /* Collect all generator parameters */
     if (m->generator) {
         int gen_n = 0;
         mlx_array **gen_params = mlx_generator_get_parameters(m->generator, &gen_n);
         if (gen_params && gen_n > 0) {
             for (int i = 0; i < gen_n; ++i) {
                 if (gen_params[i] && gen_params[i]->ctx) {
-                    mlx_array_eval(*gen_params[i]);
+                    mlx_vector_array_append_value(param_vec, *gen_params[i]);
                 }
             }
             mlx_generator_free_parameters_list(gen_params);
         }
     }
 
-    /* Evaluate all discriminator parameters */
+    /* Collect all discriminator parameters */
     if (m->discriminator) {
         int disc_n = 0;
         mlx_array **disc_params = mlx_discriminator_get_parameters(m->discriminator, &disc_n);
         if (disc_params && disc_n > 0) {
             for (int i = 0; i < disc_n; ++i) {
                 if (disc_params[i] && disc_params[i]->ctx) {
-                    mlx_array_eval(*disc_params[i]);
+                    mlx_vector_array_append_value(param_vec, *disc_params[i]);
                 }
             }
             mlx_discriminator_free_parameters_list(disc_params);
         }
     }
+
+    /* Batch eval all parameters at once */
+    mlx_eval(param_vec);
+    mlx_vector_array_free(param_vec);
 
     return 0;
 }

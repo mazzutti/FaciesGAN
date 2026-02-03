@@ -213,7 +213,7 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
     for (int si = 0; si < N; ++si) {
         mlx_vector_array fac_sample = mlx_vector_array_new();
         for (int sidx = 0; sidx < n_fac_scales; ++sidx) {
-            mlx_stream s = mlx_default_cpu_stream_new();
+            mlx_stream s = mlx_default_gpu_stream_new();
             mlx_array elem = mlx_array_new();
             int appended = 0;
             if (fac_scales && mlx_array_ndim(fac_scales[sidx]) > 0) {
@@ -298,7 +298,7 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
             mlx_vector_array well_sample = mlx_vector_array_new();
             mlx_vector_array mask_sample = mlx_vector_array_new();
             for (int sidx = 0; sidx < n_wells_scales; ++sidx) {
-                mlx_stream s = mlx_default_cpu_stream_new();
+                mlx_stream s = mlx_default_gpu_stream_new();
                 mlx_array elem = mlx_array_new();
                 int appended = 0;
                 if (wells_scales && mlx_array_ndim(wells_scales[sidx]) > 0) {
@@ -369,7 +369,9 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                     int mfound = 0;
                     if (npz_extract_member_to_mlx_reader(npz_path, mmember, &mr) == 0) {
                         mlx_array m = mlx_array_new();
-                        if (mlx_load_reader(&m, mr, s) == 0) {
+                        mlx_stream load_s = mlx_default_cpu_stream_new();  /* Load needs CPU */
+                        if (mlx_load_reader(&m, mr, load_s) == 0) {
+                            mlx_stream_free(load_s);
                             mlx_io_reader_free(mr);
                             if (mlx_vector_array_append_value(mask_sample, m) != 0) {
                                 mlx_array_free(m);
@@ -381,6 +383,7 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                             mlx_array_free(m);
                             mfound = 1;
                         } else {
+                            mlx_stream_free(load_s);
                             mlx_io_reader_free(mr);
                         }
                     }
@@ -445,7 +448,7 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
         if (n_seis_scales > 0 && seis_scales) {
             mlx_vector_array seis_sample = mlx_vector_array_new();
             for (int sidx = 0; sidx < n_seis_scales; ++sidx) {
-                mlx_stream s = mlx_default_cpu_stream_new();
+                mlx_stream s = mlx_default_gpu_stream_new();
                 mlx_array elem = mlx_array_new();
                 int appended = 0;
                 if (seis_scales && mlx_array_ndim(seis_scales[sidx]) > 0) {
@@ -897,7 +900,7 @@ int mlx_pyramids_dataset_get_scale_stack(MLXPyramidsDataset *ds, int scale,
         mlx_vector_array_free(sample);
     }
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array stacked = mlx_array_new();
     size_t vec_n = mlx_vector_array_size(scale_vec);
     if (vec_n == 0) {
@@ -906,7 +909,7 @@ int mlx_pyramids_dataset_get_scale_stack(MLXPyramidsDataset *ds, int scale,
         mlx_array_free(stacked);
         int shape0[4] = {0, h, w, c};
         if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32,
-                      mlx_default_cpu_stream_new()) != 0) {
+                      mlx_default_gpu_stream_new()) != 0) {
             return -1;
         }
     } else {
@@ -974,7 +977,7 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         int zeros_shape[4] = {0, h, w, c};
         int dtype = (int)mlx_array_dtype(first);
         mlx_array_free(first);
-        mlx_stream s = mlx_default_cpu_stream_new();
+        mlx_stream s = mlx_default_gpu_stream_new();
         mlx_array z = mlx_array_new();
         int rc = mlx_zeros(&z, zeros_shape, 4, dtype, s);
         mlx_stream_free(s);
@@ -1010,7 +1013,7 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         mlx_vector_array_free(sample);
     }
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array stacked = mlx_array_new();
     size_t vec_n = mlx_vector_array_size(scale_vec);
     if (vec_n == 0) {
@@ -1033,7 +1036,7 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         int dtype = (int)mlx_array_dtype(first);
         mlx_array_free(first);
         mlx_array z = mlx_array_new();
-        if (mlx_zeros(&z, zeros_shape, 4, dtype, mlx_default_cpu_stream_new()) != 0)
+        if (mlx_zeros(&z, zeros_shape, 4, dtype, mlx_default_gpu_stream_new()) != 0)
             return -1;
         *out = z;
         return 0;
@@ -1267,29 +1270,23 @@ static int _serialize_array_to_npy_bytes_local(const mlx_array arr,
         size_t *out_size) {
     if (!out_buf || !out_size)
         return -1;
-    /* Ensure array is materialized on CPU before calling mlx_save_writer,
-     * which may trigger device-specific encoders (Metal) if the array is
-     * device-backed. Copy to a CPU stream into a temporary array and save
-     * that buffer instead. */
+    
+    /* Use CPU stream for I/O - mlx_save_writer doesn't support GPU eval */
     mlx_stream cpu_s = mlx_default_cpu_stream_new();
-    mlx_array cpu_arr = mlx_array_new();
-    int copied = mlx_copy(&cpu_arr, arr, cpu_s);
-    /* If copy fails, fall back to saving original array (best-effort). */
+    
+    /* Synchronize to ensure any pending GPU ops are complete */
+    mlx_synchronize(cpu_s);
 
-    size_t nbytes = mlx_array_nbytes(copied == 0 ? cpu_arr : arr);
+    size_t nbytes = mlx_array_nbytes(arr);
     size_t bufsize = nbytes + 4096;
     void *data = malloc(bufsize);
     if (!data) {
-        if (copied == 0)
-            mlx_array_free(cpu_arr);
         mlx_stream_free(cpu_s);
         return -1;
     }
     mlx_mem_stream *m = NULL;
     if (mlx_alloc_pod((void **)&m, sizeof(mlx_mem_stream), 1) != 0) {
         free(data);
-        if (copied == 0)
-            mlx_array_free(cpu_arr);
         mlx_stream_free(cpu_s);
         return -1;
     }
@@ -1300,16 +1297,9 @@ static int _serialize_array_to_npy_bytes_local(const mlx_array arr,
     m->free_data = true;
 
     mlx_io_writer writer = mlx_io_writer_new(m, mlx_io_vtable_mlx_mem_stream);
-    int save_rc = 0;
-    if (copied == 0) {
-        save_rc = mlx_save_writer(writer, cpu_arr);
-    } else {
-        save_rc = mlx_save_writer(writer, arr);
-    }
+    int save_rc = mlx_save_writer(writer, arr);
     if (save_rc != 0) {
         mlx_io_writer_free(writer);
-        if (copied == 0)
-            mlx_array_free(cpu_arr);
         mlx_stream_free(cpu_s);
         return -1;
     }
@@ -1317,15 +1307,11 @@ static int _serialize_array_to_npy_bytes_local(const mlx_array arr,
     void *buf = malloc(used);
     if (!buf) {
         mlx_io_writer_free(writer);
-        if (copied == 0)
-            mlx_array_free(cpu_arr);
         mlx_stream_free(cpu_s);
         return -1;
     }
     memcpy(buf, m->data, used);
     mlx_io_writer_free(writer);
-    if (copied == 0)
-        mlx_array_free(cpu_arr);
     mlx_stream_free(cpu_s);
     *out_buf = buf;
     *out_size = used;

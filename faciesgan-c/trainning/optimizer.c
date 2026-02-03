@@ -10,6 +10,7 @@
 /* Note: includes that reference mlx-c are left unchanged (mlx-c submodule) */
 #include "../mlx-c/mlx/c/io.h"
 #include "../mlx-c/mlx/c/io_types.h"
+#include <mlx/c/transforms.h>
 
 /* Global default Adam hyperparameters (modifiable by launcher). */
 static float g_def_beta1 = 0.9f;
@@ -99,22 +100,32 @@ void mlx_adam_free(MLXOptimizer *opt) {
 void mlx_optimizer_eval_state(MLXOptimizer *opt) {
     if (!opt)
         return;
-    /* Evaluate all m (first moment) arrays */
+    /* Batch evaluate all optimizer state arrays using mlx_eval() for better
+       performance. This mirrors Python's mx.eval(optimizer.state) pattern. */
+    mlx_vector_array vec = mlx_vector_array_new();
+    
+    /* Collect all m (first moment) arrays */
     if (opt->m) {
         for (int i = 0; i < opt->param_n; ++i) {
             if (opt->m[i] && opt->m[i]->ctx) {
-                mlx_array_eval(*opt->m[i]);
+                mlx_vector_array_append_value(vec, *opt->m[i]);
             }
         }
     }
-    /* Evaluate all v (second moment) arrays */
+    /* Collect all v (second moment) arrays */
     if (opt->v) {
         for (int i = 0; i < opt->param_n; ++i) {
             if (opt->v[i] && opt->v[i]->ctx) {
-                mlx_array_eval(*opt->v[i]);
+                mlx_vector_array_append_value(vec, *opt->v[i]);
             }
         }
     }
+    
+    /* Batch evaluate all optimizer state at once */
+    if (mlx_vector_array_size(vec) > 0) {
+        mlx_eval(vec);
+    }
+    mlx_vector_array_free(vec);
 }
 
 int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
@@ -126,7 +137,7 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
 
     /* Lazy init per-parameter state on first call (or explicit init via wrapper)
      */
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     if (opt->param_n == 0) {
         mlx_stream tmp_s = s; /* pass stream into helper */
         mlx_optimizer_init_from_params(opt, params, n);
@@ -448,7 +459,7 @@ void mlx_optimizer_init_from_params(MLXOptimizer *opt, mlx_array **params,
                                     int n) {
     if (!opt || !params || n <= 0)
         return;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     opt->param_n = n;
     if (mlx_alloc_mlx_array_ptrs(&opt->m, n) != 0) {
         opt->param_n = 0;
@@ -839,7 +850,7 @@ int mlx_optimizer_save_to_npz(MLXOptimizer *opt, const char *npz_path) {
 int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
     if (!opt || !npz_path)
         return -1;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* per-parameter m/v: try m_0.npy/v_0.npy ... if present */
     for (int i = 0; i < opt->param_n; ++i) {
         char nm[64];

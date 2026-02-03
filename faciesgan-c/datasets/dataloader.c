@@ -292,6 +292,24 @@ int facies_dataloader_new(struct MLXDataloader **out, MLXPyramidsDataset *ds,
                false, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL);
 }
 
+/* Helper to free partially allocated tasks on error in build_tasks */
+static void free_partial_tasks(struct MLXDataloader *dl, size_t allocated_count) {
+    if (!dl)
+        return;
+    if (dl->tasks) {
+        for (size_t i = 0; i < allocated_count; ++i) {
+            if (dl->tasks[i])
+                mlx_free_pod((void **)&dl->tasks[i]);
+        }
+        free(dl->tasks);
+        dl->tasks = NULL;
+    }
+    if (dl->task_sizes) {
+        free(dl->task_sizes);
+        dl->task_sizes = NULL;
+    }
+}
+
 static int build_tasks(struct MLXDataloader *dl) {
     if (!dl)
         return 1;
@@ -305,16 +323,22 @@ static int build_tasks(struct MLXDataloader *dl) {
         size_t t = 0;
         dl->tasks = (size_t **)calloc(cap, sizeof(size_t *));
         dl->task_sizes = (int *)calloc(cap, sizeof(int));
-        if (!dl->tasks || !dl->task_sizes)
+        if (!dl->tasks || !dl->task_sizes) {
+            free_partial_tasks(dl, 0);
             return 1;
+        }
         size_t *buf = NULL;
         if (bs > (size_t)INT_MAX) {
             buf = (size_t *)malloc(sizeof(size_t) * bs);
-            if (!buf)
+            if (!buf) {
+                free_partial_tasks(dl, 0);
                 return 1;
+            }
         } else {
-            if (mlx_alloc_pod((void **)&buf, sizeof(size_t), (int)bs) != 0)
+            if (mlx_alloc_pod((void **)&buf, sizeof(size_t), (int)bs) != 0) {
+                free_partial_tasks(dl, 0);
                 return 1;
+            }
         }
         while (1) {
             int out_count = 0;
@@ -324,6 +348,7 @@ static int build_tasks(struct MLXDataloader *dl) {
                 break;
             if (rc != 0) {
                 free(buf);
+                free_partial_tasks(dl, t);
                 return 1;
             }
             if (out_count <= 0)
@@ -337,6 +362,7 @@ static int build_tasks(struct MLXDataloader *dl) {
                 if (mlx_alloc_pod((void **)&dl->tasks[t], sizeof(size_t), out_count) !=
                         0) {
                     free(buf);
+                    free_partial_tasks(dl, t);
                     return 1;
                 }
             } else
@@ -358,16 +384,22 @@ static int build_tasks(struct MLXDataloader *dl) {
         size_t t = 0;
         dl->tasks = (size_t **)calloc(cap, sizeof(size_t *));
         dl->task_sizes = (int *)calloc(cap, sizeof(int));
-        if (!dl->tasks || !dl->task_sizes)
+        if (!dl->tasks || !dl->task_sizes) {
+            free_partial_tasks(dl, 0);
             return 1;
+        }
         size_t *buf = NULL;
         if (bs > (size_t)INT_MAX) {
             buf = (size_t *)malloc(sizeof(size_t) * bs);
-            if (!buf)
+            if (!buf) {
+                free_partial_tasks(dl, 0);
                 return 1;
+            }
         } else {
-            if (mlx_alloc_pod((void **)&buf, sizeof(size_t), (int)bs) != 0)
+            if (mlx_alloc_pod((void **)&buf, sizeof(size_t), (int)bs) != 0) {
+                free_partial_tasks(dl, 0);
                 return 1;
+            }
         }
         while (1) {
             int filled = 0;
@@ -379,6 +411,7 @@ static int build_tasks(struct MLXDataloader *dl) {
                 }
                 if (rc != 0) {
                     free(buf);
+                    free_partial_tasks(dl, t);
                     return 1;
                 }
                 buf[filled++] = idx;
@@ -394,6 +427,7 @@ static int build_tasks(struct MLXDataloader *dl) {
                 if (mlx_alloc_pod((void **)&dl->tasks[t], sizeof(size_t), filled) !=
                         0) {
                     free(buf);
+                    free_partial_tasks(dl, t);
                     return 1;
                 }
             } else
@@ -415,8 +449,10 @@ static int build_tasks(struct MLXDataloader *dl) {
     size_t ntasks = max_full + (rem && !dl->drop_last ? 1 : 0);
     dl->tasks = (size_t **)calloc(ntasks, sizeof(size_t *));
     dl->task_sizes = (int *)calloc(ntasks, sizeof(int));
-    if (!dl->tasks || !dl->task_sizes)
+    if (!dl->tasks || !dl->task_sizes) {
+        free_partial_tasks(dl, 0);
         return 1;
+    }
     size_t off = 0;
     size_t t = 0;
     while (off < n && t < ntasks) {
@@ -424,8 +460,10 @@ static int build_tasks(struct MLXDataloader *dl) {
         if (off + cur > n)
             cur = n - off;
         if (cur > 0) {
-            if (mlx_alloc_pod((void **)&dl->tasks[t], sizeof(size_t), (int)cur) != 0)
+            if (mlx_alloc_pod((void **)&dl->tasks[t], sizeof(size_t), (int)cur) != 0) {
+                free_partial_tasks(dl, t);
                 return 1;
+            }
         } else
             dl->tasks[t] = NULL;
         for (size_t i = 0; i < cur; ++i)
@@ -522,7 +560,7 @@ static void *worker_thread(void *arg) {
     struct pthread_worker_arg *wa = (struct pthread_worker_arg *)arg;
     struct MLXDataloader *dl = wa->dl;
     int worker_id = wa->worker_id;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* worker-local epoch tracking */
     uint64_t local_epoch = (uint64_t)-1;
     while (1) {
@@ -1035,7 +1073,7 @@ static int worker_process_loop(int task_fd, int result_fd,
         facies_collate_fn cb =
             collate_cb ? collate_cb : (facies_collate_fn)facies_collate;
         int rc = cb(&out_fac, &out_w, &out_s, batch_fac, batch_wells, batch_seis,
-                    mlx_default_cpu_stream_new(), collate_ctx);
+                    mlx_default_gpu_stream_new(), collate_ctx);
         mlx_vector_vector_array_free(batch_fac);
         mlx_vector_vector_array_free(batch_wells);
         mlx_vector_vector_array_free(batch_seis);
@@ -1470,7 +1508,7 @@ int facies_dataloader_new_ex(
     if (dl->num_workers > 0) {
         /* ensure MLX runtime globals are initialized in main thread before
          * spawning worker threads/processes to avoid concurrent static init */
-        mlx_stream _init_s = mlx_default_cpu_stream_new();
+        mlx_stream _init_s = mlx_default_gpu_stream_new();
         mlx_stream_free(_init_s);
 #ifdef __APPLE__
         /* On macOS, forking after libraries that create GPU/dispatch resources

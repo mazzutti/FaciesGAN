@@ -10,6 +10,12 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON CACHE BOOL "Export compile_commands.json fo
 # Option to enable AddressSanitizer for debugging memory issues
 option(ENABLE_ASAN "Enable AddressSanitizer" OFF)
 
+# Option to enable MLX array memory leak tracking
+option(ENABLE_MLX_MEM_DEBUG "Enable MLX array memory leak tracking" OFF)
+
+# Option to enable per-batch memory usage tracking (FG_MEM_DEBUG)
+option(ENABLE_FG_MEM_DEBUG "Enable per-batch GPU/RSS memory usage display" OFF)
+
 if(ENABLE_ASAN)
   message(STATUS "AddressSanitizer: enabled (building with -fsanitize=address)")
   if(CMAKE_C_COMPILER_ID MATCHES "Clang" OR CMAKE_C_COMPILER_ID MATCHES "GNU")
@@ -18,6 +24,16 @@ if(ENABLE_ASAN)
   else()
     message(WARNING "ENABLE_ASAN set but compiler is not Clang/GNU; skipping sanitizer flags")
   endif()
+endif()
+
+if(ENABLE_MLX_MEM_DEBUG)
+  message(STATUS "MLX memory debugging: enabled (MLX_MEM_DEBUG defined)")
+  add_compile_definitions(MLX_MEM_DEBUG)
+endif()
+
+if(ENABLE_FG_MEM_DEBUG)
+  message(STATUS "FaciesGAN memory tracking: enabled (FG_MEM_DEBUG defined)")
+  add_compile_definitions(FG_MEM_DEBUG)
 endif()
 
 
@@ -41,7 +57,10 @@ else()
 endif()
 
 # Library target for our custom layers
-add_library(custom_layer SHARED
+# NOTE: Must be STATIC (not SHARED) to avoid duplicate MLX singleton instances.
+# If this is a SHARED library, the dylib gets its own copy of the MLX Metal
+# allocator, causing memory tracking to be split between two allocator instances.
+add_library(custom_layer STATIC
   faciesgan-c/models/custom_layer.c
 )
 
@@ -66,6 +85,8 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/trainning/python_entry.c
   faciesgan-c/trainning/train_utils.c
   faciesgan-c/trainning/mlx_compat.c
+  faciesgan-c/trainning/mem_debug.c
+  faciesgan-c/trainning/mlx_error_trace.c
   faciesgan-c/io/npz_create.c
   faciesgan-c/io/npz_unzip.c
   faciesgan-c/third_party/miniz.c
@@ -73,6 +94,9 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/third_party/miniz_tinfl.c
   faciesgan-c/third_party/miniz_zip.c
   # faciesgan-c/trainning/c_trainer_api.c
+)
+set_source_files_properties(faciesgan-c/trainning/mem_debug.c PROPERTIES
+  COMPILE_DEFINITIONS MLX_MEM_NO_WRAP=1
 )
 
 target_include_directories(custom_layer
@@ -83,6 +107,7 @@ target_include_directories(custom_layer
 )
 
 target_include_directories(custom_layer PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c/third_party)
+target_compile_options(custom_layer PRIVATE -include ${PROJECT_SOURCE_DIR}/faciesgan-c/trainning/mem_debug.h)
 
 
 # If MLXC was found, link against its target `mlxc` (installed by mlx-c)
@@ -103,8 +128,11 @@ set_target_properties(custom_layer PROPERTIES
   POSITION_INDEPENDENT_CODE ON
 )
 
-# Small shared library providing the C prefetcher used by Python wrappers.
-add_library(facies_prefetcher SHARED
+# Small static library providing the C prefetcher.
+# NOTE: Must be STATIC (not SHARED) to avoid duplicate MLX singleton instances.
+# If this is a SHARED library, the dylib gets its own copy of the MLX Metal
+# allocator, causing memory tracking to be split between two allocator instances.
+add_library(facies_prefetcher STATIC
   faciesgan-c/datasets/prefetcher.c
   faciesgan-c/datasets/collate.c
   faciesgan-c/datasets/dataloader.c
@@ -117,6 +145,7 @@ target_include_directories(facies_prefetcher
     ${PROJECT_SOURCE_DIR}/faciesgan-c
     ${PROJECT_SOURCE_DIR}/faciesgan-c/datasets
 )
+target_compile_options(facies_prefetcher PRIVATE -include ${PROJECT_SOURCE_DIR}/faciesgan-c/trainning/mem_debug.h)
 
 # Optionally enable STB-based C generator. To use, place `stb_image.h` and
 # `stb_image_resize.h` under `faciesgan-c/third_party` and run cmake with
@@ -178,6 +207,7 @@ add_executable(faciesgan
 
 target_include_directories(faciesgan PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c ${PROJECT_SOURCE_DIR}/mlx-c)
 target_link_libraries(faciesgan PRIVATE facies_prefetcher custom_layer mlxc)
+target_compile_options(faciesgan PRIVATE -include ${PROJECT_SOURCE_DIR}/faciesgan-c/trainning/mem_debug.h)
 
 # Include the C-native trainer implementation so the executable provides a
 # runtime `MLXTrainer_run_full` implementation (used when running the
@@ -185,6 +215,7 @@ target_link_libraries(faciesgan PRIVATE facies_prefetcher custom_layer mlxc)
 # stub to avoid linking dataset internals into the shared library; the
 # executable should supply the real implementation.
 target_sources(faciesgan PRIVATE faciesgan-c/trainning/mlx_trainer_api.c)
+target_sources(faciesgan PRIVATE faciesgan-c/trainning/mlx_error_trace.c)
 target_sources(faciesgan PRIVATE faciesgan-c/trainer.c)
 target_sources(faciesgan PRIVATE faciesgan-c/cli/options_builder.c)
 target_sources(faciesgan PRIVATE faciesgan-c/cli/cli_args.c)

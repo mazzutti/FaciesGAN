@@ -4,9 +4,11 @@
 
 #include "pybridge.h"
 #include "trainning/common_helpers.h"
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #include <wchar.h>
 
 #ifdef __has_include
@@ -78,30 +80,29 @@ int pybridge_initialize(void) {
 
     /* Set up Python configuration before initialization to use venv if available */
     const char *venv = getenv("VIRTUAL_ENV");
-    if (venv && venv[0]) {
-        /* Pre-initialize config to set the venv Python as the executable */
-        PyConfig config;
-        PyConfig_InitPythonConfig(&config);
-
-        char py_path[4096];
-        snprintf(py_path, sizeof(py_path), "%s/bin/python", venv);
-
-        /* Use PyConfig_SetBytesString to properly set executable */
-        PyStatus status = PyConfig_SetBytesString(&config, &config.executable, py_path);
-        if (PyStatus_Exception(status)) {
-            PyConfig_Clear(&config);
-            Py_Initialize();
-        } else {
-            status = PyConfig_SetBytesString(&config, &config.program_name, py_path);
-            if (PyStatus_Exception(status)) {
-            }
-            status = Py_InitializeFromConfig(&config);
-            PyConfig_Clear(&config);
-
-            if (PyStatus_Exception(status)) {
-                Py_Initialize();
-            }
+    char venv_abs[PATH_MAX];
+    if (!venv || !venv[0]) {
+        /* Prefer local .venv if present */
+        if (access(".venv/bin/python", X_OK) == 0) {
+            venv = ".venv";
         }
+    }
+    if (venv && venv[0]) {
+        const char *venv_res = venv;
+        if (realpath(venv, venv_abs) != NULL) {
+            venv_res = venv_abs;
+        }
+        venv = venv_res;
+        setenv("VIRTUAL_ENV", venv, 1);
+    }
+    if (venv && venv[0]) {
+        /* Prefer classic APIs to avoid getpath.py failures with venv embeds. */
+        char py_path[PATH_MAX];
+        snprintf(py_path, sizeof(py_path), "%s/bin/python", venv);
+        static wchar_t py_w[PATH_MAX];
+        mbstowcs(py_w, py_path, PATH_MAX - 1);
+        Py_SetProgramName(py_w);
+        Py_Initialize();
     } else {
         Py_Initialize();
     }
@@ -122,6 +123,7 @@ int pybridge_initialize(void) {
             "    if os.path.exists(py):\n"
             "        sys.executable = py\n"
             "        sys._base_executable = py\n"
+            "        os.environ['PYTHONEXECUTABLE'] = py\n"
             "    # Add venv site-packages to path\n"
             "    import glob\n"
             "    sp = glob.glob(os.path.join(venv, 'lib', 'python*', 'site-packages'))\n"
@@ -132,6 +134,34 @@ int pybridge_initialize(void) {
             "    site.main()\n"
         );
     }
+
+    /* Ensure multiprocessing spawn uses a real python executable.
+     * Without this, embedded Python may default to the C binary, causing
+     * errors like "unrecognized option -c" in child processes. */
+    PyRun_SimpleString(
+        "import os, sys, shutil\n"
+        "py = getattr(sys, 'executable', '') or ''\n"
+        "venv = os.environ.get('VIRTUAL_ENV', '')\n"
+        "if venv:\n"
+        "    vpy = os.path.join(venv, 'bin', 'python')\n"
+        "    if os.path.exists(vpy):\n"
+        "        py = vpy\n"
+        "if not py or os.path.basename(py) in ('faciesgan', 'faciesgan.exe'):\n"
+        "    py = shutil.which('python3') or shutil.which('python') or py\n"
+        "if py:\n"
+        "    sys.executable = py\n"
+        "    os.environ['PYTHONEXECUTABLE'] = py\n"
+        "    try:\n"
+        "        import multiprocessing as _mp\n"
+        "        _mp.set_executable(py)\n"
+        "        try:\n"
+        "            import multiprocessing.spawn as _s\n"
+        "            _s._python_exe = py.encode()\n"
+        "        except Exception:\n"
+        "            pass\n"
+        "    except Exception:\n"
+        "        pass\n"
+    );
 
     /* Also set multiprocessing start method to 'spawn' for safety */
     PyRun_SimpleString(

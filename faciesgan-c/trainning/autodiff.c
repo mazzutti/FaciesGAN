@@ -2,11 +2,24 @@
 #include "array_helpers.h"
 #include "mlx_compat.h"
 #include <mlx/c/mlx.h>
+#include <mlx/c/memory.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <execinfo.h>
+
+/* Debug helper to print current GPU memory usage */
+static void ag_debug_mem(const char *label) {
+    static int debug_enabled = -1;
+    if (debug_enabled < 0) {
+        debug_enabled = getenv("FG_MEM_STEP_TRACE") ? 1 : 0;
+    }
+    if (!debug_enabled) return;
+    size_t active = 0;
+    mlx_get_active_memory(&active);
+    fprintf(stderr, "[MEM_AG] %s: %.2f MB\n", label, (double)active / (1024.0 * 1024.0));
+}
 
 /* Minimal reverse-mode autodiff implementation.
    This records a simple tape of nodes and supports backprop for a
@@ -173,7 +186,7 @@ static void accumulate_into_ag(AGValue *target, AGValue *contrib) {
         AGValue *contrib_to_add = reduced_contrib;
 
         if (grad_ndim != contrib_ndim) {
-            mlx_stream s = mlx_default_cpu_stream_new();
+            mlx_stream s = mlx_default_gpu_stream_new();
 
             if (contrib_ndim > grad_ndim) {
                 /* Broadcast grad_ag to match contrib shape */
@@ -288,7 +301,7 @@ AGValue *ag_value_from_new_array(mlx_array *arr, int requires_grad) {
        operating on it. */
     if (arr) {
         v->arr = mlx_array_new();
-        mlx_stream s = mlx_default_cpu_stream_new();
+        mlx_stream s = mlx_default_gpu_stream_new();
         if (mlx_copy(&v->arr, *arr, s) != 0) {
             mlx_stream_free(s);
             free(v);
@@ -339,6 +352,7 @@ void ag_value_free(AGValue *v) {
 void ag_reset_tape(void) {
     if (!tape)
         return;
+    ag_debug_mem("ag_reset_tape: start");
     /* Free AGNode entries, their outputs, and their input arrays */
     for (size_t i = 0; i < tape_size; ++i) {
         AGNode *n = tape[i];
@@ -359,6 +373,7 @@ void ag_reset_tape(void) {
     free(tape);
     tape = NULL;
     tape_size = 0;
+    ag_debug_mem("ag_reset_tape: after nodes");
     /* Free temporary AGValue wrappers that were registered during forward.
        These may own underlying mlx_array buffers (owns_arr) and will be
        freed by ag_value_free. This restores correct lifetime semantics so
@@ -373,6 +388,7 @@ void ag_reset_tape(void) {
         temp_values = NULL;
         temp_values_size = 0;
     }
+    ag_debug_mem("ag_reset_tape: after temps");
 }
 
 mlx_array *ag_value_array(AGValue *v) {
@@ -394,7 +410,7 @@ static void ensure_grad(AGValue *v) {
         return;
     if (v->grad.ctx)
         return;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     if (v->arr.ctx) {
         mlx_zeros_like(&v->grad, v->arr, s);
     }
@@ -445,7 +461,7 @@ int ag_collect_grads(AGValue **params, int n, mlx_array ***out_grads) {
         }
         /* Create a deep copy of the grad array so caller owns it independently */
         *gptr = mlx_array_new();
-        mlx_stream s = mlx_default_cpu_stream_new();
+        mlx_stream s = mlx_default_gpu_stream_new();
         if (mlx_copy(gptr, p->grad, s) != 0) {
             mlx_stream_free(s);
             mlx_array_free(*gptr);
@@ -469,14 +485,14 @@ void ag_zero_grad_all(void) {
     for (size_t i = 0; i < tape_size; ++i) {
         AGNode *n = tape[i];
         if (n->output && n->output->grad.ctx) {
-            mlx_stream s = mlx_default_cpu_stream_new();
+            mlx_stream s = mlx_default_gpu_stream_new();
             mlx_zeros_like(&n->output->grad, n->output->arr, s);
             mlx_stream_free(s);
         }
         for (int j = 0; j < n->n_inputs; ++j) {
             AGValue *iv = n->inputs[j];
             if (iv && iv->grad.ctx) {
-                mlx_stream s = mlx_default_cpu_stream_new();
+                mlx_stream s = mlx_default_gpu_stream_new();
                 mlx_zeros_like(&iv->grad, iv->arr, s);
                 mlx_stream_free(s);
             }
@@ -601,7 +617,7 @@ static void bw_add(AGNode *node) {
         return;
     ensure_grad(a);
     ensure_grad(b);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* Reduce gradients if broadcast was used in forward */
     mlx_array grad_a = reduce_to_target_shape(out->grad, a->arr, s);
     mlx_array grad_b = reduce_to_target_shape(out->grad, b->arr, s);
@@ -667,7 +683,7 @@ static void bw_mul(AGNode *node) {
         return;
     ensure_grad(a);
     ensure_grad(b);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array tmp = mlx_array_new();
     if (mlx_multiply(&tmp, out->grad, b->arr, s) == 0) {
         /* Reduce tmp to match a's shape before accumulating */
@@ -710,7 +726,7 @@ static void bw_tanh(AGNode *node) {
     if (!out->grad.ctx)
         return;
     ensure_grad(a);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array out_sq = mlx_array_new();
     mlx_square(&out_sq, out->arr, s);
     mlx_array one = mlx_array_new_float(1.0f);
@@ -747,7 +763,7 @@ static void bw_square(AGNode *node) {
     if (!out->grad.ctx)
         return;
     ensure_grad(a);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array two = mlx_array_new_float(2.0f);
     mlx_array tmp = mlx_array_new();
     mlx_multiply(&tmp, two, a->arr, s);
@@ -782,7 +798,7 @@ static void bw_sum_axis(AGNode *node) {
             AGValue *expanded = grad_ag;
             /* If output has fewer dims, we need to expand dims at the axis that was reduced */
             if (out_ndim < in_ndim) {
-                mlx_stream s = mlx_default_cpu_stream_new();
+                mlx_stream s = mlx_default_gpu_stream_new();
                 mlx_array grad_arr = grad_ag->arr;
 
                 /* Expand at the CORRECT axis that was reduced */
@@ -816,7 +832,7 @@ static void bw_sum_axis(AGNode *node) {
     if (!out->grad.ctx)
         return;
     ensure_grad(a);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* Numeric backward: broadcast out->grad to a->arr shape.
      * If out has fewer dims than input (keepdims=0 was used), we need to
@@ -856,7 +872,7 @@ static void bw_mean(AGNode *node) {
     AGValue *a = node->inputs[0];
     if (!out || !a)
         return;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* Compute total element count (size) of the input */
     size_t ndim = mlx_array_ndim(a->arr);
     const int *shape = mlx_array_shape(a->arr);
@@ -904,7 +920,7 @@ static void bw_sum(AGNode *node) {
     AGValue *a = node->inputs[0];
     if (!out || !a)
         return;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     size_t ndim = mlx_array_ndim(a->arr);
     const int *shape = mlx_array_shape(a->arr);
 
@@ -948,7 +964,7 @@ static void bw_transpose(AGNode *node) {
     if (!out->grad.ctx)
         return;
     ensure_grad(a);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array tmp = mlx_array_new();
     mlx_transpose(&tmp, out->grad, s);
     accumulate_into(&a->grad, tmp, s);
@@ -985,7 +1001,7 @@ static void bw_matmul(AGNode *node) {
         return;
     ensure_grad(a);
     ensure_grad(b);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array b_t = mlx_array_new();
     mlx_transpose(&b_t, b->arr, s);
     mlx_array tmp = mlx_array_new();
@@ -1038,7 +1054,7 @@ static void bw_divide(AGNode *node) {
         return;
     ensure_grad(a);
     ensure_grad(b);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* da += out_grad / b */
     mlx_array tmp = mlx_array_new();
@@ -1090,7 +1106,7 @@ static void bw_sqrt(AGNode *node) {
     if (!out->grad.ctx)
         return;
     ensure_grad(a);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* da += out_grad * (0.5 / out) */
     mlx_array half = mlx_array_new_float(0.5f);
@@ -1124,7 +1140,7 @@ static void bw_conv2d(AGNode *node) {
             /* MLX conv backward for input: wt_trans = swapaxes(wt, 0, -1)
              * This converts weight from (out_ch, KH, KW, in_ch) to (in_ch, KH, KW, out_ch)
              * matching Python MLX's Convolution::vjp behavior */
-            mlx_stream s = mlx_default_cpu_stream_new();
+            mlx_stream s = mlx_default_gpu_stream_new();
             mlx_array wt_trans = mlx_array_new();
             int axes[4] = {3, 1, 2, 0}; /* swap axis 0 and 3 (last) */
             mlx_transpose_axes(&wt_trans, weight->arr, axes, 4, s);
@@ -1147,7 +1163,7 @@ static void bw_conv2d(AGNode *node) {
         return;
     ensure_grad(input);
     ensure_grad(weight);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* d_input = conv_transpose2d(out_grad, weight, stride, padding, dilation,
      * output_padding=0, groups) */
     mlx_array tmp_in = mlx_array_new();
@@ -1279,6 +1295,13 @@ static void bw_conv2d(AGNode *node) {
             mlx_zeros_like(&weight->grad, weight->arr, s);
         }
     }
+    /* Free the transposed weight array if we created one */
+    if (trans_used) {
+        detach_and_free(trans);
+    } else {
+        /* trans was allocated but never used - free the empty array */
+        mlx_array_free(trans);
+    }
     mlx_stream_free(s);
 }
 
@@ -1292,7 +1315,7 @@ static void bw_conv_transpose(AGNode *node) {
         return;
     ensure_grad(input);
     ensure_grad(weight);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* d_input = conv2d(out_grad, weight, stride=1?, pads=node->pad? This is
      * approximate. */
     mlx_array tmp_in = mlx_array_new();
@@ -1394,7 +1417,7 @@ static void bw_upsample(AGNode *node) {
         return;
     ensure_grad(in);
     /* numeric backward: sum over repeat blocks to produce input grad */
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     const int *in_shape = mlx_array_shape(in->arr);
     const int *out_shape = mlx_array_shape(out->grad);  /* Use out->grad shape, not out->arr */
     if (!in_shape || !out_shape) {
@@ -1464,7 +1487,7 @@ static void bw_upsample(AGNode *node) {
 AGValue *ag_slice(AGValue *a, const int *start, const int *stop, int ndim) {
     if (!a || !start || !stop || ndim <= 0)
         return NULL;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array res = mlx_array_new();
     if (mlx_slice(&res, a->arr, (int *)start, ndim, (int *)stop, ndim, NULL, 0,
                   s) != 0) {
@@ -1494,7 +1517,7 @@ AGValue *ag_pad(AGValue *a, const int *axes, int n_axes, const int *low_pad,
                 const char *mode) {
     if (!a)
         return NULL;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array padval = mlx_array_new_float(pad_val);
     mlx_array res = mlx_array_new();
     if (mlx_pad(&res, a->arr, (int *)axes, n_axes, (int *)low_pad, low_len,
@@ -1525,7 +1548,7 @@ AGValue *ag_pad(AGValue *a, const int *axes, int n_axes, const int *low_pad,
 AGValue *ag_tile(AGValue *a, const int *reps, int ndim) {
     if (!a || !reps || ndim <= 0)
         return NULL;
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array res = mlx_array_new();
     if (mlx_tile(&res, a->arr, (int *)reps, ndim, s) != 0) {
         mlx_stream_free(s);
@@ -1556,7 +1579,7 @@ AGValue *ag_concatenate(AGValue **parts, int n_parts, int axis) {
         mlx_array *ar = ag_value_array(parts[i]);
         mlx_vector_array_append_value(vec, *ar);
     }
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array res = mlx_array_new();
     if (mlx_concatenate_axis(&res, vec, axis, s) != 0) {
         mlx_vector_array_free(vec);
@@ -1608,7 +1631,7 @@ AGValue *ag_add(AGValue *a, AGValue *b) {
         return NULL;
 
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_add(&res, a->arr, b->arr, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
@@ -1631,7 +1654,7 @@ AGValue *ag_sub(AGValue *a, AGValue *b) {
     if (!a || !b)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_subtract(&res, a->arr, b->arr, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
@@ -1655,7 +1678,7 @@ AGValue *ag_mul(AGValue *a, AGValue *b) {
     if (!a || !b)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_multiply(&res, a->arr, b->arr, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
@@ -1678,7 +1701,7 @@ AGValue *ag_tanh(AGValue *a) {
     if (!a)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_tanh(&res, a->arr, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
@@ -1700,7 +1723,7 @@ AGValue *ag_square(AGValue *a) {
     if (!a)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_square(&res, a->arr, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
@@ -1722,7 +1745,7 @@ AGValue *ag_sum_axis(AGValue *a, int axis, int keepdims) {
     if (!a)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* Normalize negative axis to positive */
     int in_ndim = (int)mlx_array_ndim(a->arr);
     int norm_axis = axis < 0 ? in_ndim + axis : axis;
@@ -1748,7 +1771,7 @@ AGValue *ag_mean(AGValue *a) {
     if (!a)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* mlx_mean with keepdims=false reduces all elements to a scalar */
     mlx_mean(&res, a->arr, false, s);
     mlx_stream_free(s);
@@ -1771,7 +1794,7 @@ AGValue *ag_sum(AGValue *a) {
     if (!a)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     /* mlx_sum with keepdims=false reduces all elements to a scalar */
     mlx_sum(&res, a->arr, false, s);
     mlx_stream_free(s);
@@ -1794,7 +1817,7 @@ AGValue *ag_transpose(AGValue *a) {
     if (!a)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_transpose(&res, a->arr, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
@@ -1816,7 +1839,7 @@ AGValue *ag_matmul(AGValue *a, AGValue *b) {
     if (!a || !b)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_matmul(&res, a->arr, b->arr, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
@@ -1840,7 +1863,7 @@ AGValue *ag_conv2d(AGValue *input, AGValue *weight, int stride0, int stride1,
     if (!input || !weight)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     safe_mlx_conv2d(&res, input->arr, weight->arr, stride0, stride1, pad0, pad1,
                     dil0, dil1, groups, s);
     mlx_stream_free(s);
@@ -1871,7 +1894,7 @@ AGValue *ag_divide(AGValue *a, AGValue *b) {
     if (!a || !b)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_divide(&res, a->arr, b->arr, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
@@ -1894,7 +1917,7 @@ AGValue *ag_sqrt(AGValue *a) {
     if (!a)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_sqrt(&res, a->arr, s);
     mlx_stream_free(s);
     AGNode *n = calloc(1, sizeof(AGNode));
@@ -1941,7 +1964,7 @@ AGValue *ag_conv_transpose2d(AGValue *input, AGValue *weight, int stride0,
     if (!input || !weight)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_conv_transpose2d(&res, input->arr, weight->arr, stride0, stride1, pad0,
                          pad1, dil0, dil1, out_pad0, out_pad1, groups, s);
     mlx_stream_free(s);
@@ -1972,7 +1995,7 @@ AGValue *ag_ones_like(AGValue *a) {
     if (!a)
         return NULL;
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_ones_like(&res, a->arr, s);
     mlx_stream_free(s);
     AGValue *out = ag_value_from_new_array(&res, 0);
@@ -1985,7 +2008,7 @@ AGValue *ag_upsample(AGValue *a, int out_h, int out_w, const char *mode,
     if (!a)
         return NULL;
     /* perform underlying mlx upsample */
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array in_arr = a->arr;
     MLXUpsample *u =
         mlx_upsample_create(out_h, out_w, mode ? mode : "linear", align_corners);
@@ -2000,12 +2023,14 @@ AGValue *ag_upsample(AGValue *a, int out_h, int out_w, const char *mode,
     }
 
     /* Check if upsample returned the same array as input (identity case).
-     * If so, create a deep copy to ensure separate ownership. */
+     * If so, create a deep copy to ensure separate ownership.
+     * Note: We do NOT free res here because when same_array is true,
+     * res is an alias/view of in_arr which we don't own. */
     int same_array = (res.ctx == in_arr.ctx);
     if (same_array) {
         mlx_array copy = mlx_array_new();
         mlx_copy(&copy, res, s);
-        res = copy;
+        res = copy;  /* res was a view, no need to free */
     }
 
     mlx_stream_free(s);
@@ -2032,7 +2057,7 @@ int ag_backward(AGValue *output) {
         return -1;
     /* initialize grad of output to ones */
     ensure_grad(output);
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_ones_like(&output->grad, output->arr, s);
     mlx_stream_free(s);
     /* traverse tape in reverse order and call backward */
@@ -2051,7 +2076,7 @@ int ag_backward_create_graph(AGValue *output) {
     /* initialize symbolic grad of output to an array of ones matching output->arr
      */
     mlx_array res = mlx_array_new();
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
     mlx_ones_like(&res, output->arr, s);
     mlx_stream_free(s);
     AGValue *one = ag_value_from_new_array(&res, 0);

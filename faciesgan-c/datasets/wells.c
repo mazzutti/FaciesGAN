@@ -175,7 +175,7 @@ int datasets_load_wells_mapping(const char *data_root, const char *subdir,
     return -1;
   }
 
-  mlx_stream s = mlx_default_cpu_stream_new();
+  mlx_stream s = mlx_default_gpu_stream_new();
   mlx_array col_arr = mlx_array_new();
   mlx_array cnt_arr = mlx_array_new();
   int rc = 0;

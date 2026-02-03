@@ -105,11 +105,17 @@ int ensure_function_cache(const char *input_path, const char *cache_dir,
         char pycmd[PATH_MAX * 2];
         /* Prefer repository virtualenv python if present, otherwise fall back to
          * system python3. The tools/ script is located relative to repo root. */
-        const char *venv_py = ".venv/bin/python";
-        if (access(venv_py, X_OK) == 0) {
+        const char *venv = getenv("VIRTUAL_ENV");
+        char venv_py[PATH_MAX];
+        const char *venv_candidate = ".venv/bin/python";
+        if (access(venv_candidate, X_OK) != 0 && venv && venv[0]) {
+            snprintf(venv_py, sizeof(venv_py), "%s/bin/python", venv);
+            venv_candidate = venv_py;
+        }
+        if (access(venv_candidate, X_OK) == 0) {
             snprintf(pycmd, sizeof(pycmd),
                      "%s tools/gen_mlx_cache.py --output '%s' --num-pyramids %d",
-                     venv_py, cache_npz, num_samples);
+                     venv_candidate, cache_npz, num_samples);
         } else {
             snprintf(pycmd, sizeof(pycmd),
                      "python3 tools/gen_mlx_cache.py --output '%s' --num-pyramids %d",
@@ -512,7 +518,7 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
             // Create mlx_array and save
             int shape[3] = {target, target, num_img_channels};
             mlx_array a = mlx_array_new();
-            mlx_stream s = mlx_default_cpu_stream_new();
+            mlx_stream s = mlx_default_gpu_stream_new();
             if (mlx_array_set_data(&a, fdata, shape, 3, MLX_FLOAT32) != 0) {
                 mlx_stream_free(s);
                 if (nelem > (size_t)INT_MAX)
@@ -672,7 +678,7 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
 
                     int shape[3] = {target, target, num_img_channels};
                     mlx_array a = mlx_array_new();
-                    mlx_stream s = mlx_default_cpu_stream_new();
+                    mlx_stream s = mlx_default_gpu_stream_new();
                     if (mlx_array_set_data(&a, fdata, shape, 3, MLX_FLOAT32) != 0) {
                         mlx_stream_free(s);
                         if (nelem > (size_t)INT_MAX)
@@ -834,7 +840,7 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
 
                     int shape[3] = {target, target, num_img_channels};
                     mlx_array a = mlx_array_new();
-                    mlx_stream s = mlx_default_cpu_stream_new();
+                    mlx_stream s = mlx_default_gpu_stream_new();
                     if (mlx_array_set_data(&a, fdata, shape, 3, MLX_FLOAT32) != 0) {
                         mlx_stream_free(s);
                         if (nelem > (size_t)INT_MAX)

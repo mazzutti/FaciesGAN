@@ -238,10 +238,11 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
             }
         }
 
-        mlx_stream s = mlx_default_cpu_stream_new();
+        mlx_stream load_s = mlx_default_cpu_stream_new();  /* Load ops need CPU */
+        mlx_stream s = mlx_default_gpu_stream_new();       /* Compute ops use GPU */
         mlx_array a = mlx_array_new();
         if (found) {
-            if (mlx_load_reader(&a, r, s) != 0) {
+            if (mlx_load_reader(&a, r, load_s) != 0) {
                 /* fallthrough to assemble from per-sample members */
                 mlx_io_reader_free(r);
                 mlx_array_free(a);
@@ -263,6 +264,7 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
                     }
                 }
                 fac[sidx] = a;
+                mlx_stream_free(load_s);
                 mlx_stream_free(s);
                 continue;
             }
@@ -277,7 +279,7 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
             if (npz_extract_member_to_mlx_reader(cache_npz, mem2, &r2) != 0)
                 break;
             mlx_array ai = mlx_array_new();
-            if (mlx_load_reader(&ai, r2, s) != 0) {
+            if (mlx_load_reader(&ai, r2, load_s) != 0) {
                 mlx_io_reader_free(r2);
                 mlx_array_free(ai);
                 break;
@@ -286,6 +288,7 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
             if (mlx_vector_array_append_value(scale_vec, ai) != 0) {
                 mlx_array_free(ai);
                 mlx_vector_array_free(scale_vec);
+                mlx_stream_free(load_s);
                 mlx_stream_free(s);
                 free(fac);
                 return -1;
@@ -302,10 +305,11 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
                              local_scales[sidx].channels
                             };
             {
-                mlx_stream zst = mlx_default_cpu_stream_new();
+                mlx_stream zst = mlx_default_gpu_stream_new();
                 if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32, zst) != 0) {
                     mlx_stream_free(zst);
                     free(fac);
+                    mlx_stream_free(load_s);
                     mlx_stream_free(s);
                     return -1;
                 }
@@ -318,10 +322,11 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
                              local_scales[sidx].channels
                             };
             {
-                mlx_stream zst = mlx_default_cpu_stream_new();
+                mlx_stream zst = mlx_default_gpu_stream_new();
                 if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32, zst) != 0) {
                     mlx_stream_free(zst);
                     free(fac);
+                    mlx_stream_free(load_s);
                     mlx_stream_free(s);
                     return -1;
                 }
@@ -330,6 +335,7 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
         }
         mlx_vector_array_free(scale_vec);
         fac[sidx] = stacked;
+        mlx_stream_free(load_s);
         mlx_stream_free(s);
     }
     *out = fac;
@@ -392,10 +398,11 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
             }
         }
 
-        mlx_stream s = mlx_default_cpu_stream_new();
+        mlx_stream load_s = mlx_default_cpu_stream_new();  /* Load ops need CPU */
+        mlx_stream s = mlx_default_gpu_stream_new();       /* Compute ops use GPU */
         mlx_array a = mlx_array_new();
         if (found) {
-            if (mlx_load_reader(&a, r, s) != 0) {
+            if (mlx_load_reader(&a, r, load_s) != 0) {
                 mlx_io_reader_free(r);
                 mlx_array_free(a);
                 found = 0;
@@ -415,6 +422,7 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
                     }
                 }
                 seis[sidx] = a;
+                mlx_stream_free(load_s);
                 mlx_stream_free(s);
                 continue;
             }
@@ -428,7 +436,7 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
             if (npz_extract_member_to_mlx_reader(cache_npz, mem2, &r2) != 0)
                 break;
             mlx_array ai = mlx_array_new();
-            if (mlx_load_reader(&ai, r2, s) != 0) {
+            if (mlx_load_reader(&ai, r2, load_s) != 0) {
                 mlx_io_reader_free(r2);
                 mlx_array_free(ai);
                 break;
@@ -437,6 +445,7 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
             if (mlx_vector_array_append_value(scale_vec, ai) != 0) {
                 mlx_array_free(ai);
                 mlx_vector_array_free(scale_vec);
+                mlx_stream_free(load_s);
                 mlx_stream_free(s);
                 free(seis);
                 return -1;
@@ -452,10 +461,11 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
                              scales[sidx].channels
                             };
             {
-                mlx_stream zst = mlx_default_cpu_stream_new();
+                mlx_stream zst = mlx_default_gpu_stream_new();
                 if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32, zst) != 0) {
                     mlx_stream_free(zst);
                     free(seis);
+                    mlx_stream_free(load_s);
                     mlx_stream_free(s);
                     return -1;
                 }
@@ -467,10 +477,11 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
                              scales[sidx].channels
                             };
             {
-                mlx_stream zst = mlx_default_cpu_stream_new();
+                mlx_stream zst = mlx_default_gpu_stream_new();
                 if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32, zst) != 0) {
                     mlx_stream_free(zst);
                     free(seis);
+                    mlx_stream_free(load_s);
                     mlx_stream_free(s);
                     return -1;
                 }
@@ -479,6 +490,7 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
         }
         mlx_vector_array_free(scale_vec);
         seis[sidx] = stacked;
+        mlx_stream_free(load_s);
         mlx_stream_free(s);
     }
     *out = seis;
@@ -541,10 +553,11 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
             }
         }
 
-        mlx_stream s = mlx_default_cpu_stream_new();
+        mlx_stream load_s = mlx_default_cpu_stream_new();  /* Load ops need CPU */
+        mlx_stream s = mlx_default_gpu_stream_new();       /* Compute ops use GPU */
         mlx_array a = mlx_array_new();
         if (found) {
-            if (mlx_load_reader(&a, r, s) != 0) {
+            if (mlx_load_reader(&a, r, load_s) != 0) {
                 mlx_io_reader_free(r);
                 mlx_array_free(a);
                 found = 0;
@@ -564,6 +577,7 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
                     }
                 }
                 wells[sidx] = a;
+                mlx_stream_free(load_s);
                 mlx_stream_free(s);
                 continue;
             }
@@ -577,7 +591,7 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
             if (npz_extract_member_to_mlx_reader(cache_npz, mem2, &r2) != 0)
                 break;
             mlx_array ai = mlx_array_new();
-            if (mlx_load_reader(&ai, r2, s) != 0) {
+            if (mlx_load_reader(&ai, r2, load_s) != 0) {
                 mlx_io_reader_free(r2);
                 mlx_array_free(ai);
                 break;
@@ -586,6 +600,7 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
             if (mlx_vector_array_append_value(scale_vec, ai) != 0) {
                 mlx_array_free(ai);
                 mlx_vector_array_free(scale_vec);
+                mlx_stream_free(load_s);
                 mlx_stream_free(s);
                 free(wells);
                 return -1;
@@ -601,10 +616,11 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
                              scales[sidx].channels
                             };
             {
-                mlx_stream zst = mlx_default_cpu_stream_new();
+                mlx_stream zst = mlx_default_gpu_stream_new();
                 if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32, zst) != 0) {
                     mlx_stream_free(zst);
                     free(wells);
+                    mlx_stream_free(load_s);
                     mlx_stream_free(s);
                     return -1;
                 }
@@ -617,10 +633,11 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
                              scales[sidx].channels
                             };
             {
-                mlx_stream zst = mlx_default_cpu_stream_new();
+                mlx_stream zst = mlx_default_gpu_stream_new();
                 if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32, zst) != 0) {
                     mlx_stream_free(zst);
                     free(wells);
+                    mlx_stream_free(load_s);
                     mlx_stream_free(s);
                     return -1;
                 }
@@ -629,6 +646,7 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
         }
         mlx_vector_array_free(scale_vec);
         wells[sidx] = stacked;
+        mlx_stream_free(load_s);
         mlx_stream_free(s);
     }
 

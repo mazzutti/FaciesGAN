@@ -2,15 +2,23 @@
 #define MLX_COMPAT_H
 
 #include <mlx/c/mlx.h>
+#include "mem_debug.h"
 
-/* Helper: detach and free an mlx_array in one step.
- * CRITICAL: We MUST detach arrays before freeing to break computation graph
- * references. Without detach, freed arrays still have inputs[] pointing to
- * other arrays, keeping those alive and causing memory leaks in backward pass.
+/* Helper: detach from computation graph and free an mlx_array.
+ * Uses mlx_stop_gradient to break gradient references before freeing,
+ * which helps release memory from accumulated computation graphs.
  */
 static inline void detach_and_free(mlx_array arr) {
     if (arr.ctx) {
-        _mlx_array_detach(arr);
+        /* Create a stopped version to break graph references */
+        mlx_array stopped = mlx_array_new();
+        mlx_stream s = mlx_default_gpu_stream_new();
+        if (mlx_stop_gradient(&stopped, arr, s) == 0) {
+            /* Evaluate to materialize and release graph */
+            mlx_array_eval(stopped);
+            mlx_array_free(stopped);
+        }
+        mlx_stream_free(s);
     }
     mlx_array_free(arr);
 }

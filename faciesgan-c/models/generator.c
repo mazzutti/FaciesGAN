@@ -594,11 +594,11 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
     if (stop_scale >= m->n_gens)
         stop_scale = m->n_gens - 1;
 
-    mlx_stream s = mlx_default_cpu_stream_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
 
     /* Initialize out_facie */
     mlx_array_t out_facie = in_noise;
-    if (mlx_array_ndim(in_noise) == 0) {
+    if (!in_noise.ctx || mlx_array_ndim(in_noise) == 0) {
         /* create zeros with shape derived from z[start_scale] minus padding */
         const int *zshape = mlx_array_shape(z_list[start_scale]);
         int batch = zshape[0];

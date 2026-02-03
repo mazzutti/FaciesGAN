@@ -29,6 +29,36 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _configure_python_executable() -> None:
+    """Ensure multiprocessing spawn uses the local venv python when available."""
+    try:
+        import os
+        import sys
+
+        # Prefer local .venv if present
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        venv_py = os.path.join(repo_root, ".venv", "bin", "python")
+        py = None
+        if os.path.exists(venv_py):
+            py = venv_py
+        else:
+            venv = os.environ.get("VIRTUAL_ENV", "")
+            if venv:
+                candidate = os.path.join(venv, "bin", "python")
+                if os.path.exists(candidate):
+                    py = candidate
+
+        if py:
+            sys.executable = py
+            os.environ["PYTHONEXECUTABLE"] = py
+            try:
+                mp.set_executable(py)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
 def _save_plot_task(
     fake_list: TTensor,
     real_arr: TTensor,
@@ -129,6 +159,8 @@ class BackgroundWorker:
         # Initialize only once
         if getattr(self, "_initialized", False):
             return
+
+        _configure_python_executable()
 
         ctx = mp.get_context("spawn")
         self._executor: ProcessPoolExecutor = ProcessPoolExecutor(
