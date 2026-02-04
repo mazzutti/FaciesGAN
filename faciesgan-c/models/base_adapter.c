@@ -35,7 +35,6 @@ mlx_base_manager_create_with_faciesgan(const TrainningOptions *opts) {
         return NULL;
 
     /* Configure diversity sample count on created faciesgan for C metrics parity
-     */
     if (opts->num_diversity_samples > 0)
         mlx_faciesgan_set_num_diversity_samples(fg, opts->num_diversity_samples);
 

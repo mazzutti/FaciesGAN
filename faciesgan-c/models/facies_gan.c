@@ -512,7 +512,6 @@ mlx_array_t mlx_faciesgan_generate_fake(MLXFaciesGAN *m,
             use_amp_count = m->n_noise_amps;
         } else {
             /* allocate temporary array sized to n and fill from available amps or 1.0
-             */
             tmp_amps = NULL;
             if (n > (size_t)INT_MAX) {
                 tmp_amps = (float *)malloc(sizeof(float) * n);
@@ -699,7 +698,6 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
         int h = 32;
         int w = 32;
         /* Determine whether conditioning (wells/seismic) is provided for this scale
-         */
         int cond_present = (indexes && n_indexes > 0 &&
                             ((wells_pyramid && wells_pyramid[i]) ||
                              (seismic_pyramid && seismic_pyramid[i])))
@@ -760,7 +758,6 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
 
            With conditioning: noise_channels = 3, cond_channels = 3, total = 6 after concat
            Without conditioning: total_channels = gen_input_channels (typically 3)
-        */
         int final_h, final_w;
         int noise_only_c = 3;  /* Always 3 channels for pure noise */
 
@@ -1278,7 +1275,6 @@ int mlx_faciesgan_compute_recovery_loss(
  * This forces lazy computation graphs to materialize and releases intermediate
  * arrays, preventing memory accumulation during training.
  * Uses batched mlx_eval() to match Python's mx.eval([generator.state, discriminator.state]).
- */
 int mlx_faciesgan_eval_all_parameters(MLXFaciesGAN *m) {
     if (!m)
         return -1;

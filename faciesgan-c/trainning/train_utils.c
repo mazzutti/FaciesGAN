@@ -314,7 +314,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
        invoking device schedulers in smoke runs) */
     double rmse = 0.0;
     /* Prefer reading host value only when available to avoid forcing device eval
-     */
     bool ok_root = false;
     if (_mlx_array_is_available(&ok_root, root) == 0 && ok_root) {
         const float *pdata = mlx_array_data_float32(root);

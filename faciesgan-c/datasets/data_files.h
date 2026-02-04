@@ -1,7 +1,6 @@
 /* Small header exposing dataset path/name constants used by C code.
  * This mirrors the high-level dataset names managed by Python's
  * datasets/data_files.py so C code can reference the same names.
- */
 #ifndef FACIESGAN_C_DATA_FILES_H
 #define FACIESGAN_C_DATA_FILES_H
 

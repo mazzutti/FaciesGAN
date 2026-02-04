@@ -15,7 +15,6 @@
    This mirrors Python's mx.eval(list_of_arrays) which evaluates all arrays
    in a single batch, allowing MLX to optimize the computation graph and
    memory allocation across all arrays.
-*/
 static int batch_eval_arrays(mlx_array *arrays, int n) {
     if (!arrays || n <= 0)
         return 0;

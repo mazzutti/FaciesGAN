@@ -1,6 +1,5 @@
 /* Diagnostics wrapper for mlx_array_free to log stack traces and array info.
  * This is project-local and does not modify third-party code.
- */
 #ifndef FACIESGAN_DIAG_MLX_H
 #define FACIESGAN_DIAG_MLX_H
 

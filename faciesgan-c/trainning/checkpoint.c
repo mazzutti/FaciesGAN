@@ -14,7 +14,6 @@
  * for each gen param: dtype(int32), ndim(int32), shape(int32*ndim),
  * nbytes(int64), data(bytes) [disc_count int32] for each disc param: same
  * format
- */
 
 static const char *MAGIC = "MLXCKPT";
 

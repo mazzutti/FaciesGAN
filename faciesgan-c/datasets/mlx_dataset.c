@@ -18,7 +18,6 @@
 #include <unistd.h>
 
 /* in-file mlx_mem_stream vtable and helpers (copied pattern from optimizer.c)
- */
 typedef struct mlx_mem_stream_ {
     char *data;
     size_t pos;
@@ -153,11 +152,9 @@ int mlx_generate_scales_flat(MLXPyramidsDataset *ds, int channels_last) {
     return 0;
 }
 
-/*
  * Populate dataset samples from an existing function-cache NPZ.
  * Encapsulates the NPZ-reading loop used by the constructor. Returns 0
  * on success (and sets ds->n_samples) or -1 on error.
- */
 static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
 
                              int sample_count, int channels_last) {
@@ -582,7 +579,6 @@ int mlx_pyramids_dataset_new(MLXPyramidsDataset **out,
 
     /* synthesize scales first so we can pass explicit scale descriptors to the
      * function-cache generator (avoids implicit stop_scale/crop_size derivation)
-     */
     DatasetScale *tmp_scales = NULL;
     int tmp_n = 0;
     if (dataset_generate_scales(options, channels_last ? 1 : 0, &tmp_scales,
@@ -832,7 +828,6 @@ int mlx_pyramids_dataset_get_scale_stack(MLXPyramidsDataset *ds, int scale,
 
     /* Ensure function cache exists before attempting to load per-scale data.
      * Mirrors Python's @memory.cache behavior used by the torch utils helpers.
-     */
     if (ds->options) {
         char cache_npz[PATH_MAX] = {0};
         int actual_samples = 0;
@@ -1081,7 +1076,6 @@ int mlx_pyramids_dataset_generate_pyramids(MLXPyramidsDataset *ds,
      * generators (interpolators) have their cached inputs available. This
      * mirrors the Python `@memory.cache` behavior by forcing generation of
      * the underlying function cache files before stacking per-scale tensors.
-     */
     if (ds->options) {
         char cache_npz[PATH_MAX] = {0};
         int actual_samples = 0;
@@ -1497,7 +1491,6 @@ int mlx_pyramids_dataset_dump_batches_npz(MLXPyramidsDataset *ds,
  * triggered shared_ptr/ArrayDesc crashes) by ensuring each appended `mlx_array`
  * is host-materialized with `mlx_array_eval()` before being copied into the
  * destination vectors.
- */
 static int mlx_pyramids_dataset_populate_batches(MLXPyramidsDataset *ds) {
     if (!ds)
         return -1;

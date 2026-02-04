@@ -7,12 +7,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-/*
  * MLX Array Memory Leak Tracker Implementation
  *
  * Uses a simple hash table keyed by mlx_array.ctx pointer to track
  * allocations. Thread-safe via pthread mutex.
- */
 
 /* Hash table for O(1) lookup by ctx pointer */
 #define HASH_SIZE 8192

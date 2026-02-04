@@ -10,7 +10,6 @@
 
 /* Safe free helper: frees internal MLX storage if present and NULLs the ctx
  * field on the caller-side struct so subsequent callers don't double-free.
- */
 static inline void mlx_array_safe_free(mlx_array *a) {
     if (!a)
         return;
@@ -119,7 +118,6 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
 /* Helper: detect if an mlx_array likely originates from the caller-owned list
  * (z_list) or the provided in_noise. We compare the internal ctx pointer which
  * is used elsewhere as a proxy for ownership. If true, avoid freeing it here.
- */
 static int mlx_array_is_in_list(mlx_array a, const mlx_array *list, int n,
                                 mlx_array in_noise) {
     if (!a.ctx)
@@ -394,10 +392,8 @@ int mlx_scale_is_spade(MLXGenerator *m, int index) {
         return 0;
     /* s is our internal ScaleModule casted to MLXScaleModule*; check the flag
      * by probing the spade pointer (non-NULL => spade module)
-     */
     /* We can't dereference MLXScaleModule fields safely from outside, but
      * within this compilation unit we know layout: treat as struct ScaleModule.
-     */
     struct ScaleModule *sm = (struct ScaleModule *)s;
     return sm->is_spade ? 1 : 0;
 }
@@ -644,7 +640,6 @@ void mlx_generator_free_parameters_list(mlx_array **list) {
  *  - Execute per-scale module (SPADE generator for scale 0, conv-block pyramid
  * otherwise)
  *  - Add module output to facie and continue
- */
 mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                                   int z_count, const float *amp, int amp_count,
                                   mlx_array_t in_noise, int start_scale,

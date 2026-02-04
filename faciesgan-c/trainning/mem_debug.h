@@ -5,7 +5,6 @@
 #include <stdbool.h>
 #include <stddef.h>
 
-/*
  * MLX Array Memory Leak Tracking
  * ==============================
  *
@@ -20,7 +19,6 @@
  *
  * The tracker records file/line info for each allocation to help identify
  * the source of leaks.
- */
 
 #ifdef __cplusplus
 extern "C" {
@@ -81,10 +79,8 @@ void mlx_mem_set_enabled(bool enabled);
 /* Set verbosity level (0=quiet, 1=leaks only, 2=all alloc/free) */
 void mlx_mem_set_verbosity(int level);
 
-/*
  * Convenience macros for automatic file/line tracking.
  * These wrap the standard MLX functions to add tracking.
- */
 
 #if defined(MLX_MEM_DEBUG) || defined(MLX_MEM_DEBUG_RUNTIME)
 
@@ -158,11 +154,9 @@ void mlx_mem_tracked_free(mlx_array arr, const char *file, int line,
 void mlx_mem_tracked_detach_free(mlx_array arr, const char *file, int line,
                                   const char *func);
 
-/*
  * Scope-based leak checking.
  * Call mlx_mem_scope_begin() at the start of a function or block,
  * and mlx_mem_scope_end() at the end to check for leaks in that scope.
- */
 size_t mlx_mem_scope_begin(void);
 void mlx_mem_scope_end(size_t start_count, const char *scope_name);
 

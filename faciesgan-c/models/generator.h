@@ -19,7 +19,6 @@ int mlx_generator_create_scale(MLXGenerator *m, int scale, int num_features, int
 /* Forward: z_list is an array of mlx_array values, z_count is its length.
  * amp is array of floats with amp_count entries. in_noise may be mlx_array_empty.
  * start_scale and stop_scale follow Python semantics; use -1 for default stop.
- */
 mlx_array_t mlx_generator_forward(
     MLXGenerator *m,
     const mlx_array *z_list,

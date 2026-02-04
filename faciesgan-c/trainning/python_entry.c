@@ -11,7 +11,6 @@
 /* Lightweight C entrypoint callable from Python via ctypes.
  * This runs a basic training loop using existing MLX helpers.
  * Parameters are intentionally simple: path strings + numeric hyperparams.
- */
 /* Globals used by the callback installed below. */
 static MLXOptimizer **g_opts_by_scale = NULL;
 static int g_num_parallel_scales = 0;

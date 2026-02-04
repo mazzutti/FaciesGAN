@@ -143,7 +143,6 @@ MLXTrainer_create_batch_iterator(MLXTrainer *trainer, struct MLXDataloader *dl,
  * This forwards to `facies_dataloader_new_ex`. Returns 0 on success. */
 /* Create a dataloader configured from trainer options (dataset must be
  * present or will be initialised). Returns 0 on success and sets `*out`.
- */
 /* Create a dataloader configured from trainer options. On success the
  * trainer->data_loader will be set (if not already) and 0 returned. */
 int MLXTrainer_create_dataloader(MLXTrainer *trainer);
@@ -167,7 +166,6 @@ int MLXTrainer_generate_visualization_samples(
 /* Create a trainer from TrainningOptions.
  * Additional explicit args `fine_tuning` and `checkpoint_path` may be
  * provided to override values in `opts`.
- */
 MLXTrainer *MLXTrainer_new(const TrainningOptions *opts, int fine_tuning,
                            const char *checkpoint_path);
 
@@ -192,7 +190,6 @@ int MLXTrainer_train(MLXTrainer *trainer);
 /* Run a single optimization step; accepts per-scale arrays mirroring the
  * Python API: facies_pyramid, rec_in_pyramid, wells_pyramid, masks_pyramid,
  * seismic_pyramid. `active_scales` is an array of scale indices to operate on.
- */
 int MLXTrainer_optimization_step(MLXTrainer *trainer, const int *indexes,
                                  int n_indexes, mlx_array **facies_pyramid,
                                  int n_facies, mlx_array **rec_in_pyramid,
@@ -220,7 +217,6 @@ void *MLXTrainer_get_model_ctx(MLXTrainer *trainer);
 
 /* Create/return the underlying model pointer (opaque). Same as
  * `MLXTrainer_get_model_ctx` but provided for API parity with Python.
- */
 void *MLXTrainer_create_model(MLXTrainer *trainer);
 
 /* Get/set model shapes stored by the trainer. Shapes are flat arrays with 4
@@ -248,7 +244,6 @@ int MLXTrainer_close_visualizer(MLXTrainer *trainer);
  * provided `scales`. This is a thin wrapper that computes recovery inputs
  * and calls `MLXTrainer_optimization_step` per iteration. Returns 0 on
  * success.
- */
 int MLXTrainer_train_scales(MLXTrainer *trainer, const int *indexes,
                             int n_indexes, mlx_array **facies_pyramid,
                             int n_facies, mlx_array **wells_pyramid,

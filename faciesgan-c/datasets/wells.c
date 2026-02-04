@@ -27,7 +27,6 @@ static int cmp_strptr(const void *a, const void *b) {
 }
 
 /* Helper: find first .npz file in data_root/subdir (sorted lexicographically)
- */
 static int find_first_npz(const char *data_root, const char *subdir,
                           char *out_path, size_t out_len) {
   if (!data_root || !subdir || !out_path)
@@ -75,7 +74,6 @@ static int find_first_npz(const char *data_root, const char *subdir,
 }
 
 /* Public: extract columns.npy and counts.npy from mapping .npz, and list images
- */
 int datasets_extract_mapping_columns_counts(
     const char *data_root, const char *subdir, char **out_columns_tmp,
     char **out_counts_tmp, char ***out_image_files, int *out_image_count) {

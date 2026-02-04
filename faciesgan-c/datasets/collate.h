@@ -1,7 +1,6 @@
 /* Zero-copy MLX-native collate helper
  * Exposes a simple API to transpose and stack per-sample pyramids
  * into per-scale stacked arrays (facies/wells/seismic).
- */
 #ifndef FACIES_COLLATE_H
 #define FACIES_COLLATE_H
 

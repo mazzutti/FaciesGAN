@@ -16,7 +16,6 @@ extern "C" {
 #include "options.h"
 
 /* Create directory and parents (mkdir -p). Returns 0 on success, -1 on error.
- */
 int mlx_create_dirs(const char *path);
 
 /* Set seed for C library RNGs. */
@@ -25,7 +24,6 @@ void mlx_set_seed(int seed);
 /* Clamp MLX array values in range [min_val, max_val].
  * Equivalent to: min(max(a, min_val), max_val)
  * Returns 0 on success, non-zero MLX error code on failure.
- */
 int mlx_clamp(mlx_array *res, const mlx_array a, float min_val, float max_val,
               const mlx_stream s);
 
@@ -58,21 +56,18 @@ void write_options_json(const TrainningOptions *topt,
 
 /* Copy MLX array contents to a newly-allocated float buffer.
  * Caller must free(*out_buf) when done. Returns 0 on success, -1 on error.
- */
 int mlx_array_to_float_buffer(const mlx_array a, float **out_buf,
                               size_t *out_elems, int *out_ndim,
                               int **out_shape);
 
 /* Create an MLX array from a host float buffer with given shape/dimensions.
  * The function copies `buf` into MLX internal storage. Returns 0 on success.
- */
 int mlx_array_from_float_buffer(mlx_array *out, const float *buf,
                                 const int *shape, int ndim);
 
 /* CPU helper: quantize `in_pixels` (H*W*C) to nearest colors in `palette`.
  * - `in_pixels` and `out_pixels` are length (h*w*c) floats.
  * - `palette` is (ncolors * c) floats.
- */
 void quantize_pixels_float(const float *in_pixels, float *out_pixels,
                            size_t npixels, int c, const float *palette,
                            int ncolors);
@@ -81,13 +76,11 @@ void quantize_pixels_float(const float *in_pixels, float *out_pixels,
  * - `facies` and `out` are length (h*w*c) floats.
  * - `well` is (h*w*wc) floats (wc may equal c or be 1).
  * - `mask` is length (h*w) bytes (0/1).
- */
 void apply_well_mask_cpu(const float *facies, float *out, int h, int w, int c,
                          const unsigned char *mask, const float *well, int wc);
 
 /* MLX-aware helpers: operate on mlx_array inputs and produce mlx_array outputs.
  * Return 0 on success, -1 on error.
- */
 int mlx_denorm_array(const mlx_array in, mlx_array *out, int ceiling);
 int mlx_quantize_array(const mlx_array in, mlx_array *out,
                        const mlx_array palette);
@@ -97,14 +90,12 @@ int mlx_apply_well_mask_array(const mlx_array facies, mlx_array *out,
 /* Save an mlx_array image directly as PNG.
  * Array should be shape (H,W,C) or (1,H,W,C) with float32 values in [0,1].
  * Returns 0 on success, -1 on error.
- */
 int mlx_save_png(const char *path, mlx_array arr);
 
 /* Save fake and real facies side-by-side as a single PNG image.
  * Both arrays should be (1,H,W,C) or (H,W,C) with float32 values in [0,1].
  * Creates a visualization with real on left, fake on right.
  * Returns 0 on success, -1 on error.
- */
 int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
                                    mlx_array real);
 
@@ -116,7 +107,6 @@ int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
  * - cell_size: size of each cell in the grid (pixels)
  * - scale, epoch: used for labeling (reserved for future use)
  * Returns 0 on success, -1 on error.
- */
 int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
                              int num_fake, mlx_array real, int cell_size,
                              int scale, int epoch);
@@ -131,7 +121,6 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
  * - selected_indices: array of num_real indices into the batch
  * - masks: optional mlx_array for well masks (batch x H x W x 1)
  * Returns 0 on success, -1 on error.
- */
 int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
                                 int total_gen, mlx_array real,
                                 const int *selected_indices, int num_real,

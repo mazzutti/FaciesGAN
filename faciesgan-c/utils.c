@@ -223,7 +223,6 @@ void write_options_json(const TrainningOptions *topt,
     fprintf(of, "    \"enable_plot_facies\": %s,\n",
             bool_str(topt->enable_plot_facies));
     /* Make compile_backend the final key to match Python's ordering (no aliases).
-     */
     fprintf(of, "    \"compile_backend\": %s\n", bool_str(topt->compile_backend));
     /* Match Python json.dump which does not append a trailing newline */
     fprintf(of, "}");
@@ -1134,7 +1133,6 @@ static void resize_image_nearest(const float *src, int src_h, int src_w, int cha
  * cell_buf: cell to modify (cell_size x cell_size x 3), values in [0,1]
  * well_facies_buf: original facies with well colors (H x W x C)
  * Returns: modifies cell_buf in place
- */
 static void apply_well_mask_overlay(float *cell_buf, int cell_size,
                                     const float *mask_buf, int mask_h, int mask_w, int mask_c,
                                     const float *well_facies_buf, int well_h, int well_w, int well_c) {

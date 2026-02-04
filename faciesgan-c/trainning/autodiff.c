@@ -26,7 +26,6 @@ static void ag_debug_mem(const char *label) {
    This records a simple tape of nodes and supports backprop for a
    subset of ops used by the models. It's intentionally minimal and
    incremental: new ops/backprop rules can be added as needed.
-*/
 
 struct AGValue {
     mlx_array arr;  /* value (does not own external pointer) */
@@ -893,7 +892,6 @@ static void bw_sum_axis(AGNode *node) {
          * When sum_axis was called with keepdims=0, the output has fewer dims
          * than the input. We need to expand_dims on the reduced axis before
          * broadcasting to restore the proper alignment.
-         */
         AGValue *grad_ag = out->grad_ag;
         if (a && a->arr.ctx) {
             int in_ndim = mlx_array_ndim(a->arr);
@@ -1230,7 +1228,6 @@ static void bw_sqrt(AGNode *node) {
 /* conv2d backward: compute grads for input and weight using conv_transpose &
    conv This implementation assumes grouped conv and uses mlx_conv_transpose2d
    for d_input and a simple conv-like accumulation for d_weight.
-*/
 static void bw_conv2d(AGNode *node) {
     AGValue *out = node->output;
     AGValue *input = node->inputs[0];
@@ -1334,7 +1331,6 @@ static void bw_conv2d(AGNode *node) {
      * The weight gradient is computed by treating input as the "weight" and 
      * grad_output as the "input" in a correlation operation. We use mlx_conv_general
      * with flip=false to compute correlation instead of convolution.
-     */
     const int *in_shape = mlx_array_shape(input->arr);
     const int *out_shape = mlx_array_shape(out->grad);
     const int *wshape = mlx_array_shape(use_warr);
@@ -1380,7 +1376,6 @@ static void bw_conv2d(AGNode *node) {
      * TODO: Implement proper GPU-based weight gradient using MLX's native
      * value_and_grad API. For now, weight grads are zeros which means only
      * input gradients propagate. This is a known limitation.
-     */
     
     /* Initialize weight grad to zeros - proper implementation pending */
     if (!weight->grad.ctx) {
@@ -1398,7 +1393,6 @@ static void bw_conv2d(AGNode *node) {
 }
 
 /* backward for conv_transpose node (computes grads for its inputs numerically)
- */
 static void bw_conv_transpose(AGNode *node) {
     AGValue *out = node->output;
     AGValue *input = node->inputs[0];
@@ -1468,7 +1462,6 @@ static void bw_upsample(AGNode *node) {
     int scale_h = H_out / H_in;
     int scale_w = W_out / W_in;
     /* Only perform numeric upsample accumulation if host buffers are available.
-     */
     bool ok_out3 = false, ok_in3 = false;
     int r1 = _mlx_array_is_available(&ok_out3, out->grad);
     int r2 = _mlx_array_is_available(&ok_in3, in->arr);
@@ -2109,7 +2102,6 @@ int ag_backward_create_graph(AGValue *output) {
     if (!output)
         return -1;
     /* initialize symbolic grad of output to an array of ones matching output->arr
-     */
     mlx_array res = mlx_array_new();
     mlx_stream s = mlx_default_gpu_stream_new();
     mlx_ones_like(&res, output->arr, s);

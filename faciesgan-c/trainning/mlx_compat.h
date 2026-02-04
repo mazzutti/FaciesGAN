@@ -7,7 +7,6 @@
 /* Helper: detach from computation graph and free an mlx_array.
  * Uses mlx_stop_gradient to break gradient references before freeing,
  * which helps release memory from accumulated computation graphs.
- */
 static inline void detach_and_free(mlx_array arr) {
     if (arr.ctx) {
         /* Create a stopped version to break graph references */

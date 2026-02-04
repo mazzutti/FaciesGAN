@@ -15,7 +15,6 @@
  *   optimizer.update(model, grads)
  *
  * In C, model.update(params) is achieved via mlx_array_set() on each parameter.
- */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -523,7 +522,6 @@ static int disc_loss_closure(mlx_vector_array *result,
      * 2. Use mlx_vjp to get gradient of sum(D(x_interp)) w.r.t. x_interp
      * 3. Compute ||grad||_2 per sample
      * 4. gp = lambda * mean((||grad|| - 1)^2)
-     */
     if (p->lambda_grad > 0.0f) {
         /* Get batch size from real array shape */
         int ndim = (int)mlx_array_ndim(p->real);

@@ -136,7 +136,6 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
         return -1;
 
     /* Lazy init per-parameter state on first call (or explicit init via wrapper)
-     */
     mlx_stream s = mlx_default_gpu_stream_new();
     if (opt->param_n == 0) {
         mlx_stream tmp_s = s; /* pass stream into helper */
@@ -363,7 +362,6 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
 
         /* new_p = p - update */
         /* Apply AdamW decoupled weight decay: add lr * weight_decay * p to update
-         */
         if (opt->weight_decay != 0.0f) {
             mlx_array decay = mlx_array_new();
             if (mlx_multiply(&decay, *p, decay_scale_arr, s) == 0) {
@@ -617,7 +615,6 @@ static mlx_io_vtable mlx_io_vtable_mlx_mem_stream = {
 };
 
 /* Serialize an mlx_array into an in-memory .npy buffer. Caller owns *out_buf.
- */
 static int serialize_array_to_npy_bytes(const mlx_array arr, void **out_buf,
                                         size_t *out_size) {
     if (!out_buf || !out_size)

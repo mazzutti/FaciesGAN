@@ -26,7 +26,6 @@ static mlx_array *make_synthetic_grad(const mlx_array *param) {
     for (size_t i = 0; i < count; ++i)
         buf[i] = 0.01f; /* small gradient */
     /* mlx_array_new_data expects a non-const int* for shape; cast away const here
-     */
     mlx_array a = mlx_array_new_data(buf, (int *)shape, ndim, MLX_FLOAT32);
     if (count > (size_t)INT_MAX)
         free(buf);

@@ -1,4 +1,3 @@
-/*
  * Pure-C port header for custom layers (models/mlx/custom_layer.py)
  * Targets the mlx-c C API. Function names and types assume the
  * mlx-c public headers provide `mlx_core` and `mlx_nn` symbols.
@@ -7,7 +6,6 @@
  * create/destroy/forward functions. The implementations in the
  * corresponding .c file contain explanatory notes where the mlx-c
  * C API naming may need adjustment to match the installed headers.
- */
 
 #ifndef MLX_C_CUSTOM_LAYER_H
 #define MLX_C_CUSTOM_LAYER_H
