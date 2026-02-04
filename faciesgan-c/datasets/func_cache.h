@@ -17,6 +17,7 @@ extern "C" {
  * - `out_cache_npz`/`out_len`: output buffer for cache npz path
  * - `out_num_samples`: actual number of samples available (<= desired_num)
  * Returns 0 on success, non-zero on failure.
+ */
 int ensure_function_cache(const char *input_path, const char *cache_dir,
                           int desired_num, const struct DatasetScale *scales,
                           int n_scales, int num_img_channels, int use_wells,

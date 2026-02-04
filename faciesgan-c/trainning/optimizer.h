@@ -26,6 +26,7 @@ void mlx_adam_free(MLXOptimizer *opt);
 int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads, int n);
 /* Set global default Adam hyperparameters used by `mlx_adam_create_with_defaults`.
  * Call this from a launcher (e.g., main.c) to configure beta/eps via CLI.
+ */
 void mlx_optimizer_set_global_adam_params(float beta1, float beta2, float eps);
 
 /* Set learning rate */
@@ -53,6 +54,7 @@ int mlx_optimizer_apply_flat(MLXOptimizer *opt, mlx_array **params, mlx_array **
  * The .npz will contain per-parameter `m_i.npy` and `v_i.npy` members
  * along with scalar hyperparameters (step, lr, beta1, beta2, eps,
  * weight_decay, bias_correction) saved as small .npy arrays.
+ */
 int mlx_optimizer_save_to_npz(MLXOptimizer *opt, const char *npz_path);
 int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path);
 /* Attach a scheduler to an optimizer so the optimizer samples LR per-step. */

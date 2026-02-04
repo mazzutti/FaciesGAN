@@ -113,6 +113,7 @@ static void print_epoch_metrics_table(int batch_id, int total_batches,
  * These hold the original implementation bodies and will be referenced
  * by the default vtable. Wrappers below dispatch to the vtable so
  * instance-specific ops can be installed on `trainer->ops`.
+ */
 int MLXTrainer_train_impl(MLXTrainer *trainer);
 int MLXTrainer_train_scales_impl(MLXTrainer *trainer, const int *indexes,
                                  int n_indexes, mlx_array **facies_pyramid,
@@ -162,6 +163,7 @@ int MLXTrainer_set_shapes_impl(MLXTrainer *t, const int *shapes, int n_scales);
 /* Thin wrappers that dispatch through the per-instance ops vtable when
  * present. These preserve the external API while allowing per-instance
  * overrides via `trainer->ops`.
+ */
 int MLXTrainer_train(MLXTrainer *trainer) {
     if (trainer && trainer->ops && trainer->ops->train)
         return trainer->ops->train(trainer);
@@ -759,6 +761,7 @@ int MLXTrainer_setup_optimizers_impl(MLXTrainer *trainer, const int *scales,
      * concurrent writes into trainer-owned memory. */
     /* Determine required container size: ensure we have room for the
      * largest scale index present in `scales` (scales may be non-sequential).
+     */
     int needed_alloc_n = trainer->n_scales;
     if (trainer->opts.num_parallel_scales > needed_alloc_n)
         needed_alloc_n = trainer->opts.num_parallel_scales;
@@ -845,6 +848,7 @@ int MLXTrainer_setup_optimizers_impl(MLXTrainer *trainer, const int *scales,
 
 /* Producer thread logic is now centralized in datasets/prefetcher.c.
  * Use `prefetcher_start_from_dataloader` to spawn a producer.
+ */
 
 int MLXTrainer_compute_rec_input(MLXTrainer *trainer, int scale,
                                  const int *indexes, int n_indexes,
@@ -1159,6 +1163,7 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
      * indices into the collector. Upstream bugs were observed where shape
      * heights (e.g. 12,20) were passed as scale ids; attempt a best-effort
      * mapping by matching those values to trainer shapes (height or width).
+     */
     int *san_active = NULL;
     if (active_scales && n_active_scales > 0) {
         if (mlx_alloc_int_array(&san_active, n_active_scales) == 0) {
@@ -1962,6 +1967,7 @@ int MLXTrainer_train_scales_impl(MLXTrainer *trainer, const int *indexes,
 
 /* Dataset-runner implementation: these functions depend on dataset and
  * pybridge symbols and were merged here per project layout requirements.
+ */
 
 int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
                    int width, int batch_size) {

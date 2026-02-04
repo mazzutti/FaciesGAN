@@ -10,6 +10,7 @@
 extern "C" {
 #endif
 
+/**
  * Compute generator loss and gradients using MLX's native value_and_grad.
  *
  * This is the preferred way to compute gradients - it uses MLX's built-in
@@ -41,6 +42,7 @@ extern "C" {
  * @param out_rec       Output: recovery loss (optional, can be NULL)
  *
  * @return 0 on success, -1 on error
+ */
 int mlx_native_compute_gen_loss_and_grads(
     MLXFaciesGAN *m,
     int scale,
@@ -64,6 +66,7 @@ int mlx_native_compute_gen_loss_and_grads(
     mlx_array *out_div,
     mlx_array *out_rec);
 
+/**
  * Compute discriminator loss and gradients using MLX's native value_and_grad.
  *
  * @param m             The FaciesGAN model
@@ -79,6 +82,7 @@ int mlx_native_compute_gen_loss_and_grads(
  * @param out_d_gp      Output: gradient penalty (optional, can be NULL)
  *
  * @return 0 on success, -1 on error
+ */
 int mlx_native_compute_disc_loss_and_grads(
     MLXFaciesGAN *m,
     int scale,
@@ -92,7 +96,9 @@ int mlx_native_compute_disc_loss_and_grads(
     mlx_array *out_d_fake,
     mlx_array *out_d_gp);
 
+/**
  * Free gradients array allocated by the compute functions.
+ */
 void mlx_native_free_grads(mlx_array **grads, int n);
 
 #ifdef __cplusplus

@@ -12,18 +12,21 @@ extern "C"
 
 /* Apply SGD to a generator using provided gradients (array length == n).
  * Returns 0 on success, -1 on error.
+ */
 int mlx_faciesgan_apply_sgd_to_generator(MLXFaciesGAN *m, MLXOptimizer *opt, mlx_array **grads, int n);
 /* Scale-specific version - use when gradients are collected for a specific scale only */
 int mlx_faciesgan_apply_sgd_to_generator_for_scale(MLXFaciesGAN *m, MLXOptimizer *opt, mlx_array **grads, int n, int scale);
 
 /* Apply SGD to a discriminator using provided gradients (array length == n).
  * Returns 0 on success, -1 on error.
+ */
 int mlx_faciesgan_apply_sgd_to_discriminator(MLXFaciesGAN *m, MLXOptimizer *opt, mlx_array **grads, int n);
 /* Scale-specific version - use when gradients are collected for a specific scale only */
 int mlx_faciesgan_apply_sgd_to_discriminator_for_scale(MLXFaciesGAN *m, MLXOptimizer *opt, mlx_array **grads, int n, int scale);
 
 /* Convenience train-step that updates both generator and discriminator parameters.
  * Each grads array must match the parameter counts for its model.
+ */
 int mlx_faciesgan_train_step(MLXFaciesGAN *m, MLXOptimizer *opt_g, mlx_array **gen_grads, int gen_n, MLXOptimizer *opt_d, mlx_array **disc_grads, int disc_n);
 
 /* Wrappers that accept an MLXBaseManager (adapter-backed) */

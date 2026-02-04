@@ -1,3 +1,4 @@
+/*
  * Pure-C port implementation for custom layers. This file is intentionally
  * conservative: it contains implementations that call into the expected
  * mlx-c C API. The exact symbol names for creating layers / operators
@@ -9,6 +10,7 @@
  * convention: forward functions return a newly retained array pointer
  * (or the same pointer passed through when not transformed). The user
  * of this library must adapt these to their memory management model.
+ */
 
 #include "custom_layer.h"
 #include <limits.h>
@@ -27,9 +29,11 @@
 #include "../trainning/mlx_compat.h"
 #include "utils.h"
 
+/**
  * Create a random normal array matching Python's weight initialization:
  * weight = mx.random.normal(shape) * std
  * where std defaults to 0.02
+ */
 static mlx_array mlx_init_conv_weight(const int *shape, int ndim, float std) {
     mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array result = mlx_array_new();
@@ -78,6 +82,7 @@ mlx_array_t mlx_leakyrelu_forward(MLXLeakyReLU *m, mlx_array_t x) {
     /* Implement leaky-relu using mlx_maximum for parity with Python MLX.
      * out = max(x, x * negative_slope)
      * Previous implementation used sqrt-based formula which has numerical precision issues.
+     */
     if (!m)
         return x;
 
@@ -128,6 +133,7 @@ cleanup:
  * parameters (scale and bias). The actual normalization used in forward
  * implementations in this file is done manually, so this handle only
  * provides allocation/free and optional parameter storage for later use.
+ */
 typedef struct mlx_nn_instancenorm_ {
     int num_features;
     int affine;
@@ -268,6 +274,7 @@ MLXConvBlock *mlx_convblock_create(int in_ch, int out_ch, int kernel_size,
         /* Create an mlx-c InstanceNorm module handle if available.
          * Signature assumed: void* mlx_nn_instancenorm_create(int dims, int
          * affine); Adjust if your mlx-c version uses a different name or signature.
+         */
         m->norm = (void *)mlx_nn_instancenorm_create(out_ch, 1);
     }
     m->activation = mlx_leakyrelu_create(0.2f);
@@ -420,9 +427,11 @@ void mlx_upsample_free(MLXUpsample *m) {
         mlx_free_pod((void **)&m);
 }
 
+/**
  * Bilinear interpolation resize for NHWC tensors.
  * Supports any scale factor including non-integer and downsampling.
  * Matches Python's upsample_linear with align_corners=True.
+ */
 mlx_array_t mlx_upsample_forward(MLXUpsample *m, mlx_array_t x) {
     if (!m)
         return x;
@@ -1449,6 +1458,7 @@ mlx_array_t mlx_scalemodule_forward(MLXScaleModule *m, mlx_array_t x) {
      * C-side dispatcher simple and avoids making assumptions about the
      * concrete module struct layouts. If you instead intend to pass module
      * pointers, replace this dispatcher with a typed call-site implementation.
+     */
 
     typedef mlx_array_t (*scale_fn_t)(mlx_array_t);
 
@@ -1913,6 +1923,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
 
     /* If not training: nearest neighbor assignment (hard quantization)
      * Match Python: indices = mx.argmin(distances, axis=-1); quantized = pure_colors[indices]
+     */
     if (!training) {
         /* Try host-side quantization first (faster for small arrays) */
         mlx_array quant = mlx_array_new();
@@ -1959,6 +1970,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
             /* quantized = pure_colors[indices] via take along axis 0
              * pure has shape (K, c), indices has shape (N,)
              * We need to gather pure[indices[i]] for each pixel i
+             */
             mlx_array quantized_flat = mlx_array_new();
             if (mlx_take_axis(&quantized_flat, pure, indices, 0, s) == 0) {
                 int outshape[4] = {b, h, w, c};
@@ -1989,6 +2001,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
     /* Training: soft assignment
      * weights = softmax(-distances / temperature, axis=-1)
      * quantized = weights @ pure  -> shape (N, c)
+     */
     temp_arr = mlx_array_new_float(m->temperature);
     mlx_array div = mlx_array_new();
     if (mlx_divide(&div, distances, temp_arr, s) != 0) {

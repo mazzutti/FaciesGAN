@@ -22,6 +22,7 @@ int mlx_faciesgan_train_manager(MLXBaseManager *mgr, MLXOptimizer *opt_g,
         for (int s = 0; s < steps_per_epoch; ++s) {
             int step_idx = e * steps_per_epoch + s;
             /* scheduler step: use step-and-get-lr then apply to available optimizers
+             */
             if (sched) {
                 float tmp_lr[16];
                 mlx_scheduler_step_and_get_lr(sched, step_idx, opt_g, tmp_lr,
@@ -79,6 +80,7 @@ int mlx_faciesgan_train_manager(MLXBaseManager *mgr, MLXOptimizer *opt_g,
                      * directory
                      * - Save per-scale parameter arrays as temporary .npy files
                      * - Invoke Python helper to pack them into `generator.npz`
+                     */
                     /* derive base run dir from checkpoint_path (strip file name) */
                     char base_dir[PATH_MAX];
                     strncpy(base_dir, checkpoint_path, PATH_MAX - 1);

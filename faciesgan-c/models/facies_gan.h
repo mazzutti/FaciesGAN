@@ -49,6 +49,7 @@ int mlx_faciesgan_get_noise_amplitude(MLXFaciesGAN *m, int scale,
      Caller receives a malloc'd array of `mlx_array*` (one per scale).
      Caller must free each mlx_array via `mlx_array_free` and free the
      returned pointer array.
+*/
 int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                                     const int *indexes, int n_indexes,
                                     mlx_array ***out_noises, int *out_n,
@@ -93,6 +94,7 @@ int mlx_faciesgan_load_wells(MLXFaciesGAN *m, const char *scale_path);
 
 /* High-level per-scale training orchestration (placeholders may be no-ops).
    These accept arrays indexed by scale and arrays of optimizers for each scale.
+ */
 int mlx_faciesgan_optimize_discriminator_scales(
     MLXFaciesGAN *m, const int *indexes, int n_indexes,
     MLXOptimizer **optimizers_by_scale, mlx_array **facies_pyramid,
@@ -110,6 +112,7 @@ int mlx_faciesgan_optimize_generator_scales(
    The functions compute scalar loss values (as a malloc'd mlx_array) and
    return 0 on success. Caller must free the returned mlx_array via
    mlx_array_free() when done.
+*/
 int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
         mlx_array **fake_samples,
         int n_samples, float lambda_diversity,

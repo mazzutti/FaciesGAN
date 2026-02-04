@@ -19,6 +19,7 @@ typedef struct MLXBatch {
 
 /* Full dataset struct exposed so callers can inspect metadata. Keep fields
  * minimal and preserve ownership semantics: callers must not free internals.
+ */
 typedef struct MLXPyramidsDataset {
   mlx_vector_vector_array facies;
   mlx_vector_vector_array wells;
@@ -39,6 +40,7 @@ typedef struct MLXPyramidsDataset {
  * `use_seismic`, `manual_seed`: generation params
  * - `shuffle`: whether to shuffle samples after load
  * Returns 0 on success and sets `*out`.
+ */
 int mlx_pyramids_dataset_new(MLXPyramidsDataset **out,
                              const TrainningOptions *options, int shuffle,
                              int regenerate, int channels_last);
@@ -54,21 +56,25 @@ int mlx_pyramids_dataset_clean_cache(const char *cache_dir);
 /* Get stacked per-scale tensors as a single mlx_array with shape (N,H,W,C).
  * Caller must free the returned mlx_array with `mlx_array_free()`.
  * Returns 0 on success, non-zero on failure.
+ */
 int mlx_pyramids_dataset_get_scale_stack(MLXPyramidsDataset *ds, int scale,
                                          mlx_array *out);
 
 /* Get stacked per-scale wells arrays (shape (N,H,W,C)). If the dataset has no
  * wells, returns an empty array with shape (0,H,W,C) to match Python semantics.
+ */
 int mlx_pyramids_dataset_get_wells_stack(MLXPyramidsDataset *ds, int scale,
                                          mlx_array *out);
 
 /* Get stacked per-scale masks arrays (shape (N,H,W,C)). If dataset has no
  * masks, returns an empty array with shape (0,H,W,C).
+ */
 int mlx_pyramids_dataset_get_masks_stack(MLXPyramidsDataset *ds, int scale,
                                          mlx_array *out);
 
 /* Get stacked per-scale seismic arrays (shape (N,H,W,C)). If dataset has no
  * seismic data, returns an empty array with shape (0,H,W,C).
+ */
 int mlx_pyramids_dataset_get_seismic_stack(MLXPyramidsDataset *ds, int scale,
                                            mlx_array *out);
 

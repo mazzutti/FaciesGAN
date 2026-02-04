@@ -13,6 +13,7 @@ extern "C" {
  * - `member_sizes`: array of sizes for each member
  * - `n_members`: number of members
  * Returns 0 on success.
+ */
 int npz_create_from_memory(const char *npz_path, const char **member_names, const void **member_bufs, const size_t *member_sizes, int n_members);
 
 #ifdef __cplusplus

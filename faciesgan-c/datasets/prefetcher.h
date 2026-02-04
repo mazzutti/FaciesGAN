@@ -33,6 +33,7 @@ typedef struct PrefetchedBatch {
  * `MLXDataPrefetcher` API this exposes per-scale arrays aligned to the
  * trainer-provided `scales` list. Each array has length `n_scales`; when an
  * entry is absent the corresponding mlx_array will be empty (ndim == 0).
+ */
 typedef struct PrefetchedPyramidsBatch {
     int n_scales;
     int *scales; /* heap-allocated array of length n_scales */
@@ -100,6 +101,7 @@ PrefetcherHandle prefetcher_create_with_stream(int max_queue, mlx_stream stream,
 /* Push already-constructed MLX arrays representing per-scale pyramids.
  * Each pointer array must point to `n_*` mlx_array values. Arrays are copied
  * into the prefetcher and optionally copied onto the prefetcher's stream.
+ */
 int prefetcher_push_mlx(PrefetcherHandle h, const mlx_array *facies,
                         int n_facies, const mlx_array *wells, int n_wells,
                         const mlx_array *masks, int n_masks,
@@ -107,9 +109,11 @@ int prefetcher_push_mlx(PrefetcherHandle h, const mlx_array *facies,
 
 /* Pop a prepared pyramids batch (per-scale MLX arrays). Caller must free
  * the batch with `prefetcher_free_pyramids`.
+ */
 PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h);
 
 /* Free a pyramids batch returned by `prefetcher_pop_pyramids`.
+ */
 void prefetcher_free_pyramids(PrefetchedPyramidsBatch *b);
 
 // Push a batch into the prefetcher (copies buffers). Returns 0 on success.
@@ -147,6 +151,7 @@ int prefetcher_stop(PrefetcherHandle h);
  * provided `stream` is used when calling `facies_dataloader_next` and is
  * freed by the background thread when finished. Returns non-zero on
  * failure.
+ */
 int prefetcher_start_from_dataloader(PrefetcherHandle ph,
                                      struct MLXDataloader *dl,
                                      mlx_stream stream);

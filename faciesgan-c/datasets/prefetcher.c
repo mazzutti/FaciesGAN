@@ -199,6 +199,7 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
      * loop) to avoid thread-safety issues with MLX. The producer thread only
      * passes through the wells data, and masks are computed after prefetcher_pop.
      * See mlx_trainer_api.c for the mask computation logic.
+     */
 
     /* If explicit masks were provided, store them */
     for (int i = 0; i < n_masks; ++i) {
@@ -318,6 +319,7 @@ PrefetcherHandle prefetcher_create_with_stream(int max_queue, mlx_stream stream,
 /* Background producer that reads from a facies_dataloader and pushes into
  * the provided prefetcher handle. Ownership of the provided `stream` is
  * consumed by the thread and it will be freed when the producer finishes.
+ */
 typedef struct PrefetcherDLProducerArgs {
     struct MLXDataloader *dl;
     PrefetcherHandle ph;
@@ -697,6 +699,7 @@ PrefetchedBatch *prefetcher_pop(PrefetcherHandle h) {
 /* Pop a prepared pyramids batch and return per-scale MLX arrays. Caller owns
  * the returned `PrefetchedPyramidsBatch` and must call
  * `prefetcher_free_pyramids`.
+ */
 PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
     Prefetcher *p = (Prefetcher *)h;
     if (!p) {

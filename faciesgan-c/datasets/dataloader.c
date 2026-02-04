@@ -969,6 +969,7 @@ static int serialize_vec_to_fd(int fd, mlx_vector_array vec) {
  * For each sample i: uint32_t nscales_fac, then for each scale the array
  * (ndim,int32 dims[], uint64 elems, float[elems]) Then similarly for wells
  * (per-sample scales) and seismic.
+ */
 static int write_dataset_to_fd(int fd, MLXPyramidsDataset *ds) {
     if (!ds)
         return 1;
@@ -996,6 +997,7 @@ static int write_dataset_to_fd(int fd, MLXPyramidsDataset *ds) {
  * n_scales_facies, for each scale: uint32_t ndim, int32_t dims[ndim], uint64_t
  * elems, float[elems] After facies, uint32_t n_scales_wells, ... then
  * n_scales_seismic, ...
+ */
 static int worker_process_loop(int task_fd, int result_fd,
                                MLXPyramidsDataset *ds,
                                facies_collate_fn collate_cb,
@@ -1539,6 +1541,7 @@ int facies_dataloader_new_ex(
             if (pid == 0) {
                 /* child: exec the spawn worker executable which will read the
                  * serialized dataset from the task fd and then enter its loop.
+                 */
                 close(taskpipe[1]);
                 close(resultpipe[0]);
                 char task_fd_str[32];
