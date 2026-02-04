@@ -84,5 +84,6 @@
   "[c]": {
     "editor.defaultFormatter": "chiehyu.vscode-astyle"
   },
-  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json"
+  "C_Cpp.default.compileCommands": "${workspaceFolder}/build/compile_commands.json",
+  "python-envs.defaultEnvManager": "ms-python.python:venv"
 }

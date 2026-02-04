@@ -1127,7 +1127,7 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
 
     /* color quantization (can be disabled via FACIESGAN_DISABLE_COLOR_QUANT) */
     if (m->color_quant && getenv("FACIESGAN_DISABLE_COLOR_QUANT") == NULL) {
-        /* Use soft quantization (training=1) when NOT in eval mode, 
+        /* Use soft quantization (training=1) when NOT in eval mode,
          * hard quantization (training=0) when in eval mode.
          * This matches Python's behavior where training=self.training. */
         int training = m->eval_mode ? 0 : 1;

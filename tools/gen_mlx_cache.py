@@ -25,14 +25,7 @@ except Exception:
 from datasets.torch.utils import to_facies_pyramids
 from datasets.torch.utils import to_seismic_pyramids
 from datasets.torch.utils import to_wells_pyramids
-from datasets.utils import generate_scales as py_generate_scales
 
-# Ensure child processes spawned by multiprocessing use the same Python
-# executable and prefer the 'fork' start method to avoid using the parent
-# process name as the python executable (which can cause spawned children
-# to invoke the C binary with '-c').
-import os
-import sys
 
 try:
     # Force PYTHONEXECUTABLE for multiprocessing.spawn to read.

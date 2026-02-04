@@ -77,7 +77,7 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
     }
     mlx_array up = mlx_upsample_forward(u, sel);
     mlx_upsample_free(u);
-    
+
     /* Free the intermediate selection array - mlx_upsample_forward creates
        a new output array, so `sel` is no longer needed. */
     mlx_array_free(sel);

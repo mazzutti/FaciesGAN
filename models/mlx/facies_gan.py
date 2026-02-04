@@ -324,7 +324,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         seismic_pyramid: dict[int, mx.array] = {},
     ) -> list[mx.array]:
         samples: list[mx.array] = []
-        for i in range(self.num_diversity_samples):
+        for _ in range(self.num_diversity_samples):
             noises = self.get_pyramid_noise(
                 scale, indexes, wells_pyramid, seismic_pyramid
             )
@@ -993,11 +993,11 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 if isinstance(loaded, dict) and loaded:
                     c_map = {str(k): v for k, v in loaded.items()}
             if not c_map:
-                params = self.discriminator.discs[scale].parameters()
-                flat = mlx_utils.tree_flatten(params)
+                params = self.discriminator.discs[scale].parameters()  # type: ignore
+                flat = mlx_utils.tree_flatten(params)  # type: ignore
                 if not flat:
                     return
-                if isinstance(flat[0], tuple) and len(flat[0]) == 2:
+                if isinstance(flat[0], tuple) and len(flat[0]) == 2:  # type: ignore
                     c_map = {str(k): v for k, v in flat}
                 else:
                     c_map = {f"param_{i:06d}": v for i, v in enumerate(flat)}
@@ -1041,14 +1041,14 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
                 if isinstance(loaded, dict) and loaded:
                     c_map = {str(k): v for k, v in loaded.items()}
             if not c_map:
-                params = self.generator.gens[scale].parameters()
-                flat = mlx_utils.tree_flatten(params)
+                params = self.generator.gens[scale].parameters()  # type: ignore
+                flat = mlx_utils.tree_flatten(params)  # type: ignore
                 if not flat:
                     return
-                if isinstance(flat[0], tuple) and len(flat[0]) == 2:
-                    c_map = {str(k): v for k, v in flat}
+                if isinstance(flat[0], tuple) and len(flat[0]) == 2:  # type: ignore
+                    c_map = {str(k): v for k, v in flat}  # type: ignore
                 else:
-                    c_map = {f"param_{i:06d}": v for i, v in enumerate(flat)}
+                    c_map = {f"param_{i:06d}": v for i, v in enumerate(flat)}  # type: ignore
             path = os.path.join(scale_path, "generator.safetensors")
             mx.save_safetensors(path, c_map)  # type: ignore
         except Exception:

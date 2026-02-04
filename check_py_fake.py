@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import numpy as np
 
-py_path = '/Users/mazzutti/POSDOC/Experimentos/FaciesGAN/results/py/2026_02_03_18_01_44/0/real_x_generated_facies/scale_0_epoch_0_fake.npy'
-c_path = '/Users/mazzutti/POSDOC/Experimentos/FaciesGAN/results/c/2026_02_03_18_29_06/0/real_x_generated_facies/scale_0_epoch_99_fake.npy'
+py_path = "/Users/mazzutti/POSDOC/Experimentos/FaciesGAN/results/py/2026_02_03_18_01_44/0/real_x_generated_facies/scale_0_epoch_0_fake.npy"
+c_path = "/Users/mazzutti/POSDOC/Experimentos/FaciesGAN/results/c/2026_02_03_18_29_06/0/real_x_generated_facies/scale_0_epoch_99_fake.npy"
 
 print("=== Python Fake Analysis ===")
 py_data = np.load(py_path)

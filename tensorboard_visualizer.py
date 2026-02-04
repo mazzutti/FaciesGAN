@@ -145,10 +145,10 @@ class TensorBoardVisualizer:
         if hasattr(scale_metrics, "as_tuple_of_dicts"):
             flat_metrics: dict[int, dict[str, float]] = {
                 i: metrics
-                for i, metrics in enumerate(scale_metrics.as_tuple_of_dicts())
+                for i, metrics in enumerate(scale_metrics.as_tuple_of_dicts())  # type: ignore
             }
         else:
-            flat_metrics: dict[int, dict[str, float]] = scale_metrics
+            flat_metrics: dict[int, dict[str, float]] = scale_metrics  # type: ignore
 
         # Calculate timing info
         current_time = time.time()

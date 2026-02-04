@@ -15,7 +15,7 @@ from typing import Any, Self, cast, TYPE_CHECKING
 
 import numpy as np
 from numpy.typing import NDArray
-import scipy.stats as st
+import scipy.stats as st  # type: ignore
 
 if TYPE_CHECKING:
     import torch as torch
@@ -1342,9 +1342,9 @@ def get_best_distribution(data: np.ndarray) -> tuple[str, float, tuple[Any, ...]
 
         # Applying the Kolmogorov-Smirnov test
         # Use flattened data for the KS test to match the fit input
-        result = st.kstest(data.flatten(), dist_name, args=param)
+        result = st.kstest(data.flatten(), dist_name, args=param)  # type: ignore
         # pvalue may be a scalar or array-like; coerce to float
-        pval = float(np.sum(result.pvalue))
+        pval = float(np.sum(result.pvalue))  # type: ignore
         dist_results.append((dist_name, pval))
 
     # Select the best fitted distribution

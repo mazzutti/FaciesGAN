@@ -28,76 +28,76 @@
 #include <unistd.h>
 
 static void mlx_error_trace_handler(const char *msg, void *data) {
-  (void)data;
-  fprintf(stderr, "MLX error: %s\n", msg);
-  void *bt[64];
-  int bt_size = backtrace(bt, 64);
-  char **syms = backtrace_symbols(bt, bt_size);
-  if (syms) {
-    for (int i = 0; i < bt_size; ++i) {
-      fprintf(stderr, "  [%d] %s\n", i, syms[i]);
+    (void)data;
+    fprintf(stderr, "MLX error: %s\n", msg);
+    void *bt[64];
+    int bt_size = backtrace(bt, 64);
+    char **syms = backtrace_symbols(bt, bt_size);
+    if (syms) {
+        for (int i = 0; i < bt_size; ++i) {
+            fprintf(stderr, "  [%d] %s\n", i, syms[i]);
+        }
+        free(syms);
+    } else {
+        backtrace_symbols_fd(bt, bt_size, STDERR_FILENO);
     }
-    free(syms);
-  } else {
-    backtrace_symbols_fd(bt, bt_size, STDERR_FILENO);
-  }
-  fflush(stderr);
-  exit(-1);
+    fflush(stderr);
+    exit(-1);
 }
 
 int main(int argc, char **argv) {
-  mlx_set_error_handler(mlx_error_trace_handler, NULL, NULL);
-  char *output_path = NULL;
-  char *output_fullpath = NULL;
-  int gpu_device = 0;
+    mlx_set_error_handler(mlx_error_trace_handler, NULL, NULL);
+    char *output_path = NULL;
+    char *output_fullpath = NULL;
+    int gpu_device = 0;
 
-  CLIArgs parsed_args;
-  CLIArgs_init(&parsed_args);
-  int parse_rc = CLIArgs_parse_from_argv(&parsed_args, argc, argv);
-  if (parse_rc == 2) {
+    CLIArgs parsed_args;
+    CLIArgs_init(&parsed_args);
+    int parse_rc = CLIArgs_parse_from_argv(&parsed_args, argc, argv);
+    if (parse_rc == 2) {
+        CLIArgs_free(&parsed_args);
+        return 0;
+    }
+    if (parse_rc != 0) {
+        CLIArgs_free(&parsed_args);
+        return 1;
+    }
+
+    TrainningOptions *topt = trainning_options_from_cli(&parsed_args);
+
     CLIArgs_free(&parsed_args);
-    return 0;
-  }
-  if (parse_rc != 0) {
-    CLIArgs_free(&parsed_args);
-    return 1;
-  }
+    if (!topt)
+        return 1;
+    char timestamp[TIMESTAMP_BUFSZ];
+    format_timestamp(timestamp, sizeof(timestamp));
 
-  TrainningOptions *topt = trainning_options_from_cli(&parsed_args);
+    char final_out[PATH_BUFSZ];
+    if (output_fullpath) {
+        strncpy(final_out, output_fullpath, sizeof(final_out) - 1);
+        final_out[sizeof(final_out) - 1] = '\0';
+    } else {
+        const char *base = output_path ? output_path : topt->output_path;
+        join_path(final_out, sizeof(final_out), base, timestamp);
+    }
 
-  CLIArgs_free(&parsed_args);
-  if (!topt)
-    return 1;
-  char timestamp[TIMESTAMP_BUFSZ];
-  format_timestamp(timestamp, sizeof(timestamp));
+    free(topt->output_path);
+    topt->output_path = strdup(final_out);
 
-  char final_out[PATH_BUFSZ];
-  if (output_fullpath) {
-    strncpy(final_out, output_fullpath, sizeof(final_out) - 1);
-    final_out[sizeof(final_out) - 1] = '\0';
-  } else {
-    const char *base = output_path ? output_path : topt->output_path;
-    join_path(final_out, sizeof(final_out), base, timestamp);
-  }
+    ensure_dir(topt->output_path);
 
-  free(topt->output_path);
-  topt->output_path = strdup(final_out);
+    write_options_json(topt, topt->wells_mask_columns, topt->wells_mask_count);
 
-  ensure_dir(topt->output_path);
-
-  write_options_json(topt, topt->wells_mask_columns, topt->wells_mask_count);
-
-  FaciesGANTrainer *ftr = facies_trainer_new(topt, gpu_device, ".checkpoints");
-  if (!ftr) {
+    FaciesGANTrainer *ftr = facies_trainer_new(topt, gpu_device, ".checkpoints");
+    if (!ftr) {
+        mlx_options_free_trainning(topt);
+        return 1;
+    }
+    int rc = facies_trainer_run(ftr);
+    facies_trainer_destroy(ftr);
     mlx_options_free_trainning(topt);
-    return 1;
-  }
-  int rc = facies_trainer_run(ftr);
-  facies_trainer_destroy(ftr);
-  mlx_options_free_trainning(topt);
-  if (mlx_mem_is_enabled()) {
-    mlx_mem_print_stats();
-    mlx_mem_print_leaks();
-  }
-  return rc;
+    if (mlx_mem_is_enabled()) {
+        mlx_mem_print_stats();
+        mlx_mem_print_leaks();
+    }
+    return rc;
 }

@@ -1270,10 +1270,10 @@ static int _serialize_array_to_npy_bytes_local(const mlx_array arr,
         size_t *out_size) {
     if (!out_buf || !out_size)
         return -1;
-    
+
     /* Use CPU stream for I/O - mlx_save_writer doesn't support GPU eval */
     mlx_stream cpu_s = mlx_default_cpu_stream_new();
-    
+
     /* Synchronize to ensure any pending GPU ops are complete */
     mlx_synchronize(cpu_s);
 

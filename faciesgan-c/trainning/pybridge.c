@@ -11,59 +11,8 @@
 #include <unistd.h>
 #include <wchar.h>
 
-#ifdef __has_include
-#if __has_include(<Python.h>)
+/* Always use Python C API. Python development headers are required by CMake. */
 #include <Python.h>
-#define HAVE_PYTHON_API 1
-#else
-#define HAVE_PYTHON_API 0
-#endif
-#else
-#define HAVE_PYTHON_API 0
-#endif
-
-#if !HAVE_PYTHON_API
-/* Stubs when Python headers aren't available. */
-int pybridge_initialize(void) {
-    return 0;
-}
-int pybridge_finalize(void) {
-    return 0;
-}
-int pybridge_create_visualizer(int num_scales, const char *output_dir,
-                               const char *log_dir, int update_interval) {
-    /* stub: parameters unused without Python support */
-    return 0;
-}
-int pybridge_update_visualizer_from_json(int epoch, const char *metrics_json,
-        int samples_processed) {
-    /* stub: parameters unused without Python support */
-    return 0;
-}
-int pybridge_close_visualizer(void) {
-    return 0;
-}
-int pybridge_create_background_worker(int max_workers, int max_pending) {
-    /* stub: parameters unused without Python support */
-    return 0;
-}
-int pybridge_background_pending_count(void) {
-    return -1;
-}
-int pybridge_shutdown_background_worker(int wait) {
-    /* stub: parameter unused without Python support */
-    return 0;
-}
-
-int pybridge_submit_plot_generated_facies(const char *fake_path,
-        const char *real_path, int stage,
-        int index, const char *out_dir,
-        const char *masks_path) {
-    /* stub: parameters unused without Python support */
-    return 0;
-}
-
-#else
 
 /* Real implementation using the Python C API. */
 static PyObject *g_visualizer = NULL;
@@ -95,17 +44,19 @@ int pybridge_initialize(void) {
         venv = venv_res;
         setenv("VIRTUAL_ENV", venv, 1);
     }
-    if (venv && venv[0]) {
-        /* Prefer classic APIs to avoid getpath.py failures with venv embeds. */
-        char py_path[PATH_MAX];
-        snprintf(py_path, sizeof(py_path), "%s/bin/python", venv);
-        static wchar_t py_w[PATH_MAX];
-        mbstowcs(py_w, py_path, PATH_MAX - 1);
-        Py_SetProgramName(py_w);
-        Py_Initialize();
-    } else {
-        Py_Initialize();
-    }
+        if (venv && venv[0]) {
+            /* Prefer classic APIs to avoid getpath.py failures with venv embeds. */
+            char py_path[PATH_MAX];
+            snprintf(py_path, sizeof(py_path), "%s/bin/python", venv);
+    #if PY_VERSION_HEX < 0x03080000
+            static wchar_t py_w[PATH_MAX];
+            mbstowcs(py_w, py_path, PATH_MAX - 1);
+            Py_SetProgramName(py_w);
+    #endif
+            Py_Initialize();
+        } else {
+            Py_Initialize();
+        }
 
     if (!Py_IsInitialized())
         return 0;
@@ -366,4 +317,4 @@ int pybridge_submit_plot_generated_facies(const char *fake_path,
     return 1;
 }
 
-#endif /* HAVE_PYTHON_API */
+

@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from numpy.typing import NDArray
-from scipy.ndimage import zoom
+from scipy.ndimage import zoom  # type: ignore
 
 import datasets.utils as data_utils
 from interpolators.base import BaseInterpolator
@@ -158,9 +158,9 @@ class NearestInterpolator(BaseInterpolator):
         h, w, _ = img.shape
 
         # Step 1: Vectorized horizontal downsampling for all channels at once
-        h_downsampled = zoom(img, (1, target_w / w, 1), order=0)
+        h_downsampled = zoom(img, (1, target_w / w, 1), order=0)  # type: ignore
 
         # Step 2: Vectorized vertical downsampling for all columns and channels at once
-        output = zoom(h_downsampled, (target_h / h, 1, 1), order=0)
+        output = zoom(h_downsampled, (target_h / h, 1, 1), order=0)  # type: ignore
 
-        return output.astype(np.float32)
+        return output.astype(np.float32)  # type: ignore

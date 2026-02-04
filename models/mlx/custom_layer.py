@@ -95,7 +95,7 @@ class MLXConvBlock(nn.Module):
         x = self.conv(x)
         if self.use_norm:
             x = self.norm(x)
-        x = cast(mx.array, self.activation(x))
+        x = self.activation(x)
         return x
 
     def reset_parameters(self) -> None:
@@ -317,7 +317,7 @@ class MLXSPADEConvBlock(nn.Module):
 
     def __call__(self, x: mx.array, cond: mx.array) -> mx.array:
         spade_out = self.spade(x, cond)
-        act_out = cast(mx.array, self.activation(spade_out))
+        act_out = self.activation(spade_out)
         conv_out = self.conv(act_out)
         return conv_out
 
@@ -407,7 +407,7 @@ class MLXSPADEGenerator(nn.Module):
     def __call__(self, cond: mx.array) -> mx.array:
         # Initial feature extraction
         x = self.init_conv(cond)
-        x = cast(mx.array, self.leaky_relu(x))
+        x = self.leaky_relu(x)
 
         for block in self.spade_blocks.layers:  # type: ignore
             x = cast(mx.array, block(x, cond))

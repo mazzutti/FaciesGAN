@@ -360,10 +360,14 @@ def main() -> None:
                     from torch.profiler import ProfilerActivity  # type: ignore
                     from torch.profiler import profile
                 except Exception:
-                    print("Warning: PyTorch profiler not available in this environment.")
+                    print(
+                        "Warning: PyTorch profiler not available in this environment."
+                    )
                     trainer.train()
                 else:
-                    trace_file = os.path.join(options.output_path, "profiler_trace.json")
+                    trace_file = os.path.join(
+                        options.output_path, "profiler_trace.json"
+                    )
                     activities = [ProfilerActivity.CPU]
                     if torch.cuda.is_available():
                         activities.append(ProfilerActivity.CUDA)

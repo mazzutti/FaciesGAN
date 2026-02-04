@@ -13,6 +13,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from tqdm import tqdm
 from abc import ABC, abstractmethod
 from typing import Any, Iterator, cast
 
@@ -34,7 +35,6 @@ class DummyProgress:
         pass
 
 
-from torch.hub import tqdm
 import utils
 from config import RESULT_FACIES_PATH
 from datasets import PyramidsDataset
@@ -488,14 +488,14 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     seismic_pyramid,
                 )
 
-            self.handle_epoch_end(
+            self.handle_epoch_end(  # type: ignore
                 scales=scales,
                 epoch=epoch,
                 scale_metrics=cast(ScaleMetrics[TTensor], scale_metrics),
                 generated_samples=generated_samples,
                 writers=writers,
                 results_paths=results_paths,
-                progress=progress,
+                progress=progress,  # type: ignore
                 facies_pyramid=facies_pyramid,
                 wells_pyramid=wells_pyramid,
                 masks_pyramid=masks_pyramid,
@@ -766,7 +766,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         for scale in scales:
             g = scale_metrics.generator[scale]
             d = scale_metrics.discriminator[scale]
-            self.log_epoch(progress, writers[scale], epoch, g, d)
+            self.log_epoch(progress, writers[scale], epoch, g, d)  # type: ignore
 
         # Save generated facies at intervals
         if (epoch % self.save_interval == 0 or epoch == self.num_iter - 1) and (
@@ -785,7 +785,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         # Step schedulers
         self.schedulers_step(scales)
-        progress.update(1)
+        progress.update(1)  # type: ignore
 
     def schedulers_step(
         self,
@@ -857,7 +857,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             # Iterate over DataLoader batches for this group and train on each
             # Single progress bar for all batches and epochs in this group
             total_batches = len(self.data_loader)
-            progress = tqdm(total=self.num_iter * total_batches, position=0)
+            progress = tqdm(total=self.num_iter * total_batches, position=0)  # type: ignore
 
             # Use create_batch_iterator to allow subclasses to inject prefetching logic
             # Need to load all scales from 0 to max(scales_to_train) for noise initialization
@@ -881,20 +881,20 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 facies_pyramid, wells_pyramid, masks_pyramid, seismic_pyramid = batch
 
                 # Pass prepared dictionaries directly to train_scales
-                self.train_scales(
+                self.train_scales(  # type: ignore
                     scales_to_train,
                     writers,
                     scale_paths,
                     results_paths,
                     batch_id,
-                    progress,
+                    progress,  # type: ignore
                     facies_pyramid=facies_pyramid,
                     wells_pyramid=wells_pyramid,
                     masks_pyramid=masks_pyramid,
                     seismic_pyramid=seismic_pyramid,
                 )
 
-            progress.close()
+            progress.close()  # type: ignore
 
             # After processing all batches for this group, save models
             for s in scales_to_train:

@@ -140,7 +140,7 @@ void mlx_mem_set_verbosity(int level);
 
 /* Helper functions used by macros (always available) */
 mlx_array mlx_mem_tracked_new(const char *file, int line, const char *func,
-                               const char *varname);
+                              const char *varname);
 
 mlx_array mlx_mem_tracked_new_float(float v, const char *file, int line,
                                     const char *func);
@@ -156,7 +156,7 @@ void mlx_mem_tracked_free(mlx_array arr, const char *file, int line,
                           const char *func);
 
 void mlx_mem_tracked_detach_free(mlx_array arr, const char *file, int line,
-                                  const char *func);
+                                 const char *func);
 
 /*
  * Scope-based leak checking.

@@ -205,13 +205,13 @@ def plot_mds(
     fake_facies_reduced = mds.fit(
         (fake_facies_similarities + fake_facies_similarities.T) / 2
     ).embedding_
-    plt.scatter(real_facies_reduced[:, 0], real_facies_reduced[:, 1])
-    plt.scatter(fake_facies_reduced[:, 0], fake_facies_reduced[:, 1])
-    plt.title("MDS Visualization of FaciesGAN generated facies")
-    plt.xlabel("MDS Dimension 1")
-    plt.ylabel("MDS Dimension 2")
+    plt.scatter(real_facies_reduced[:, 0], real_facies_reduced[:, 1])  # type: ignore
+    plt.scatter(fake_facies_reduced[:, 0], fake_facies_reduced[:, 1])  # type: ignore
+    plt.title("MDS Visualization of FaciesGAN generated facies")  # type: ignore
+    plt.xlabel("MDS Dimension 1")  # type: ignore
+    plt.ylabel("MDS Dimension 2")  # type: ignore
     plt.legend(("Real Facies", "Fake Facies"), loc="upper right")  # type: ignore
-    plt.show()
+    plt.show()  # type: ignore
 
 
 if __name__ == "__main__":
@@ -344,7 +344,7 @@ if __name__ == "__main__":
             # create figure and axes for plotting
             fig: Figure
             axes: Axes
-            fig, axes = plt.subplots(1, 1)
+            fig, axes = plt.subplots(1, 1)  # type: ignore
             axes.imshow(facie.squeeze(), cmap="gray")  # type: ignore
             # Ensure numeric dtypes for matplotlib scatter to avoid analyzer/runtime issues
             x_coords = np.full(masked_facie_arr.shape[0], mask_index, dtype=float)
@@ -359,8 +359,8 @@ if __name__ == "__main__":
                 cmap="plasma",
                 label="Facies Mask",
             )
-            axes.set_xticks([])
-            axes.set_yticks([])
+            axes.set_xticks([])  # type: ignore
+            axes.set_yticks([])  # type: ignore
             axes.axis("off")  # type: ignore
 
             out_file = os.path.join(arguments.out_path, f"generated_facie_{i}.tif")
