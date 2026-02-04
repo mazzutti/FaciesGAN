@@ -309,10 +309,11 @@ static int gen_loss_closure(mlx_vector_array *result,
                     };
                 }
 
-                /* Forward generator with rec_in as in_noise */
+                /* Forward generator with rec_in as in_noise
+                 * Python uses start_scale=scale, stop_scale=scale for reconstruction */
                 mlx_array rec = mlx_generator_forward(gen, rec_noises, n_rec_noises,
                                                       p->amp, p->amp_count,
-                                                      p->rec_in, 1, p->scale);
+                                                      p->rec_in, p->scale, p->scale);
 
                 if (rec.ctx) {
                     /* MSE(rec, real) */
@@ -585,22 +586,29 @@ static int disc_loss_closure(mlx_vector_array *result,
                 mlx_vector_array_get(&grad_x, vjp_grads, 0);
 
                 if (grad_x.ctx) {
-                    /* 3. Compute ||grad||_2 per sample
+                    /* 3. Compute ||grad||_2 per pixel (matching Python)
                      * grad_x shape is [batch, H, W, C]
-                     * We need sqrt(sum(grad^2)) over axes (1,2,3) */
+                     * Python: grad_norm = sqrt(sum(grad^2, axis=-1) + 1e-12)
+                     * So we sum over axis 3 (channels) only, NOT H, W */
 
                     /* grad^2 */
                     mlx_array grad_sq = mlx_array_new();
                     mlx_square(&grad_sq, grad_x, s);
 
-                    /* Sum over H, W, C (axes 1, 2, 3) */
-                    int axes[3] = {1, 2, 3};
+                    /* Sum over C only (axis 3) - NOT H, W
+                     * This gives per-pixel gradient norms with shape [batch, H, W] */
+                    int axes[1] = {3};
                     mlx_array grad_sum = mlx_array_new();
-                    mlx_sum_axes(&grad_sum, grad_sq, axes, 3, false, s);
+                    mlx_sum_axes(&grad_sum, grad_sq, axes, 1, false, s);
 
-                    /* sqrt to get L2 norm per sample */
+                    /* Add epsilon for numerical stability (matching Python) */
+                    mlx_array eps_arr = mlx_array_new_float(1e-12f);
+                    mlx_array grad_sum_eps = mlx_array_new();
+                    mlx_add(&grad_sum_eps, grad_sum, eps_arr, s);
+
+                    /* sqrt to get L2 norm per pixel */
                     mlx_array grad_norm = mlx_array_new();
-                    mlx_sqrt(&grad_norm, grad_sum, s);
+                    mlx_sqrt(&grad_norm, grad_sum_eps, s);
 
                     /* 4. (grad_norm - 1)^2 */
                     mlx_array norm_minus_1 = mlx_array_new();
@@ -609,9 +617,13 @@ static int disc_loss_closure(mlx_vector_array *result,
                     mlx_array penalty_sq = mlx_array_new();
                     mlx_square(&penalty_sq, norm_minus_1, s);
 
-                    /* Mean over batch */
+                    /* Mean over all dimensions (batch, H, W) */
                     mlx_array gp_mean = mlx_array_new();
                     mlx_mean(&gp_mean, penalty_sq, false, s);
+
+                    /* Cleanup additional arrays */
+                    mlx_array_free(eps_arr);
+                    mlx_array_free(grad_sum_eps);
 
                     /* lambda * gp_mean */
                     mlx_array lambda_arr = mlx_array_new_float(p->lambda_grad);

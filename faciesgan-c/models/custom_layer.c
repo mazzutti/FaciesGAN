@@ -1921,29 +1921,16 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         CLEANUP_RETURN(x);
     }
 
-    /* If not training: nearest neighbor assignment
-     * Use the MLX helper `mlx_quantize_array` which handles host-side
-     * quantization and returns an MLX array, avoiding manual host loops.
+    /* If not training: nearest neighbor assignment (hard quantization)
+     * Match Python: indices = mx.argmin(distances, axis=-1); quantized = pure_colors[indices]
      */
     if (!training) {
-        /* If host-side data is not available for fast quantization, skip and
-         * return input unchanged to avoid forcing a device eval which can
-         * crash the Metal device scheduler in some debug/runtime states. */
+        /* Try host-side quantization first (faster for small arrays) */
         mlx_array quant = mlx_array_new();
         const float *flat_host = NULL;
         const float *pure_host = NULL;
-        /* Try to use a fast host-side quantization when possible. If host
-         * pointers are not available, fall through to the soft-assignment
-         * (MLX ops) path below which does not require a host copy. */
-        /* Note: calling mlx_array_data_float32 on arrays that are not host-backed
-         * may trigger internal allocator access; guard by trying and catching
-         * via checking pointers only if safe. We attempt but defensively handle
-         * crashes by checking for nullptr. */
-        flat_host = NULL;
-        pure_host = NULL;
-        /* Check if arrays are available on host before attempting to get raw
-         * pointers. Use the internal availability check to avoid throwing into
-         * C code paths. */
+        int host_quant_success = 0;
+
         {
             bool ok_flat = false;
             bool ok_pure = false;
@@ -1954,16 +1941,10 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
             }
         }
         if (flat_host && pure_host) {
-            if (mlx_quantize_array(flat, &quant, pure) != 0) {
-                mlx_array_free(quant);
-                /* fall through to soft-assignment below */
-            } else {
+            if (mlx_quantize_array(flat, &quant, pure) == 0) {
                 int outshape[4] = {b, h, w, c};
                 mlx_array out = mlx_array_new();
-                if (mlx_reshape(&out, quant, outshape, 4, s) != 0) {
-                    mlx_array_free(quant);
-                    /* fall through to soft-assignment below */
-                } else {
+                if (mlx_reshape(&out, quant, outshape, 4, s) == 0) {
                     /* cleanup temporaries */
                     mlx_array_free(quant);
                     mlx_array_free(flat);
@@ -1977,8 +1958,44 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
                     mlx_array_free(distances);
                     CLEANUP_RETURN(out);
                 }
+                mlx_array_free(out);
             }
+            mlx_array_free(quant);
         }
+
+        /* GPU-side hard quantization: indices = argmin(distances, axis=-1)
+         * This matches Python: indices = mx.argmin(distances, axis=-1) */
+        mlx_array indices = mlx_array_new();
+        if (mlx_argmin_axis(&indices, distances, 1, false, s) == 0) {
+            /* quantized = pure_colors[indices] via take along axis 0
+             * pure has shape (K, c), indices has shape (N,)
+             * We need to gather pure[indices[i]] for each pixel i
+             */
+            mlx_array quantized_flat = mlx_array_new();
+            if (mlx_take_axis(&quantized_flat, pure, indices, 0, s) == 0) {
+                int outshape[4] = {b, h, w, c};
+                mlx_array out = mlx_array_new();
+                if (mlx_reshape(&out, quantized_flat, outshape, 4, s) == 0) {
+                    /* cleanup temporaries */
+                    mlx_array_free(quantized_flat);
+                    mlx_array_free(indices);
+                    mlx_array_free(flat);
+                    mlx_array_free(x_norm);
+                    mlx_array_free(c_norm);
+                    mlx_array_free(pure_t);
+                    mlx_array_free(prod);
+                    mlx_array_free(c_norm_t);
+                    mlx_array_free(neg2prod);
+                    mlx_array_free(tmp);
+                    mlx_array_free(distances);
+                    CLEANUP_RETURN(out);
+                }
+                mlx_array_free(out);
+            }
+            mlx_array_free(quantized_flat);
+        }
+        mlx_array_free(indices);
+        /* If GPU quantization failed, fall through to soft assignment */
     }
 
     /* Training: soft assignment

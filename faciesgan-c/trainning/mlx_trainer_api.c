@@ -1422,19 +1422,27 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
             return -1;
         }
 
-        /* use default amplitudes (all ones) */
+        /* Use learned noise amplitudes from the model (matching Python behavior).
+         * This is critical for proper progressive synthesis quality. */
         float *use_amps = NULL;
-        if (mlx_alloc_float_buf(&use_amps, scale + 1) != 0) {
-            mlx_free_mlx_array_ptrs(&noises, n_noises);
-            for (int j = 0; j < gen_idx; j++)
-                mlx_array_free(all_fakes[j]);
-            free(all_fakes);
-            free(selected_indices);
-            mlx_stream_free(s);
-            return -1;
+        int n_amps = 0;
+        if (mlx_faciesgan_get_noise_amps(trainer->model, &use_amps, &n_amps) != 0 ||
+                use_amps == NULL || n_amps < scale + 1) {
+            /* Fallback to default amplitudes (all ones) if learned amps not available */
+            if (use_amps) mlx_free_float_buf(&use_amps, &n_amps);
+            if (mlx_alloc_float_buf(&use_amps, scale + 1) != 0) {
+                mlx_free_mlx_array_ptrs(&noises, n_noises);
+                for (int j = 0; j < gen_idx; j++)
+                    mlx_array_free(all_fakes[j]);
+                free(all_fakes);
+                free(selected_indices);
+                mlx_stream_free(s);
+                return -1;
+            }
+            for (int i = 0; i < scale + 1; ++i)
+                use_amps[i] = 1.0f;
+            n_amps = scale + 1;
         }
-        for (int i = 0; i < scale + 1; ++i)
-            use_amps[i] = 1.0f;
 
         /* Convert pointer array to contiguous mlx_array values.
          * Transfer ownership from noises to zvals. */
@@ -1467,9 +1475,13 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
         }
 
         mlx_array in_noise = mlx_array_new();
+        /* Generate fake using progressive synthesis from scale 0 to current scale.
+         * IMPORTANT: start_scale must be 0 for proper multi-scale progressive
+         * synthesis. Previously this was incorrectly set to `scale` which caused
+         * scales > 0 to produce all zeros since they had no input from previous scales. */
         mlx_array_t fake = mlx_faciesgan_generate_fake(
                                trainer->model, zvals, zvals_count, use_amps, scale + 1,
-                               in_noise, scale, scale);
+                               in_noise, 0, scale);
 
         /* IMPORTANT: Evaluate the fake array BEFORE freeing noise inputs!
          * MLX uses lazy evaluation, so the computation graph references the noise
@@ -2116,11 +2128,13 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         }
     }
 
-    /* Ensure generator scales exist for the discovered/synthesized shapes so
-     * subsequent noise/forward calls have initialized modules. */
+    /* Ensure generator and discriminator scales exist for the discovered/synthesized
+     * shapes so subsequent noise/forward calls have initialized modules. */
     for (int si = 0; si < n_scales; ++si) {
         mlx_faciesgan_create_generator_scale(
             trainer->model, si, opts->num_feature, opts->min_num_feature);
+        mlx_faciesgan_create_discriminator_scale(
+            trainer->model, opts->num_feature, opts->min_num_feature);
     }
 
     MLXPyramidsDataset *ds = NULL;

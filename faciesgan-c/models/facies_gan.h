@@ -25,6 +25,9 @@ MLXGenerator *mlx_faciesgan_build_generator(MLXFaciesGAN *m);
 int mlx_faciesgan_create_generator_scale(MLXFaciesGAN *m, int scale,
         int num_features,
         int min_num_features);
+int mlx_faciesgan_create_discriminator_scale(MLXFaciesGAN *m,
+        int num_features,
+        int min_num_features);
 
 /* Inference */
 mlx_array_t mlx_faciesgan_generate_fake(MLXFaciesGAN *m,

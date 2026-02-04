@@ -474,6 +474,18 @@ int mlx_faciesgan_create_generator_scale(MLXFaciesGAN *m, int scale,
                                       min_num_features);
 }
 
+int mlx_faciesgan_create_discriminator_scale(MLXFaciesGAN *m,
+        int num_features,
+        int min_num_features) {
+    if (!m)
+        return -1;
+    /* Ensure discriminator exists */
+    MLXDiscriminator *d = mlx_faciesgan_build_discriminator(m);
+    if (!d)
+        return -1;
+    return mlx_discriminator_create_scale(d, num_features, min_num_features);
+}
+
 mlx_array_t mlx_faciesgan_generate_fake(MLXFaciesGAN *m,
                                         const mlx_array *z_list, int z_count,
                                         const float *amp, int amp_count,
