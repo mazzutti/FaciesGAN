@@ -131,13 +131,13 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
     /* Use CPU stream for numeric ops */
     mlx_stream s = mlx_default_gpu_stream_new();
 
-    /* Determine element count from first sample */
+    /* Determine element count from first sample.
+     * mlx_array_size reads shape metadata only — no eval needed. */
     mlx_array *first = fake_samples[0];
     if (!first) {
         mlx_stream_free(s);
         return -1;
     }
-    mlx_array_eval(*first);
     size_t total_elems = (size_t)mlx_array_size(*first);
     if (total_elems == 0) {
         mlx_stream_free(s);

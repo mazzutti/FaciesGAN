@@ -1348,13 +1348,14 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
             MLXScaleResults *sr = &res->scales[i];
             int sc = sr->scale;
 
-            /* Store discriminator metrics on first D step for logging */
+            /* Store discriminator metrics on first D step for logging.
+             * Metrics were already batch-eval'd in collect_metrics, so use
+             * mlx_array_data_float32 (zero-copy pointer read, no sync). */
             if (d_step == 0 && sc >= 0 && sc < trainer->n_scales && trainer->last_d_total) {
 #define EXTRACT_SCALAR(arr_ptr) \
                     ((arr_ptr) && (arr_ptr)->ctx ? ({ \
-                        float val = 0.0f; \
-                        mlx_array_item_float32(&val, *(arr_ptr)); \
-                        (double)val; \
+                        const float *_p = mlx_array_data_float32(*(arr_ptr)); \
+                        _p ? (double)_p[0] : 0.0; \
                     }) : 0.0)
                 trainer->last_d_real[sc] = EXTRACT_SCALAR(sr->metrics.d_real);
                 trainer->last_d_fake[sc] = EXTRACT_SCALAR(sr->metrics.d_fake);
@@ -1402,13 +1403,13 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
             MLXScaleResults *sr = &res->scales[i];
             int sc = sr->scale;
 
-            /* Store generator metrics on first G step for logging */
+            /* Store generator metrics on first G step for logging.
+             * Metrics were already batch-eval'd in collect_metrics. */
             if (g_step == 0 && sc >= 0 && sc < trainer->n_scales && trainer->last_g_total) {
 #define EXTRACT_SCALAR(arr_ptr) \
                     ((arr_ptr) && (arr_ptr)->ctx ? ({ \
-                        float val = 0.0f; \
-                        mlx_array_item_float32(&val, *(arr_ptr)); \
-                        (double)val; \
+                        const float *_p = mlx_array_data_float32(*(arr_ptr)); \
+                        _p ? (double)_p[0] : 0.0; \
                     }) : 0.0)
                 trainer->last_g_adv[sc] = EXTRACT_SCALAR(sr->metrics.fake);
                 trainer->last_g_well[sc] = EXTRACT_SCALAR(sr->metrics.well);
@@ -1618,7 +1619,8 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
 
         /* IMPORTANT: Evaluate the fake array BEFORE freeing noise inputs!
          * MLX uses lazy evaluation, so the computation graph references the noise
-         * arrays. If we free them before evaluation, we get zeros/garbage. */
+         * arrays. If we free them before evaluation, we get zeros/garbage.
+         * Must synchronize so the eval completes before we free zvals below. */
         mlx_array_eval(fake);
         mlx_synchronize(s);
 
@@ -2578,10 +2580,19 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
                     mlx_array_free(sum_arr);
                     mlx_array_free(zero);
 
-                    /* Evaluate immediately on main thread */
-                    mlx_array_eval(*mask_ptr);
                     computed_masks[wi] = mask_ptr;
                     n_computed_masks++;
+                }
+                /* Batch-eval all computed masks in one call instead of
+                 * N individual mlx_array_eval barriers. */
+                if (n_computed_masks > 0) {
+                    mlx_vector_array mvec = mlx_vector_array_new();
+                    for (int mi = 0; mi < nsc; ++mi) {
+                        if (computed_masks[mi] && (*computed_masks[mi]).ctx)
+                            mlx_vector_array_append_value(mvec, *computed_masks[mi]);
+                    }
+                    mlx_eval(mvec);
+                    mlx_vector_array_free(mvec);
                 }
                 mlx_stream_free(mask_s);
             }
@@ -2716,10 +2727,13 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
                 }
             }
 
-            /* Sync and clear cache for memory management after each epoch */
-            mlx_synchronize(s);
-            if (clear_cache) {
-                mlx_clear_cache();
+            /* Sync only when we need to (save epochs), or periodically
+             * every 4 epochs to bound Metal command-buffer accumulation
+             * without draining the pipeline every single epoch. */
+            if (should_save || (epoch & 3) == 3 || epoch == num_iter - 1) {
+                mlx_synchronize(s);
+                if (clear_cache)
+                    mlx_clear_cache();
             }
         } /* end epoch loop */
 

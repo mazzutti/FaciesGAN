@@ -202,7 +202,11 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
 
     /* generate fake for this scale (numeric forward) */
     /* Convert returned array-of-pointers into a contiguous array of mlx_array
-       values required by mlx_faciesgan_generate_fake. */
+       values required by mlx_faciesgan_generate_fake.
+       Transfer ownership from noises[i] → zvals[i] without copying the
+       underlying MLX array (which would allocate a new stream + graph node).
+       After the transfer, null out noises[i] so the later
+       mlx_free_mlx_array_ptrs skips them and avoids a double-free. */
     mlx_array *zvals = NULL;
     if (n_noises > 0) {
         if (mlx_alloc_mlx_array_vals(&zvals, n_noises) != 0) {
@@ -213,17 +217,15 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
             return -1;
         }
         for (int i = 0; i < n_noises; ++i) {
-            mlx_stream _s = mlx_default_gpu_stream_new();
-            mlx_array tmp_dst = mlx_array_new();
-            if (mlx_copy(&tmp_dst, *noises[i], _s) == 0) {
+            if (noises[i] && (*noises[i]).ctx) {
                 mlx_array_free(zvals[i]);
-                zvals[i] = tmp_dst;
-            } else {
-                mlx_array_free(tmp_dst);
-                mlx_array_free(zvals[i]);
-                mlx_array_set(&zvals[i], *noises[i]);
+                zvals[i] = *noises[i];  /* take ownership of the handle */
+                /* Null out the source so mlx_free_mlx_array_ptrs won't
+                 * free the same underlying array a second time. We only
+                 * free the wrapper struct here (not the MLX array). */
+                free(noises[i]);
+                noises[i] = NULL;
             }
-            mlx_stream_free(_s);
         }
         /* Ensure none of the zvals are empty */
         for (int i = 0; i < n_noises; ++i) {

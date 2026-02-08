@@ -393,14 +393,20 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
                 sr->disc_grads = disc_grads;
                 sr->disc_n = disc_n;
 
-                /* Batch-eval all disc metrics in one mlx_eval call instead
-                 * of 4 separate mlx_array_eval barriers. */
+                /* Batch-eval disc metrics AND gradients together in one
+                 * mlx_eval call. Since metrics and grads share the same
+                 * computation graph from value_and_grad, evaluating them
+                 * together avoids a second barrier in the optimizer. */
                 {
                     mlx_vector_array mv = mlx_vector_array_new();
                     if (disc_loss.ctx) mlx_vector_array_append_value(mv, disc_loss);
                     if (d_real.ctx)    mlx_vector_array_append_value(mv, d_real);
                     if (d_fake.ctx)    mlx_vector_array_append_value(mv, d_fake);
                     if (d_gp.ctx)      mlx_vector_array_append_value(mv, d_gp);
+                    for (int gi = 0; gi < disc_n; ++gi) {
+                        if (disc_grads[gi] && disc_grads[gi]->ctx)
+                            mlx_vector_array_append_value(mv, *disc_grads[gi]);
+                    }
                     mlx_eval(mv);
                     mlx_vector_array_free(mv);
                 }
@@ -456,8 +462,9 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
                 sr->gen_grads = gen_grads;
                 sr->gen_n = gen_n;
 
-                /* Batch-eval all gen metrics in one mlx_eval call instead
-                 * of 5 separate mlx_array_eval barriers. */
+                /* Batch-eval gen metrics AND gradients together in one
+                 * mlx_eval call. Merging avoids a second barrier in the
+                 * optimizer since grads will already be materialized. */
                 {
                     mlx_vector_array mv = mlx_vector_array_new();
                     if (gen_loss.ctx) mlx_vector_array_append_value(mv, gen_loss);
@@ -465,6 +472,10 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
                     if (g_well.ctx)   mlx_vector_array_append_value(mv, g_well);
                     if (g_div.ctx)    mlx_vector_array_append_value(mv, g_div);
                     if (g_rec.ctx)    mlx_vector_array_append_value(mv, g_rec);
+                    for (int gi = 0; gi < gen_n; ++gi) {
+                        if (gen_grads[gi] && gen_grads[gi]->ctx)
+                            mlx_vector_array_append_value(mv, *gen_grads[gi]);
+                    }
                     mlx_eval(mv);
                     mlx_vector_array_free(mv);
                 }
