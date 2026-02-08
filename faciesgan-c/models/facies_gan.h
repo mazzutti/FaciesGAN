@@ -141,6 +141,10 @@ int mlx_faciesgan_get_use_create_graph_gp(void);
    arrays, preventing memory accumulation during training. */
 int mlx_faciesgan_eval_all_parameters(MLXFaciesGAN *m);
 
+/* Append all model parameters to an external vector_array for deferred
+ * batch evaluation (single-eval-per-epoch pattern). */
+int mlx_faciesgan_append_params_to_vec(MLXFaciesGAN *m, mlx_vector_array vec);
+
 /* Store a reconstruction noise tensor for the given scale.
    Mirrors Python: self.model.rec_noise.append(z_rec).
    The array is deep-copied. */

@@ -66,6 +66,9 @@ float mlx_optimizer_get_last_used_lr(MLXOptimizer *opt);
  * This is essential for memory management: without evaluating these arrays,
  * the MLX computation graph accumulates across iterations and leaks memory. */
 void mlx_optimizer_eval_state(MLXOptimizer *opt);
+/* Append all optimizer state arrays (m, v) to an external vector_array for
+ * deferred batch evaluation (single-eval-per-epoch pattern). */
+void mlx_optimizer_append_state_to_vec(MLXOptimizer *opt, mlx_vector_array vec);
 
 #ifdef __cplusplus
 }

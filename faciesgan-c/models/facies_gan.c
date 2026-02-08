@@ -1433,3 +1433,38 @@ int mlx_faciesgan_eval_all_parameters(MLXFaciesGAN *m) {
 
     return 0;
 }
+
+/* Append all model parameters (gen + disc) to an external vector_array
+ * for deferred batch evaluation.  This is the non-eval counterpart of
+ * mlx_faciesgan_eval_all_parameters, used when the caller builds a
+ * combined eval vector (model params + optimizer state + metrics). */
+int mlx_faciesgan_append_params_to_vec(MLXFaciesGAN *m, mlx_vector_array vec) {
+    if (!m || !vec.ctx)
+        return -1;
+
+    if (m->generator) {
+        int gen_n = 0;
+        mlx_array **gen_params = mlx_generator_get_parameters(m->generator, &gen_n);
+        if (gen_params && gen_n > 0) {
+            for (int i = 0; i < gen_n; ++i) {
+                if (gen_params[i] && gen_params[i]->ctx)
+                    mlx_vector_array_append_value(vec, *gen_params[i]);
+            }
+            mlx_generator_free_parameters_list(gen_params);
+        }
+    }
+
+    if (m->discriminator) {
+        int disc_n = 0;
+        mlx_array **disc_params = mlx_discriminator_get_parameters(m->discriminator, &disc_n);
+        if (disc_params && disc_n > 0) {
+            for (int i = 0; i < disc_n; ++i) {
+                if (disc_params[i] && disc_params[i]->ctx)
+                    mlx_vector_array_append_value(vec, *disc_params[i]);
+            }
+            mlx_discriminator_free_parameters_list(disc_params);
+        }
+    }
+
+    return 0;
+}

@@ -1325,10 +1325,12 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
     int rc = 0;
     int overall = 0;
     MLXResults *res = NULL;
+    MLXResults *d0_res = NULL;  /* first D-step results kept for metric extraction */
+    MLXResults *g0_res = NULL;  /* first G-step results kept for metric extraction */
 
     /* ======== DISCRIMINATOR OPTIMIZATION LOOP (disc_steps iterations) ========
      * Matches Python: for _ in range(self.discriminator_steps): ...
-     * Each iteration: compute D gradients with fresh forward pass, apply D update */
+     * Everything stays lazy — no eval barriers inside the loop. */
     for (int d_step = 0; d_step < disc_steps; ++d_step) {
         rc = mlx_faciesgan_collect_metrics_and_grads_native(
                  trainer->model, indexes, n_indexes,
@@ -1343,28 +1345,10 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
             continue;
         }
 
-        /* Apply ONLY discriminator gradients this iteration */
+        /* Apply discriminator gradients lazily (no eval inside optimizer) */
         for (int i = 0; i < res->n_scales; ++i) {
             MLXScaleResults *sr = &res->scales[i];
             int sc = sr->scale;
-
-            /* Store discriminator metrics on first D step for logging.
-             * Metrics were already batch-eval'd in collect_metrics, so use
-             * mlx_array_data_float32 (zero-copy pointer read, no sync). */
-            if (d_step == 0 && sc >= 0 && sc < trainer->n_scales && trainer->last_d_total) {
-#define EXTRACT_SCALAR(arr_ptr) \
-                    ((arr_ptr) && (arr_ptr)->ctx ? ({ \
-                        const float *_p = mlx_array_data_float32(*(arr_ptr)); \
-                        _p ? (double)_p[0] : 0.0; \
-                    }) : 0.0)
-                trainer->last_d_real[sc] = EXTRACT_SCALAR(sr->metrics.d_real);
-                trainer->last_d_fake[sc] = EXTRACT_SCALAR(sr->metrics.d_fake);
-                trainer->last_d_gp[sc] = EXTRACT_SCALAR(sr->metrics.d_gp);
-                trainer->last_d_total[sc] = EXTRACT_SCALAR(sr->metrics.d_total);
-#undef EXTRACT_SCALAR
-            }
-
-            /* Apply discriminator grads using scale-specific function */
             if (sr->disc_n > 0 && sr->disc_grads && trainer->disc_opts &&
                     trainer->disc_opts[sc]) {
                 int r = mlx_faciesgan_apply_sgd_to_discriminator_for_scale(
@@ -1373,17 +1357,18 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
             }
         }
 
-        /* NOTE: per-step eval_all_parameters + optimizer_eval_state removed;
-         * the batched optimizer (mlx_adam_step) already evaluates all new
-         * parameters and optimizer state in a single mlx_eval call. */
-
-        mlx_results_free(res);
+        /* Keep first-step results for metric extraction after the single eval */
+        if (d_step == 0) {
+            d0_res = res;
+        } else {
+            mlx_results_free(res);
+        }
         res = NULL;
     }
 
     /* ======== GENERATOR OPTIMIZATION LOOP (gen_steps iterations) ========
      * Matches Python: for _ in range(self.generator_steps): ...
-     * Each iteration: compute G gradients with fresh forward pass, apply G update */
+     * Everything stays lazy — no eval barriers inside the loop. */
     for (int g_step = 0; g_step < gen_steps; ++g_step) {
         rc = mlx_faciesgan_collect_metrics_and_grads_native(
                  trainer->model, indexes, n_indexes,
@@ -1398,28 +1383,10 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
             continue;
         }
 
-        /* Apply ONLY generator gradients this iteration */
+        /* Apply generator gradients lazily (no eval inside optimizer) */
         for (int i = 0; i < res->n_scales; ++i) {
             MLXScaleResults *sr = &res->scales[i];
             int sc = sr->scale;
-
-            /* Store generator metrics on first G step for logging.
-             * Metrics were already batch-eval'd in collect_metrics. */
-            if (g_step == 0 && sc >= 0 && sc < trainer->n_scales && trainer->last_g_total) {
-#define EXTRACT_SCALAR(arr_ptr) \
-                    ((arr_ptr) && (arr_ptr)->ctx ? ({ \
-                        const float *_p = mlx_array_data_float32(*(arr_ptr)); \
-                        _p ? (double)_p[0] : 0.0; \
-                    }) : 0.0)
-                trainer->last_g_adv[sc] = EXTRACT_SCALAR(sr->metrics.fake);
-                trainer->last_g_well[sc] = EXTRACT_SCALAR(sr->metrics.well);
-                trainer->last_g_div[sc] = EXTRACT_SCALAR(sr->metrics.div);
-                trainer->last_g_rec[sc] = EXTRACT_SCALAR(sr->metrics.rec);
-                trainer->last_g_total[sc] = EXTRACT_SCALAR(sr->metrics.total);
-#undef EXTRACT_SCALAR
-            }
-
-            /* Apply generator grads using scale-specific function */
             if (sr->gen_n > 0 && sr->gen_grads && trainer->gen_opts &&
                     trainer->gen_opts[sc]) {
                 int r = mlx_faciesgan_apply_sgd_to_generator_for_scale(
@@ -1428,11 +1395,102 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
             }
         }
 
-        /* NOTE: per-step eval removed — optimizer batch-evals internally. */
-
-        mlx_results_free(res);
+        /* Keep first-step results for metric extraction after the single eval */
+        if (g_step == 0) {
+            g0_res = res;
+        } else {
+            mlx_results_free(res);
+        }
         res = NULL;
     }
+
+    /* ======== SINGLE EVAL: model params + optimizer state + metrics ========
+     * This matches Python's single mx.eval(model.state, optimizer.state)
+     * pattern.  Instead of 3 eval barriers per substep (18 total with
+     * disc_steps=3 + gen_steps=3), we do ONE eval covering everything.
+     * This allows MLX to fuse the entire computation graph (all D and G
+     * forward/backward passes + optimizer updates) into one GPU dispatch. */
+    {
+        mlx_vector_array bv = mlx_vector_array_new();
+
+        /* 1) All model parameters (gen + disc weights) */
+        mlx_faciesgan_append_params_to_vec(trainer->model, bv);
+
+        /* 2) All optimizer states (Adam m/v moments) */
+        for (int ai = 0; ai < n_active_scales; ++ai) {
+            int sc = san_active ? san_active[ai] : active_scales[ai];
+            if (trainer->disc_opts && trainer->disc_opts[sc])
+                mlx_optimizer_append_state_to_vec(trainer->disc_opts[sc], bv);
+            if (trainer->gen_opts && trainer->gen_opts[sc])
+                mlx_optimizer_append_state_to_vec(trainer->gen_opts[sc], bv);
+        }
+
+        /* 3) Metric arrays from first D and G steps (for EXTRACT_SCALAR) */
+#define APPEND_METRIC(vec, m_ptr) \
+        do { if ((m_ptr) && (m_ptr)->ctx) mlx_vector_array_append_value((vec), *(m_ptr)); } while(0)
+
+        if (d0_res) {
+            for (int i = 0; i < d0_res->n_scales; ++i) {
+                MLXScaleResults *sr = &d0_res->scales[i];
+                APPEND_METRIC(bv, sr->metrics.d_real);
+                APPEND_METRIC(bv, sr->metrics.d_fake);
+                APPEND_METRIC(bv, sr->metrics.d_gp);
+                APPEND_METRIC(bv, sr->metrics.d_total);
+            }
+        }
+        if (g0_res) {
+            for (int i = 0; i < g0_res->n_scales; ++i) {
+                MLXScaleResults *sr = &g0_res->scales[i];
+                APPEND_METRIC(bv, sr->metrics.fake);
+                APPEND_METRIC(bv, sr->metrics.well);
+                APPEND_METRIC(bv, sr->metrics.div);
+                APPEND_METRIC(bv, sr->metrics.rec);
+                APPEND_METRIC(bv, sr->metrics.total);
+            }
+        }
+#undef APPEND_METRIC
+
+        mlx_eval(bv);
+        mlx_vector_array_free(bv);
+    }
+
+    /* ======== Extract metrics from now-materialised arrays ======== */
+#define EXTRACT_SCALAR(arr_ptr) \
+        ((arr_ptr) && (arr_ptr)->ctx ? ({ \
+            const float *_p = mlx_array_data_float32(*(arr_ptr)); \
+            _p ? (double)_p[0] : 0.0; \
+        }) : 0.0)
+
+    if (d0_res) {
+        for (int i = 0; i < d0_res->n_scales; ++i) {
+            MLXScaleResults *sr = &d0_res->scales[i];
+            int sc = sr->scale;
+            if (sc >= 0 && sc < trainer->n_scales && trainer->last_d_total) {
+                trainer->last_d_real[sc] = EXTRACT_SCALAR(sr->metrics.d_real);
+                trainer->last_d_fake[sc] = EXTRACT_SCALAR(sr->metrics.d_fake);
+                trainer->last_d_gp[sc] = EXTRACT_SCALAR(sr->metrics.d_gp);
+                trainer->last_d_total[sc] = EXTRACT_SCALAR(sr->metrics.d_total);
+            }
+        }
+        mlx_results_free(d0_res);
+        d0_res = NULL;
+    }
+    if (g0_res) {
+        for (int i = 0; i < g0_res->n_scales; ++i) {
+            MLXScaleResults *sr = &g0_res->scales[i];
+            int sc = sr->scale;
+            if (sc >= 0 && sc < trainer->n_scales && trainer->last_g_total) {
+                trainer->last_g_adv[sc] = EXTRACT_SCALAR(sr->metrics.fake);
+                trainer->last_g_well[sc] = EXTRACT_SCALAR(sr->metrics.well);
+                trainer->last_g_div[sc] = EXTRACT_SCALAR(sr->metrics.div);
+                trainer->last_g_rec[sc] = EXTRACT_SCALAR(sr->metrics.rec);
+                trainer->last_g_total[sc] = EXTRACT_SCALAR(sr->metrics.total);
+            }
+        }
+        mlx_results_free(g0_res);
+        g0_res = NULL;
+    }
+#undef EXTRACT_SCALAR
 
     /* Step schedulers once per epoch (not per D/G step) */
     for (int ai = 0; ai < n_active_scales; ++ai) {
@@ -1451,10 +1509,6 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
         mlx_free_int_array(&san_active, &_tmpn);
         san_active = NULL;
     }
-
-    /* NOTE: per-optimization-step synchronize+clear_cache removed.
-     * One sync at the end of each epoch is sufficient.  The batched
-     * optimizer eval materialises all parameter updates. */
 
     if (tmp_wells)
         mlx_free_ptr_array((void ***)&tmp_wells, need_n);

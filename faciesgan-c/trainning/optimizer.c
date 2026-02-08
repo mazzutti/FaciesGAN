@@ -128,6 +128,27 @@ void mlx_optimizer_eval_state(MLXOptimizer *opt) {
     mlx_vector_array_free(vec);
 }
 
+/* Append all optimizer state arrays (m, v moments) to an external vector
+ * for batch evaluation.  Used by the training loop to build a single
+ * mlx_eval call covering model params + optimizer state + metrics,
+ * matching Python's mx.eval(model.state, optimizer.state) pattern. */
+void mlx_optimizer_append_state_to_vec(MLXOptimizer *opt, mlx_vector_array vec) {
+    if (!opt || !vec.ctx)
+        return;
+    if (opt->m) {
+        for (int i = 0; i < opt->param_n; ++i) {
+            if (opt->m[i] && opt->m[i]->ctx)
+                mlx_vector_array_append_value(vec, *opt->m[i]);
+        }
+    }
+    if (opt->v) {
+        for (int i = 0; i < opt->param_n; ++i) {
+            if (opt->v[i] && opt->v[i]->ctx)
+                mlx_vector_array_append_value(vec, *opt->v[i]);
+        }
+    }
+}
+
 int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
                   int n) {
     if (!opt)
@@ -183,21 +204,11 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
         decay_scale_arr = mlx_array_new_float(opt->lr * opt->weight_decay);
     }
 
-    /* Batch-eval all gradients in a single mlx_eval call instead of N
-     * individual mlx_array_eval barriers.  This lets MLX schedule the
-     * entire gradient computation graph at once. */
-    {
-        mlx_vector_array gvec = mlx_vector_array_new();
-        for (int i = 0; i < n; ++i) {
-            if (grads[i] && grads[i]->ctx)
-                mlx_vector_array_append_value(gvec, *grads[i]);
-        }
-        if (mlx_vector_array_size(gvec) > 0)
-            mlx_eval(gvec);
-        mlx_vector_array_free(gvec);
-    }
+    /* Gradients are left lazy — they will be transitively evaluated
+     * when the caller batch-evals model params + optimizer state at the
+     * end of the optimisation step (matching Python's single mx.eval). */
 
-    /* Collect new parameter values for deferred batch eval.
+    /* Collect new parameter values for deferred lazy set.
      * Adam updates are independent per-parameter, so we can build
      * the entire lazy graph and eval once at the end. */
     mlx_array *deferred_new_p = calloc(n, sizeof(mlx_array));
@@ -402,20 +413,13 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
         mlx_array_free(update);
     }
 
-    /* Batch-eval all new parameter values in a single GPU dispatch,
-     * then set all parameters.  This replaces N individual mlx_array_eval
-     * barriers with one batched mlx_eval call. */
-    if (n_deferred > 0) {
-        mlx_vector_array pvec = mlx_vector_array_new();
-        for (int i = 0; i < n_deferred; ++i)
-            mlx_vector_array_append_value(pvec, deferred_new_p[i]);
-        mlx_eval(pvec);
-        mlx_vector_array_free(pvec);
-
-        for (int i = 0; i < n_deferred; ++i) {
-            mlx_array_set(deferred_param_ptr[i], deferred_new_p[i]);
-            mlx_array_free(deferred_new_p[i]);
-        }
+    /* Set all new parameter values lazily (no eval barrier).
+     * The caller is responsible for batch-evaluating model params +
+     * optimizer state at the end of the epoch, matching Python's
+     * single mx.eval(model.state, optimizer.state) pattern. */
+    for (int i = 0; i < n_deferred; ++i) {
+        mlx_array_set(deferred_param_ptr[i], deferred_new_p[i]);
+        mlx_array_free(deferred_new_p[i]);
     }
     free(deferred_new_p);
     free(deferred_param_ptr);

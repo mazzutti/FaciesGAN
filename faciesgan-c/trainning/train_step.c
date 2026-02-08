@@ -393,25 +393,12 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
                 sr->disc_grads = disc_grads;
                 sr->disc_n = disc_n;
 
-                /* Batch-eval disc metrics AND gradients together in one
-                 * mlx_eval call. Since metrics and grads share the same
-                 * computation graph from value_and_grad, evaluating them
-                 * together avoids a second barrier in the optimizer. */
-                {
-                    mlx_vector_array mv = mlx_vector_array_new();
-                    if (disc_loss.ctx) mlx_vector_array_append_value(mv, disc_loss);
-                    if (d_real.ctx)    mlx_vector_array_append_value(mv, d_real);
-                    if (d_fake.ctx)    mlx_vector_array_append_value(mv, d_fake);
-                    if (d_gp.ctx)      mlx_vector_array_append_value(mv, d_gp);
-                    for (int gi = 0; gi < disc_n; ++gi) {
-                        if (disc_grads[gi] && disc_grads[gi]->ctx)
-                            mlx_vector_array_append_value(mv, *disc_grads[gi]);
-                    }
-                    mlx_eval(mv);
-                    mlx_vector_array_free(mv);
-                }
+                /* Metrics and gradients are left lazy — the caller’s
+                 * single-eval-per-epoch will batch-evaluate model params,
+                 * optimizer state, and these metrics together, matching
+                 * Python’s mx.eval(model.state, optimizer.state). */
 
-                /* Store disc metrics (already evaluated) */
+                /* Store disc metrics (lazy) */
                 if (disc_loss.ctx) {
                     sr->metrics.d_total = malloc(sizeof(mlx_array));
                     if (sr->metrics.d_total) *sr->metrics.d_total = disc_loss;
@@ -462,25 +449,10 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
                 sr->gen_grads = gen_grads;
                 sr->gen_n = gen_n;
 
-                /* Batch-eval gen metrics AND gradients together in one
-                 * mlx_eval call. Merging avoids a second barrier in the
-                 * optimizer since grads will already be materialized. */
-                {
-                    mlx_vector_array mv = mlx_vector_array_new();
-                    if (gen_loss.ctx) mlx_vector_array_append_value(mv, gen_loss);
-                    if (g_adv.ctx)    mlx_vector_array_append_value(mv, g_adv);
-                    if (g_well.ctx)   mlx_vector_array_append_value(mv, g_well);
-                    if (g_div.ctx)    mlx_vector_array_append_value(mv, g_div);
-                    if (g_rec.ctx)    mlx_vector_array_append_value(mv, g_rec);
-                    for (int gi = 0; gi < gen_n; ++gi) {
-                        if (gen_grads[gi] && gen_grads[gi]->ctx)
-                            mlx_vector_array_append_value(mv, *gen_grads[gi]);
-                    }
-                    mlx_eval(mv);
-                    mlx_vector_array_free(mv);
-                }
+                /* Metrics and gradients are left lazy — the caller’s
+                 * single-eval-per-epoch will materialise everything. */
 
-                /* Store gen metrics (already evaluated) */
+                /* Store gen metrics (lazy) */
                 if (gen_loss.ctx) {
                     sr->metrics.total = malloc(sizeof(mlx_array));
                     if (sr->metrics.total) *sr->metrics.total = gen_loss;
