@@ -329,7 +329,9 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
                 continue;
             }
             for (int ni = 0; ni < gen_n_noises; ++ni) {
-                gen_noises[ni] = gen_noises_ptr[ni] ? *gen_noises_ptr[ni] : (mlx_array){0};
+                gen_noises[ni] = gen_noises_ptr[ni] ? *gen_noises_ptr[ni] : (mlx_array) {
+                    0
+                };
             }
         }
 
@@ -363,15 +365,16 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
 
         /* Generate fake (detached - just forward pass, no grad tracking).
          * Only needed for discriminator training; G-only mode generates its
-         * own fake inside the gradient closure. */
+         * own fake inside the gradient closure.
+         * NOTE: Do NOT eval fake here — let value_and_grad build a fused
+         * graph (gen forward → disc loss → disc grads) for much better
+         * GPU throughput. */
         mlx_array fake = {0};
         if (mode != MLX_COLLECT_GEN_ONLY) {
             fake = mlx_generator_forward(gen, gen_noises, gen_n_noises,
-            amp, amp_count, (mlx_array){0}, 0, scale);
-
-            if (fake.ctx) {
-                mlx_array_eval(fake);
-            }
+            amp, amp_count, (mlx_array) {
+                0
+            }, 0, scale);
         }
 
         /* === Discriminator training step using native grad === */
@@ -390,44 +393,38 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
                 sr->disc_grads = disc_grads;
                 sr->disc_n = disc_n;
 
-                /* Store disc loss as total metric */
-                if (disc_loss.ctx) {
-                    mlx_array_eval(disc_loss);
-                    sr->metrics.d_total = malloc(sizeof(mlx_array));
-                    if (sr->metrics.d_total) {
-                        *sr->metrics.d_total = disc_loss;
-                    } else {
-                        mlx_array_free(disc_loss);
-                    }
+                /* Batch-eval all disc metrics in one mlx_eval call instead
+                 * of 4 separate mlx_array_eval barriers. */
+                {
+                    mlx_vector_array mv = mlx_vector_array_new();
+                    if (disc_loss.ctx) mlx_vector_array_append_value(mv, disc_loss);
+                    if (d_real.ctx)    mlx_vector_array_append_value(mv, d_real);
+                    if (d_fake.ctx)    mlx_vector_array_append_value(mv, d_fake);
+                    if (d_gp.ctx)      mlx_vector_array_append_value(mv, d_gp);
+                    mlx_eval(mv);
+                    mlx_vector_array_free(mv);
                 }
 
-                /* Store individual discriminator metrics */
+                /* Store disc metrics (already evaluated) */
+                if (disc_loss.ctx) {
+                    sr->metrics.d_total = malloc(sizeof(mlx_array));
+                    if (sr->metrics.d_total) *sr->metrics.d_total = disc_loss;
+                    else mlx_array_free(disc_loss);
+                }
                 if (d_real.ctx) {
-                    mlx_array_eval(d_real);
                     sr->metrics.d_real = malloc(sizeof(mlx_array));
-                    if (sr->metrics.d_real) {
-                        *sr->metrics.d_real = d_real;
-                    } else {
-                        mlx_array_free(d_real);
-                    }
+                    if (sr->metrics.d_real) *sr->metrics.d_real = d_real;
+                    else mlx_array_free(d_real);
                 }
                 if (d_fake.ctx) {
-                    mlx_array_eval(d_fake);
                     sr->metrics.d_fake = malloc(sizeof(mlx_array));
-                    if (sr->metrics.d_fake) {
-                        *sr->metrics.d_fake = d_fake;
-                    } else {
-                        mlx_array_free(d_fake);
-                    }
+                    if (sr->metrics.d_fake) *sr->metrics.d_fake = d_fake;
+                    else mlx_array_free(d_fake);
                 }
                 if (d_gp.ctx) {
-                    mlx_array_eval(d_gp);
                     sr->metrics.d_gp = malloc(sizeof(mlx_array));
-                    if (sr->metrics.d_gp) {
-                        *sr->metrics.d_gp = d_gp;
-                    } else {
-                        mlx_array_free(d_gp);
-                    }
+                    if (sr->metrics.d_gp) *sr->metrics.d_gp = d_gp;
+                    else mlx_array_free(d_gp);
                 }
             } else {
                 if (disc_grads) mlx_native_free_grads(disc_grads, disc_n);
@@ -459,53 +456,44 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
                 sr->gen_grads = gen_grads;
                 sr->gen_n = gen_n;
 
-                /* Store gen loss as total metric */
-                if (gen_loss.ctx) {
-                    mlx_array_eval(gen_loss);
-                    sr->metrics.total = malloc(sizeof(mlx_array));
-                    if (sr->metrics.total) {
-                        *sr->metrics.total = gen_loss;
-                    } else {
-                        mlx_array_free(gen_loss);
-                    }
+                /* Batch-eval all gen metrics in one mlx_eval call instead
+                 * of 5 separate mlx_array_eval barriers. */
+                {
+                    mlx_vector_array mv = mlx_vector_array_new();
+                    if (gen_loss.ctx) mlx_vector_array_append_value(mv, gen_loss);
+                    if (g_adv.ctx)    mlx_vector_array_append_value(mv, g_adv);
+                    if (g_well.ctx)   mlx_vector_array_append_value(mv, g_well);
+                    if (g_div.ctx)    mlx_vector_array_append_value(mv, g_div);
+                    if (g_rec.ctx)    mlx_vector_array_append_value(mv, g_rec);
+                    mlx_eval(mv);
+                    mlx_vector_array_free(mv);
                 }
 
-                /* Store individual generator metrics */
+                /* Store gen metrics (already evaluated) */
+                if (gen_loss.ctx) {
+                    sr->metrics.total = malloc(sizeof(mlx_array));
+                    if (sr->metrics.total) *sr->metrics.total = gen_loss;
+                    else mlx_array_free(gen_loss);
+                }
                 if (g_adv.ctx) {
-                    mlx_array_eval(g_adv);
                     sr->metrics.fake = malloc(sizeof(mlx_array));
-                    if (sr->metrics.fake) {
-                        *sr->metrics.fake = g_adv;
-                    } else {
-                        mlx_array_free(g_adv);
-                    }
+                    if (sr->metrics.fake) *sr->metrics.fake = g_adv;
+                    else mlx_array_free(g_adv);
                 }
                 if (g_well.ctx) {
-                    mlx_array_eval(g_well);
                     sr->metrics.well = malloc(sizeof(mlx_array));
-                    if (sr->metrics.well) {
-                        *sr->metrics.well = g_well;
-                    } else {
-                        mlx_array_free(g_well);
-                    }
+                    if (sr->metrics.well) *sr->metrics.well = g_well;
+                    else mlx_array_free(g_well);
                 }
                 if (g_div.ctx) {
-                    mlx_array_eval(g_div);
                     sr->metrics.div = malloc(sizeof(mlx_array));
-                    if (sr->metrics.div) {
-                        *sr->metrics.div = g_div;
-                    } else {
-                        mlx_array_free(g_div);
-                    }
+                    if (sr->metrics.div) *sr->metrics.div = g_div;
+                    else mlx_array_free(g_div);
                 }
                 if (g_rec.ctx) {
-                    mlx_array_eval(g_rec);
                     sr->metrics.rec = malloc(sizeof(mlx_array));
-                    if (sr->metrics.rec) {
-                        *sr->metrics.rec = g_rec;
-                    } else {
-                        mlx_array_free(g_rec);
-                    }
+                    if (sr->metrics.rec) *sr->metrics.rec = g_rec;
+                    else mlx_array_free(g_rec);
                 }
             } else {
                 if (gen_grads) mlx_native_free_grads(gen_grads, gen_n);

@@ -266,6 +266,39 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
      * No padding of real - shapes should match since we now use the full
      * progressive chain (start_scale=0). */
     mlx_stream s = mlx_default_gpu_stream_new();
+
+    /* Ensure fake and real shapes match (H/W) before subtract to avoid
+     * broadcast errors when parallel scales are active. */
+    const int *fake_shape = mlx_array_shape(fake);
+    const int *real_shape = mlx_array_shape(*real);
+    if (fake_shape && real_shape) {
+        int fake_ndim = mlx_array_ndim(fake);
+        int real_ndim = mlx_array_ndim(*real);
+        if (fake_ndim == 4 && real_ndim == 4) {
+            if (fake_shape[0] != real_shape[0] || fake_shape[3] != real_shape[3]) {
+                mlx_stream_free(s);
+                mlx_array_free(fake);
+                mlx_array_free(in_noise);
+                mlx_global_unlock();
+                return -1;
+            }
+            if (fake_shape[1] != real_shape[1] || fake_shape[2] != real_shape[2]) {
+                MLXUpsample *u = mlx_upsample_create(real_shape[1], real_shape[2], "linear", 1);
+                if (!u) {
+                    mlx_stream_free(s);
+                    mlx_array_free(fake);
+                    mlx_array_free(in_noise);
+                    mlx_global_unlock();
+                    return -1;
+                }
+                mlx_array resized = mlx_upsample_forward(u, fake);
+                mlx_upsample_free(u);
+                mlx_array_free(fake);
+                fake = resized;
+            }
+        }
+    }
+
     mlx_array diff = mlx_array_new();
     if (mlx_subtract(&diff, fake, *real, s) != 0) {
         mlx_stream_free(s);

@@ -117,6 +117,9 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/third_party/miniz_zip.c
   # faciesgan-c/trainning/c_trainer_api.c
 )
+set_source_files_properties(faciesgan-c/utils.c PROPERTIES
+  COMPILE_OPTIONS "-O3;-march=native;-ffast-math"
+)
 set_source_files_properties(faciesgan-c/trainning/mem_debug.c PROPERTIES
   COMPILE_DEFINITIONS MLX_MEM_NO_WRAP=1
 )
@@ -134,10 +137,8 @@ target_compile_options(custom_layer PRIVATE -include ${PROJECT_SOURCE_DIR}/facie
 
 # If MLXC was found, link against its target `mlxc` (installed by mlx-c)
 if(MLXC_FOUND)
-  target_link_libraries(custom_layer PRIVATE mlxc)
+  # MLX linkage is handled at executable level to avoid duplicate static libs
 else()
-  # Fallback: link against the in-tree `mlxc` target we added above
-  target_link_libraries(custom_layer PRIVATE mlxc)
   # Add the in-tree mlx-c top-level directory so headers referenced
   # as <mlx/c/...> resolve correctly (keeps include paths explicit).
   target_include_directories(custom_layer PRIVATE
@@ -211,9 +212,9 @@ target_sources(facies_prefetcher PRIVATE faciesgan-c/third_party/miniz_zip.c)
 target_include_directories(facies_prefetcher PRIVATE ${PROJECT_SOURCE_DIR}/faciesgan-c/third_party)
 
 if(MLXC_FOUND)
-  target_link_libraries(facies_prefetcher PRIVATE mlxc custom_layer)
+  target_link_libraries(facies_prefetcher PRIVATE custom_layer)
 else()
-  target_link_libraries(facies_prefetcher PRIVATE mlxc custom_layer)
+  target_link_libraries(facies_prefetcher PRIVATE custom_layer)
   target_include_directories(facies_prefetcher PRIVATE ${PROJECT_SOURCE_DIR}/mlx-c)
 endif()
 

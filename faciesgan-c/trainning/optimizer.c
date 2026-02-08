@@ -183,14 +183,26 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
         decay_scale_arr = mlx_array_new_float(opt->lr * opt->weight_decay);
     }
 
-    /* Force eval of all gradients before using them to ensure lazy computations
-     * are materialized. This is critical for MLX's lazy evaluation model. */
-    /* Force eval of all gradients in-place before using them. */
-    for (int i = 0; i < n; ++i) {
-        if (grads[i] && grads[i]->ctx) {
-            mlx_array_eval(*grads[i]);
+    /* Batch-eval all gradients in a single mlx_eval call instead of N
+     * individual mlx_array_eval barriers.  This lets MLX schedule the
+     * entire gradient computation graph at once. */
+    {
+        mlx_vector_array gvec = mlx_vector_array_new();
+        for (int i = 0; i < n; ++i) {
+            if (grads[i] && grads[i]->ctx)
+                mlx_vector_array_append_value(gvec, *grads[i]);
         }
+        if (mlx_vector_array_size(gvec) > 0)
+            mlx_eval(gvec);
+        mlx_vector_array_free(gvec);
     }
+
+    /* Collect new parameter values for deferred batch eval.
+     * Adam updates are independent per-parameter, so we can build
+     * the entire lazy graph and eval once at the end. */
+    mlx_array *deferred_new_p = calloc(n, sizeof(mlx_array));
+    mlx_array **deferred_param_ptr = calloc(n, sizeof(mlx_array *));
+    int n_deferred = 0;
 
     for (int i = 0; i < n; ++i) {
         mlx_array *p = params[i];
@@ -382,16 +394,31 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
             mlx_array_free(new_p);
             continue;
         }
-        /* Evaluate new_p before overwriting p to ensure the lazy computation
-         * graph is materialized. Otherwise, new_p might still reference the
-         * old p value and get invalidated when we overwrite p. */
-        mlx_array_eval(new_p);
+        /* Defer evaluation — collect all new_p for batch eval */
+        deferred_new_p[n_deferred] = new_p;
+        deferred_param_ptr[n_deferred] = p;
+        n_deferred++;
 
-        mlx_array_set(p, new_p);
-
-        mlx_array_free(new_p);
         mlx_array_free(update);
     }
+
+    /* Batch-eval all new parameter values in a single GPU dispatch,
+     * then set all parameters.  This replaces N individual mlx_array_eval
+     * barriers with one batched mlx_eval call. */
+    if (n_deferred > 0) {
+        mlx_vector_array pvec = mlx_vector_array_new();
+        for (int i = 0; i < n_deferred; ++i)
+            mlx_vector_array_append_value(pvec, deferred_new_p[i]);
+        mlx_eval(pvec);
+        mlx_vector_array_free(pvec);
+
+        for (int i = 0; i < n_deferred; ++i) {
+            mlx_array_set(deferred_param_ptr[i], deferred_new_p[i]);
+            mlx_array_free(deferred_new_p[i]);
+        }
+    }
+    free(deferred_new_p);
+    free(deferred_param_ptr);
 
     /* Free shared scalar temporaries */
     mlx_array_free(scal_b1);

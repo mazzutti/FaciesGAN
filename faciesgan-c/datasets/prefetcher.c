@@ -68,6 +68,12 @@ typedef struct PrefetcherIterator {
     int ref_count;
 } PrefetcherIterator;
 
+static int prefetcher_push_vectors(PrefetcherHandle h,
+                                   mlx_vector_array facies_vec,
+                                   mlx_vector_array wells_vec,
+                                   mlx_vector_array masks_vec,
+                                   mlx_vector_array seismic_vec);
+
 PrefetcherHandle prefetcher_create(int max_queue, int device_index,
                                    const int *scales, int n_scales) {
     Prefetcher *p = NULL;
@@ -130,15 +136,14 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
     ib->masks_vec = mlx_vector_array_new();
     ib->seismic_vec = mlx_vector_array_new();
 
-    /* copy provided mlx_arrays into internal vectors; if stream is non-CPU,
-        attempt to copy arrays onto that stream/device. */
+    /* copy provided mlx_arrays into internal vectors.  A single copy (or
+     * set for CPU-resident data) is sufficient — mlx_vector_array_append_value
+     * increments the refcount internally, so no second copy is needed. */
     for (int i = 0; i < n_facies; ++i) {
         mlx_array a = facies[i];
         mlx_array a_copy = mlx_array_new();
         if (stream.ctx) {
-            if (mlx_copy(&a_copy, a, stream) == 0) {
-                /* use copied */
-            } else {
+            if (mlx_copy(&a_copy, a, stream) != 0) {
                 mlx_array_free(a_copy);
                 a_copy = mlx_array_new();
                 mlx_array_set(&a_copy, a);
@@ -146,32 +151,11 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
         } else {
             mlx_array_set(&a_copy, a);
         }
-        /* ensure vector stores an independent buffer to avoid aliasing */
-        {
-            mlx_array to_append = mlx_array_new();
-            if (stream.ctx) {
-                if (mlx_copy(&to_append, a_copy, stream) == 0) {
-                    mlx_vector_array_append_value(ib->facies_vec, to_append);
-                    mlx_array_free(to_append);
-                    mlx_array_free(a_copy);
-                } else {
-                    mlx_array_free(to_append);
-                    mlx_vector_array_append_value(ib->facies_vec, a_copy);
-                    mlx_array_free(a_copy);
-                }
-            } else {
-                /* CPU stream: `a_copy` is already CPU-resident; append it directly */
-                mlx_array_free(to_append);
-                mlx_vector_array_append_value(ib->facies_vec, a_copy);
-                mlx_array_free(a_copy);
-            }
-        }
+        mlx_vector_array_append_value(ib->facies_vec, a_copy);
+        mlx_array_free(a_copy);
     }
     for (int i = 0; i < n_wells; ++i) {
         mlx_array a = wells[i];
-        /* Debug: check input well array (NO eval - not thread-safe) */
-        int input_ndim = (int)mlx_array_ndim(a);
-        (void)input_ndim;
         mlx_array a_copy = mlx_array_new();
         if (stream.ctx) {
             if (mlx_copy(&a_copy, a, stream) != 0) {
@@ -180,25 +164,8 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
         } else {
             mlx_array_set(&a_copy, a);
         }
-        /* ensure vector stores independent buffer */
-        {
-            mlx_array to_append = mlx_array_new();
-            if (stream.ctx) {
-                if (mlx_copy(&to_append, a_copy, stream) == 0) {
-                    mlx_vector_array_append_value(ib->wells_vec, to_append);
-                    mlx_array_free(to_append);
-                    mlx_array_free(a_copy);
-                } else {
-                    mlx_array_free(to_append);
-                    mlx_vector_array_append_value(ib->wells_vec, a_copy);
-                    mlx_array_free(a_copy);
-                }
-            } else {
-                mlx_array_free(to_append);
-                mlx_vector_array_append_value(ib->wells_vec, a_copy);
-                mlx_array_free(a_copy);
-            }
-        }
+        mlx_vector_array_append_value(ib->wells_vec, a_copy);
+        mlx_array_free(a_copy);
     }
 
     /* NOTE: Mask computation has been moved to the main thread (in the training
@@ -220,25 +187,8 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
                 mlx_array_set(&a_copy, a);
         } else
             mlx_array_set(&a_copy, a);
-        /* ensure vector stores independent buffer */
-        {
-            mlx_array to_append = mlx_array_new();
-            if (stream.ctx) {
-                if (mlx_copy(&to_append, a_copy, stream) == 0) {
-                    mlx_vector_array_append_value(ib->masks_vec, to_append);
-                    mlx_array_free(to_append);
-                    mlx_array_free(a_copy);
-                } else {
-                    mlx_array_free(to_append);
-                    mlx_vector_array_append_value(ib->masks_vec, a_copy);
-                    mlx_array_free(a_copy);
-                }
-            } else {
-                mlx_array_free(to_append);
-                mlx_vector_array_append_value(ib->masks_vec, a_copy);
-                mlx_array_free(a_copy);
-            }
-        }
+        mlx_vector_array_append_value(ib->masks_vec, a_copy);
+        mlx_array_free(a_copy);
     }
     for (int i = 0; i < n_seismic; ++i) {
         mlx_array a = seismic[i];
@@ -248,25 +198,8 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
                 mlx_array_set(&a_copy, a);
         } else
             mlx_array_set(&a_copy, a);
-        /* ensure vector stores independent buffer */
-        {
-            mlx_array to_append = mlx_array_new();
-            if (stream.ctx) {
-                if (mlx_copy(&to_append, a_copy, stream) == 0) {
-                    mlx_vector_array_append_value(ib->seismic_vec, to_append);
-                    mlx_array_free(to_append);
-                    mlx_array_free(a_copy);
-                } else {
-                    mlx_array_free(to_append);
-                    mlx_vector_array_append_value(ib->seismic_vec, a_copy);
-                    mlx_array_free(a_copy);
-                }
-            } else {
-                mlx_array_free(to_append);
-                mlx_vector_array_append_value(ib->seismic_vec, a_copy);
-                mlx_array_free(a_copy);
-            }
-        }
+        mlx_vector_array_append_value(ib->seismic_vec, a_copy);
+        mlx_array_free(a_copy);
     }
 
     ib->valid = 1;
@@ -357,8 +290,14 @@ static void *prefetcher_dataloader_producer(void *v) {
         mlx_vector_array wells_out = mlx_vector_array_new();
         mlx_vector_array seis_out = mlx_vector_array_new();
 
-        /* Acquire global MLX lock for ALL MLX operations in this iteration */
-        mlx_global_lock();
+        /* Avoid holding the global MLX lock while waiting on process workers,
+         * which can deadlock when the optimizer also acquires the lock. */
+        int use_mlx_lock = 1;
+        const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+        if (proc_env && strcmp(proc_env, "1") == 0)
+            use_mlx_lock = 0;
+        if (use_mlx_lock)
+            mlx_global_lock();
         int rc = facies_dataloader_next(dl, &facs, &wells_out, &seis_out, s);
 
         if (rc == 2) {
@@ -366,14 +305,16 @@ static void *prefetcher_dataloader_producer(void *v) {
             mlx_vector_array_free(facs);
             mlx_vector_array_free(wells_out);
             mlx_vector_array_free(seis_out);
-            mlx_global_unlock();
+            if (use_mlx_lock)
+                mlx_global_unlock();
             facies_dataloader_reset(dl);
             continue;
         } else if (rc != 0) {
             mlx_vector_array_free(facs);
             mlx_vector_array_free(wells_out);
             mlx_vector_array_free(seis_out);
-            mlx_global_unlock();
+            if (use_mlx_lock)
+                mlx_global_unlock();
             pthread_mutex_lock(&pref->mutex);
             if (pref->error == 0)
                 pref->error = rc;
@@ -381,6 +322,18 @@ static void *prefetcher_dataloader_producer(void *v) {
             pthread_cond_broadcast(&pref->not_empty);
             pthread_mutex_unlock(&pref->mutex);
             break;
+        }
+
+        int use_vector_push = (proc_env && strcmp(proc_env, "1") == 0);
+        if (use_vector_push) {
+            mlx_vector_array masks_vec = mlx_vector_array_new();
+            if (prefetcher_push_vectors(ph, facs, wells_out, masks_vec, seis_out) != 0) {
+                mlx_vector_array_free(facs);
+                mlx_vector_array_free(wells_out);
+                mlx_vector_array_free(seis_out);
+                mlx_vector_array_free(masks_vec);
+            }
+            continue;
         }
 
         int nsc = (int)mlx_vector_array_size(facs);
@@ -437,7 +390,8 @@ static void *prefetcher_dataloader_producer(void *v) {
         }
 
         /* Release lock before pushing to queue (may block) */
-        mlx_global_unlock();
+        if (use_mlx_lock)
+            mlx_global_unlock();
 
         /* Note: masks are computed from wells inside create_internal_from_mlx,
          * so we pass NULL for masks here. This ensures consistent mask computation
@@ -663,6 +617,39 @@ int prefetcher_push_mlx(PrefetcherHandle h, const mlx_array *facies,
             mlx_array_free(ib.facies);
         if (ib.seismic.ctx)
             mlx_array_free(ib.seismic);
+        return -1;
+    }
+    p->buf[p->tail] = ib;
+    p->tail = (p->tail + 1) % p->capacity;
+    p->count++;
+    pthread_cond_signal(&p->not_empty);
+    pthread_mutex_unlock(&p->mutex);
+    return 0;
+}
+
+static int prefetcher_push_vectors(PrefetcherHandle h,
+                                   mlx_vector_array facies_vec,
+                                   mlx_vector_array wells_vec,
+                                   mlx_vector_array masks_vec,
+                                   mlx_vector_array seismic_vec) {
+    Prefetcher *p = (Prefetcher *)h;
+    if (!p)
+        return -1;
+    InternalBatch ib;
+    memset(&ib, 0, sizeof(InternalBatch));
+    ib.valid = 1;
+    ib.is_pyramids = 1;
+    ib.facies_vec = facies_vec;
+    ib.wells_vec = wells_vec;
+    ib.masks_vec = masks_vec;
+    ib.seismic_vec = seismic_vec;
+
+    pthread_mutex_lock(&p->mutex);
+    while (p->count == p->capacity && p->alive) {
+        pthread_cond_wait(&p->not_full, &p->mutex);
+    }
+    if (!p->alive) {
+        pthread_mutex_unlock(&p->mutex);
         return -1;
     }
     p->buf[p->tail] = ib;
@@ -1345,6 +1332,10 @@ static void *iterator_preload_thread(void *arg) {
 int prefetcher_iterator_preload(PrefetcherIteratorHandle it_h) {
     if (!it_h)
         return -1;
+    const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+    if (proc_env && strcmp(proc_env, "1") == 0) {
+        return 0;
+    }
     PrefetcherIterator *it = (PrefetcherIterator *)it_h;
     pthread_mutex_lock(&it->mutex);
     if (it->preload_in_progress) {

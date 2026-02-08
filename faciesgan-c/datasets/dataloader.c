@@ -6,6 +6,7 @@
 #include "mlx/c/transforms.h"
 #include "trainning/array_helpers.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
@@ -13,6 +14,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -75,6 +78,14 @@ static int array_to_float_buffer_cpu(const mlx_array arr, float **out_buf,
 static int write_vv_fd(int fd, const mlx_vector_vector_array vv,
                        uint64_t n_samples_local) {
     size_t n = mlx_vector_vector_array_size(vv);
+    if (n == 0 && n_samples_local > 0) {
+        uint32_t nscales = 0;
+        for (uint64_t i = 0; i < n_samples_local; ++i) {
+            if (write_all(fd, &nscales, sizeof(nscales)) <= 0)
+                return 1;
+        }
+        return 0;
+    }
     if ((uint64_t)n != n_samples_local)
         return 1;
     for (size_t i = 0; i < n; ++i) {
@@ -224,6 +235,8 @@ struct MLXDataloader {
     pthread_cond_t q_nonfull;
     bool workers_started;
     bool finished;
+    size_t pending_tasks;
+    int dispatcher_done;
     /* process worker fields */
     pid_t *pids;
     int *task_wfds;   /* parent writes tasks to worker */
@@ -374,6 +387,18 @@ static int build_tasks(struct MLXDataloader *dl) {
         return 1;
     size_t n = dl->n_indices;
     size_t bs = dl->batch_size;
+    const char *bs_override = getenv("FACIESGAN_BATCH_SIZE");
+    if (bs_override) {
+        long v = atol(bs_override);
+        if (v > 0)
+            bs = (size_t)v;
+    }
+    const char *bs_scale = getenv("FACIESGAN_BATCH_SCALE");
+    if (bs_scale) {
+        long s = atol(bs_scale);
+        if (s > 1)
+            bs *= (size_t)s;
+    }
     if (bs == 0)
         return 1;
     /* If a batch_sampler callback is provided, use it to obtain batches. */
@@ -714,6 +739,209 @@ static int read_vector_array_from_fd(int fd, mlx_vector_array *out_vec);
 static int serialize_vec_to_fd(int fd, mlx_vector_array vec);
 static int write_dataset_to_fd(int fd, MLXPyramidsDataset *ds);
 
+static int ipc_use_shm(void) {
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
+    const char *env = getenv("FACIESGAN_IPC_SHM");
+    cached = (env && atoi(env) != 0) ? 1 : 0;
+    return cached;
+}
+
+static int proc_sync_io_enabled(void) {
+    const char *env = getenv("FACIESGAN_PROC_SYNC_IO");
+    if (!env || env[0] == '\0')
+        return 1;
+    return atoi(env) != 0;
+}
+
+static void ipc_advise_hugepages(void *mem, size_t size) {
+    const char *env = getenv("FACIESGAN_HUGEPAGE");
+    if (!env || atoi(env) == 0)
+        return;
+#ifdef MADV_HUGEPAGE
+    madvise(mem, size, MADV_HUGEPAGE);
+#elif defined(MADV_SEQUENTIAL)
+    madvise(mem, size, MADV_SEQUENTIAL);
+#endif
+}
+
+static int read_mem(const unsigned char *buf, size_t len, size_t *off,
+                    void *out, size_t n) {
+    if (*off + n > len)
+        return 1;
+    memcpy(out, buf + *off, n);
+    *off += n;
+    return 0;
+}
+
+static int read_vector_array_from_mem(const unsigned char *buf, size_t len,
+                                      size_t *off, mlx_vector_array *out_vec) {
+    *out_vec = mlx_vector_array_new();
+    uint32_t nscales = 0;
+    if (read_mem(buf, len, off, &nscales, sizeof(nscales)) != 0)
+        return 1;
+    for (uint32_t si = 0; si < nscales; ++si) {
+        uint32_t ndim = 0;
+        if (read_mem(buf, len, off, &ndim, sizeof(ndim)) != 0)
+            return 1;
+        int s_ndim = (int)ndim;
+        int *shape = NULL;
+        if (s_ndim > 0) {
+            if (mlx_alloc_int_array(&shape, s_ndim) != 0)
+                return 1;
+        }
+        for (uint32_t d = 0; d < ndim; ++d) {
+            int32_t s32 = 0;
+            if (read_mem(buf, len, off, &s32, sizeof(s32)) != 0) {
+                if (shape)
+                    mlx_free_int_array(&shape, &s_ndim);
+                return 1;
+            }
+            shape[d] = s32;
+        }
+        uint64_t uelems = 0;
+        if (read_mem(buf, len, off, &uelems, sizeof(uelems)) != 0) {
+            if (shape)
+                mlx_free_int_array(&shape, &s_ndim);
+            return 1;
+        }
+        size_t elems = (size_t)uelems;
+        float *fbuf = NULL;
+        if (elems > 0) {
+            if (elems > (size_t)INT_MAX) {
+                fbuf = (float *)malloc(sizeof(float) * elems);
+            } else {
+                if (mlx_alloc_float_buf(&fbuf, (int)elems) != 0)
+                    fbuf = NULL;
+            }
+            if (!fbuf) {
+                if (shape)
+                    mlx_free_int_array(&shape, &s_ndim);
+                return 1;
+            }
+            if (read_mem(buf, len, off, fbuf, sizeof(float) * elems) != 0) {
+                if (shape)
+                    mlx_free_int_array(&shape, &s_ndim);
+                if (elems > (size_t)INT_MAX)
+                    free(fbuf);
+                else
+                    mlx_free_float_buf(&fbuf, NULL);
+                return 1;
+            }
+        }
+        mlx_array arr = mlx_array_new_data(fbuf, shape, (int)ndim, MLX_FLOAT32);
+        if (mlx_vector_array_append_value(*out_vec, arr)) {
+            mlx_array_free(arr);
+            if (shape)
+                mlx_free_int_array(&shape, &s_ndim);
+            if (fbuf) {
+                if (elems > (size_t)INT_MAX)
+                    free(fbuf);
+                else
+                    mlx_free_float_buf(&fbuf, NULL);
+            }
+            return 1;
+        }
+        mlx_array_free(arr);
+        if (shape)
+            mlx_free_int_array(&shape, &s_ndim);
+        if (fbuf) {
+            if (elems > (size_t)INT_MAX)
+                free(fbuf);
+            else
+                mlx_free_float_buf(&fbuf, NULL);
+        }
+    }
+    return 0;
+}
+
+static int read_worker_result(int fd, mlx_vector_array *fac,
+                              mlx_vector_array *wells,
+                              mlx_vector_array *seis) {
+    *fac = mlx_vector_array_new();
+    *wells = mlx_vector_array_new();
+    *seis = mlx_vector_array_new();
+    if (ipc_use_shm()) {
+        int shm_error = 0;
+        uint32_t name_len = 0;
+        if (read_all(fd, &name_len, sizeof(name_len)) <= 0)
+            shm_error = 1;
+        if (!shm_error && name_len == 0)
+            shm_error = 1;
+        char *name = NULL;
+        if (!shm_error) {
+            name = (char *)malloc(name_len + 1);
+            if (!name)
+                shm_error = 1;
+        }
+        if (!shm_error && read_all(fd, name, name_len) <= 0)
+            shm_error = 1;
+        if (!shm_error)
+            name[name_len] = '\0';
+        uint64_t total64 = 0;
+        if (!shm_error && read_all(fd, &total64, sizeof(total64)) <= 0)
+            shm_error = 1;
+        if (!shm_error && total64 == 0)
+            shm_error = 1;
+        size_t total = (size_t)total64;
+        int shm_fd = -1;
+        if (!shm_error) {
+            shm_fd = shm_open(name, O_RDONLY, 0600);
+            if (shm_fd < 0)
+                shm_error = 1;
+        }
+        void *mem = MAP_FAILED;
+        if (!shm_error) {
+            mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
+            close(shm_fd);
+            shm_unlink(name);
+            if (mem == MAP_FAILED)
+                shm_error = 1;
+        }
+        if (name)
+            free(name);
+        if (!shm_error) {
+            ipc_advise_hugepages(mem, total);
+            size_t off = 0;
+            const unsigned char *buf = (const unsigned char *)mem;
+            if (read_vector_array_from_mem(buf, total, &off, fac) != 0 ||
+                    read_vector_array_from_mem(buf, total, &off, wells) != 0 ||
+                    read_vector_array_from_mem(buf, total, &off, seis) != 0) {
+                shm_error = 1;
+            }
+            munmap(mem, total);
+        }
+        if (shm_error) {
+            mlx_vector_array_free(*fac);
+            mlx_vector_array_free(*wells);
+            mlx_vector_array_free(*seis);
+            return 1;
+        }
+        return 0;
+    }
+
+    if (read_vector_array_from_fd(fd, fac) != 0) {
+        mlx_vector_array_free(*fac);
+        mlx_vector_array_free(*wells);
+        mlx_vector_array_free(*seis);
+        return 1;
+    }
+    if (read_vector_array_from_fd(fd, wells) != 0) {
+        mlx_vector_array_free(*fac);
+        mlx_vector_array_free(*wells);
+        mlx_vector_array_free(*seis);
+        return 1;
+    }
+    if (read_vector_array_from_fd(fd, seis) != 0) {
+        mlx_vector_array_free(*fac);
+        mlx_vector_array_free(*wells);
+        mlx_vector_array_free(*seis);
+        return 1;
+    }
+    return 0;
+}
+
 struct reader_arg {
     struct MLXDataloader *dl;
     int worker;
@@ -726,6 +954,8 @@ static void *proc_reader_thread(void *arg) {
     int fd = dl->result_rfds[worker];
     const char *log_env = getenv("FACIESGAN_WORKER_LOG");
     int log_enabled = log_env && atoi(log_env) != 0;
+    const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+    int use_mlx_lock = (proc_env && strcmp(proc_env, "1") == 0);
     while (1) {
         int32_t status = 0;
         if (read_all(fd, &status, sizeof(status)) <= 0)
@@ -786,37 +1016,151 @@ static void *proc_reader_thread(void *arg) {
             fprintf(stderr, "proc_reader: worker=%d batch status=%d\n",
                     worker, (int)status);
         }
+        if (use_mlx_lock)
+            mlx_global_lock();
         mlx_vector_array fac = mlx_vector_array_new();
         mlx_vector_array wells = mlx_vector_array_new();
         mlx_vector_array seis = mlx_vector_array_new();
-        if (read_vector_array_from_fd(fd, &fac) != 0) {
-            mlx_vector_array_free(fac);
-            mlx_vector_array_free(wells);
-            mlx_vector_array_free(seis);
-            queue_push(dl, mlx_vector_array_new(), mlx_vector_array_new(),
-                       mlx_vector_array_new(), 1);
-            continue;
-        }
-        if (read_vector_array_from_fd(fd, &wells) != 0) {
-            mlx_vector_array_free(fac);
-            mlx_vector_array_free(wells);
-            mlx_vector_array_free(seis);
-            queue_push(dl, mlx_vector_array_new(), mlx_vector_array_new(),
-                       mlx_vector_array_new(), 1);
-            continue;
-        }
-        if (read_vector_array_from_fd(fd, &seis) != 0) {
-            mlx_vector_array_free(fac);
-            mlx_vector_array_free(wells);
-            mlx_vector_array_free(seis);
-            queue_push(dl, mlx_vector_array_new(), mlx_vector_array_new(),
-                       mlx_vector_array_new(), 1);
-            continue;
+
+        if (ipc_use_shm()) {
+            int shm_error = 0;
+            uint32_t name_len = 0;
+            if (read_all(fd, &name_len, sizeof(name_len)) <= 0)
+                shm_error = 1;
+            if (!shm_error && name_len == 0)
+                shm_error = 1;
+            char *name = NULL;
+            if (!shm_error) {
+                name = (char *)malloc(name_len + 1);
+                if (!name)
+                    shm_error = 1;
+            }
+            if (!shm_error && read_all(fd, name, name_len) <= 0)
+                shm_error = 1;
+            if (!shm_error) {
+                name[name_len] = '\0';
+            }
+            uint64_t total64 = 0;
+            if (!shm_error && read_all(fd, &total64, sizeof(total64)) <= 0)
+                shm_error = 1;
+            if (!shm_error && total64 == 0)
+                shm_error = 1;
+            size_t total = (size_t)total64;
+            int shm_fd = -1;
+            if (!shm_error) {
+                shm_fd = shm_open(name, O_RDONLY, 0600);
+                if (shm_fd < 0)
+                    shm_error = 1;
+            }
+            void *mem = MAP_FAILED;
+            if (!shm_error) {
+                mem = mmap(NULL, total, PROT_READ, MAP_SHARED, shm_fd, 0);
+                close(shm_fd);
+                shm_unlink(name);
+                if (mem == MAP_FAILED)
+                    shm_error = 1;
+            }
+            if (name)
+                free(name);
+            if (!shm_error) {
+                ipc_advise_hugepages(mem, total);
+                size_t off = 0;
+                const unsigned char *buf = (const unsigned char *)mem;
+                if (read_vector_array_from_mem(buf, total, &off, &fac) != 0 ||
+                        read_vector_array_from_mem(buf, total, &off, &wells) != 0 ||
+                        read_vector_array_from_mem(buf, total, &off, &seis) != 0) {
+                    shm_error = 1;
+                }
+                munmap(mem, total);
+            }
+            if (shm_error) {
+                mlx_vector_array_free(fac);
+                mlx_vector_array_free(wells);
+                mlx_vector_array_free(seis);
+                if (use_mlx_lock)
+                    mlx_global_unlock();
+                queue_push(dl, mlx_vector_array_new(), mlx_vector_array_new(),
+                           mlx_vector_array_new(), 1);
+                pthread_mutex_lock(&dl->q_mutex);
+                if (dl->pending_tasks > 0)
+                    dl->pending_tasks -= 1;
+                if (dl->dispatcher_done && dl->pending_tasks == 0) {
+                    dl->finished = true;
+                    pthread_cond_broadcast(&dl->q_nonempty);
+                }
+                pthread_mutex_unlock(&dl->q_mutex);
+                continue;
+            }
+        } else {
+            if (read_vector_array_from_fd(fd, &fac) != 0) {
+                mlx_vector_array_free(fac);
+                mlx_vector_array_free(wells);
+                mlx_vector_array_free(seis);
+                if (use_mlx_lock)
+                    mlx_global_unlock();
+                queue_push(dl, mlx_vector_array_new(), mlx_vector_array_new(),
+                           mlx_vector_array_new(), 1);
+                pthread_mutex_lock(&dl->q_mutex);
+                if (dl->pending_tasks > 0)
+                    dl->pending_tasks -= 1;
+                if (dl->dispatcher_done && dl->pending_tasks == 0) {
+                    dl->finished = true;
+                    pthread_cond_broadcast(&dl->q_nonempty);
+                }
+                pthread_mutex_unlock(&dl->q_mutex);
+                continue;
+            }
+            if (read_vector_array_from_fd(fd, &wells) != 0) {
+                mlx_vector_array_free(fac);
+                mlx_vector_array_free(wells);
+                mlx_vector_array_free(seis);
+                if (use_mlx_lock)
+                    mlx_global_unlock();
+                queue_push(dl, mlx_vector_array_new(), mlx_vector_array_new(),
+                           mlx_vector_array_new(), 1);
+                pthread_mutex_lock(&dl->q_mutex);
+                if (dl->pending_tasks > 0)
+                    dl->pending_tasks -= 1;
+                if (dl->dispatcher_done && dl->pending_tasks == 0) {
+                    dl->finished = true;
+                    pthread_cond_broadcast(&dl->q_nonempty);
+                }
+                pthread_mutex_unlock(&dl->q_mutex);
+                continue;
+            }
+            if (read_vector_array_from_fd(fd, &seis) != 0) {
+                mlx_vector_array_free(fac);
+                mlx_vector_array_free(wells);
+                mlx_vector_array_free(seis);
+                if (use_mlx_lock)
+                    mlx_global_unlock();
+                queue_push(dl, mlx_vector_array_new(), mlx_vector_array_new(),
+                           mlx_vector_array_new(), 1);
+                pthread_mutex_lock(&dl->q_mutex);
+                if (dl->pending_tasks > 0)
+                    dl->pending_tasks -= 1;
+                if (dl->dispatcher_done && dl->pending_tasks == 0) {
+                    dl->finished = true;
+                    pthread_cond_broadcast(&dl->q_nonempty);
+                }
+                pthread_mutex_unlock(&dl->q_mutex);
+                continue;
+            }
         }
         if (log_enabled) {
             fprintf(stderr, "proc_reader: worker=%d batch read ok\n", worker);
         }
+        if (use_mlx_lock)
+            mlx_global_unlock();
         queue_push(dl, fac, wells, seis, 0);
+        pthread_mutex_lock(&dl->q_mutex);
+        if (dl->pending_tasks > 0)
+            dl->pending_tasks -= 1;
+        if (dl->dispatcher_done && dl->pending_tasks == 0) {
+            dl->finished = true;
+            pthread_cond_broadcast(&dl->q_nonempty);
+        }
+        pthread_mutex_unlock(&dl->q_mutex);
     }
     return NULL;
 }
@@ -871,8 +1215,80 @@ static void *proc_dispatcher_thread(void *arg) {
             }
             free(buf);
         }
+
+        pthread_mutex_lock(&dl->q_mutex);
+        dl->pending_tasks += 1;
+        pthread_mutex_unlock(&dl->q_mutex);
     }
+
+    pthread_mutex_lock(&dl->q_mutex);
+    dl->dispatcher_done = 1;
+    if (dl->pending_tasks == 0) {
+        dl->finished = true;
+        pthread_cond_broadcast(&dl->q_nonempty);
+    }
+    pthread_mutex_unlock(&dl->q_mutex);
     return NULL;
+}
+
+static int proc_sync_next(struct MLXDataloader *dl,
+                          mlx_vector_array *out_facies,
+                          mlx_vector_array *out_wells,
+                          mlx_vector_array *out_seismic) {
+    if (!dl)
+        return 1;
+    const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+    int use_mlx_lock = (proc_env && strcmp(proc_env, "1") == 0);
+    pthread_mutex_lock(&dl->task_mutex);
+    if (dl->next_task >= dl->n_tasks) {
+        pthread_mutex_unlock(&dl->task_mutex);
+        return 2;
+    }
+    size_t tid = dl->next_task++;
+    pthread_mutex_unlock(&dl->task_mutex);
+
+    int worker = dl->next_worker % dl->num_workers;
+    dl->next_worker = (dl->next_worker + 1) % dl->num_workers;
+
+    uint32_t nidx = (uint32_t)dl->task_sizes[tid];
+    if (write_all(dl->task_wfds[worker], &nidx, sizeof(nidx)) <= 0)
+        return 1;
+    if (nidx > 0) {
+        uint64_t *buf = NULL;
+        if (nidx > (uint32_t)INT_MAX) {
+            buf = (uint64_t *)malloc(sizeof(uint64_t) * nidx);
+            if (!buf)
+                return 1;
+        } else {
+            if (mlx_alloc_pod((void **)&buf, sizeof(uint64_t), (int)nidx) != 0)
+                return 1;
+        }
+        for (uint32_t i = 0; i < nidx; ++i)
+            buf[i] = (uint64_t)dl->tasks[tid][i];
+        if (write_all(dl->task_wfds[worker], buf, sizeof(uint64_t) * nidx) <= 0) {
+            free(buf);
+            return 1;
+        }
+        free(buf);
+    }
+
+    int32_t status = 0;
+    if (read_all(dl->result_rfds[worker], &status, sizeof(status)) <= 0)
+        return 1;
+    if (status != 0)
+        return 1;
+
+    if (use_mlx_lock)
+        mlx_global_lock();
+    if (read_worker_result(dl->result_rfds[worker], out_facies, out_wells,
+                           out_seismic) != 0) {
+        if (use_mlx_lock)
+            mlx_global_unlock();
+        return 1;
+    }
+    if (use_mlx_lock)
+        mlx_global_unlock();
+    return 0;
 }
 
 static int spawn_process_workers(struct MLXDataloader *dl) {
@@ -1003,6 +1419,43 @@ static int spawn_process_workers(struct MLXDataloader *dl) {
         }
     }
     dl->next_worker = 0;
+    if (proc_sync_io_enabled()) {
+        for (int wi = 0; wi < dl->num_workers; ++wi) {
+            int32_t status = 0;
+            if (read_all(dl->result_rfds[wi], &status, sizeof(status)) <= 0) {
+                facies_dataloader_free(dl);
+                return 1;
+            }
+            uint32_t msglen = 0;
+            if (read_all(dl->result_rfds[wi], &msglen, sizeof(msglen)) <= 0) {
+                facies_dataloader_free(dl);
+                return 1;
+            }
+            char *msg = NULL;
+            if (msglen > 0) {
+                msg = (char *)malloc(msglen + 1);
+                if (!msg || read_all(dl->result_rfds[wi], msg, msglen) <= 0) {
+                    if (msg)
+                        free(msg);
+                    facies_dataloader_free(dl);
+                    return 1;
+                }
+                msg[msglen] = '\0';
+            }
+            dl->worker_init_done[wi] = 1;
+            if (status != 0) {
+                if (msg)
+                    dl->worker_init_err_msg[wi] = msg;
+                facies_dataloader_free(dl);
+                return 1;
+            }
+            if (msg)
+                free(msg);
+        }
+        dl->process_workers_started = false;
+        return 0;
+    }
+
     /* start per-worker reader threads and a dispatcher thread */
     dl->proc_readers = (pthread_t *)calloc(dl->num_workers, sizeof(pthread_t));
     dl->reader_args =
@@ -1530,9 +1983,18 @@ int facies_dataloader_next(struct MLXDataloader *dl,
      * implementation simple (no background reader thread) while providing
      * correct IPC handling for the fork-based workers. */
     if (dl->pids) {
+        if (proc_sync_io_enabled()) {
+            return proc_sync_next(dl, out_facies, out_wells, out_seismic);
+        }
         /* ensure dispatcher/reader threads are started (created in constructor)
          * and then consume precomputed results from the queue like the
          * threaded backend. */
+        pthread_mutex_lock(&dl->q_mutex);
+        if (dl->dispatcher_done && dl->pending_tasks == 0 && dl->q_count == 0) {
+            pthread_mutex_unlock(&dl->q_mutex);
+            return 2;
+        }
+        pthread_mutex_unlock(&dl->q_mutex);
         int perr = 0;
         int qrc = queue_pop_timeout(dl, out_facies, out_wells, out_seismic, &perr);
         if (qrc != 0) {

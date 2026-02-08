@@ -911,7 +911,10 @@ MLXTrainer_create_batch_iterator_impl(MLXTrainer *trainer,
         }
     }
     int qcap = 4;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+    int use_cpu_stream = (proc_env && strcmp(proc_env, "1") == 0);
+    mlx_stream s = use_cpu_stream ? mlx_default_cpu_stream_new()
+                   : mlx_default_gpu_stream_new();
     /* scales and n_scales are used below when creating prefetcher */
 
     PrefetcherHandle ph =
@@ -926,7 +929,8 @@ MLXTrainer_create_batch_iterator_impl(MLXTrainer *trainer,
     /* Start the centralized prefetcher producer thread which will read from
      * the dataloader and push into the prefetcher. The helper detaches the
      * thread and will free the provided stream when finished. */
-    mlx_stream prod_stream = mlx_default_gpu_stream_new();
+    mlx_stream prod_stream = use_cpu_stream ? mlx_default_cpu_stream_new()
+                             : mlx_default_gpu_stream_new();
     if (prefetcher_start_from_dataloader(ph, dl, prod_stream) != 0) {
         if (prod_stream.ctx)
             mlx_stream_free(prod_stream);
@@ -937,6 +941,101 @@ MLXTrainer_create_batch_iterator_impl(MLXTrainer *trainer,
     }
     trainer->batch_producer_running = 1;
     return trainer->batch_iterator;
+}
+
+static PrefetchedPyramidsBatch *prefetched_pyramids_from_vectors(
+    int n_scales, const int *scales,
+    mlx_vector_array facs, mlx_vector_array wells,
+    mlx_vector_array masks, mlx_vector_array seis) {
+    PrefetchedPyramidsBatch *out = NULL;
+    if (mlx_alloc_pod((void **)&out, sizeof(PrefetchedPyramidsBatch), 1) != 0)
+        return NULL;
+    memset(out, 0, sizeof(*out));
+    out->n_scales = n_scales;
+    if (n_scales > 0 && scales) {
+        if (mlx_alloc_int_array(&out->scales, n_scales) == 0) {
+            for (int i = 0; i < n_scales; ++i)
+                out->scales[i] = scales[i];
+        }
+    }
+
+    int nf = (int)mlx_vector_array_size(facs);
+    if (mlx_alloc_mlx_array_raw(&out->facies, n_scales) == 0) {
+        for (int i = 0; i < n_scales; ++i) {
+            if (i < nf) {
+                mlx_array tmp = mlx_array_new();
+                mlx_vector_array_get(&tmp, facs, i);
+                out->facies[i] = mlx_array_new();
+                mlx_array_set(&out->facies[i], tmp);
+                mlx_array_free(tmp);
+            } else {
+                out->facies[i] = mlx_array_new();
+            }
+        }
+        if (mlx_alloc_ptr_array((void ***)&out->facies_ptrs, n_scales) == 0) {
+            for (int i = 0; i < n_scales; ++i)
+                out->facies_ptrs[i] = &out->facies[i];
+        }
+    }
+
+    int nw = (int)mlx_vector_array_size(wells);
+    if (nw > 0 && mlx_alloc_mlx_array_raw(&out->wells, n_scales) == 0) {
+        for (int i = 0; i < n_scales; ++i) {
+            if (i < nw) {
+                mlx_array tmp = mlx_array_new();
+                mlx_vector_array_get(&tmp, wells, i);
+                out->wells[i] = mlx_array_new();
+                mlx_array_set(&out->wells[i], tmp);
+                mlx_array_free(tmp);
+            } else {
+                out->wells[i] = mlx_array_new();
+            }
+        }
+        if (mlx_alloc_ptr_array((void ***)&out->wells_ptrs, n_scales) == 0) {
+            for (int i = 0; i < n_scales; ++i)
+                out->wells_ptrs[i] = &out->wells[i];
+        }
+    }
+
+    int ns = (int)mlx_vector_array_size(seis);
+    if (ns > 0 && mlx_alloc_mlx_array_raw(&out->seismic, n_scales) == 0) {
+        for (int i = 0; i < n_scales; ++i) {
+            if (i < ns) {
+                mlx_array tmp = mlx_array_new();
+                mlx_vector_array_get(&tmp, seis, i);
+                out->seismic[i] = mlx_array_new();
+                mlx_array_set(&out->seismic[i], tmp);
+                mlx_array_free(tmp);
+            } else {
+                out->seismic[i] = mlx_array_new();
+            }
+        }
+        if (mlx_alloc_ptr_array((void ***)&out->seismic_ptrs, n_scales) == 0) {
+            for (int i = 0; i < n_scales; ++i)
+                out->seismic_ptrs[i] = &out->seismic[i];
+        }
+    }
+
+    int nm = (int)mlx_vector_array_size(masks);
+    if (nm > 0 && mlx_alloc_mlx_array_raw(&out->masks, n_scales) == 0) {
+        for (int i = 0; i < n_scales; ++i) {
+            if (i < nm) {
+                mlx_array tmp = mlx_array_new();
+                mlx_vector_array_get(&tmp, masks, i);
+                out->masks[i] = mlx_array_new();
+                mlx_array_set(&out->masks[i], tmp);
+                mlx_array_free(tmp);
+            } else {
+                out->masks[i] = mlx_array_new();
+            }
+        }
+        if (mlx_alloc_ptr_array((void ***)&out->masks_ptrs, n_scales) == 0) {
+            for (int i = 0; i < n_scales; ++i)
+                out->masks_ptrs[i] = &out->masks[i];
+        }
+    }
+
+    return out;
 }
 
 int MLXTrainer_create_dataloader_impl(MLXTrainer *trainer) {
@@ -1273,12 +1372,9 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
             }
         }
 
-        /* Eval and sync after each D step to force weight updates */
-        mlx_faciesgan_eval_all_parameters(trainer->model);
-        for (int sc = 0; sc < trainer->n_scales; ++sc) {
-            if (trainer->disc_opts && trainer->disc_opts[sc])
-                mlx_optimizer_eval_state(trainer->disc_opts[sc]);
-        }
+        /* NOTE: per-step eval_all_parameters + optimizer_eval_state removed;
+         * the batched optimizer (mlx_adam_step) already evaluates all new
+         * parameters and optimizer state in a single mlx_eval call. */
 
         mlx_results_free(res);
         res = NULL;
@@ -1331,12 +1427,7 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
             }
         }
 
-        /* Eval and sync after each G step to force weight updates */
-        mlx_faciesgan_eval_all_parameters(trainer->model);
-        for (int sc = 0; sc < trainer->n_scales; ++sc) {
-            if (trainer->gen_opts && trainer->gen_opts[sc])
-                mlx_optimizer_eval_state(trainer->gen_opts[sc]);
-        }
+        /* NOTE: per-step eval removed — optimizer batch-evals internally. */
 
         mlx_results_free(res);
         res = NULL;
@@ -1360,13 +1451,9 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
         san_active = NULL;
     }
 
-    /* Synchronize and clear Metal cache after each optimization step to avoid
-     * accumulating resources (command buffers/encoders) and hitting the
-     * Metal resource limit. */
-    mlx_stream sync_s = mlx_default_gpu_stream_new();
-    mlx_synchronize(sync_s);
-    mlx_clear_cache();
-    mlx_stream_free(sync_s);
+    /* NOTE: per-optimization-step synchronize+clear_cache removed.
+     * One sync at the end of each epoch is sufficient.  The batched
+     * optimizer eval materialises all parameter updates. */
 
     if (tmp_wells)
         mlx_free_ptr_array((void ***)&tmp_wells, need_n);
@@ -2162,6 +2249,21 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
 
     TrainningOptions *opts = &trainer->opts;
 
+    /* Disable MLX compile backend for process workers unless explicitly allowed.
+     * This avoids long stalls during multi-scale training on macOS. */
+    if (opts->compile_backend) {
+        const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+        const char *allow_compile = getenv("FACIESGAN_ALLOW_COMPILE_BACKEND");
+        if (proc_env && strcmp(proc_env, "1") == 0 &&
+                (!allow_compile || strcmp(allow_compile, "1") != 0)) {
+            opts->compile_backend = false;
+            mlx_set_compile_mode(MLX_COMPILE_MODE_DISABLED);
+            fprintf(stderr,
+                    "warning: disabling MLX compile backend for process workers "
+                    "(set FACIESGAN_ALLOW_COMPILE_BACKEND=1 to override)\n");
+        }
+    }
+
     int n_scales = trainer->n_scales;
     if (n_scales <= 0) {
         /* Prefer to initialise scales from existing dataset/model state rather
@@ -2179,6 +2281,45 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
             return -1;
         }
     }
+
+    /* Respect the --num-parallel-scales CLI argument: it controls how many
+     * scales are trained in a single parallel window.  `n_scales` (total
+     * model scales) is only an upper bound. */
+    int max_parallel = opts->num_parallel_scales;
+    if (max_parallel <= 0 || max_parallel > n_scales)
+        max_parallel = n_scales;
+
+    /* Environment overrides */
+    const char *env_max = getenv("FACIESGAN_MAX_PARALLEL_SCALES");
+    if (env_max && env_max[0] != '\0') {
+        int v = atoi(env_max);
+        if (v > 0 && v < max_parallel)
+            max_parallel = v;
+    }
+#ifdef __APPLE__
+    {
+        const char *allow_env = getenv("FACIESGAN_ALLOW_PARALLEL_SCALES");
+        int allow_parallel = allow_env ? atoi(allow_env) : -1;
+        if (allow_parallel == 0) {
+            /* Explicitly disabled → cap to 1 */
+            max_parallel = 1;
+        } else if (allow_parallel < 0) {
+            /* Not set → auto-cap when using async process worker IO only.
+             * The default sync IO path (FACIESGAN_PROC_SYNC_IO != 0) does
+             * not use background reader/dispatcher threads, so it is safe
+             * to keep the user's requested parallelism. */
+            const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+            const char *sync_env = getenv("FACIESGAN_PROC_SYNC_IO");
+            int sync_io = !sync_env || sync_env[0] == '\0' || atoi(sync_env) != 0;
+            if (proc_env && strcmp(proc_env, "1") == 0 && !sync_io &&
+                    max_parallel > 1)
+                max_parallel = 1;
+        }
+        /* allow_parallel > 0 → honour the user's value, no cap */
+    }
+#endif
+    if (max_parallel < n_scales)
+        n_scales = max_parallel;
 
     /* NOTE: Generator and discriminator scales are already created during
      * MLXTrainer_new → MLXTrainer_create_model → mlx_base_manager_init_scales,
@@ -2240,19 +2381,24 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
      * and producer thread logic is consistent. */
     PrefetcherIteratorHandle pit = NULL;
     int *scale_list = NULL;
-    pit = MLXTrainer_create_batch_iterator(trainer, dl, scale_idxs, n_scales);
-    if (!pit) {
-        fprintf(stderr, "failed to create prefetcher iterator\n");
-        if (scale_idxs) {
-            int _sn = n_scales;
-            mlx_free_int_array(&scale_idxs, &_sn);
+    const char *sync_env = getenv("FACIESGAN_SYNC_BATCHES");
+    int sync_batches = (sync_env && atoi(sync_env) != 0);
+    if (!sync_batches) {
+        pit = MLXTrainer_create_batch_iterator(trainer, dl, scale_idxs, n_scales);
+        if (!pit) {
+            fprintf(stderr, "failed to create prefetcher iterator\n");
+            if (scale_idxs) {
+                int _sn = n_scales;
+                mlx_free_int_array(&scale_idxs, &_sn);
+            }
+            return -1;
         }
-        return -1;
     }
 
     /* Training loop: consume prepared pyramids from prefetcher iterator */
     mlx_stream s = mlx_default_gpu_stream_new();
-    prefetcher_iterator_preload(pit);
+    if (pit)
+        prefetcher_iterator_preload(pit);
 
     /* Print training scales banner (parity with Python Trainer.train) */
     printf("\n============================================================\n");
@@ -2284,10 +2430,41 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     mlx_set_cache_limit(&cache_limit_result, cache_limit);
 
     while (batches < total_batches) {
-        PrefetchedPyramidsBatch *pb = prefetcher_iterator_next(pit);
+        PrefetchedPyramidsBatch *pb = NULL;
+        if (sync_batches) {
+            mlx_vector_array out_facies = mlx_vector_array_new();
+            mlx_vector_array out_wells = mlx_vector_array_new();
+            mlx_vector_array out_seismic = mlx_vector_array_new();
+            mlx_vector_array out_masks = mlx_vector_array_new();
+            int rc = facies_dataloader_next(dl, &out_facies, &out_wells,
+                                            &out_seismic, s);
+            if (rc == 2) {
+                mlx_vector_array_free(out_facies);
+                mlx_vector_array_free(out_wells);
+                mlx_vector_array_free(out_seismic);
+                mlx_vector_array_free(out_masks);
+                break;
+            } else if (rc != 0) {
+                fprintf(stderr, "dataloader_next error: %d\n", rc);
+                mlx_vector_array_free(out_facies);
+                mlx_vector_array_free(out_wells);
+                mlx_vector_array_free(out_seismic);
+                mlx_vector_array_free(out_masks);
+                break;
+            }
+            pb = prefetched_pyramids_from_vectors(n_scales, scale_idxs,
+                                                  out_facies, out_wells,
+                                                  out_masks, out_seismic);
+            mlx_vector_array_free(out_facies);
+            mlx_vector_array_free(out_wells);
+            mlx_vector_array_free(out_seismic);
+            mlx_vector_array_free(out_masks);
+        } else {
+            pb = prefetcher_iterator_next(pit);
+        }
         if (!pb)
             break; /* no more batches */
-        if (prefetcher_iterator_get_error(pit) != 0) {
+        if (pit && prefetcher_iterator_get_error(pit) != 0) {
             fprintf(stderr, "error: dataloader timeout detected, aborting training\n");
             prefetcher_free_pyramids(pb);
             break;
@@ -2413,6 +2590,10 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         /* Use computed masks if we created them, otherwise use prefetched masks */
         mlx_array **effective_mask_pyr = (computed_masks && n_computed_masks > 0) ? computed_masks : mask_pyr;
 
+        /* Release MLX lock before heavy optimization step (some ops also
+         * acquire the global lock internally; holding it here can deadlock). */
+        mlx_global_unlock();
+
         int batch_n = (int)opts->batch_size;
         int *indexes = NULL;
         if (mlx_alloc_int_array(&indexes, batch_n) != 0) {
@@ -2472,10 +2653,9 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
             fg_progress_update((size_t)(batches * num_iter + epoch));
 #endif
 
-            /* Pre-sync and clear before optimization step to prevent Metal resource
-             * accumulation when many arrays are created during gradient computation */
-            mlx_synchronize(s);
-            mlx_clear_cache();
+            /* NOTE: pre-optimization sync+clear_cache removed to avoid
+             * draining the GPU pipeline before every step.  One sync at
+             * the end of each epoch is sufficient. */
 
             int step_rc = MLXTrainer_optimization_step(
                               trainer, indexes, batch_n, fac_pyr, nsc, rec_pyr, nsc, well_pyr,
@@ -2573,8 +2753,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
 
         batches++;
 
-        /* Release MLX lock before looping to get next batch */
-        mlx_global_unlock();
+        /* MLX lock already released above */
     }
 
     mlx_stream_free(s);

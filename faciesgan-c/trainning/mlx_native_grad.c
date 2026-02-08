@@ -276,6 +276,7 @@ static int gen_loss_closure(mlx_vector_array *result,
     if (n_samples > 1 && p->lambda_diversity > 0.0f) {
         /* Compute pairwise exp(-10 * mean((fi-fj)^2)) */
         mlx_array acc = mlx_array_new_float(0.0f);
+        mlx_array neg10 = mlx_array_new_float(-10.0f);  /* hoist out of loop */
         int pairs = 0;
         for (int i = 0; i < n_samples; ++i) {
             for (int j = i + 1; j < n_samples; ++j) {
@@ -287,7 +288,6 @@ static int gen_loss_closure(mlx_vector_array *result,
                 mlx_array mean_sq = mlx_array_new();
                 mlx_mean(&mean_sq, sq, false, s);
                 /* exp(-10 * mean_sq) */
-                mlx_array neg10 = mlx_array_new_float(-10.0f);
                 mlx_array scaled = mlx_array_new();
                 mlx_multiply(&scaled, mean_sq, neg10, s);
                 mlx_array expval = mlx_array_new();
@@ -303,12 +303,12 @@ static int gen_loss_closure(mlx_vector_array *result,
                 mlx_array_free(diff);
                 mlx_array_free(sq);
                 mlx_array_free(mean_sq);
-                mlx_array_free(neg10);
                 mlx_array_free(scaled);
                 mlx_array_free(expval);
                 pairs++;
             }
         }
+        mlx_array_free(neg10);
 
         if (pairs > 0) {
             /* mean of pairwise values */

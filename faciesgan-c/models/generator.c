@@ -75,7 +75,16 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
         }
     }
     int rc = 0;
-    if (getenv("FACIESGAN_FAST_ADD_NO_COPY")) {
+    /* Default to the fast path (no copy).  MLX's lazy evaluation model uses
+     * reference counting so mlx_add already creates a new output array —
+     * the double-copy was unnecessary and doubled GPU memory traffic.
+     * Set FACIESGAN_SLOW_ADD_COPY=1 to restore the old cautious path. */
+    static int slow_add = -1;
+    if (slow_add < 0) {
+        const char *e = getenv("FACIESGAN_SLOW_ADD_COPY");
+        slow_add = (e && e[0] == '1') ? 1 : 0;
+    }
+    if (!slow_add) {
         rc = mlx_add(out, a_copy, b_copy, s);
     } else {
         /* To avoid aliasing/in-place updates from the backend which can lead to
@@ -1157,7 +1166,10 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
     }
 
     /* color quantization (can be disabled via FACIESGAN_DISABLE_COLOR_QUANT) */
-    if (m->color_quant && getenv("FACIESGAN_DISABLE_COLOR_QUANT") == NULL) {
+    static int cq_disabled = -1;
+    if (cq_disabled < 0)
+        cq_disabled = getenv("FACIESGAN_DISABLE_COLOR_QUANT") != NULL;
+    if (m->color_quant && !cq_disabled) {
         /* Use soft quantization (training=1) when NOT in eval mode,
          * hard quantization (training=0) when in eval mode.
          * This matches Python's behavior where training=self.training. */
