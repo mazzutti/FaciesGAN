@@ -2,6 +2,8 @@
 #include "collate.h"
 #include "faciesgan-c/utils.h"
 #include "mlx/c/array.h"
+#include "mlx/c/ops.h"
+#include "mlx/c/transforms.h"
 #include "trainning/array_helpers.h"
 #include <errno.h>
 #include <limits.h>
@@ -32,6 +34,44 @@ typedef struct batch_item_s {
     int error;
 } batch_item;
 
+static int array_to_float_buffer_cpu(const mlx_array arr, float **out_buf,
+                                     size_t *out_elems, int *out_ndim,
+                                     int **out_shape) {
+    if (mlx_array_to_float_buffer(arr, out_buf, out_elems, out_ndim, out_shape) ==
+            0)
+        return 0;
+
+    mlx_stream cpu_s = mlx_default_cpu_stream_new();
+    mlx_array src = arr;
+    mlx_array cast = mlx_array_new();
+    int used_cast = 0;
+    if (mlx_array_dtype(arr) != MLX_FLOAT32) {
+        if (mlx_astype(&cast, arr, MLX_FLOAT32, cpu_s) == 0) {
+            src = cast;
+            used_cast = 1;
+        }
+    }
+    mlx_array cpu_arr = mlx_array_new();
+    int copy_ok = (mlx_copy(&cpu_arr, src, cpu_s) == 0) ? 1 : 0;
+    if (copy_ok) {
+        mlx_vector_array eval_vec = mlx_vector_array_new();
+        mlx_vector_array_append_value(eval_vec, cpu_arr);
+        mlx_eval(eval_vec);
+        mlx_vector_array_free(eval_vec);
+        mlx_synchronize(cpu_s);
+    }
+    mlx_stream_free(cpu_s);
+
+    int rc = -1;
+    if (copy_ok)
+        rc = mlx_array_to_float_buffer(cpu_arr, out_buf, out_elems, out_ndim,
+                                       out_shape);
+    mlx_array_free(cpu_arr);
+    if (used_cast)
+        mlx_array_free(cast);
+    return rc == 0 ? 0 : -1;
+}
+
 static int write_vv_fd(int fd, const mlx_vector_vector_array vv,
                        uint64_t n_samples_local) {
     size_t n = mlx_vector_vector_array_size(vv);
@@ -52,16 +92,26 @@ static int write_vv_fd(int fd, const mlx_vector_vector_array vv,
             mlx_array arr = mlx_array_new();
             if (mlx_vector_array_get(&arr, sample, si) != 0) {
                 uint32_t zero = 0;
+                uint64_t zero64 = 0;
+                fprintf(stderr,
+                        "write_vv_fd: sample=%zu scale=%u get failed, writing empty\n",
+                        i, si);
                 write_all(fd, &zero, sizeof(zero));
+                write_all(fd, &zero64, sizeof(zero64));
                 continue;
             }
             float *buf = NULL;
             size_t elems = 0;
             int ndim = 0;
             int *shape = NULL;
-            if (mlx_array_to_float_buffer(arr, &buf, &elems, &ndim, &shape) != 0) {
+            if (array_to_float_buffer_cpu(arr, &buf, &elems, &ndim, &shape) != 0) {
                 uint32_t zero = 0;
+                uint64_t zero64 = 0;
+                fprintf(stderr,
+                        "write_vv_fd: sample=%zu scale=%u to_float_buffer failed, writing empty\n",
+                        i, si);
                 write_all(fd, &zero, sizeof(zero));
+                write_all(fd, &zero64, sizeof(zero64));
                 mlx_array_free(arr);
                 continue;
             }
@@ -180,6 +230,15 @@ struct MLXDataloader {
     int *result_rfds; /* parent reads results from worker */
     int next_worker;
 };
+
+static const char *resolve_worker_exe(void) {
+    const char *env_path = getenv("FACIESGAN_WORKER_PATH");
+    if (env_path && env_path[0] != '\0')
+        return env_path;
+    if (access("./build/facies_worker", X_OK) == 0)
+        return "./build/facies_worker";
+    return "./facies_worker";
+}
 
 int facies_dataset_new(MLXPyramidsDataset **out,
                        const mlx_vector_vector_array facies_pyramids,
@@ -653,6 +712,7 @@ static ssize_t read_all(int fd, void *buf, size_t count);
 static ssize_t write_all(int fd, const void *buf, size_t count);
 static int read_vector_array_from_fd(int fd, mlx_vector_array *out_vec);
 static int serialize_vec_to_fd(int fd, mlx_vector_array vec);
+static int write_dataset_to_fd(int fd, MLXPyramidsDataset *ds);
 
 struct reader_arg {
     struct MLXDataloader *dl;
@@ -664,6 +724,8 @@ static void *proc_reader_thread(void *arg) {
     struct MLXDataloader *dl = ra->dl;
     int worker = ra->worker;
     int fd = dl->result_rfds[worker];
+    const char *log_env = getenv("FACIESGAN_WORKER_LOG");
+    int log_enabled = log_env && atoi(log_env) != 0;
     while (1) {
         int32_t status = 0;
         if (read_all(fd, &status, sizeof(status)) <= 0)
@@ -712,9 +774,17 @@ static void *proc_reader_thread(void *arg) {
                     }
                 }
             }
+            if (log_enabled) {
+                fprintf(stderr, "proc_reader: worker=%d init status=%d msglen=%u\n",
+                        worker, (int)status, msglen);
+            }
             /* After processing init response, continue to next message (which
                may be a normal batch result). */
             continue;
+        }
+        if (log_enabled) {
+            fprintf(stderr, "proc_reader: worker=%d batch status=%d\n",
+                    worker, (int)status);
         }
         mlx_vector_array fac = mlx_vector_array_new();
         mlx_vector_array wells = mlx_vector_array_new();
@@ -743,6 +813,9 @@ static void *proc_reader_thread(void *arg) {
                        mlx_vector_array_new(), 1);
             continue;
         }
+        if (log_enabled) {
+            fprintf(stderr, "proc_reader: worker=%d batch read ok\n", worker);
+        }
         queue_push(dl, fac, wells, seis, 0);
     }
     return NULL;
@@ -750,6 +823,8 @@ static void *proc_reader_thread(void *arg) {
 
 static void *proc_dispatcher_thread(void *arg) {
     struct MLXDataloader *dl = (struct MLXDataloader *)arg;
+    const char *log_env = getenv("FACIESGAN_WORKER_LOG");
+    int log_enabled = log_env && atoi(log_env) != 0;
     while (1) {
         pthread_mutex_lock(&dl->task_mutex);
         if (dl->next_task >= dl->n_tasks) {
@@ -770,6 +845,11 @@ static void *proc_dispatcher_thread(void *arg) {
         dl->next_worker = (dl->next_worker + 1) % dl->num_workers;
 
         uint32_t nidx = (uint32_t)dl->task_sizes[tid];
+        if (log_enabled) {
+            fprintf(stderr,
+                    "proc_dispatcher: tid=%zu nidx=%u -> worker=%d\n",
+                    tid, nidx, worker);
+        }
         if (write_all(dl->task_wfds[worker], &nidx, sizeof(nidx)) <= 0) {
             continue;
         }
@@ -793,6 +873,188 @@ static void *proc_dispatcher_thread(void *arg) {
         }
     }
     return NULL;
+}
+
+static int spawn_process_workers(struct MLXDataloader *dl) {
+    signal(SIGPIPE, SIG_IGN);
+    dl->pids = (pid_t *)calloc(dl->num_workers, sizeof(pid_t));
+    dl->task_wfds = (int *)calloc(dl->num_workers, sizeof(int));
+    dl->result_rfds = (int *)calloc(dl->num_workers, sizeof(int));
+    dl->worker_init_err_msg = (char **)calloc(dl->num_workers, sizeof(char *));
+    dl->worker_init_done = (int *)calloc(dl->num_workers, sizeof(int));
+    for (int i = 0; i < dl->num_workers; ++i) {
+        int taskpipe[2];
+        int resultpipe[2];
+        if (pipe(taskpipe) != 0 || pipe(resultpipe) != 0) {
+            /* cleanup */
+            continue;
+        }
+        pid_t pid = fork();
+        if (pid == 0) {
+            /* child: exec the spawn worker executable which will read the
+             * serialized dataset from the task fd and then enter its loop.
+             */
+            close(taskpipe[1]);
+            close(resultpipe[0]);
+            char task_fd_str[32];
+            char result_fd_str[32];
+            snprintf(task_fd_str, sizeof(task_fd_str), "%d", taskpipe[0]);
+            snprintf(result_fd_str, sizeof(result_fd_str), "%d", resultpipe[1]);
+            setenv("FACIES_WORKER_TASK_FD", task_fd_str, 1);
+            setenv("FACIES_WORKER_RESULT_FD", result_fd_str, 1);
+            const char *exe = resolve_worker_exe();
+            char exe_resolved[PATH_MAX];
+            const char *exe_to_report = exe;
+            if (realpath(exe, exe_resolved) != NULL) {
+                exe_to_report = exe_resolved;
+            }
+            fprintf(stderr,
+                    "facies_dataloader: child pid=%d exec '%s' (resolved '%s')\n",
+                    (int)getpid(), exe, exe_to_report);
+            const char *argv_exec[2] = {"facies_worker", NULL};
+            execv(exe, (char *const *)argv_exec);
+            /* if exec failed, log error and exit child */
+            fprintf(stderr, "facies_dataloader: execv('%s') failed: %s\n", exe,
+                    strerror(errno));
+            _exit(1);
+        } else if (pid > 0) {
+            /* parent */
+            close(taskpipe[0]);
+            close(resultpipe[1]);
+            dl->pids[i] = pid;
+            dl->task_wfds[i] = taskpipe[1];
+            dl->result_rfds[i] = resultpipe[0];
+            /* immediately send an init header (worker id + seed) then optional
+             * init lib/sym strings and finally the serialized dataset so the
+             * spawned worker can dlopen/dlsym and initialize itself. */
+            uint32_t wid = (uint32_t)i;
+            uint64_t wseed = (uint64_t)(dl->iterator_base_seed + (uint64_t)i);
+            if (write_all(dl->task_wfds[i], &wid, sizeof(wid)) <= 0 ||
+                    write_all(dl->task_wfds[i], &wseed, sizeof(wseed)) <= 0) {
+                fprintf(stderr,
+                        "facies_dataloader: failed to send init header to worker %d\n",
+                        i);
+                continue;
+            }
+            /* write lib path and symbol as uint32_t length-prefixed bytes */
+            if (dl->worker_init_lib) {
+                uint32_t l = (uint32_t)strlen(dl->worker_init_lib);
+                if (write_all(dl->task_wfds[i], &l, sizeof(l)) <= 0 ||
+                        write_all(dl->task_wfds[i], dl->worker_init_lib, l) <= 0) {
+                    fprintf(stderr,
+                            "facies_dataloader: failed to send worker init lib to worker %d\n",
+                            i);
+                    continue;
+                }
+            } else {
+                uint32_t l = 0;
+                if (write_all(dl->task_wfds[i], &l, sizeof(l)) <= 0) {
+                    fprintf(stderr,
+                            "facies_dataloader: failed to send empty worker init lib to worker %d\n",
+                            i);
+                    continue;
+                }
+            }
+            if (dl->worker_init_sym) {
+                uint32_t l = (uint32_t)strlen(dl->worker_init_sym);
+                if (write_all(dl->task_wfds[i], &l, sizeof(l)) <= 0 ||
+                        write_all(dl->task_wfds[i], dl->worker_init_sym, l) <= 0) {
+                    fprintf(stderr,
+                            "facies_dataloader: failed to send worker init sym to worker %d\n",
+                            i);
+                    continue;
+                }
+            } else {
+                uint32_t l = 0;
+                if (write_all(dl->task_wfds[i], &l, sizeof(l)) <= 0) {
+                    fprintf(stderr,
+                            "facies_dataloader: failed to send empty worker init sym to worker %d\n",
+                            i);
+                    continue;
+                }
+            }
+            /* send serialized worker_init_ctx */
+            if (dl->worker_init_ctx_data && dl->worker_init_ctx_len > 0) {
+                uint32_t l = dl->worker_init_ctx_len;
+                if (write_all(dl->task_wfds[i], &l, sizeof(l)) <= 0 ||
+                        write_all(dl->task_wfds[i], dl->worker_init_ctx_data, l) <= 0) {
+                    fprintf(stderr,
+                            "facies_dataloader: failed to send worker init ctx to worker %d\n",
+                            i);
+                    continue;
+                }
+            } else {
+                uint32_t l = 0;
+                if (write_all(dl->task_wfds[i], &l, sizeof(l)) <= 0) {
+                    fprintf(stderr,
+                            "facies_dataloader: failed to send empty worker init ctx to worker %d\n",
+                            i);
+                    continue;
+                }
+            }
+            if (write_dataset_to_fd(dl->task_wfds[i], dl->ds) != 0) {
+                fprintf(stderr,
+                        "facies_dataloader: failed to send dataset to worker %d\n",
+                        i);
+                continue;
+            }
+        } else {
+            /* fork failed */
+        }
+    }
+    dl->next_worker = 0;
+    /* start per-worker reader threads and a dispatcher thread */
+    dl->proc_readers = (pthread_t *)calloc(dl->num_workers, sizeof(pthread_t));
+    dl->reader_args =
+        (struct reader_arg *)calloc(dl->num_workers, sizeof(struct reader_arg));
+    for (int i = 0; i < dl->num_workers; ++i) {
+        dl->reader_args[i].dl = dl;
+        dl->reader_args[i].worker = i;
+        if (dl->result_rfds[i] >= 0) {
+            pthread_create(&dl->proc_readers[i], NULL, proc_reader_thread,
+                           &dl->reader_args[i]);
+        }
+    }
+    /* wait for per-worker init responses (proc_reader_thread sets
+     * dl->worker_init_done and dl->worker_init_err_msg). If any worker
+     * reports an init error, kill children and fail fast. */
+    {
+        int wait_ms = 5000;
+        struct timeval st, now;
+        gettimeofday(&st, NULL);
+        int all_done = 0;
+        while (1) {
+            all_done = 1;
+            for (int wi = 0; wi < dl->num_workers; ++wi) {
+                if (!dl->worker_init_done[wi]) {
+                    all_done = 0;
+                    break;
+                }
+            }
+            if (all_done)
+                break;
+            gettimeofday(&now, NULL);
+            long elapsed =
+                (now.tv_sec - st.tv_sec) * 1000 + (now.tv_usec - st.tv_usec) / 1000;
+            if (elapsed > wait_ms)
+                break;
+            usleep(50000);
+        }
+        for (int wi = 0; wi < dl->num_workers; ++wi) {
+            if (dl->worker_init_err_msg && dl->worker_init_err_msg[wi]) {
+                /* mark failure and stop all child workers */
+                for (int j = 0; j < dl->num_workers; ++j) {
+                    if (dl->pids && dl->pids[j] > 0)
+                        kill(dl->pids[j], SIGKILL);
+                }
+                facies_dataloader_free(dl);
+                return 1;
+            }
+        }
+    }
+    pthread_create(&dl->proc_dispatcher, NULL, proc_dispatcher_thread, dl);
+    dl->process_workers_started = true;
+    return 0;
 }
 
 /* helper: read exactly count bytes or return -1 on error/EOF */
@@ -907,16 +1169,20 @@ static int serialize_vec_to_fd(int fd, mlx_vector_array vec) {
         mlx_array arr = mlx_array_new();
         if (mlx_vector_array_get(&arr, vec, si) != 0) {
             uint32_t zero = 0;
+            uint64_t zero64 = 0;
             write_all(fd, &zero, sizeof(zero));
+            write_all(fd, &zero64, sizeof(zero64));
             continue;
         }
         float *buf = NULL;
         size_t elems = 0;
         int ndim = 0;
         int *shape = NULL;
-        if (mlx_array_to_float_buffer(arr, &buf, &elems, &ndim, &shape) != 0) {
+        if (array_to_float_buffer_cpu(arr, &buf, &elems, &ndim, &shape) != 0) {
             uint32_t zero = 0;
+            uint64_t zero64 = 0;
             write_all(fd, &zero, sizeof(zero));
+            write_all(fd, &zero64, sizeof(zero64));
             mlx_array_free(arr);
             continue;
         }
@@ -1270,10 +1536,23 @@ int facies_dataloader_next(struct MLXDataloader *dl,
         int perr = 0;
         int qrc = queue_pop_timeout(dl, out_facies, out_wells, out_seismic, &perr);
         if (qrc != 0) {
+            if (dl->timeout_ms > 0) {
+                fprintf(stderr,
+                        "dataloader_next timeout after %d ms waiting for worker results (num_workers=%d)\n",
+                        dl->timeout_ms, dl->num_workers);
+            } else {
+                fprintf(stderr,
+                        "dataloader_next wait interrupted waiting for worker results (num_workers=%d)\n",
+                        dl->num_workers);
+            }
             return 1; /* timeout or error */
         }
-        if (perr != 0)
+        if (perr != 0) {
+            fprintf(stderr,
+                    "dataloader_next worker error while reading results (num_workers=%d)\n",
+                    dl->num_workers);
             return 1;
+        }
         pthread_mutex_lock(&dl->q_mutex);
         bool fin = dl->finished && dl->q_count == 0;
         pthread_mutex_unlock(&dl->q_mutex);
@@ -1286,10 +1565,23 @@ int facies_dataloader_next(struct MLXDataloader *dl,
     int perr = 0;
     int qrc = queue_pop_timeout(dl, out_facies, out_wells, out_seismic, &perr);
     if (qrc != 0) {
+        if (dl->timeout_ms > 0) {
+            fprintf(stderr,
+                    "dataloader_next timeout after %d ms waiting for worker results (num_workers=%d)\n",
+                    dl->timeout_ms, dl->num_workers);
+        } else {
+            fprintf(stderr,
+                    "dataloader_next wait interrupted waiting for worker results (num_workers=%d)\n",
+                    dl->num_workers);
+        }
         return 1; /* timeout or error */
     }
-    if (perr != 0)
+    if (perr != 0) {
+        fprintf(stderr,
+                "dataloader_next worker error while reading results (num_workers=%d)\n",
+                dl->num_workers);
         return 1;
+    }
     pthread_mutex_lock(&dl->q_mutex);
     bool fin = dl->finished && dl->q_count == 0;
     pthread_mutex_unlock(&dl->q_mutex);
@@ -1508,165 +1800,42 @@ int facies_dataloader_new_ex(
     }
 
     if (dl->num_workers > 0) {
+#ifdef __APPLE__
+        const char *force_proc = getenv("FACIESGAN_PROCESS_WORKERS");
+        bool use_process = force_proc && atoi(force_proc) != 0;
+        bool skip_mlx_init = use_process;
+#else
+        bool skip_mlx_init = false;
+#endif
         /* ensure MLX runtime globals are initialized in main thread before
          * spawning worker threads/processes to avoid concurrent static init */
-        mlx_stream _init_s = mlx_default_gpu_stream_new();
-        mlx_stream_free(_init_s);
+        if (!skip_mlx_init) {
+            mlx_stream _init_s = mlx_default_gpu_stream_new();
+            mlx_stream_free(_init_s);
+        }
 #ifdef __APPLE__
-        /* On macOS, forking after libraries that create GPU/dispatch resources
-         * can crash in the child. Use pthread workers as a safe fallback. */
-        dl->workers = (pthread_t *)calloc(dl->num_workers, sizeof(pthread_t));
-        dl->worker_args =
-            calloc(dl->num_workers, sizeof(struct pthread_worker_arg));
-        struct pthread_worker_arg *wargs = dl->worker_args;
-        for (int i = 0; i < dl->num_workers; ++i) {
-            wargs[i].dl = dl;
-            wargs[i].worker_id = i;
-            wargs[i].last_epoch = (uint64_t)-1;
-            pthread_create(&dl->workers[i], NULL, worker_thread, &wargs[i]);
+        if (use_process) {
+            fprintf(stderr,
+                    "facies_dataloader: forcing process workers on macOS (experimental)\n");
+            if (spawn_process_workers(dl) != 0)
+                return 1;
+        } else {
+            /* On macOS, forking after libraries that create GPU/dispatch resources
+             * can crash in the child. Use pthread workers as a safe fallback. */
+            dl->workers = (pthread_t *)calloc(dl->num_workers, sizeof(pthread_t));
+            dl->worker_args =
+                calloc(dl->num_workers, sizeof(struct pthread_worker_arg));
+            struct pthread_worker_arg *wargs = dl->worker_args;
+            for (int i = 0; i < dl->num_workers; ++i) {
+                wargs[i].dl = dl;
+                wargs[i].worker_id = i;
+                wargs[i].last_epoch = (uint64_t)-1;
+                pthread_create(&dl->workers[i], NULL, worker_thread, &wargs[i]);
+            }
         }
 #else
-        /* If num_workers > 0 we will spawn processes for worker backend */
-        dl->pids = (pid_t *)calloc(dl->num_workers, sizeof(pid_t));
-        dl->task_wfds = (int *)calloc(dl->num_workers, sizeof(int));
-        dl->result_rfds = (int *)calloc(dl->num_workers, sizeof(int));
-        dl->worker_init_err_msg = (char **)calloc(dl->num_workers, sizeof(char *));
-        dl->worker_init_done = (int *)calloc(dl->num_workers, sizeof(int));
-        for (int i = 0; i < dl->num_workers; ++i) {
-            int taskpipe[2];
-            int resultpipe[2];
-            if (pipe(taskpipe) != 0 || pipe(resultpipe) != 0) {
-                /* cleanup */
-                continue;
-            }
-            pid_t pid = fork();
-            if (pid == 0) {
-                /* child: exec the spawn worker executable which will read the
-                 * serialized dataset from the task fd and then enter its loop.
-                 */
-                close(taskpipe[1]);
-                close(resultpipe[0]);
-                char task_fd_str[32];
-                char result_fd_str[32];
-                snprintf(task_fd_str, sizeof(task_fd_str), "%d", taskpipe[0]);
-                snprintf(result_fd_str, sizeof(result_fd_str), "%d", resultpipe[1]);
-                setenv("FACIES_WORKER_TASK_FD", task_fd_str, 1);
-                setenv("FACIES_WORKER_RESULT_FD", result_fd_str, 1);
-                /* exec worker binary located in current working directory */
-                const char *exe = "./facies_worker";
-                /* resolve exe to absolute path for logging */
-                char exe_resolved[PATH_MAX];
-                const char *exe_to_report = exe;
-                if (realpath(exe, exe_resolved) != NULL) {
-                    exe_to_report = exe_resolved;
-                }
-                fprintf(stderr,
-                        "facies_dataloader: child pid=%d exec '%s' (resolved '%s')\n",
-                        (int)getpid(), exe, exe_to_report);
-                const char *argv_exec[2] = {"facies_worker", NULL};
-                execv(exe, (char *const *)argv_exec);
-                /* if exec failed, log error and exit child */
-                fprintf(stderr, "facies_dataloader: execv('%s') failed: %s\n", exe,
-                        strerror(errno));
-                _exit(1);
-            } else if (pid > 0) {
-                /* parent */
-                close(taskpipe[0]);
-                close(resultpipe[1]);
-                dl->pids[i] = pid;
-                dl->task_wfds[i] = taskpipe[1];
-                dl->result_rfds[i] = resultpipe[0];
-                /* immediately send an init header (worker id + seed) then optional
-                 * init lib/sym strings and finally the serialized dataset so the
-                 * spawned worker can dlopen/dlsym and initialize itself. */
-                uint32_t wid = (uint32_t)i;
-                uint64_t wseed = (uint64_t)(dl->iterator_base_seed + (uint64_t)i);
-                write_all(dl->task_wfds[i], &wid, sizeof(wid));
-                write_all(dl->task_wfds[i], &wseed, sizeof(wseed));
-                /* write lib path and symbol as uint32_t length-prefixed bytes */
-                if (dl->worker_init_lib) {
-                    uint32_t l = (uint32_t)strlen(dl->worker_init_lib);
-                    write_all(dl->task_wfds[i], &l, sizeof(l));
-                    write_all(dl->task_wfds[i], dl->worker_init_lib, l);
-                } else {
-                    uint32_t l = 0;
-                    write_all(dl->task_wfds[i], &l, sizeof(l));
-                }
-                if (dl->worker_init_sym) {
-                    uint32_t l = (uint32_t)strlen(dl->worker_init_sym);
-                    write_all(dl->task_wfds[i], &l, sizeof(l));
-                    write_all(dl->task_wfds[i], dl->worker_init_sym, l);
-                } else {
-                    uint32_t l = 0;
-                    write_all(dl->task_wfds[i], &l, sizeof(l));
-                }
-                /* send serialized worker_init_ctx */
-                if (dl->worker_init_ctx_data && dl->worker_init_ctx_len > 0) {
-                    uint32_t l = dl->worker_init_ctx_len;
-                    write_all(dl->task_wfds[i], &l, sizeof(l));
-                    write_all(dl->task_wfds[i], dl->worker_init_ctx_data, l);
-                } else {
-                    uint32_t l = 0;
-                    write_all(dl->task_wfds[i], &l, sizeof(l));
-                }
-                write_dataset_to_fd(dl->task_wfds[i], dl->ds);
-            } else {
-                /* fork failed */
-            }
-        }
-        dl->next_worker = 0;
-        /* start per-worker reader threads and a dispatcher thread */
-        dl->proc_readers = (pthread_t *)calloc(dl->num_workers, sizeof(pthread_t));
-        dl->reader_args =
-            (struct reader_arg *)calloc(dl->num_workers, sizeof(struct reader_arg));
-        for (int i = 0; i < dl->num_workers; ++i) {
-            dl->reader_args[i].dl = dl;
-            dl->reader_args[i].worker = i;
-            if (dl->result_rfds[i] >= 0) {
-                pthread_create(&dl->proc_readers[i], NULL, proc_reader_thread,
-                               &dl->reader_args[i]);
-            }
-        }
-        /* wait for per-worker init responses (proc_reader_thread sets
-         * dl->worker_init_done and dl->worker_init_err_msg). If any worker
-         * reports an init error, kill children and fail fast. */
-        {
-            int wait_ms = 5000;
-            struct timeval st, now;
-            gettimeofday(&st, NULL);
-            int all_done = 0;
-            while (1) {
-                all_done = 1;
-                for (int wi = 0; wi < dl->num_workers; ++wi) {
-                    if (!dl->worker_init_done[wi]) {
-                        all_done = 0;
-                        break;
-                    }
-                }
-                if (all_done)
-                    break;
-                gettimeofday(&now, NULL);
-                long elapsed =
-                    (now.tv_sec - st.tv_sec) * 1000 + (now.tv_usec - st.tv_usec) / 1000;
-                if (elapsed > wait_ms)
-                    break;
-                usleep(50000);
-            }
-            for (int wi = 0; wi < dl->num_workers; ++wi) {
-                if (dl->worker_init_err_msg && dl->worker_init_err_msg[wi]) {
-                    /* mark global fail-fast so other threads/tools can observe */
-                    ff_set();
-                    for (int j = 0; j < dl->num_workers; ++j) {
-                        if (dl->pids && dl->pids[j] > 0)
-                            kill(dl->pids[j], SIGKILL);
-                    }
-                    facies_dataloader_free(dl);
-                    return 1;
-                }
-            }
-        }
-        pthread_create(&dl->proc_dispatcher, NULL, proc_dispatcher_thread, dl);
-        dl->process_workers_started = true;
+        if (spawn_process_workers(dl) != 0)
+            return 1;
 #endif
     }
 

@@ -40,6 +40,7 @@ typedef struct Prefetcher {
     pthread_cond_t not_full;
     int alive;
     int producer_finished;
+    int error;
     mlx_stream stream;
     mlx_device device;
     int use_device;
@@ -85,6 +86,8 @@ PrefetcherHandle prefetcher_create(int max_queue, int device_index,
     p->producer_threads_count = 0;
     p->alive = 1;
     p->producer_finished = 0;
+    p->error = 0;
+    p->error = 0;
     p->use_device = 0;
     p->device = mlx_device_new();
     p->scales = NULL;
@@ -150,8 +153,6 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
                 if (mlx_copy(&to_append, a_copy, stream) == 0) {
                     mlx_vector_array_append_value(ib->facies_vec, to_append);
                     mlx_array_free(to_append);
-                    if (stream.ctx)
-                        mlx_synchronize(stream);
                     mlx_array_free(a_copy);
                 } else {
                     mlx_array_free(to_append);
@@ -186,8 +187,6 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
                 if (mlx_copy(&to_append, a_copy, stream) == 0) {
                     mlx_vector_array_append_value(ib->wells_vec, to_append);
                     mlx_array_free(to_append);
-                    if (stream.ctx)
-                        mlx_synchronize(stream);
                     mlx_array_free(a_copy);
                 } else {
                     mlx_array_free(to_append);
@@ -228,8 +227,6 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
                 if (mlx_copy(&to_append, a_copy, stream) == 0) {
                     mlx_vector_array_append_value(ib->masks_vec, to_append);
                     mlx_array_free(to_append);
-                    if (stream.ctx)
-                        mlx_synchronize(stream);
                     mlx_array_free(a_copy);
                 } else {
                     mlx_array_free(to_append);
@@ -258,8 +255,6 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
                 if (mlx_copy(&to_append, a_copy, stream) == 0) {
                     mlx_vector_array_append_value(ib->seismic_vec, to_append);
                     mlx_array_free(to_append);
-                    if (stream.ctx)
-                        mlx_synchronize(stream);
                     mlx_array_free(a_copy);
                 } else {
                     mlx_array_free(to_append);
@@ -379,6 +374,12 @@ static void *prefetcher_dataloader_producer(void *v) {
             mlx_vector_array_free(wells_out);
             mlx_vector_array_free(seis_out);
             mlx_global_unlock();
+            pthread_mutex_lock(&pref->mutex);
+            if (pref->error == 0)
+                pref->error = rc;
+            pref->producer_finished = 1;
+            pthread_cond_broadcast(&pref->not_empty);
+            pthread_mutex_unlock(&pref->mutex);
             break;
         }
 
@@ -744,6 +745,10 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
         return NULL;
     }
     pthread_mutex_lock(&p->mutex);
+    if (p->error != 0) {
+        pthread_mutex_unlock(&p->mutex);
+        return NULL;
+    }
     while (p->count == 0 && !p->producer_finished) {
         pthread_cond_wait(&p->not_empty, &p->mutex);
     }
@@ -1203,6 +1208,25 @@ PrefetcherIteratorHandle prefetcher_iterator_create(PrefetcherHandle h) {
     pthread_mutex_init(&it->mutex, NULL);
     pthread_cond_init(&it->cond, NULL);
     return (PrefetcherIteratorHandle)it;
+}
+
+int prefetcher_get_error(PrefetcherHandle h) {
+    Prefetcher *p = (Prefetcher *)h;
+    if (!p)
+        return 0;
+    pthread_mutex_lock(&p->mutex);
+    int err = p->error;
+    pthread_mutex_unlock(&p->mutex);
+    return err;
+}
+
+int prefetcher_iterator_get_error(PrefetcherIteratorHandle it_h) {
+    if (!it_h)
+        return 0;
+    PrefetcherIterator *it = (PrefetcherIterator *)it_h;
+    if (!it->p)
+        return 0;
+    return prefetcher_get_error((PrefetcherHandle)it->p);
 }
 
 PrefetchedPyramidsBatch *

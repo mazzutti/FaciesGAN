@@ -23,6 +23,12 @@
 			"problemMatcher": []
 		},
 		{
+			"label": "CMake Configure (Release+LTO)",
+			"type": "shell",
+			"command": "cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_LTO=ON",
+			"problemMatcher": []
+		},
+		{
 			"label": "Build FaciesGAN",
 			"type": "shell",
 			"command": "cmake --build build -- -j4",
@@ -33,6 +39,18 @@
 				"kind": "build",
 				"isDefault": true
 			},
+			"problemMatcher": [
+				"$gcc"
+			]
+		},
+		{
+			"label": "Build FaciesGAN (Release+LTO)",
+			"type": "shell",
+			"command": "cmake --build build -- -j4",
+			"dependsOn": [
+				"CMake Configure (Release+LTO)"
+			],
+			"group": "build",
 			"problemMatcher": [
 				"$gcc"
 			]

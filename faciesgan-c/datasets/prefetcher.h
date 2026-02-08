@@ -80,6 +80,12 @@ void prefetcher_iterator_destroy(PrefetcherIteratorHandle it);
 // Calling this when a preload is already in progress is a no-op.
 int prefetcher_iterator_preload(PrefetcherIteratorHandle it);
 
+// Return non-zero if the prefetcher has encountered a fatal error.
+int prefetcher_get_error(PrefetcherHandle h);
+
+// Return non-zero if the iterator's prefetcher has encountered a fatal error.
+int prefetcher_iterator_get_error(PrefetcherIteratorHandle it);
+
 // Change the stream used by the prefetcher. The provided `stream` is copied
 // into the prefetcher and used for subsequent copies and operations.
 // Returns 0 on success.

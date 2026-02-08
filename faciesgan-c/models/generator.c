@@ -74,36 +74,41 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
             mlx_array_safe_free(&zero);
         }
     }
-    /* To avoid aliasing/in-place updates from the backend which can lead to
-     * callers freeing the same underlying storage twice, make local copies of
-     * the operands (after any padding) and perform the add on those copies. */
-    mlx_array a_tmp = mlx_array_new();
-    mlx_array b_tmp = mlx_array_new();
-    int r1 = mlx_copy(&a_tmp, a_copy, s);
-    int r2 = mlx_copy(&b_tmp, b_copy, s);
-    if (r1 != 0 || r2 != 0) {
+    int rc = 0;
+    if (getenv("FACIESGAN_FAST_ADD_NO_COPY")) {
+        rc = mlx_add(out, a_copy, b_copy, s);
+    } else {
+        /* To avoid aliasing/in-place updates from the backend which can lead to
+         * callers freeing the same underlying storage twice, make local copies of
+         * the operands (after any padding) and perform the add on those copies. */
+        mlx_array a_tmp = mlx_array_new();
+        mlx_array b_tmp = mlx_array_new();
+        int r1 = mlx_copy(&a_tmp, a_copy, s);
+        int r2 = mlx_copy(&b_tmp, b_copy, s);
+        if (r1 != 0 || r2 != 0) {
+            if (a_tmp.ctx)
+                mlx_array_safe_free(&a_tmp);
+            if (b_tmp.ctx)
+                mlx_array_safe_free(&b_tmp);
+            if (a_padded)
+                mlx_array_safe_free(&a_copy);
+            if (b_padded)
+                mlx_array_safe_free(&b_copy);
+            return -1;
+        }
+
+        rc = mlx_add(out, a_tmp, b_tmp, s);
+
+        /* Free the temporary copies.  Reference counting in MLX ensures the
+           underlying buffers stay alive while the output array still needs
+           them, so no explicit synchronize is required here.  Calling
+           mlx_synchronize inside a value_and_grad closure disrupts lazy
+           evaluation and can hurt gradient computation. */
         if (a_tmp.ctx)
             mlx_array_safe_free(&a_tmp);
         if (b_tmp.ctx)
             mlx_array_safe_free(&b_tmp);
-        if (a_padded)
-            mlx_array_safe_free(&a_copy);
-        if (b_padded)
-            mlx_array_safe_free(&b_copy);
-        return -1;
     }
-
-    int rc = mlx_add(out, a_tmp, b_tmp, s);
-
-    /* Free the temporary copies.  Reference counting in MLX ensures the
-       underlying buffers stay alive while the output array still needs
-       them, so no explicit synchronize is required here.  Calling
-       mlx_synchronize inside a value_and_grad closure disrupts lazy
-       evaluation and can hurt gradient computation. */
-    if (a_tmp.ctx)
-        mlx_array_safe_free(&a_tmp);
-    if (b_tmp.ctx)
-        mlx_array_safe_free(&b_tmp);
 
     if (a_padded)
         mlx_array_safe_free(&a_copy);
@@ -469,7 +474,7 @@ mlx_array *mlx_scale_get_tail_conv(MLXGenerator *m, int index) {
 /* Helper: count parameters for a non-SPADE ScaleModule including all trainable params */
 static int count_nonspade_params(struct ScaleModule *sm) {
     int total = 0;
-    #define COUNT_IF(ptr) do { if ((ptr)) total++; } while(0)
+#define COUNT_IF(ptr) do { if ((ptr)) total++; } while(0)
     /* head ConvBlock: conv w/b + norm w/b */
     if (sm->head) {
         COUNT_IF(mlx_convblock_get_conv_weight(sm->head));
@@ -490,13 +495,13 @@ static int count_nonspade_params(struct ScaleModule *sm) {
     /* tail conv w/b */
     COUNT_IF(sm->tail_conv);
     COUNT_IF(sm->tail_conv_bias);
-    #undef COUNT_IF
+#undef COUNT_IF
     return total;
 }
 
 /* Helper: fill parameter list for a non-SPADE ScaleModule */
 static int fill_nonspade_params(struct ScaleModule *sm, mlx_array **list, int idx) {
-    #define ADD_IF(ptr) do { if ((ptr)) list[idx++] = (mlx_array *)(ptr); } while(0)
+#define ADD_IF(ptr) do { if ((ptr)) list[idx++] = (mlx_array *)(ptr); } while(0)
     if (sm->head) {
         ADD_IF(mlx_convblock_get_conv_weight(sm->head));
         ADD_IF(mlx_convblock_get_conv_bias(sm->head));
@@ -514,7 +519,7 @@ static int fill_nonspade_params(struct ScaleModule *sm, mlx_array **list, int id
     }
     ADD_IF(sm->tail_conv);
     ADD_IF(sm->tail_conv_bias);
-    #undef ADD_IF
+#undef ADD_IF
     return idx;
 }
 
@@ -657,6 +662,7 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
         stop_scale = m->n_gens - 1;
 
     mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_array zero_scalar = mlx_array_new_float(0.0f);
 
     /* Initialize out_facie */
     mlx_array_t out_facie = in_noise;
@@ -687,6 +693,7 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
         /* Upsample out_facie to (target_h, target_w) */
         mlx_array_t upsampled = out_facie;
         mlx_array_t upsampled_for_residual = out_facie; /* Keep unpadded version for final addition */
+        int residual_shares_upsampled = 1;
         if (mlx_array_ndim(out_facie) != 0) {
             MLXUpsample *u = mlx_upsample_create(target_h, target_w, "linear", 1);
             if (u) {
@@ -698,15 +705,19 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                         mlx_array_free(out_facie);
                 }
                 upsampled = tmp;
-                /* Make a deep copy for upsampled_for_residual to avoid sharing ctx
-                 * with upsampled (which gets modified/freed later in conditioning code) */
-                mlx_array ufr_copy = mlx_array_new();
-                if (mlx_copy(&ufr_copy, tmp, s) == 0) {
-                    upsampled_for_residual = ufr_copy;
-                } else {
-                    /* fallback: share the same array (may cause issues) */
-                    upsampled_for_residual = tmp;
-                }
+                upsampled_for_residual = tmp;
+                residual_shares_upsampled = 1;
+            }
+        }
+        if (residual_shares_upsampled &&
+                mlx_array_is_in_list(upsampled_for_residual, z_list, z_count,
+                                     in_noise)) {
+            mlx_array ufr_copy = mlx_array_new();
+            if (mlx_copy(&ufr_copy, upsampled_for_residual, s) == 0) {
+                upsampled_for_residual = ufr_copy;
+                residual_shares_upsampled = 0;
+            } else {
+                mlx_array_free(ufr_copy);
             }
         }
         /* report upsampled shape removed (debug prints cleared) */
@@ -767,16 +778,14 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
 
             /* pad upsampled facie */
             int p = m->zero_padding;
-            mlx_array pad_val = mlx_array_new_float(0.0f);
             int axes[2] = {1, 2};
             int low_pad[2] = {p, p};
             int high_pad[2] = {p, p};
             mlx_array padded = mlx_array_new();
-            if (mlx_pad(&padded, upsampled, axes, 2, low_pad, 2, high_pad, 2, pad_val,
+            if (mlx_pad(&padded, upsampled, axes, 2, low_pad, 2, high_pad, 2, zero_scalar,
                         "constant", s) != 0) {
                 padded = upsampled;
             }
-            mlx_array_free(pad_val);
 
             /* tile if needed to match cond channels */
             int num_repeats = 1;
@@ -808,10 +817,9 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                     int axes_pad[2] = {1, 2};
                     int low_pad[2] = {low_h, low_w};
                     int high_pad[2] = {high_h, high_w};
-                    mlx_array pad_zero = mlx_array_new_float(0.0f);
                     mlx_array cond_padded = mlx_array_new();
                     if (mlx_pad(&cond_padded, cond, axes_pad, 2, low_pad, 2, high_pad, 2,
-                                pad_zero, "constant", s) == 0) {
+                                zero_scalar, "constant", s) == 0) {
                         /* cond_padded is a new owned array.
                          * Free old cond handle (even slices hold a C++ shared_ptr). */
                         if (cond.ctx) {
@@ -820,7 +828,6 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                         cond = cond_padded;
                         cond_owned = 1;  /* now we own cond */
                     }
-                    mlx_array_free(pad_zero);
                 }
             }
             mlx_array cond_plus = mlx_array_new();
@@ -855,10 +862,12 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
 
             /* free padded/up sample if different and not the original in_noise */
             if (upsampled.ctx && upsampled.ctx != padded.ctx &&
-                    !mlx_array_is_in_list(upsampled, z_list, z_count, in_noise)) {
+                    !mlx_array_is_in_list(upsampled, z_list, z_count, in_noise) &&
+                    !residual_shares_upsampled) {
                 mlx_array_free(upsampled);
             }
             upsampled = padded; /* keep for potential reuse */
+            residual_shares_upsampled = 0;
 
             /* debug prints removed */
         } else {
@@ -875,19 +884,19 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                 mlx_array_free(scale);
             }
             int p = m->zero_padding;
-            mlx_array pad_val = mlx_array_new_float(0.0f);
             int axes[2] = {1, 2};
             int low_pad[2] = {p, p};
             int high_pad[2] = {p, p};
             mlx_array padded = mlx_array_new();
-            if (mlx_pad(&padded, upsampled, axes, 2, low_pad, 2, high_pad, 2, pad_val,
+            if (mlx_pad(&padded, upsampled, axes, 2, low_pad, 2, high_pad, 2, zero_scalar,
                         "constant", s) == 0) {
                 if (upsampled.ctx &&
-                        !mlx_array_is_in_list(upsampled, z_list, z_count, in_noise))
+                        !mlx_array_is_in_list(upsampled, z_list, z_count, in_noise) &&
+                        !residual_shares_upsampled)
                     mlx_array_free(upsampled);
                 upsampled = padded;
+                residual_shares_upsampled = 0;
             }
-            mlx_array_free(pad_val);
 
             /* shape debug prints removed */
 
@@ -906,16 +915,14 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                     int axes_pad[2] = {1, 2};
                     int low_pad[2] = {low_h, low_w};
                     int high_pad[2] = {high_h, high_w};
-                    mlx_array pad_zero = mlx_array_new_float(0.0f);
                     mlx_array zin_padded = mlx_array_new();
                     if (mlx_pad(&zin_padded, z_in, axes_pad, 2, low_pad, 2, high_pad, 2,
-                                pad_zero, "constant", s) == 0) {
+                                zero_scalar, "constant", s) == 0) {
                         if (z_in.ctx) {
                             mlx_array_free(z_in);
                         }
                         z_in = zin_padded;
                     }
-                    mlx_array_free(pad_zero);
                 }
             }
             /* z_in = z_in + padded */
@@ -928,7 +935,9 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                 if (upsampled.ctx &&
                         !mlx_array_is_in_list(upsampled, z_list, z_count, in_noise)) {
                     mlx_array_free(upsampled);
-                    upsampled = (mlx_array){0}; /* prevent double-free at end of loop */
+                    upsampled = (mlx_array) {
+                        0
+                    }; /* prevent double-free at end of loop */
                 }
                 z_in = sum;
             }
@@ -1073,17 +1082,15 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                 int axes_pad[2] = {1, 2};
                 int low_pad[2] = {low_h, low_w};
                 int high_pad[2] = {high_h, high_w};
-                mlx_array pad_zero = mlx_array_new_float(0.0f);
                 mlx_array out_padded = mlx_array_new();
                 if (mlx_pad(&out_padded, out_mod, axes_pad, 2, low_pad, 2, high_pad, 2,
-                            pad_zero, "constant", s) == 0) {
+                            zero_scalar, "constant", s) == 0) {
                     if (out_mod.ctx)
                         mlx_array_free(out_mod);
                     out_mod = out_padded;
                 } else {
                     mlx_array_free(out_padded);
                 }
-                mlx_array_free(pad_zero);
             } else {
                 /* pad upsampled_for_residual to match out_mod (dh,dw negative) */
                 int pdh = -dh;
@@ -1095,17 +1102,16 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                 int axes_pad[2] = {1, 2};
                 int low_pad[2] = {low_h, low_w};
                 int high_pad[2] = {high_h, high_w};
-                mlx_array pad_zero = mlx_array_new_float(0.0f);
                 mlx_array up_padded = mlx_array_new();
                 if (mlx_pad(&up_padded, upsampled_for_residual, axes_pad, 2, low_pad, 2, high_pad, 2,
-                            pad_zero, "constant", s) == 0) {
+                            zero_scalar, "constant", s) == 0) {
                     if (upsampled_for_residual.ctx)
                         mlx_array_free(upsampled_for_residual);
                     upsampled_for_residual = up_padded;
+                    residual_shares_upsampled = 0;
                 } else {
                     mlx_array_free(up_padded);
                 }
-                mlx_array_free(pad_zero);
             }
         }
 
@@ -1118,8 +1124,14 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                 mlx_array_safe_free(&out_mod);
             }
             /* Free our deep copy of upsampled_for_residual */
-            if (upsampled_for_residual.ctx) {
+            if (upsampled_for_residual.ctx &&
+                    !mlx_array_is_in_list(upsampled_for_residual, z_list, z_count,
+                                          in_noise)) {
                 mlx_array_free(upsampled_for_residual);
+                if (residual_shares_upsampled)
+                    upsampled = (mlx_array) {
+                    0
+                };
             }
             out_facie = new_out;
         } else {
@@ -1157,6 +1169,7 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
         out_facie = q;
     }
 
+    mlx_array_free(zero_scalar);
     mlx_stream_free(s);
 
     /* Release global MLX lock */

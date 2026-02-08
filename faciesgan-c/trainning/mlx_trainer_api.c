@@ -22,6 +22,7 @@
 #include <execinfo.h>
 #include <limits.h>
 #include <mlx/c/array.h>
+#include <mlx/c/compile.h>
 #include <mlx/c/device.h>
 #include <mlx/c/io.h>
 #include <mlx/c/memory.h>
@@ -515,6 +516,11 @@ MLXTrainer *MLXTrainer_new(const TrainningOptions *opts, int fine_tuning,
 
     /* Print MLX Metal Configuration (parity with Python MLXTrainer.__init__) */
     {
+        if (opts->compile_backend) {
+            mlx_set_compile_mode(MLX_COMPILE_MODE_ENABLED);
+        } else {
+            mlx_set_compile_mode(MLX_COMPILE_MODE_DISABLED);
+        }
         size_t active_mem = 0, peak_mem = 0;
         mlx_get_active_memory(&active_mem);
         mlx_get_peak_memory(&peak_mem);
@@ -959,6 +965,25 @@ int MLXTrainer_create_dataloader_impl(MLXTrainer *trainer) {
     int num_workers = trainer->opts.num_workers;
     int prefetch_factor = 2;
     int timeout_ms = 2000;
+    const char *timeout_env = getenv("FACIESGAN_DATALOADER_TIMEOUT_MS");
+    if (timeout_env && timeout_env[0] != '\0') {
+        int val = atoi(timeout_env);
+        if (val >= 0)
+            timeout_ms = val;
+    } else {
+        const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+        if (proc_env && strcmp(proc_env, "1") == 0)
+            timeout_ms = 0;
+    }
+    if (trainer->opts.use_mlx && num_workers > 0) {
+        const char *allow_workers = getenv("FACIESGAN_ALLOW_DATALOADER_WORKERS");
+        if (!allow_workers || strcmp(allow_workers, "1") != 0) {
+            fprintf(stderr,
+                    "warning: MLX dataloader workers disabled (set "
+                    "FACIESGAN_ALLOW_DATALOADER_WORKERS=1 to override)\n");
+            num_workers = 0;
+        }
+    }
 
     struct MLXDataloader *dl = NULL;
     int rc = facies_dataloader_new_ex(
@@ -2262,6 +2287,11 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         PrefetchedPyramidsBatch *pb = prefetcher_iterator_next(pit);
         if (!pb)
             break; /* no more batches */
+        if (prefetcher_iterator_get_error(pit) != 0) {
+            fprintf(stderr, "error: dataloader timeout detected, aborting training\n");
+            prefetcher_free_pyramids(pb);
+            break;
+        }
 
         int nsc = pb->n_scales;
         mlx_array **fac_pyr = pb->facies_ptrs;
@@ -2269,17 +2299,33 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         mlx_array **seis_pyr = pb->seismic_ptrs;
         mlx_array **mask_pyr = pb->masks_ptrs;
 
+        /* Facies are mandatory for training; abort if any required facies is empty. */
+        if (!fac_pyr) {
+            fprintf(stderr, "error: facies pyramid is missing\n");
+            mlx_global_unlock();
+            prefetcher_free_pyramids(pb);
+            return -1;
+        }
+        for (int i = 0; i < nsc; ++i) {
+            if (!fac_pyr[i] || !(*fac_pyr[i]).ctx) {
+                fprintf(stderr, "error: facies pyramid[%d] is empty\n", i);
+                mlx_global_unlock();
+                prefetcher_free_pyramids(pb);
+                return -1;
+            }
+        }
+
         /* Evaluate lazy arrays in batch (matches Python mx.eval pattern) */
         mlx_global_lock(); /* protect all MLX operations */
         mlx_vector_array pyr_vec = mlx_vector_array_new();
         for (int i = 0; i < nsc; ++i) {
-            if (fac_pyr && fac_pyr[i])
+            if (fac_pyr && fac_pyr[i] && (*fac_pyr[i]).ctx)
                 mlx_vector_array_append_value(pyr_vec, *fac_pyr[i]);
-            if (well_pyr && well_pyr[i])
+            if (well_pyr && well_pyr[i] && (*well_pyr[i]).ctx)
                 mlx_vector_array_append_value(pyr_vec, *well_pyr[i]);
-            if (seis_pyr && seis_pyr[i])
+            if (seis_pyr && seis_pyr[i] && (*seis_pyr[i]).ctx)
                 mlx_vector_array_append_value(pyr_vec, *seis_pyr[i]);
-            if (mask_pyr && mask_pyr[i])
+            if (mask_pyr && mask_pyr[i] && (*mask_pyr[i]).ctx)
                 mlx_vector_array_append_value(pyr_vec, *mask_pyr[i]);
         }
         mlx_eval(pyr_vec);
@@ -2387,17 +2433,22 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
             rec_pyr = (mlx_array **)calloc((size_t)nsc, sizeof(mlx_array *));
             for (int si = 0; si < nsc; ++si) {
                 mlx_array *tmp_rec = NULL;
-                if (mlx_compute_rec_input(si, indexes, batch_n, fac_pyr, &tmp_rec) == 0 && tmp_rec) {
-                    rec_pyr[si] = tmp_rec;
+                if (fac_pyr && fac_pyr[si] && (*fac_pyr[si]).ctx &&
+                        (si == 0 || (fac_pyr[si - 1] && (*fac_pyr[si - 1]).ctx))) {
+                    if (mlx_compute_rec_input(si, indexes, batch_n, fac_pyr, &tmp_rec) == 0 && tmp_rec) {
+                        rec_pyr[si] = tmp_rec;
+                    } else {
+                        rec_pyr[si] = NULL;
+                    }
+                    /* initialize noise amplitudes based on current real sample */
+                    mlx_init_rec_noise_and_amp(
+                        trainer->model, si, indexes, batch_n,
+                        fac_pyr[si], well_pyr, seis_pyr,
+                        trainer->scale0_noise_amp, trainer->noise_amp,
+                        trainer->min_noise_amp);
                 } else {
                     rec_pyr[si] = NULL;
                 }
-                /* initialize noise amplitudes based on current real sample */
-                mlx_init_rec_noise_and_amp(
-                    trainer->model, si, indexes, batch_n,
-                    fac_pyr && fac_pyr[si] ? fac_pyr[si] : NULL, well_pyr, seis_pyr,
-                    trainer->scale0_noise_amp, trainer->noise_amp,
-                    trainer->min_noise_amp);
             }
         }
 
@@ -2412,6 +2463,11 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
          *           handle_epoch_end()
          * ================================================================ */
         for (int epoch = 0; epoch < num_iter; ++epoch) {
+            if (prefetcher_iterator_get_error(pit) != 0) {
+                fprintf(stderr,
+                        "error: dataloader timeout detected, aborting training\n");
+                break;
+            }
 #ifdef FG_PROGRESS
             fg_progress_update((size_t)(batches * num_iter + epoch));
 #endif

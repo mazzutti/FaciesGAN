@@ -155,15 +155,19 @@ static int gen_loss_closure(mlx_vector_array *result,
         mlx_array **noise_ptrs = NULL;
         int n_noises = 0;
         if (mlx_faciesgan_get_pyramid_noise(
-                p->model, p->scale, p->indexes, p->n_indexes,
-                &noise_ptrs, &n_noises,
-                p->wells_pyramid, p->seismic_pyramid, /*rec=*/0) == 0 && n_noises > 0) {
+                    p->model, p->scale, p->indexes, p->n_indexes,
+                    &noise_ptrs, &n_noises,
+                    p->wells_pyramid, p->seismic_pyramid, /*rec=*/0) == 0 && n_noises > 0) {
             mlx_array *z_list_d = malloc(n_noises * sizeof(mlx_array));
             if (z_list_d) {
                 for (int ni = 0; ni < n_noises; ++ni)
-                    z_list_d[ni] = noise_ptrs[ni] ? *noise_ptrs[ni] : (mlx_array){0};
+                    z_list_d[ni] = noise_ptrs[ni] ? *noise_ptrs[ni] : (mlx_array) {
+                    0
+                };
                 fakes[di] = mlx_generator_forward(gen, z_list_d, n_noises,
-                    p->amp, p->amp_count, (mlx_array){0}, 0, p->scale);
+                p->amp, p->amp_count, (mlx_array) {
+                    0
+                }, 0, p->scale);
                 free(z_list_d);
             } else {
                 fakes[di] = mlx_array_new();

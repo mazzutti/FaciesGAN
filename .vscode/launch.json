@@ -74,7 +74,7 @@
       "type": "lldb",
       "request": "launch",
       "program": "${workspaceFolder}/build/faciesgan",
-      "preLaunchTask": "Build FaciesGAN",
+      "preLaunchTask": "Build FaciesGAN (Release+LTO)",
       "args": [
         "--input-path",
         "data",
@@ -85,7 +85,7 @@
         "--batch-size",
         "1",
         "--num-workers",
-        "0",
+        "2",
         "--num-iter",
         "100",
         "--num-parallel-scales",
@@ -115,7 +115,8 @@
         "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
         "PYTHONEXECUTABLE": "${workspaceFolder}/.venv/bin/python",
         "VIRTUAL_ENV": "${workspaceFolder}/.venv",
-        "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
+        "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}",
+        // "FACIESGAN_COLLATE_VECTORIZE": "1"
       },
       "stopOnEntry": false,
       "terminal": "integrated",
