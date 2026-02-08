@@ -97,6 +97,7 @@ PrefetcherHandle prefetcher_create(int max_queue, int device_index,
         }
     }
     if (device_index >= 0) {
+        mlx_device_free(p->device);
         p->device = mlx_device_new_type(MLX_GPU, device_index);
         p->stream = mlx_stream_new_device(p->device);
         p->use_device = 1;
@@ -148,17 +149,20 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
             if (stream.ctx) {
                 if (mlx_copy(&to_append, a_copy, stream) == 0) {
                     mlx_vector_array_append_value(ib->facies_vec, to_append);
+                    mlx_array_free(to_append);
                     if (stream.ctx)
                         mlx_synchronize(stream);
                     mlx_array_free(a_copy);
                 } else {
                     mlx_array_free(to_append);
                     mlx_vector_array_append_value(ib->facies_vec, a_copy);
+                    mlx_array_free(a_copy);
                 }
             } else {
                 /* CPU stream: `a_copy` is already CPU-resident; append it directly */
                 mlx_array_free(to_append);
                 mlx_vector_array_append_value(ib->facies_vec, a_copy);
+                mlx_array_free(a_copy);
             }
         }
     }
@@ -181,16 +185,19 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
             if (stream.ctx) {
                 if (mlx_copy(&to_append, a_copy, stream) == 0) {
                     mlx_vector_array_append_value(ib->wells_vec, to_append);
+                    mlx_array_free(to_append);
                     if (stream.ctx)
                         mlx_synchronize(stream);
                     mlx_array_free(a_copy);
                 } else {
                     mlx_array_free(to_append);
                     mlx_vector_array_append_value(ib->wells_vec, a_copy);
+                    mlx_array_free(a_copy);
                 }
             } else {
                 mlx_array_free(to_append);
                 mlx_vector_array_append_value(ib->wells_vec, a_copy);
+                mlx_array_free(a_copy);
             }
         }
     }
@@ -220,16 +227,19 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
             if (stream.ctx) {
                 if (mlx_copy(&to_append, a_copy, stream) == 0) {
                     mlx_vector_array_append_value(ib->masks_vec, to_append);
+                    mlx_array_free(to_append);
                     if (stream.ctx)
                         mlx_synchronize(stream);
                     mlx_array_free(a_copy);
                 } else {
                     mlx_array_free(to_append);
                     mlx_vector_array_append_value(ib->masks_vec, a_copy);
+                    mlx_array_free(a_copy);
                 }
             } else {
                 mlx_array_free(to_append);
                 mlx_vector_array_append_value(ib->masks_vec, a_copy);
+                mlx_array_free(a_copy);
             }
         }
     }
@@ -247,16 +257,19 @@ static int create_internal_from_mlx(InternalBatch *ib, const mlx_array *facies,
             if (stream.ctx) {
                 if (mlx_copy(&to_append, a_copy, stream) == 0) {
                     mlx_vector_array_append_value(ib->seismic_vec, to_append);
+                    mlx_array_free(to_append);
                     if (stream.ctx)
                         mlx_synchronize(stream);
                     mlx_array_free(a_copy);
                 } else {
                     mlx_array_free(to_append);
                     mlx_vector_array_append_value(ib->seismic_vec, a_copy);
+                    mlx_array_free(a_copy);
                 }
             } else {
                 mlx_array_free(to_append);
                 mlx_vector_array_append_value(ib->seismic_vec, a_copy);
+                mlx_array_free(a_copy);
             }
         }
     }
@@ -306,6 +319,7 @@ PrefetcherHandle prefetcher_create_with_stream(int max_queue, mlx_stream stream,
         if (mlx_device_get_type(&t, dev) == 0) {
             if (t == MLX_GPU) {
                 p->use_device = 1;
+                mlx_device_free(p->device);
                 p->device = dev;
             } else {
                 // CPU stream: keep device empty
@@ -431,14 +445,25 @@ static void *prefetcher_dataloader_producer(void *v) {
         /* push into prefetcher (handles its own MLX lock for create_internal_from_mlx) */
         prefetcher_push_mlx(ph, fac_arr, nsc, well_arr, nw, NULL, 0, sei_arr, ns);
 
-        /* Free only container memory; elements may have been moved into
-           prefetcher internal vectors. Use raw container free helper. */
-        if (fac_arr)
+        /* Free element handles (obtained from mlx_vector_array_get, which creates
+         * copies of the C++ shared_ptr) and container memory. The elements have
+         * already been copied into the prefetcher's internal batch by
+         * create_internal_from_mlx, so we can safely free these handles. */
+        if (fac_arr) {
+            for (int i = 0; i < nsc; ++i)
+                mlx_array_free(fac_arr[i]);
             mlx_free_mlx_array_raw(&fac_arr, nsc);
-        if (well_arr)
+        }
+        if (well_arr) {
+            for (int i = 0; i < nw; ++i)
+                mlx_array_free(well_arr[i]);
             mlx_free_mlx_array_raw(&well_arr, nw);
-        if (sei_arr)
+        }
+        if (sei_arr) {
+            for (int i = 0; i < ns; ++i)
+                mlx_array_free(sei_arr[i]);
             mlx_free_mlx_array_raw(&sei_arr, ns);
+        }
 
         mlx_vector_array_free(facs);
         mlx_vector_array_free(wells_out);
@@ -620,10 +645,23 @@ int prefetcher_push_mlx(PrefetcherHandle h, const mlx_array *facies,
     }
     if (!p->alive) {
         pthread_mutex_unlock(&p->mutex);
-        /* During shutdown: avoid freeing internal vector elements here.
-           Some elements may alias buffers owned elsewhere and freeing them
-           here can cause double-free. Let process exit reclaim memory or
-           handle thorough cleanup in a controlled shutdown path. */
+        /* During shutdown: free the InternalBatch we just created.
+           create_internal_from_mlx copies elements into its own vectors,
+           so these handles are independent and must be freed. */
+        if (ib.is_pyramids) {
+            if (ib.facies_vec.ctx)
+                mlx_vector_array_free(ib.facies_vec);
+            if (ib.wells_vec.ctx)
+                mlx_vector_array_free(ib.wells_vec);
+            if (ib.masks_vec.ctx)
+                mlx_vector_array_free(ib.masks_vec);
+            if (ib.seismic_vec.ctx)
+                mlx_vector_array_free(ib.seismic_vec);
+        }
+        if (ib.facies.ctx)
+            mlx_array_free(ib.facies);
+        if (ib.seismic.ctx)
+            mlx_array_free(ib.seismic);
         return -1;
     }
     p->buf[p->tail] = ib;
@@ -1122,6 +1160,16 @@ void prefetcher_destroy(PrefetcherHandle h) {
                 mlx_array_free(p->buf[i].facies);
             if (p->buf[i].seismic.ctx)
                 mlx_array_free(p->buf[i].seismic);
+            if (p->buf[i].is_pyramids) {
+                if (p->buf[i].facies_vec.ctx)
+                    mlx_vector_array_free(p->buf[i].facies_vec);
+                if (p->buf[i].wells_vec.ctx)
+                    mlx_vector_array_free(p->buf[i].wells_vec);
+                if (p->buf[i].masks_vec.ctx)
+                    mlx_vector_array_free(p->buf[i].masks_vec);
+                if (p->buf[i].seismic_vec.ctx)
+                    mlx_vector_array_free(p->buf[i].seismic_vec);
+            }
         }
     }
     if (p->stream.ctx)
@@ -1302,6 +1350,8 @@ int prefetcher_set_stream(PrefetcherHandle h, mlx_stream stream) {
         mlx_stream_free(p->stream);
     p->stream = stream;
     p->use_device = 0;
+    if (p->device.ctx)
+        mlx_device_free(p->device);
     p->device = mlx_device_new();
     mlx_device dev = mlx_device_new();
     if (mlx_stream_get_device(&dev, stream) == 0) {
@@ -1309,6 +1359,7 @@ int prefetcher_set_stream(PrefetcherHandle h, mlx_stream stream) {
         if (mlx_device_get_type(&t, dev) == 0) {
             if (t == MLX_GPU) {
                 p->use_device = 1;
+                mlx_device_free(p->device);
                 p->device = dev;
             } else {
                 mlx_device_free(dev);

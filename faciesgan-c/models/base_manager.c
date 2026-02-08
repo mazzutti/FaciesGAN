@@ -13,6 +13,7 @@
  * user_ctx separately. */
 #include "facies_gan.h"
 #include "trainning/array_helpers.h"
+#include "generator.h"
 #include "utils.h"
 
 struct MLXBaseManager {
@@ -102,14 +103,30 @@ size_t mlx_base_manager_shapes_count(MLXBaseManager *mgr) {
 }
 
 void mlx_base_manager_init_generator_for_scale(MLXBaseManager *mgr, int scale) {
-  int num_feature = mgr->opts.num_feature;
-  int min_num_feature = mgr->opts.min_num_feature;
+  /* Compute feature counts matching Python's get_num_features:
+   *   num_feature = min(self.num_feature * pow(2, floor(scale / 4)), 128)
+   *   min_num_feature = min(self.min_num_feature * pow(2, floor(scale / 4)), 128) */
+  int scale_pow = 1 << (scale / 4);  /* 2^(floor(scale/4)) */
+  int num_feature = mgr->opts.num_feature * scale_pow;
+  if (num_feature > 128) num_feature = 128;
+  int min_num_feature = mgr->opts.min_num_feature * scale_pow;
+  if (min_num_feature > 128) min_num_feature = 128;
   if (mgr->cbs.create_generator_scale) {
     mgr->cbs.create_generator_scale(mgr, scale, num_feature, min_num_feature);
   }
   if (mgr->cbs.finalize_generator_scale) {
-    int prev_is_spade = 0;
-    int curr_is_spade = 0;
+    /* Compute reinit flag matching Python's logic:
+     *   prev_is_spade = self.is_spade_scale(scale - 1) if scale > 0 else False
+     *   curr_is_spade = self.is_spade_scale(scale)
+     *   reinit = prev_is_spade or curr_is_spade
+     * When reinit is False (both prev and curr are non-SPADE, i.e. scale >= 2),
+     * parameters should be copied from the previous scale for warm start. */
+    MLXGenerator *gen = NULL;
+    if (mgr->cbs.build_generator) {
+      gen = (MLXGenerator *)mgr->cbs.build_generator(mgr);
+    }
+    int prev_is_spade = (scale > 0 && gen) ? mlx_scale_is_spade(gen, scale - 1) : 0;
+    int curr_is_spade = gen ? mlx_scale_is_spade(gen, scale) : 0;
     int reinit = prev_is_spade || curr_is_spade;
     mgr->cbs.finalize_generator_scale(mgr, scale, reinit);
   }
@@ -124,8 +141,14 @@ void mlx_base_manager_init_generator_for_scale(MLXBaseManager *mgr, int scale) {
 
 void mlx_base_manager_init_discriminator_for_scale(MLXBaseManager *mgr,
                                                    int scale) {
-  int num_feature = mgr->opts.num_feature;
-  int min_num_feature = mgr->opts.min_num_feature;
+  /* Compute feature counts matching Python's get_num_features:
+   *   num_feature = min(self.num_feature * pow(2, floor(scale / 4)), 128)
+   *   min_num_feature = min(self.min_num_feature * pow(2, floor(scale / 4)), 128) */
+  int scale_pow = 1 << (scale / 4);  /* 2^(floor(scale/4)) */
+  int num_feature = mgr->opts.num_feature * scale_pow;
+  if (num_feature > 128) num_feature = 128;
+  int min_num_feature = mgr->opts.min_num_feature * scale_pow;
+  if (min_num_feature > 128) min_num_feature = 128;
   if (mgr->cbs.create_discriminator_scale) {
     mgr->cbs.create_discriminator_scale(mgr, num_feature, min_num_feature);
   }

@@ -208,6 +208,7 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
     }
 
     int found_samples = 0;
+    int gen_rc = 0; /* track error for goto-based cleanup */
 
     /* Populate facies per-sample vectors */
     for (int si = 0; si < N; ++si) {
@@ -275,7 +276,8 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                         mlx_array_free(elem);
                         mlx_vector_array_free(fac_sample);
                         mlx_stream_free(s);
-                        return -1;
+                        gen_rc = -1;
+                        goto gen_cleanup;
                     }
                     mlx_array_free(elem);
                 }
@@ -288,7 +290,8 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
         /* append completed facies sample */
         if (mlx_vector_vector_array_append_value(ds->facies, fac_sample) != 0) {
             mlx_vector_array_free(fac_sample);
-            return -1;
+            gen_rc = -1;
+            goto gen_cleanup;
         }
         mlx_vector_array_free(fac_sample);
         ++found_samples;
@@ -357,7 +360,8 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                         mlx_vector_array_free(well_sample);
                         mlx_vector_array_free(mask_sample);
                         mlx_stream_free(s);
-                        return -1;
+                        gen_rc = -1;
+                        goto gen_cleanup;
                     }
 
                     /* attempt to load an explicit mask from the NPZ; fall back to
@@ -378,7 +382,8 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                                 mlx_vector_array_free(well_sample);
                                 mlx_vector_array_free(mask_sample);
                                 mlx_stream_free(s);
-                                return -1;
+                                gen_rc = -1;
+                                goto gen_cleanup;
                             }
                             mlx_array_free(m);
                             mfound = 1;
@@ -412,7 +417,8 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                                                 mlx_vector_array_free(well_sample);
                                                 mlx_vector_array_free(mask_sample);
                                                 mlx_stream_free(s);
-                                                return -1;
+                                                gen_rc = -1;
+                                                goto gen_cleanup;
                                             }
                                         }
                                         mlx_array_free(mask_arr);
@@ -433,13 +439,15 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
             if (mlx_vector_vector_array_append_value(ds->wells, well_sample) != 0) {
                 mlx_vector_array_free(well_sample);
                 mlx_vector_array_free(mask_sample);
-                return -1;
+                gen_rc = -1;
+                goto gen_cleanup;
             }
             mlx_vector_array_free(well_sample);
 
             if (mlx_vector_vector_array_append_value(ds->masks, mask_sample) != 0) {
                 mlx_vector_array_free(mask_sample);
-                return -1;
+                gen_rc = -1;
+                goto gen_cleanup;
             }
             mlx_vector_array_free(mask_sample);
         }
@@ -505,7 +513,8 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                         mlx_array_free(elem);
                         mlx_vector_array_free(seis_sample);
                         mlx_stream_free(s);
-                        return -1;
+                        gen_rc = -1;
+                        goto gen_cleanup;
                     }
                     mlx_array_free(elem);
                 }
@@ -513,7 +522,8 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
             }
             if (mlx_vector_vector_array_append_value(ds->seismic, seis_sample) != 0) {
                 mlx_vector_array_free(seis_sample);
-                return -1;
+                gen_rc = -1;
+                goto gen_cleanup;
             }
             mlx_vector_array_free(seis_sample);
         }
@@ -523,16 +533,27 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
 
     /* Respect explicit flags: if wells/seismic are disabled in options,
      * treat their pyramids as empty even if files exist on disk. */
-    if (ds->options && !ds->options->use_wells) {
-        mlx_vector_vector_array_free(ds->wells);
-        ds->wells = mlx_vector_vector_array_new();
-    }
-    if (ds->options && !ds->options->use_seismic) {
-        mlx_vector_vector_array_free(ds->seismic);
-        ds->seismic = mlx_vector_vector_array_new();
+    if (gen_rc == 0) {
+        if (ds->options && !ds->options->use_wells) {
+            mlx_vector_vector_array_free(ds->wells);
+            ds->wells = mlx_vector_vector_array_new();
+        }
+        if (ds->options && !ds->options->use_seismic) {
+            mlx_vector_vector_array_free(ds->seismic);
+            ds->seismic = mlx_vector_vector_array_new();
+        }
     }
 
-    return 0;
+    /* free scale arrays allocated by to_{facies,wells,seismic}_pyramids */
+gen_cleanup:
+    if (fac_scales)
+        mlx_free_mlx_array_vals(&fac_scales, n_fac_scales);
+    if (wells_scales)
+        mlx_free_mlx_array_vals(&wells_scales, n_wells_scales);
+    if (seis_scales)
+        mlx_free_mlx_array_vals(&seis_scales, n_seis_scales);
+
+    return gen_rc;
 }
 
 /* close generate_pyramids (missing brace fixed) */
@@ -587,6 +608,7 @@ int mlx_pyramids_dataset_new(MLXPyramidsDataset **out,
     int tmp_n = 0;
     if (dataset_generate_scales(options, channels_last ? 1 : 0, &tmp_scales,
                                 &tmp_n) != 0) {
+        mlx_pyramids_dataset_free(ds);
         return -1;
     }
 
@@ -601,6 +623,7 @@ int mlx_pyramids_dataset_new(MLXPyramidsDataset **out,
             "sample_count=%d rc=%d\n",
             npz_path, sample_count, rc);
     if (rc != 0) {
+        mlx_pyramids_dataset_free(ds);
         return rc;
     }
 
@@ -866,15 +889,22 @@ int mlx_pyramids_dataset_get_scale_stack(MLXPyramidsDataset *ds, int scale,
     mlx_vector_array sample0;
     if (mlx_vector_vector_array_get(&sample0, ds->facies, 0) != 0)
         return -1;
-    if (scale >= (int)mlx_vector_array_size(sample0))
+    if (scale >= (int)mlx_vector_array_size(sample0)) {
+        mlx_vector_array_free(sample0);
         return -1;
+    }
     mlx_array first = mlx_array_new();
-    if (mlx_vector_array_get(&first, sample0, scale) != 0)
+    if (mlx_vector_array_get(&first, sample0, scale) != 0) {
+        mlx_array_free(first);
+        mlx_vector_array_free(sample0);
         return -1;
+    }
     const int *shape = mlx_array_shape(first);
     int h = shape[0];
     int w = shape[1];
     int c = shape[2];
+    mlx_array_free(first);
+    mlx_vector_array_free(sample0);
 
     mlx_vector_array scale_vec = mlx_vector_array_new();
     for (int i = 0; i < N; ++i) {
@@ -886,6 +916,7 @@ int mlx_pyramids_dataset_get_scale_stack(MLXPyramidsDataset *ds, int scale,
         }
         mlx_array elem = mlx_array_new();
         if (mlx_vector_array_get(&elem, sample, scale)) {
+            mlx_array_free(elem);
             mlx_vector_array_free(scale_vec);
             mlx_vector_array_free(sample);
             return -1;
@@ -908,10 +939,12 @@ int mlx_pyramids_dataset_get_scale_stack(MLXPyramidsDataset *ds, int scale,
         mlx_stream_free(s);
         mlx_array_free(stacked);
         int shape0[4] = {0, h, w, c};
-        if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32,
-                      mlx_default_gpu_stream_new()) != 0) {
+        mlx_stream s2 = mlx_default_gpu_stream_new();
+        if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32, s2) != 0) {
+            mlx_stream_free(s2);
             return -1;
         }
+        mlx_stream_free(s2);
     } else {
         int rc = mlx_stack(&stacked, scale_vec, s);
         mlx_vector_array_free(scale_vec);
@@ -968,6 +1001,7 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         mlx_array first = mlx_array_new();
         if (mlx_vector_array_get(&first, sample0, scale) != 0) {
             mlx_array_free(first);
+            mlx_vector_array_free(sample0);
             return -1;
         }
         const int *shape = mlx_array_shape(first);
@@ -977,6 +1011,7 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         int zeros_shape[4] = {0, h, w, c};
         int dtype = (int)mlx_array_dtype(first);
         mlx_array_free(first);
+        mlx_vector_array_free(sample0);
         mlx_stream s = mlx_default_gpu_stream_new();
         mlx_array z = mlx_array_new();
         int rc = mlx_zeros(&z, zeros_shape, 4, dtype, s);
@@ -999,6 +1034,7 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         }
         mlx_array elem = mlx_array_new();
         if (mlx_vector_array_get(&elem, sample, scale)) {
+            mlx_array_free(elem);
             mlx_vector_array_free(scale_vec);
             mlx_vector_array_free(sample);
             return -1;
@@ -1020,12 +1056,14 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         /* derive fallback shape from ds->facies first sample */
         mlx_vector_array_free(scale_vec);
         mlx_stream_free(s);
+        mlx_array_free(stacked);
         mlx_vector_array sample0;
         if (mlx_vector_vector_array_get(&sample0, ds->facies, 0) != 0)
             return -1;
         mlx_array first = mlx_array_new();
         if (mlx_vector_array_get(&first, sample0, scale) != 0) {
             mlx_array_free(first);
+            mlx_vector_array_free(sample0);
             return -1;
         }
         const int *shape = mlx_array_shape(first);
@@ -1035,9 +1073,14 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         int zeros_shape[4] = {0, h, w, c};
         int dtype = (int)mlx_array_dtype(first);
         mlx_array_free(first);
+        mlx_vector_array_free(sample0);
         mlx_array z = mlx_array_new();
-        if (mlx_zeros(&z, zeros_shape, 4, dtype, mlx_default_gpu_stream_new()) != 0)
+        mlx_stream s2 = mlx_default_gpu_stream_new();
+        if (mlx_zeros(&z, zeros_shape, 4, dtype, s2) != 0) {
+            mlx_stream_free(s2);
             return -1;
+        }
+        mlx_stream_free(s2);
         *out = z;
         return 0;
     } else {

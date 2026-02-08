@@ -143,17 +143,15 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
         mlx_optimizer_init_from_params(opt, params, n);
     }
 
-    opt->step += 1; /* increment time step */
+    opt->step += 1; /* increment time step (used for bias correction only) */
 
-    /* determine effective LR: prefer attached scheduler if present */
+    /* Use opt->lr directly — it is maintained by the epoch-level scheduler
+     * step (mlx_scheduler_step_auto → mlx_optimizer_set_lr) which matches
+     * Python's StepLR.step() behaviour.  Do NOT query the attached scheduler
+     * here: opt->step counts gradient-application calls (disc_steps *
+     * gen_steps per epoch), whereas the Python scheduler counts epochs,
+     * so a per-call query would decay the LR ~disc_steps× too early. */
     float effective_lr = opt->lr;
-    if (opt->attached_scheduler) {
-        float tmp_lr[4] = {0.0f, 0.0f, 0.0f, 0.0f};  /* Initialize to avoid garbage */
-        int got = mlx_scheduler_lr_for_step(opt->attached_scheduler, opt->step,
-                                            tmp_lr, 1);
-        if (got > 0)
-            effective_lr = tmp_lr[0];
-    }
     opt->last_used_lr = effective_lr;
 
     /* Pre-allocate scalar temporaries for reuse to reduce allocation churn */
@@ -852,9 +850,9 @@ int mlx_optimizer_save_to_npz(MLXOptimizer *opt, const char *npz_path) {
     for (int i = 0; i < idx; ++i) {
         /* free names for m_i/v_i created with malloc */
         if (i < n_params * 2)
-            mlx_free_pod((void **)&names[i]);
+            free((void *)names[i]);
         if (bufs[i] && sizes[i] > 0)
-            mlx_free_pod((void **)&bufs[i]);
+            free((void *)bufs[i]);
     }
     mlx_free_pod((void **)&names);
     mlx_free_pod((void **)&bufs);
@@ -876,11 +874,16 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
             if (mlx_load_reader(&tmp, reader, s) == 0) {
                 if (opt->m && opt->m[i]) {
                     mlx_array_set(opt->m[i], tmp);
+                    mlx_array_free(tmp);
                 } else {
                     opt->m[i] = NULL;
                     if (mlx_alloc_pod((void **)&opt->m[i], sizeof(mlx_array), 1) == 0)
                         *opt->m[i] = tmp;
+                    else
+                        mlx_array_free(tmp);
                 }
+            } else {
+                mlx_array_free(tmp);
             }
             mlx_io_reader_free(reader);
         }
@@ -890,11 +893,16 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
             if (mlx_load_reader(&tmp, reader, s) == 0) {
                 if (opt->v && opt->v[i]) {
                     mlx_array_set(opt->v[i], tmp);
+                    mlx_array_free(tmp);
                 } else {
                     opt->v[i] = NULL;
                     if (mlx_alloc_pod((void **)&opt->v[i], sizeof(mlx_array), 1) == 0)
                         *opt->v[i] = tmp;
+                    else
+                        mlx_array_free(tmp);
                 }
+            } else {
+                mlx_array_free(tmp);
             }
             mlx_io_reader_free(reader);
         }
@@ -910,6 +918,7 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
                 mlx_array_item_int64(&v, tmp);
                 opt->step = (int)v;
             }
+            mlx_array_free(tmp);
             mlx_io_reader_free(reader);
         }
         if (npz_extract_member_to_mlx_reader(npz_path, "lr.npy", &reader) == 0) {
@@ -919,6 +928,7 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
                 mlx_array_item_float32(&v, tmp);
                 opt->lr = v;
             }
+            mlx_array_free(tmp);
             mlx_io_reader_free(reader);
         }
         if (npz_extract_member_to_mlx_reader(npz_path, "beta1.npy", &reader) == 0) {
@@ -928,6 +938,7 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
                 mlx_array_item_float32(&v, tmp);
                 opt->beta1 = v;
             }
+            mlx_array_free(tmp);
             mlx_io_reader_free(reader);
         }
         if (npz_extract_member_to_mlx_reader(npz_path, "beta2.npy", &reader) == 0) {
@@ -937,6 +948,7 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
                 mlx_array_item_float32(&v, tmp);
                 opt->beta2 = v;
             }
+            mlx_array_free(tmp);
             mlx_io_reader_free(reader);
         }
         if (npz_extract_member_to_mlx_reader(npz_path, "eps.npy", &reader) == 0) {
@@ -946,6 +958,7 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
                 mlx_array_item_float32(&v, tmp);
                 opt->eps = v;
             }
+            mlx_array_free(tmp);
             mlx_io_reader_free(reader);
         }
         if (npz_extract_member_to_mlx_reader(npz_path, "weight_decay.npy",
@@ -956,6 +969,7 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
                 mlx_array_item_float32(&v, tmp);
                 opt->weight_decay = v;
             }
+            mlx_array_free(tmp);
             mlx_io_reader_free(reader);
         }
         if (npz_extract_member_to_mlx_reader(npz_path, "bias_correction.npy",
@@ -966,6 +980,7 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
                 mlx_array_item_int32(&v, tmp);
                 opt->bias_correction = v ? 1 : 0;
             }
+            mlx_array_free(tmp);
             mlx_io_reader_free(reader);
         }
     }

@@ -256,7 +256,7 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
     mlx_array **rec_in_pyramid, mlx_array **wells_pyramid,
     mlx_array **masks_pyramid, mlx_array **seismic_pyramid,
     float lambda_diversity, float well_loss_penalty, float alpha,
-    float lambda_grad, MLXResults **out_results) {
+    float lambda_grad, int mode, MLXResults **out_results) {
 
     if (!m || !out_results)
         return -1;
@@ -294,38 +294,46 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
         mlx_array *rec_in = rec_in_pyramid ? rec_in_pyramid[scale] : NULL;
 
         /* === Generate fake for discriminator training ===
-         * We need a detached fake sample (no grad tracking) for disc training */
+         * We need a detached fake sample (no grad tracking) for disc training.
+         *
+         * FIX 35: Only generate noise when needed for the disc path.
+         * After Fix 34 the gen_loss_closure generates its own fresh noise
+         * internally via get_pyramid_noise.  Generating unused noise here
+         * would advance the RNG state and break random-number parity with
+         * Python, where optimize_generator never calls get_pyramid_noise
+         * outside the closure. */
         MLXGenerator *gen = mlx_faciesgan_build_generator(m);
         if (!gen) continue;
 
-        /* Generate noise for this scale */
         mlx_array **gen_noises_ptr = NULL;
         int gen_n_noises = 0;
-        if (mlx_faciesgan_get_pyramid_noise(
-                    m, scale, indexes, n_indexes, &gen_noises_ptr, &gen_n_noises,
-                    wells_pyramid, seismic_pyramid, 0) != 0) {
-            continue;
-        }
+        mlx_array *gen_noises = NULL;
 
-        /* Convert mlx_array** to flat mlx_array* for generator forward */
-        mlx_array *gen_noises = malloc(gen_n_noises * sizeof(mlx_array));
-        if (!gen_noises) {
-            for (int ni = 0; ni < gen_n_noises; ++ni) {
-                if (gen_noises_ptr[ni]) {
-                    mlx_array_free(*gen_noises_ptr[ni]);
-                    mlx_free_pod((void **)&gen_noises_ptr[ni]);
-                }
+        /* Only generate noise for disc path — gen closure generates its own */
+        if (mode != MLX_COLLECT_GEN_ONLY) {
+            if (mlx_faciesgan_get_pyramid_noise(
+                        m, scale, indexes, n_indexes, &gen_noises_ptr, &gen_n_noises,
+                        wells_pyramid, seismic_pyramid, 0) != 0) {
+                continue;
             }
-            mlx_free_ptr_array((void ***)&gen_noises_ptr, gen_n_noises);
-            continue;
-        }
-        for (int ni = 0; ni < gen_n_noises; ++ni) {
-            gen_noises[ni] = gen_noises_ptr[ni] ? *gen_noises_ptr[ni] : (mlx_array) {
-                0
-            };
+
+            gen_noises = malloc(gen_n_noises * sizeof(mlx_array));
+            if (!gen_noises) {
+                for (int ni = 0; ni < gen_n_noises; ++ni) {
+                    if (gen_noises_ptr[ni]) {
+                        mlx_array_free(*gen_noises_ptr[ni]);
+                        mlx_free_pod((void **)&gen_noises_ptr[ni]);
+                    }
+                }
+                mlx_free_ptr_array((void ***)&gen_noises_ptr, gen_n_noises);
+                continue;
+            }
+            for (int ni = 0; ni < gen_n_noises; ++ni) {
+                gen_noises[ni] = gen_noises_ptr[ni] ? *gen_noises_ptr[ni] : (mlx_array){0};
+            }
         }
 
-        /* Build amplitude array */
+        /* Build amplitude array (always needed — used by gen closure too) */
         float *amp = NULL;
         int amp_count = scale + 1;
         if (mlx_alloc_float_buf(&amp, amp_count) == 0) {
@@ -340,31 +348,34 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
             }
             if (noise_amps) mlx_free_float_buf(&noise_amps, &n_amps);
         } else {
-            for (int ni = 0; ni < gen_n_noises; ++ni) {
-                if (gen_noises_ptr[ni]) {
-                    mlx_array_free(*gen_noises_ptr[ni]);
-                    mlx_free_pod((void **)&gen_noises_ptr[ni]);
+            if (gen_noises_ptr) {
+                for (int ni = 0; ni < gen_n_noises; ++ni) {
+                    if (gen_noises_ptr[ni]) {
+                        mlx_array_free(*gen_noises_ptr[ni]);
+                        mlx_free_pod((void **)&gen_noises_ptr[ni]);
+                    }
                 }
+                mlx_free_ptr_array((void ***)&gen_noises_ptr, gen_n_noises);
             }
-            mlx_free_ptr_array((void ***)&gen_noises_ptr, gen_n_noises);
             free(gen_noises);
             continue;
         }
 
-        /* Generate fake (detached - just forward pass, no grad tracking) */
-        mlx_array fake = mlx_generator_forward(gen, gen_noises, gen_n_noises,
-        amp, amp_count, (mlx_array) {
-            0
-        },
-        0, scale);
+        /* Generate fake (detached - just forward pass, no grad tracking).
+         * Only needed for discriminator training; G-only mode generates its
+         * own fake inside the gradient closure. */
+        mlx_array fake = {0};
+        if (mode != MLX_COLLECT_GEN_ONLY) {
+            fake = mlx_generator_forward(gen, gen_noises, gen_n_noises,
+            amp, amp_count, (mlx_array){0}, 0, scale);
 
-        /* Evaluate fake to materialize it before using in discriminator */
-        if (fake.ctx) {
-            mlx_array_eval(fake);
+            if (fake.ctx) {
+                mlx_array_eval(fake);
+            }
         }
 
         /* === Discriminator training step using native grad === */
-        if (fake.ctx) {
+        if (mode != MLX_COLLECT_GEN_ONLY && fake.ctx) {
             mlx_array disc_loss = {0};
             mlx_array **disc_grads = NULL;
             int disc_n = 0;
@@ -427,8 +438,10 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
             }
         }
 
-        /* === Generator training step using native grad === */
-        {
+        /* === Generator training step using native grad ===
+         * Skipped in DISC_ONLY mode to avoid advancing the RNG state with
+         * diversity noise that would be discarded anyway. */
+        if (mode != MLX_COLLECT_DISC_ONLY) {
             mlx_array gen_loss = {0};
             mlx_array **gen_grads = NULL;
             int gen_n = 0;
@@ -504,14 +517,16 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
             }
         }
 
-        /* Cleanup noise arrays */
-        for (int ni = 0; ni < gen_n_noises; ++ni) {
-            if (gen_noises_ptr[ni]) {
-                mlx_array_free(*gen_noises_ptr[ni]);
-                mlx_free_pod((void **)&gen_noises_ptr[ni]);
+        /* Cleanup noise arrays (only allocated in disc path) */
+        if (gen_noises_ptr) {
+            for (int ni = 0; ni < gen_n_noises; ++ni) {
+                if (gen_noises_ptr[ni]) {
+                    mlx_array_free(*gen_noises_ptr[ni]);
+                    mlx_free_pod((void **)&gen_noises_ptr[ni]);
+                }
             }
+            mlx_free_ptr_array((void ***)&gen_noises_ptr, gen_n_noises);
         }
-        mlx_free_ptr_array((void ***)&gen_noises_ptr, gen_n_noises);
         free(gen_noises);
         if (amp) mlx_free_float_buf(&amp, &amp_count);
         mlx_array_free(fake);

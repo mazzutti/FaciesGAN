@@ -95,12 +95,11 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
 
     int rc = mlx_add(out, a_tmp, b_tmp, s);
 
-    /* ensure any async work on the provided stream completed before freeing
-       temporaries which may be referenced by backend kernels */
-    if (s.ctx)
-        mlx_synchronize(s);
-
-    /* free the temporary copies */
+    /* Free the temporary copies.  Reference counting in MLX ensures the
+       underlying buffers stay alive while the output array still needs
+       them, so no explicit synchronize is required here.  Calling
+       mlx_synchronize inside a value_and_grad closure disrupts lazy
+       evaluation and can hurt gradient computation. */
     if (a_tmp.ctx)
         mlx_array_safe_free(&a_tmp);
     if (b_tmp.ctx)
@@ -140,6 +139,7 @@ struct ScaleModule {
     MLXConvBlock **body;
     int n_body;
     mlx_array *tail_conv; /* pointer to mlx_array weights */
+    mlx_array *tail_conv_bias; /* pointer to mlx_array bias */
 };
 
 struct MLXGenerator {
@@ -208,6 +208,10 @@ void mlx_generator_free(MLXGenerator *m) {
                     mlx_array_safe_free(s->tail_conv);
                     mlx_free_pod((void **)&s->tail_conv);
                 }
+                if (s->tail_conv_bias) {
+                    mlx_array_safe_free(s->tail_conv_bias);
+                    mlx_free_pod((void **)&s->tail_conv_bias);
+                }
             }
             free(s);
         }
@@ -259,28 +263,13 @@ int mlx_generator_create_scale(MLXGenerator *m, int scale, int num_features,
                                                   m->padding_size, 1, 1);
                 current_features = out_ch;
             }
-            /* tail conv weights */
-            size_t tail_count = (size_t)m->output_channels * m->kernel_size *
-                                m->kernel_size * (size_t)current_features;
-            float *tail_buf = NULL;
-            if (tail_count > (size_t)INT_MAX) {
-                tail_buf = (float *)calloc(tail_count, sizeof(float));
-            } else {
-                if (mlx_alloc_float_buf(&tail_buf, (int)tail_count) != 0)
-                    tail_buf = NULL;
-            }
-            if (tail_buf) {
-                /* tail_conv weights in canonical MLX layout:
-                 * (out_ch=m->output_channels, KH, KW, in_ch=current_features) */
+            /* tail conv weights: use mlx_init_conv_weight (random normal * 0.02)
+             * to match Python's init_conv_weights(tail_conv) */
+            {
                 int tshape[4] = {m->output_channels, m->kernel_size, m->kernel_size,
                                  current_features
                                 };
-                mlx_array tw = mlx_array_new_data(tail_buf, tshape, 4, MLX_FLOAT32);
-                if (tail_count > (size_t)INT_MAX)
-                    free(tail_buf);
-                else
-                    mlx_free_float_buf(&tail_buf, NULL);
-                /* keep tail_conv weights in MLX layout: [C_in, KH, KW, C_out] */
+                mlx_array tw = mlx_init_conv_weight(tshape, 4, 0.02f);
                 mlx_array *twptr = NULL;
                 if (mlx_alloc_pod((void **)&twptr, sizeof(mlx_array), 1) == 0) {
                     *twptr = tw;
@@ -288,6 +277,8 @@ int mlx_generator_create_scale(MLXGenerator *m, int scale, int num_features,
                 } else {
                     mlx_array_free(tw);
                 }
+                /* Allocate tail_conv bias (zero-initialised, shape [output_channels]) */
+                s->tail_conv_bias = mlx_alloc_array_ptr(mlx_init_conv_bias(m->output_channels));
             }
         }
     }
@@ -310,6 +301,10 @@ int mlx_generator_create_scale(MLXGenerator *m, int scale, int num_features,
             if (s->tail_conv) {
                 mlx_array_free(*s->tail_conv);
                 mlx_free_pod((void **)&s->tail_conv);
+            }
+            if (s->tail_conv_bias) {
+                mlx_array_free(*s->tail_conv_bias);
+                mlx_free_pod((void **)&s->tail_conv_bias);
             }
         }
         free(s);
@@ -471,6 +466,58 @@ mlx_array *mlx_scale_get_tail_conv(MLXGenerator *m, int index) {
     return sm->tail_conv;
 }
 
+/* Helper: count parameters for a non-SPADE ScaleModule including all trainable params */
+static int count_nonspade_params(struct ScaleModule *sm) {
+    int total = 0;
+    #define COUNT_IF(ptr) do { if ((ptr)) total++; } while(0)
+    /* head ConvBlock: conv w/b + norm w/b */
+    if (sm->head) {
+        COUNT_IF(mlx_convblock_get_conv_weight(sm->head));
+        COUNT_IF(mlx_convblock_get_conv_bias(sm->head));
+        COUNT_IF(mlx_convblock_get_norm_weight(sm->head));
+        COUNT_IF(mlx_convblock_get_norm_bias(sm->head));
+    }
+    /* body ConvBlocks */
+    if (sm->body) {
+        for (int b = 0; b < sm->n_body; ++b) {
+            if (!sm->body[b]) continue;
+            COUNT_IF(mlx_convblock_get_conv_weight(sm->body[b]));
+            COUNT_IF(mlx_convblock_get_conv_bias(sm->body[b]));
+            COUNT_IF(mlx_convblock_get_norm_weight(sm->body[b]));
+            COUNT_IF(mlx_convblock_get_norm_bias(sm->body[b]));
+        }
+    }
+    /* tail conv w/b */
+    COUNT_IF(sm->tail_conv);
+    COUNT_IF(sm->tail_conv_bias);
+    #undef COUNT_IF
+    return total;
+}
+
+/* Helper: fill parameter list for a non-SPADE ScaleModule */
+static int fill_nonspade_params(struct ScaleModule *sm, mlx_array **list, int idx) {
+    #define ADD_IF(ptr) do { if ((ptr)) list[idx++] = (mlx_array *)(ptr); } while(0)
+    if (sm->head) {
+        ADD_IF(mlx_convblock_get_conv_weight(sm->head));
+        ADD_IF(mlx_convblock_get_conv_bias(sm->head));
+        ADD_IF(mlx_convblock_get_norm_weight(sm->head));
+        ADD_IF(mlx_convblock_get_norm_bias(sm->head));
+    }
+    if (sm->body) {
+        for (int b = 0; b < sm->n_body; ++b) {
+            if (!sm->body[b]) continue;
+            ADD_IF(mlx_convblock_get_conv_weight(sm->body[b]));
+            ADD_IF(mlx_convblock_get_conv_bias(sm->body[b]));
+            ADD_IF(mlx_convblock_get_norm_weight(sm->body[b]));
+            ADD_IF(mlx_convblock_get_norm_bias(sm->body[b]));
+        }
+    }
+    ADD_IF(sm->tail_conv);
+    ADD_IF(sm->tail_conv_bias);
+    #undef ADD_IF
+    return idx;
+}
+
 /* Parameter collection implementation */
 mlx_array **mlx_generator_get_parameters(MLXGenerator *m, int *out_count) {
     if (!m || !out_count)
@@ -488,18 +535,7 @@ mlx_array **mlx_generator_get_parameters(MLXGenerator *m, int *out_count) {
                 mlx_spadegen_free_parameters_list(tmp);
             }
         } else {
-            mlx_array *hw = mlx_convblock_get_conv_weight(sm->head);
-            if (hw)
-                total++;
-            if (sm->body) {
-                for (int b = 0; b < sm->n_body; ++b) {
-                    mlx_array *bw = mlx_convblock_get_conv_weight(sm->body[b]);
-                    if (bw)
-                        total++;
-                }
-            }
-            if (sm->tail_conv)
-                total++;
+            total += count_nonspade_params(sm);
         }
     }
     if (total == 0) {
@@ -511,7 +547,6 @@ mlx_array **mlx_generator_get_parameters(MLXGenerator *m, int *out_count) {
         *out_count = 0;
         return NULL;
     }
-    /* initialize to NULL to avoid returning uninitialized pointers */
     memset(list, 0, sizeof(mlx_array *) * total);
     int idx = 0;
     for (int i = 0; i < m->n_gens; ++i) {
@@ -523,41 +558,15 @@ mlx_array **mlx_generator_get_parameters(MLXGenerator *m, int *out_count) {
             mlx_array **tmp = mlx_spadegen_get_parameters(sm->spade, &t);
             if (tmp) {
                 for (int j = 0; j < t; ++j) {
-                    list[idx] = tmp[j];
-                    idx++;
+                    list[idx++] = tmp[j];
                 }
                 mlx_spadegen_free_parameters_list(tmp);
             }
         } else {
-            mlx_array *hw = mlx_convblock_get_conv_weight(sm->head);
-            if (hw) {
-                list[idx] = hw;
-                idx++;
-            }
-            if (sm->body) {
-                for (int b = 0; b < sm->n_body; ++b) {
-                    mlx_array *bw = mlx_convblock_get_conv_weight(sm->body[b]);
-                    if (bw) {
-                        list[idx] = bw;
-                        idx++;
-                    }
-                }
-            }
-            if (sm->tail_conv) {
-                list[idx] = (mlx_array *)sm->tail_conv;
-                idx++;
-            }
+            idx = fill_nonspade_params(sm, list, idx);
         }
     }
     *out_count = idx;
-    if (idx != total) {
-        fprintf(stderr,
-                "mlx_generator_get_parameters: warning, counted %d but filled %d\n",
-                total, idx);
-        /* defensive: ensure remaining slots are NULL */
-        for (int z = idx; z < total; ++z)
-            list[z] = NULL;
-    }
     return list;
 }
 
@@ -572,7 +581,6 @@ mlx_array **mlx_generator_get_parameters_for_scale(MLXGenerator *m, int scale_in
         return NULL;
     }
 
-    /* Count parameters for this scale */
     int total = 0;
     if (sm->is_spade && sm->spade) {
         int t = 0;
@@ -582,15 +590,7 @@ mlx_array **mlx_generator_get_parameters_for_scale(MLXGenerator *m, int scale_in
             mlx_spadegen_free_parameters_list(tmp);
         }
     } else {
-        mlx_array *hw = mlx_convblock_get_conv_weight(sm->head);
-        if (hw) total++;
-        if (sm->body) {
-            for (int b = 0; b < sm->n_body; ++b) {
-                mlx_array *bw = mlx_convblock_get_conv_weight(sm->body[b]);
-                if (bw) total++;
-            }
-        }
-        if (sm->tail_conv) total++;
+        total = count_nonspade_params(sm);
     }
 
     if (total == 0) {
@@ -616,15 +616,7 @@ mlx_array **mlx_generator_get_parameters_for_scale(MLXGenerator *m, int scale_in
             mlx_spadegen_free_parameters_list(tmp);
         }
     } else {
-        mlx_array *hw = mlx_convblock_get_conv_weight(sm->head);
-        if (hw) list[idx++] = hw;
-        if (sm->body) {
-            for (int b = 0; b < sm->n_body; ++b) {
-                mlx_array *bw = mlx_convblock_get_conv_weight(sm->body[b]);
-                if (bw) list[idx++] = bw;
-            }
-        }
-        if (sm->tail_conv) list[idx++] = (mlx_array *)sm->tail_conv;
+        idx = fill_nonspade_params(sm, list, idx);
     }
 
     *out_count = idx;
@@ -762,9 +754,9 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                 mlx_array scale = mlx_array_new_float(amp[index]);
                 mlx_array scaled = mlx_array_new();
                 if (mlx_multiply(&scaled, noise, scale, s) == 0) {
-                    /* scaled is a new array - if noise was not owned, don't free it.
-                     * After this, we own the scaled array. */
-                    if (noise_owned && noise.ctx) {
+                    /* Free old noise (even if it's a slice, the mlx_array handle
+                     * holds a C++ shared_ptr that needs releasing). */
+                    if (noise.ctx) {
                         mlx_array_free(noise);
                     }
                     noise = scaled;
@@ -821,8 +813,8 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                     if (mlx_pad(&cond_padded, cond, axes_pad, 2, low_pad, 2, high_pad, 2,
                                 pad_zero, "constant", s) == 0) {
                         /* cond_padded is a new owned array.
-                         * Only free old cond if we owned it. */
-                        if (cond_owned && cond.ctx) {
+                         * Free old cond handle (even slices hold a C++ shared_ptr). */
+                        if (cond.ctx) {
                             mlx_array_free(cond);
                         }
                         cond = cond_padded;
@@ -834,8 +826,8 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
             mlx_array cond_plus = mlx_array_new();
             if (safe_add(&cond_plus, cond, padded, s) == 0) {
                 /* cond_plus is a new owned array.
-                 * Only free old cond if we owned it. */
-                if (cond_owned && cond.ctx) {
+                 * Free old cond handle (even slices hold a C++ shared_ptr). */
+                if (cond.ctx) {
                     mlx_array_free(cond);
                 }
                 cond = cond_plus;
@@ -849,10 +841,10 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
             }, 2);
             mlx_array znew = mlx_array_new();
             if (mlx_concatenate_axis(&znew, vec, 3, s) == 0) {
-                /* free constituents only if owned */
-                if (noise_owned && noise.ctx)
+                /* free constituents — even slices hold C++ shared_ptrs */
+                if (noise.ctx)
                     mlx_array_free(noise);
-                if (cond_owned && cond.ctx)
+                if (cond.ctx)
                     mlx_array_free(cond);
                 z_in = znew;
             } else {
@@ -875,6 +867,9 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                 mlx_array scale = mlx_array_new_float(amp[index]);
                 mlx_array scaled = mlx_array_new();
                 if (mlx_multiply(&scaled, z_in, scale, s) == 0) {
+                    /* Free old z_in only if it differs from the original z_list entry */
+                    if (z_in.ctx && z_in.ctx != z_list[index].ctx)
+                        mlx_array_free(z_in);
                     z_in = scaled;
                 }
                 mlx_array_free(scale);
@@ -928,6 +923,12 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
             if (safe_add(&sum, z_in, upsampled, s) == 0) {
                 if (z_in.ctx) {
                     mlx_array_free(z_in);
+                }
+                /* Free upsampled (holds padded result) since safe_add produced a new array */
+                if (upsampled.ctx &&
+                        !mlx_array_is_in_list(upsampled, z_list, z_count, in_noise)) {
+                    mlx_array_free(upsampled);
+                    upsampled = (mlx_array){0}; /* prevent double-free at end of loop */
                 }
                 z_in = sum;
             }
@@ -997,8 +998,19 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                     if (safe_mlx_conv2d(&outc, cur, *smod->tail_conv, 1, 1,
                                         m->padding_size, m->padding_size, 1, 1, 1,
                                         s) == 0) {
+                        /* Apply tail_conv bias */
+                        if (smod->tail_conv_bias) {
+                            mlx_array biased = mlx_array_new();
+                            if (mlx_add(&biased, outc, *smod->tail_conv_bias, s) == 0) {
+                                mlx_array_free(outc);
+                                outc = biased;
+                            } else {
+                                mlx_array_free(biased);
+                            }
+                        }
                         mlx_array t = mlx_array_new();
                         if (mlx_tanh(&t, outc, s) == 0) {
+                            mlx_array_free(outc);
                             out_mod = t;
                         } else {
                             out_mod = outc;
@@ -1123,6 +1135,13 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
         /* if we created a new z_in (concat/slices), free it */
         if (z_in.ctx && z_in.ctx != z_list[index].ctx)
             mlx_array_free(z_in);
+
+        /* Free upsampled if it's an owned intermediate (e.g. padded from mlx_pad
+         * or upsample result) that is no longer needed. upsampled_for_residual
+         * was a deep copy, so upsampled can be freed safely. */
+        if (upsampled.ctx && upsampled.ctx != out_facie.ctx &&
+                !mlx_array_is_in_list(upsampled, z_list, z_count, in_noise))
+            mlx_array_free(upsampled);
     }
 
     /* color quantization (can be disabled via FACIESGAN_DISABLE_COLOR_QUANT) */

@@ -1072,8 +1072,10 @@ static int worker_process_loop(int task_fd, int result_fd,
         mlx_vector_array out_s = mlx_vector_array_new();
         facies_collate_fn cb =
             collate_cb ? collate_cb : (facies_collate_fn)facies_collate;
+        mlx_stream collate_s = mlx_default_gpu_stream_new();
         int rc = cb(&out_fac, &out_w, &out_s, batch_fac, batch_wells, batch_seis,
-                    mlx_default_gpu_stream_new(), collate_ctx);
+                    collate_s, collate_ctx);
+        mlx_stream_free(collate_s);
         mlx_vector_vector_array_free(batch_fac);
         mlx_vector_vector_array_free(batch_wells);
         mlx_vector_vector_array_free(batch_seis);

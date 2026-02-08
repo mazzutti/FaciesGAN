@@ -154,7 +154,9 @@ int MLXTrainer_load_model_impl(MLXTrainer *trainer, int scale,
                                const char *checkpoint_dir);
 int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
         int epoch, const char *results_path, mlx_array real_facies,
-        mlx_array masks);
+        mlx_array masks,
+        mlx_array **wells_pyramid, int n_wells,
+        mlx_array **seismic_pyramid, int n_seismic);
 void *MLXTrainer_get_model_ctx_impl(MLXTrainer *trainer);
 int MLXTrainer_get_shapes_flat_impl(MLXTrainer *t, int **out_shapes,
                                     int *out_n);
@@ -290,12 +292,16 @@ int MLXTrainer_load_model(MLXTrainer *trainer, int scale,
 }
 int MLXTrainer_save_generated_facies(MLXTrainer *trainer, int scale, int epoch,
                                      const char *results_path, mlx_array real_facies,
-                                     mlx_array masks) {
+                                     mlx_array masks,
+                                     mlx_array **wells_pyramid, int n_wells,
+                                     mlx_array **seismic_pyramid, int n_seismic) {
     if (trainer && trainer->ops && trainer->ops->save_generated_facies)
         return trainer->ops->save_generated_facies(trainer, scale, epoch,
-                results_path, real_facies, masks);
+                results_path, real_facies, masks,
+                wells_pyramid, n_wells, seismic_pyramid, n_seismic);
     return MLXTrainer_save_generated_facies_impl(trainer, scale, epoch,
-            results_path, real_facies, masks);
+            results_path, real_facies, masks,
+            wells_pyramid, n_wells, seismic_pyramid, n_seismic);
 }
 
 void *MLXTrainer_get_model_ctx(MLXTrainer *trainer) {
@@ -864,7 +870,10 @@ int MLXTrainer_init_rec_noise_and_amp(MLXTrainer *trainer, int scale,
     if (!trainer)
         return -1;
     return mlx_init_rec_noise_and_amp(trainer->model, scale, indexes, n_indexes,
-                                      real, wells_pyramid, seismic_pyramid);
+                                      real, wells_pyramid, seismic_pyramid,
+                                      trainer->scale0_noise_amp,
+                                      trainer->noise_amp,
+                                      trainer->min_noise_amp);
 }
 
 PrefetcherIteratorHandle
@@ -1203,7 +1212,7 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
                  facies_arg, rec_arg, wells_arg, masks_arg,
                  seismic_arg, trainer->opts.lambda_diversity,
                  trainer->opts.well_loss_penalty, trainer->opts.alpha,
-                 trainer->opts.lambda_grad, &res);
+                 trainer->opts.lambda_grad, MLX_COLLECT_DISC_ONLY, &res);
         if (rc != 0 || !res) {
             if (res) mlx_results_free(res);
             res = NULL;
@@ -1260,7 +1269,7 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
                  facies_arg, rec_arg, wells_arg, masks_arg,
                  seismic_arg, trainer->opts.lambda_diversity,
                  trainer->opts.well_loss_penalty, trainer->opts.alpha,
-                 trainer->opts.lambda_grad, &res);
+                 trainer->opts.lambda_grad, MLX_COLLECT_GEN_ONLY, &res);
         if (rc != 0 || !res) {
             if (res) mlx_results_free(res);
             res = NULL;
@@ -1365,7 +1374,9 @@ int MLXTrainer_load_model_impl(MLXTrainer *trainer, int scale,
 
 int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
         int epoch, const char *results_path, mlx_array real_facies,
-        mlx_array masks) {
+        mlx_array masks,
+        mlx_array **wells_pyramid, int n_wells,
+        mlx_array **seismic_pyramid, int n_seismic) {
     if (!trainer || !results_path)
         return -1;
 
@@ -1408,11 +1419,21 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
 
     /* Generate total_gen fake samples with different noise */
     for (int gen_idx = 0; gen_idx < total_gen; gen_idx++) {
-        /* Generate new random noises for each sample */
+        /* Compute which real sample this generation corresponds to
+         * (matches Python: repeated_indexes = mx.repeat(indexes, repeats=num_gen_per_real)) */
+        int real_idx = selected_indices[gen_idx / num_gen_per_real];
+
+        /* Generate new random noises with conditioning (wells/seismic) when
+         * available.  This matches Python's save_generated_facies which calls
+         * get_pyramid_noise(scale, repeated_indexes, wells_pyramid, seismic_pyramid). */
         mlx_array **noises = NULL;
         int n_noises = 0;
-        if (mlx_faciesgan_get_pyramid_noise(trainer->model, scale, NULL, 0, &noises,
-                                            &n_noises, NULL, NULL, 0) != 0) {
+        if (mlx_faciesgan_get_pyramid_noise(trainer->model, scale,
+                                            &real_idx, 1, &noises,
+                                            &n_noises,
+                                            (n_wells > 0) ? wells_pyramid : NULL,
+                                            (n_seismic > 0) ? seismic_pyramid : NULL,
+                                            0) != 0) {
             /* Clean up on error */
             for (int j = 0; j < gen_idx; j++)
                 mlx_array_free(all_fakes[j]);
@@ -1525,7 +1546,6 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
         }
         mlx_array_free(one);
         mlx_array_free(two);
-        mlx_array_free(in_noise);
 
         all_fakes[gen_idx] = fake;
     }
@@ -1884,6 +1904,11 @@ void *MLXTrainer_create_model_impl(MLXTrainer *trainer) {
         mlx_base_manager_free(mgr);
         return NULL;
     }
+    /* Detach user_ctx so mlx_base_manager_free won't double-free the model
+     * (MLXTrainer_destroy frees trainer->model separately). Then free the
+     * manager shell to avoid leaking it. */
+    mlx_base_manager_set_user_ctx(mgr, NULL);
+    mlx_base_manager_free(mgr);
     return (void *)trainer->model;
 }
 
@@ -1944,7 +1969,9 @@ int MLXTrainer_train_scales_impl(MLXTrainer *trainer, const int *indexes,
             rec_pyr[si] = r;
             mlx_init_rec_noise_and_amp(
                 (MLXFaciesGAN *)MLXTrainer_get_model_ctx(trainer), si, indexes,
-                n_indexes, facies_pyramid[si], wells_pyramid, seismic_pyramid);
+                n_indexes, facies_pyramid[si], wells_pyramid, seismic_pyramid,
+                trainer->scale0_noise_amp, trainer->noise_amp,
+                trainer->min_noise_amp);
         }
 
         int rc = MLXTrainer_optimization_step(
@@ -2128,14 +2155,13 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         }
     }
 
-    /* Ensure generator and discriminator scales exist for the discovered/synthesized
-     * shapes so subsequent noise/forward calls have initialized modules. */
-    for (int si = 0; si < n_scales; ++si) {
-        mlx_faciesgan_create_generator_scale(
-            trainer->model, si, opts->num_feature, opts->min_num_feature);
-        mlx_faciesgan_create_discriminator_scale(
-            trainer->model, opts->num_feature, opts->min_num_feature);
-    }
+    /* NOTE: Generator and discriminator scales are already created during
+     * MLXTrainer_new → MLXTrainer_create_model → mlx_base_manager_init_scales,
+     * which properly computes feature counts (2^(floor(scale/4)) scaling,
+     * capped at 128), calls finalize callbacks for weight init, and tracks
+     * active scales. Do NOT re-create scales here—mlx_generator_create_scale
+     * and mlx_discriminator_create_scale always APPEND, so a duplicate loop
+     * would give 2N modules with wrong feature counts and no finalization. */
 
     MLXPyramidsDataset *ds = NULL;
     struct MLXDataloader *dl = NULL;
@@ -2214,12 +2240,11 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     printf("============================================================\n\n");
     int batches = 0;
     int max_batches = opts->num_iter > 0 ? opts->num_iter : INT_MAX;
-#ifdef FG_MEM_DEBUG
-    size_t mem_before_first = 0;
-#endif
+    int total_batches = trainer->num_of_batchs > 0 ? trainer->num_of_batchs : 1;
+    int num_iter = max_batches; /* num_iter epochs per batch (matches Python) */
     /* Initialize terminal progress bar if enabled */
 #ifdef FG_PROGRESS
-    fg_progress_init("Train", (size_t)max_batches, 0);
+    fg_progress_init("Train", (size_t)total_batches * (size_t)max_batches, 0);
 #endif
     const char *clear_cache_env = getenv("MLX_MEM_CLEAR_CACHE");
     /* Default to clearing cache unless explicitly disabled (0 or false) */
@@ -2233,25 +2258,10 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     size_t cache_limit = 512 * 1024 * 1024;  /* 512 MB cache limit */
     mlx_set_cache_limit(&cache_limit_result, cache_limit);
 
-    while (batches < max_batches) {
-#ifdef FG_MEM_DEBUG
-        /* Memory tracking: measure before batch */
-        size_t mem_before_active = 0;
-        size_t mem_before_cache = 0;
-        size_t mem_before_peak = 0;
-        size_t rss_before = 0;
-        mlx_get_active_memory(&mem_before_active);
-        mlx_get_cache_memory(&mem_before_cache);
-        mlx_get_peak_memory(&mem_before_peak);
-        size_t mem_before = mem_before_active + mem_before_cache;
-        rss_before = mlx_get_process_rss_bytes();
-        if (batches == 0) mem_before_first = mem_before;
-        mlx_reset_peak_memory();
-#endif
-
+    while (batches < total_batches) {
         PrefetchedPyramidsBatch *pb = prefetcher_iterator_next(pit);
         if (!pb)
-            break; /* finished */
+            break; /* no more batches */
 
         int nsc = pb->n_scales;
         mlx_array **fac_pyr = pb->facies_ptrs;
@@ -2261,10 +2271,6 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
 
         /* Evaluate lazy arrays in batch (matches Python mx.eval pattern) */
         mlx_global_lock(); /* protect all MLX operations */
-        /* update progress bar (show current batch index) */
-#ifdef FG_PROGRESS
-        fg_progress_update((size_t)batches);
-#endif
         mlx_vector_array pyr_vec = mlx_vector_array_new();
         for (int i = 0; i < nsc; ++i) {
             if (fac_pyr && fac_pyr[i])
@@ -2375,7 +2381,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         int act = n_scales;
 
         /* Stage 3: compute recovery inputs and initialize per-scale noise
-           amplitudes (parity with Python Trainer). */
+           amplitudes ONCE per batch (parity with Python train_scales). */
         mlx_array **rec_pyr = NULL;
         if (nsc > 0) {
             rec_pyr = (mlx_array **)calloc((size_t)nsc, sizeof(mlx_array *));
@@ -2389,55 +2395,99 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
                 /* initialize noise amplitudes based on current real sample */
                 mlx_init_rec_noise_and_amp(
                     trainer->model, si, indexes, batch_n,
-                    fac_pyr && fac_pyr[si] ? fac_pyr[si] : NULL, well_pyr, seis_pyr);
+                    fac_pyr && fac_pyr[si] ? fac_pyr[si] : NULL, well_pyr, seis_pyr,
+                    trainer->scale0_noise_amp, trainer->noise_amp,
+                    trainer->min_noise_amp);
             }
         }
 
-        /* Pre-sync and clear before optimization step to prevent Metal resource
-         * accumulation when many arrays are created during gradient computation */
-        mlx_synchronize(s);
-        mlx_clear_cache();
+        /* ================================================================
+         * Inner epoch loop: train num_iter epochs on the SAME batch data.
+         * This matches Python's structure:
+         *   train_scales(batch):
+         *       compute rec_in ONCE
+         *       init_rec_noise_and_amp ONCE
+         *       for epoch in range(num_iter):
+         *           optimization_step()
+         *           handle_epoch_end()
+         * ================================================================ */
+        for (int epoch = 0; epoch < num_iter; ++epoch) {
+#ifdef FG_PROGRESS
+            fg_progress_update((size_t)(batches * num_iter + epoch));
+#endif
 
-        int step_rc = MLXTrainer_optimization_step(
-                          trainer, indexes, batch_n, fac_pyr, nsc, rec_pyr, nsc, well_pyr,
-                          well_pyr ? nsc : 0, effective_mask_pyr, effective_mask_pyr ? nsc : 0,
-                          seis_pyr, seis_pyr ? nsc : 0, scale_idxs, act);
+            /* Pre-sync and clear before optimization step to prevent Metal resource
+             * accumulation when many arrays are created during gradient computation */
+            mlx_synchronize(s);
+            mlx_clear_cache();
 
-        /* Print metrics table at specific intervals (parity with Python handle_epoch_end) */
-        print_epoch_metrics_table(
-            0, 1,  /* batch_id, total_batches - C has single batch iterator */
-            batches, max_batches, n_scales,
-            trainer->last_g_total, trainer->last_g_adv,
-            trainer->last_g_rec, trainer->last_g_well,
-            trainer->last_g_div, trainer->last_d_total,
-            trainer->last_d_real, trainer->last_d_fake,
-            trainer->last_d_gp);
+            int step_rc = MLXTrainer_optimization_step(
+                              trainer, indexes, batch_n, fac_pyr, nsc, rec_pyr, nsc, well_pyr,
+                              well_pyr ? nsc : 0, effective_mask_pyr, effective_mask_pyr ? nsc : 0,
+                              seis_pyr, seis_pyr ? nsc : 0, scale_idxs, act);
+            (void)step_rc;
 
-        /* Keep a copy of all scales' real facies and masks for visualization before freeing batch */
-        mlx_array *real_facies_all_scales = NULL;
-        mlx_array *masks_all_scales = NULL;
-        if (fac_pyr && nsc > 0) {
-            real_facies_all_scales = (mlx_array *)calloc(nsc, sizeof(mlx_array));
-            masks_all_scales = (mlx_array *)calloc(nsc, sizeof(mlx_array));
-            if (real_facies_all_scales && masks_all_scales) {
-                mlx_stream copy_s = mlx_default_gpu_stream_new();
-                for (int sc = 0; sc < nsc; ++sc) {
-                    real_facies_all_scales[sc] = mlx_array_new();
-                    masks_all_scales[sc] = mlx_array_new();
-                    if (fac_pyr[sc]) {
-                        mlx_copy(&real_facies_all_scales[sc], *fac_pyr[sc], copy_s);
-                    }
-                    /* Use effective_mask_pyr which may be computed_masks or prefetched masks */
-                    if (effective_mask_pyr && effective_mask_pyr[sc]) {
-                        mlx_copy(&masks_all_scales[sc], *effective_mask_pyr[sc], copy_s);
-                    }
+            /* Print metrics table at specific intervals (parity with Python handle_epoch_end) */
+            print_epoch_metrics_table(
+                batches, total_batches,
+                epoch, num_iter, n_scales,
+                trainer->last_g_total, trainer->last_g_adv,
+                trainer->last_g_rec, trainer->last_g_well,
+                trainer->last_g_div, trainer->last_d_total,
+                trainer->last_d_real, trainer->last_d_fake,
+                trainer->last_d_gp);
+
+            /* build a simple JSON metrics and update visualizer (best-effort) */
+            {
+                char metrics[1024];
+                int off = 0;
+                off += snprintf(metrics + off, sizeof(metrics) - off, "{");
+                for (int sc = 0; sc < n_scales; ++sc) {
+                    off += snprintf(metrics + off, sizeof(metrics) - off,
+                                    "\"%d\":{\"d_total\":%g}", sc, 0.0);
+                    if (sc + 1 < n_scales)
+                        off += snprintf(metrics + off, sizeof(metrics) - off, ",");
                 }
-                mlx_stream_free(copy_s);
+                off += snprintf(metrics + off, sizeof(metrics) - off, "}");
+                pybridge_update_visualizer_from_json(epoch, metrics,
+                                                     epoch * opts->batch_size);
             }
-        }
 
-        /* Now that we've consumed pb and created owned copies, free the
-         * prefetched batch so the prefetcher can reuse its buffers. */
+            /* Save policy matches Python exactly:
+             * Python: if (epoch % save_interval == 0 or epoch == num_iter - 1)
+             *           and (epoch != 0 or num_iter == 1) */
+            int is_save_interval = (epoch % opts->save_interval == 0);
+            int is_last_epoch = (epoch == num_iter - 1);
+            int not_first_or_single = (epoch != 0 || num_iter == 1);
+            int should_save = (is_save_interval || is_last_epoch) && not_first_or_single;
+
+            if (should_save) {
+                const char *spath = opts->output_path ? opts->output_path : ".";
+                /* Save generated facies for ALL active scales (matching Python behavior) */
+                for (int sc = 0; sc < n_scales; ++sc) {
+                    mlx_array real_for_scale = (fac_pyr && fac_pyr[sc])
+                                               ? *fac_pyr[sc]
+                                               : mlx_array_new();
+                    mlx_array mask_for_scale = (effective_mask_pyr && effective_mask_pyr[sc])
+                                               ? *effective_mask_pyr[sc]
+                                               : mlx_array_new();
+                    /* Python uses 0-based epoch in filename (gen_{scale}_{epoch}.png) */
+                    int save_rc = MLXTrainer_save_generated_facies(
+                                      trainer, sc, epoch, spath, real_for_scale, mask_for_scale,
+                                      well_pyr, well_pyr ? nsc : 0,
+                                      seis_pyr, seis_pyr ? nsc : 0);
+                    (void)save_rc;
+                }
+            }
+
+            /* Sync and clear cache for memory management after each epoch */
+            mlx_synchronize(s);
+            if (clear_cache) {
+                mlx_clear_cache();
+            }
+        } /* end epoch loop */
+
+        /* Free batch resources AFTER all epochs on this batch complete */
         if (pb)
             prefetcher_free_pyramids(pb);
 
@@ -2463,104 +2513,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
             free(rec_pyr);
         }
 
-        /* pointer arrays were stack-allocated and reference pb entries; the
-         * underlying buffers were freed by `prefetcher_free_pyramids(pb)` above,
-         * so there is no heap memory to release here. */
         mlx_free_int_array(&indexes, &batch_n);
-
-        /* build a simple JSON metrics and update visualizer (best-effort) */
-        char metrics[1024];
-        int off = 0;
-        off += snprintf(metrics + off, sizeof(metrics) - off, "{");
-        for (int sc = 0; sc < n_scales; ++sc) {
-            off += snprintf(metrics + off, sizeof(metrics) - off,
-                            "\"%d\":{\"d_total\":%g}", sc, 0.0);
-            if (sc + 1 < n_scales)
-                off += snprintf(metrics + off, sizeof(metrics) - off, ",");
-        }
-        off += snprintf(metrics + off, sizeof(metrics) - off, "}");
-        pybridge_update_visualizer_from_json(batches, metrics,
-                                             batches * opts->batch_size);
-
-        /* Save policy matches Python exactly:
-         * Python: if (epoch % save_interval == 0 or epoch == num_iter - 1) and (epoch != 0 or num_iter == 1)
-         * - epoch is 0-based in Python (batches is also 0-based in C)
-         * - Save at intervals (batches % save_interval == 0)
-         * - Save on last epoch (batches == max_batches - 1)
-         * - Skip first epoch (batches == 0) unless num_iter == 1 */
-        int is_save_interval = (batches % opts->save_interval == 0);
-        int is_last_epoch = (batches == max_batches - 1);
-        int not_first_or_single = (batches != 0 || max_batches == 1);
-        int should_save = (is_save_interval || is_last_epoch) && not_first_or_single;
-
-        if (should_save) {
-            const char *spath = opts->output_path ? opts->output_path : ".";
-            /* Save generated facies for ALL active scales (matching Python behavior) */
-            for (int sc = 0; sc < n_scales; ++sc) {
-                mlx_array real_for_scale = (real_facies_all_scales && sc < nsc)
-                                           ? real_facies_all_scales[sc]
-                                           : mlx_array_new();
-                mlx_array mask_for_scale = (masks_all_scales && sc < nsc)
-                                           ? masks_all_scales[sc]
-                                           : mlx_array_new();
-                /* Python uses 0-based epoch in filename (gen_{scale}_{epoch}.png) */
-                int save_rc = MLXTrainer_save_generated_facies(
-                                  trainer, sc, batches, spath, real_for_scale, mask_for_scale);
-                (void)save_rc;
-            }
-        }
-
-        /* Free saved real facies and masks copies for all scales BEFORE memory measurement */
-        if (real_facies_all_scales) {
-            for (int sc = 0; sc < nsc; ++sc) {
-                mlx_array_free(real_facies_all_scales[sc]);
-            }
-            free(real_facies_all_scales);
-            real_facies_all_scales = NULL;
-        }
-        if (masks_all_scales) {
-            for (int sc = 0; sc < nsc; ++sc) {
-                mlx_array_free(masks_all_scales[sc]);
-            }
-            free(masks_all_scales);
-            masks_all_scales = NULL;
-        }
-
-        /* Sync and clear cache for memory management */
-        mlx_synchronize(s);
-        if (clear_cache) {
-            mlx_clear_cache();
-        }
-#ifdef FG_MEM_DEBUG
-        /* Memory tracking: measure after ALL batch cleanup including array frees */
-        size_t mem_after_active = 0;
-        size_t mem_after_cache = 0;
-        size_t mem_after_peak = 0;
-        size_t rss_after = 0;
-        mlx_get_active_memory(&mem_after_active);
-        mlx_get_cache_memory(&mem_after_cache);
-        mlx_get_peak_memory(&mem_after_peak);
-        size_t mem_after = mem_after_active + mem_after_cache;
-        rss_after = mlx_get_process_rss_bytes();
-        /* Cast to signed to handle negative differences (memory freed) */
-        double leak_mb = (double)((int64_t)mem_after - (int64_t)mem_before) / (1024.0 * 1024.0);
-        double total_mb = (double)mem_after / (1024.0 * 1024.0);
-        double before_mb = (double)mem_before / (1024.0 * 1024.0);
-        double cumul_mb = (double)((int64_t)mem_after - (int64_t)mem_before_first) / (1024.0 * 1024.0);
-        double before_active_mb = (double)mem_before_active / (1024.0 * 1024.0);
-        double before_cache_mb = (double)mem_before_cache / (1024.0 * 1024.0);
-        double after_active_mb = (double)mem_after_active / (1024.0 * 1024.0);
-        double after_cache_mb = (double)mem_after_cache / (1024.0 * 1024.0);
-        double peak_mb = (double)mem_after_peak / (1024.0 * 1024.0);
-        double rss_before_mb = (double)rss_before / (1024.0 * 1024.0);
-        double rss_after_mb = (double)rss_after / (1024.0 * 1024.0);
-        fprintf(stderr,
-                "[MEM] batch=%d: before=%.2fMB after=%.2fMB leak=%.2fMB cumulative=%.2fMB "
-                "(active %.2f->%.2f MB, cache %.2f->%.2f MB, peak %.2f MB, rss %.2f->%.2f MB)\n",
-                batches, before_mb, total_mb, leak_mb, cumul_mb,
-                before_active_mb, after_active_mb, before_cache_mb, after_cache_mb,
-                peak_mb, rss_before_mb, rss_after_mb);
-#endif
 
         batches++;
 
@@ -2594,6 +2547,11 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         prefetcher_destroy(trainer->batch_prefetcher);
         trainer->batch_prefetcher = NULL;
         trainer->batch_producer_running = 0;
+    }
+    /* Free the scale index array allocated at the beginning of this function */
+    if (scale_idxs) {
+        int _sn = n_scales;
+        mlx_free_int_array(&scale_idxs, &_sn);
     }
     return 0;
 }

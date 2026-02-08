@@ -115,11 +115,116 @@ static void fg_create_discriminator_scale(void *mgr, int num_feature,
 }
 
 static void fg_finalize_generator_scale(void *mgr, int scale, int reinit) {
-    /* no-op placeholder for now */
+    /* FIX 38 — no-op for ALL scales.
+     *
+     * Python's MLXFaciesGAN.finalize_generator_scale does two things:
+     *   if reinit: utils.init_weights(gen)        [randomize]
+     *   else:      gen.update(prev.parameters())   [copy from prev scale]
+     *
+     * However, Python's trainer.__init__ calls reset_parameters() AFTER
+     * mx.random.seed(), which reinitializes ALL scales' Conv2d weights with
+     * fresh seeded random values — overwriting whatever finalize did.
+     *
+     * In C, the seed is set BEFORE layer creation, so creation-time weights
+     * are already the correct seeded values (equivalent to Python's
+     * reset_parameters).  If we copied scale-1 → scale here (as the old
+     * code did for non-SPADE scale ≥ 2), we would overwrite gen2-6's
+     * unique seeded weights with gen1's values, causing a parameter
+     * mismatch vs Python.
+     *
+     * Therefore: do nothing.  The creation-time weights are final.
+     */
+    (void)mgr;
+    (void)scale;
+    (void)reinit;
+}
+
+/**
+ * Re-initialise a single MLXConvBlock in place to match Python's reset_parameters:
+ *   Conv2d  weight → N(0, 0.02),  bias → zeros
+ *   InstanceNorm weight → ones(), bias → zeros  (Fix 37: no RNG consumed)
+ */
+static void reinit_convblock_weights(MLXConvBlock *cb) {
+    if (!cb)
+        return;
+    mlx_stream s = mlx_default_gpu_stream_new();
+
+    /* --- Conv2d weight: N(0, 0.02) --- */
+    mlx_array *w = mlx_convblock_get_conv_weight(cb);
+    if (w && w->ctx) {
+        int ndim = mlx_array_ndim(*w);
+        const int *shape = mlx_array_shape(*w);
+        mlx_array new_w = mlx_array_new();
+        if (mlx_random_normal(&new_w, shape, ndim, MLX_FLOAT32,
+                              0.0f, 0.02f, mlx_array_empty, s) == 0) {
+            mlx_array_set(w, new_w);
+        }
+        mlx_array_free(new_w);
+    }
+
+    /* --- Conv2d bias: zeros --- */
+    mlx_array *b = mlx_convblock_get_conv_bias(cb);
+    if (b && b->ctx) {
+        int ndim = mlx_array_ndim(*b);
+        const int *shape = mlx_array_shape(*b);
+        mlx_array new_b = mlx_array_new();
+        mlx_zeros(&new_b, shape, ndim, MLX_FLOAT32, s);
+        mlx_array_set(b, new_b);
+        mlx_array_free(new_b);
+    }
+
+    /* --- InstanceNorm weight: ones() (Fix 37 — matches Python's
+     * _init_instance_norm: norm.weight = mx.ones(weight.shape)) --- */
+    mlx_array *nw = mlx_convblock_get_norm_weight(cb);
+    if (nw && nw->ctx) {
+        int ndim = mlx_array_ndim(*nw);
+        const int *shape = mlx_array_shape(*nw);
+        mlx_array new_nw = mlx_array_new();
+        mlx_ones(&new_nw, shape, ndim, MLX_FLOAT32, s);
+        mlx_array_set(nw, new_nw);
+        mlx_array_free(new_nw);
+    }
+
+    /* --- InstanceNorm bias: zeros --- */
+    mlx_array *nb = mlx_convblock_get_norm_bias(cb);
+    if (nb && nb->ctx) {
+        int ndim = mlx_array_ndim(*nb);
+        const int *shape = mlx_array_shape(*nb);
+        mlx_array new_nb = mlx_array_new();
+        mlx_zeros(&new_nb, shape, ndim, MLX_FLOAT32, s);
+        mlx_array_set(nb, new_nb);
+        mlx_array_free(new_nb);
+    }
+
+    mlx_stream_free(s);
 }
 
 static void fg_finalize_discriminator_scale(void *mgr, int scale) {
-    /* no-op placeholder for now */
+    /* FIX 36: Skip reinitialisation — match Python's RNG consumption order.
+     *
+     * In Python, model creation happens BEFORE mx.random.seed() is set,
+     * and then reset_parameters() calls init_weights() AFTER the seed.
+     * So the post-seed RNG consumption for scale 0 is:
+     *   gen0 init_weights → disc0 init_weights
+     *
+     * In C, the seed is set BEFORE model creation, so creation-time random
+     * init IS the seeded init.  If we also reinitialise here, the disc
+     * weights get DOUBLE-initialised:
+     *   gen0 create (N_gen RNG) → disc0 create (N_disc RNG) → disc0 finalize (N_disc RNG)
+     *
+     * That shifts all subsequent random numbers by N_disc positions compared
+     * to Python.  By skipping the reinit, disc weights come from creation-time
+     * random init at the correct RNG positions:
+     *   gen0 create (N_gen RNG) → disc0 create (N_disc RNG)
+     *
+     * The creation-time init already uses the correct distributions:
+     *   Conv2d weight  → N(0, 0.02)   [consumes RNG]
+     *   Conv2d bias    → zeros         [no RNG]
+     *   InstanceNorm weight → ones()   [no RNG — Fix 37]
+     *   InstanceNorm bias   → zeros    [no RNG]
+     */
+    (void)mgr;
+    (void)scale;
 }
 
 static void fg_save_generator_state(void *mgr, const char *path, int scale) {

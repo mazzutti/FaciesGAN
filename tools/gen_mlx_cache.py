@@ -8,10 +8,12 @@ This script calls the existing Python dataset helpers to produce exactly the
 same NPZ that the Python/MLX trainer would produce.
 """
 import argparse
+import json
 import numpy as np
 import os
 import sys
 import atexit
+import joblib
 
 # Ensure the project root is on sys.path so imports like `datasets.*` work
 # when this script is executed from the `tools/` directory or elsewhere.
@@ -82,6 +84,35 @@ except Exception:
 
 
 # Diagnostic: print what Python thinks the executable is and what
+def _load_joblib_cached(
+    func_name: str,
+    scale_list: tuple[tuple[int, ...], ...],
+    channels_last: bool,
+):
+    base = os.path.join(".cache", "joblib", "datasets", "torch", "utils", func_name)
+    if not os.path.isdir(base):
+        return None
+    target_scale = str(scale_list)
+    target_channels = str(bool(channels_last))
+    for entry in os.listdir(base):
+        meta = os.path.join(base, entry, "metadata.json")
+        out = os.path.join(base, entry, "output.pkl")
+        if not (os.path.isfile(meta) and os.path.isfile(out)):
+            continue
+        try:
+            with open(meta, "r") as f:
+                data = json.load(f)
+            args = data.get("input_args", {})
+            if (
+                args.get("scale_list") == target_scale
+                and args.get("channels_last") == target_channels
+            ):
+                return joblib.load(out)
+        except Exception:
+            continue
+    return None
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--output", "-o", required=True)
@@ -96,8 +127,6 @@ def main():
     # Prefer options.json near the output path (C trainer writes it under
     # <output_path>/options.json), then fall back to CWD.
     try:
-        import json
-
         candidates: list[str] = []
         if args.output:
             out_dir = os.path.dirname(os.path.abspath(args.output))
@@ -154,37 +183,78 @@ def main():
         scale_list.append((1, out_wh, out_wh, num_img_channels))
 
     # Produce pyramids
-    fac = to_facies_pyramids(tuple(scale_list), channels_last=True)
-    seis = to_seismic_pyramids(tuple(scale_list), channels_last=True)
-    wells = to_wells_pyramids(tuple(scale_list), channels_last=True)
+    scale_list_tuple = tuple(scale_list)
 
-    # Pack into NPZ similar structure used by MLX trainer dump
-    # We'll follow keys sample_0/facies_i etc and only include sample_0 since
-    # num_pyramids handling is more complex; this is enough to ensure parity
+    fac = _load_joblib_cached("to_facies_pyramids", scale_list_tuple, True)
+    if fac is None:
+        fac = to_facies_pyramids(scale_list_tuple, channels_last=True)
+
+    seis = _load_joblib_cached("to_seismic_pyramids", scale_list_tuple, True)
+    if seis is None:
+        seis = to_seismic_pyramids(scale_list_tuple, channels_last=True)
+
+    wells = _load_joblib_cached("to_wells_pyramids", scale_list_tuple, True)
+    if wells is None:
+        wells = to_wells_pyramids(scale_list_tuple, channels_last=True)
+
+    # Determine which samples to store.  The Python trainer does:
+    #     mx.random.seed(manual_seed)
+    #     perm = mx.random.permutation(mx.arange(len(dataset)))
+    #     selected = perm[:num_train_pyramids]
+    # Reproduce that here so the C code trains on the same sample(s).
+    manual_seed = _get_int("manual_seed", -1)
+    num_train = _get_int("num_train_pyramids", 0)
+
+    # fac[0] has shape (N, H, W, C) where N = total available samples
+    total_samples = (
+        fac[0].shape[0] if fac and hasattr(fac[0], "shape") and fac[0].ndim >= 4 else 1
+    )
+    num_to_store = min(args.num_pyramids, total_samples) if args.num_pyramids > 0 else 1
+
+    selected_indices: list[int] = []
+    if manual_seed >= 0 and 0 < num_train < total_samples:
+        try:
+            import mlx.core as mx
+
+            mx.random.seed(manual_seed)
+            perm = mx.random.permutation(mx.arange(total_samples))
+            mx.eval(perm)
+            selected_indices = [
+                int(perm[i]) for i in range(min(num_train, num_to_store))
+            ]
+        except ImportError:
+            selected_indices = list(range(num_to_store))
+    else:
+        selected_indices = list(range(num_to_store))
+
     arrays: dict[str, np.ndarray] = {}
     # Each returned tensor has shape (N, H, W, C) because we asked for
-    # channels_last=True. Store only the first element (sample_0) per scale
-    # and ensure shape is (H, W, C) float32 to match the C loader.
-    # NOTE: np.savez automatically appends `.npy` to key names, so we use keys
-    # WITHOUT the `.npy` suffix here.  The resulting archive will have members
-    # like `sample_0/facies_0.npy`, matching what the C loader expects.
-    for i, a in enumerate(fac):
-        np_a = a.numpy()
-        if np_a.ndim == 4:
-            out_arr = np_a[0].astype(np.float32)
-        else:
-            out_arr = np_a.astype(np.float32)
-        arrays[f"sample_0/facies_{i}"] = out_arr
-    for i, a in enumerate(seis):
-        np_a = a.numpy()
-        arrays[f"sample_0/seismic_{i}"] = (
-            np_a[0].astype(np.float32) if np_a.ndim == 4 else np_a.astype(np.float32)
-        )
-    for i, a in enumerate(wells):
-        np_a = a.numpy()
-        arrays[f"sample_0/wells_{i}"] = (
-            np_a[0].astype(np.float32) if np_a.ndim == 4 else np_a.astype(np.float32)
-        )
+    # channels_last=True.  Store the selected sample(s) using the
+    # sample_<idx>/facies_<scale>.npy naming convention the C loader expects.
+    # NOTE: np.savez automatically appends `.npy` to key names.
+    for si_out, si_in in enumerate(selected_indices):
+        for i, a in enumerate(fac):
+            np_a = a.numpy()
+            out_arr = (
+                np_a[si_in].astype(np.float32)
+                if np_a.ndim == 4
+                else np_a.astype(np.float32)
+            )
+            arrays[f"sample_{si_out}/facies_{i}"] = out_arr
+        for i, a in enumerate(seis):
+            np_a = a.numpy()
+            arrays[f"sample_{si_out}/seismic_{i}"] = (
+                np_a[si_in].astype(np.float32)
+                if np_a.ndim == 4
+                else np_a.astype(np.float32)
+            )
+        for i, a in enumerate(wells):
+            np_a = a.numpy()
+            arrays[f"sample_{si_out}/wells_{i}"] = (
+                np_a[si_in].astype(np.float32)
+                if np_a.ndim == 4
+                else np_a.astype(np.float32)
+            )
 
     # Save as .npz
     # Note: numpy.savez will append .npy extension to key names automatically

@@ -34,7 +34,7 @@
  * weight = mx.random.normal(shape) * std
  * where std defaults to 0.02
  */
-static mlx_array mlx_init_conv_weight(const int *shape, int ndim, float std) {
+mlx_array mlx_init_conv_weight(const int *shape, int ndim, float std) {
     mlx_stream s = mlx_default_gpu_stream_new();
     mlx_array result = mlx_array_new();
 
@@ -48,6 +48,44 @@ static mlx_array mlx_init_conv_weight(const int *shape, int ndim, float std) {
 
     mlx_stream_free(s);
     return result;
+}
+
+/**
+ * Create a zero-initialized bias array matching Python's Conv2d default.
+ * bias = mx.zeros((out_channels,))
+ */
+mlx_array mlx_init_conv_bias(int out_ch) {
+    mlx_stream s = mlx_default_gpu_stream_new();
+    int shape[1] = {out_ch};
+    mlx_array result = mlx_array_new();
+    mlx_zeros(&result, shape, 1, MLX_FLOAT32, s);
+    mlx_stream_free(s);
+    return result;
+}
+
+/**
+ * Helper: allocate and store an mlx_array on the heap (like conv weights).
+ * Returns pointer to allocated mlx_array, or NULL on failure.
+ */
+mlx_array *mlx_alloc_array_ptr(mlx_array arr) {
+    mlx_array *ptr = NULL;
+    if (mlx_alloc_pod((void **)&ptr, sizeof(mlx_array), 1) != 0) {
+        mlx_array_free(arr);
+        return NULL;
+    }
+    *ptr = arr;
+    return ptr;
+}
+
+/**
+ * Helper: free a heap-allocated mlx_array pointer (frees array + pointer).
+ * Accepts void** to work with void* struct fields storing mlx_array pointers.
+ */
+void mlx_free_array_ptr(void **pptr) {
+    if (!pptr || !*pptr) return;
+    mlx_array *ap = (mlx_array *)*pptr;
+    mlx_array_free(*ap);
+    mlx_free_pod(pptr);
 }
 
 struct MLXLeakyReLU {
@@ -106,11 +144,11 @@ mlx_array_t mlx_leakyrelu_forward(MLXLeakyReLU *m, mlx_array_t x) {
     }
 
 cleanup:
-    /* Ensure any queued work on `s` completed before freeing temporaries */
-    if (s.ctx)
-        mlx_synchronize(s);
-
-    /* Free temporaries if they were allocated (ctx==0 indicates empty) */
+    /* Free temporaries if they were allocated (ctx==0 indicates empty).
+     * Do NOT synchronize here — mlx_synchronize inside a value_and_grad
+     * closure disrupts MLX's lazy evaluation and breaks gradient tracing.
+     * MLX handles reference counting; freeing our handle is safe even if
+     * the computation graph still references the array. */
     if (scaled.ctx)
         mlx_array_free(scaled);
 
@@ -184,36 +222,47 @@ void *mlx_nn_instancenorm_create(int num_features, int affine) {
             wbuf[i] = 1.0f;
             bbuf[i] = 0.0f;
         }
-        mlx_array warr = mlx_array_new_data(wbuf, shape, 1, MLX_FLOAT32);
-        mlx_array barr = mlx_array_new_data(bbuf, shape, 1, MLX_FLOAT32);
-        if (num_features > (size_t)INT_MAX) {
-            free(wbuf);
-            free(bbuf);
-        } else {
-            mlx_free_float_buf(&wbuf, NULL);
-            mlx_free_float_buf(&bbuf, NULL);
+        /* FIX 37: Weights initialized to ones(), bias to zeros() — matching
+         * Python's _init_instance_norm() in custom_layer.py:
+         *   norm.weight = mx.ones(weight.shape)
+         *   norm.bias   = mx.zeros(bias.shape)
+         *
+         * Previously this used random_normal(1.0, 0.02) which consumed RNG
+         * values, shifting all subsequent Conv2d weight random values out of
+         * alignment with Python.  Python's reset_parameters() never uses
+         * random for InstanceNorm — it always uses deterministic ones(). */
+        {
+            mlx_array warr = mlx_array_new_data(wbuf, shape, 1, MLX_FLOAT32);
+            mlx_array barr = mlx_array_new_data(bbuf, shape, 1, MLX_FLOAT32);
+            if (num_features > (size_t)INT_MAX) {
+                free(wbuf);
+                free(bbuf);
+            } else {
+                mlx_free_float_buf(&wbuf, NULL);
+                mlx_free_float_buf(&bbuf, NULL);
+            }
+            h->weight = NULL;
+            h->bias = NULL;
+            if (mlx_alloc_pod((void **)&h->weight, sizeof(mlx_array), 1) != 0 ||
+                    mlx_alloc_pod((void **)&h->bias, sizeof(mlx_array), 1) != 0) {
+                if (h->weight) {
+                    *h->weight = warr;
+                } else
+                    mlx_array_free(warr);
+                if (h->bias) {
+                    *h->bias = barr;
+                } else
+                    mlx_array_free(barr);
+                if (h->weight)
+                    mlx_free_pod((void **)&h->weight);
+                if (h->bias)
+                    mlx_free_pod((void **)&h->bias);
+                mlx_free_pod((void **)&h);
+                return NULL;
+            }
+            *h->weight = warr;
+            *h->bias = barr;
         }
-        h->weight = NULL;
-        h->bias = NULL;
-        if (mlx_alloc_pod((void **)&h->weight, sizeof(mlx_array), 1) != 0 ||
-                mlx_alloc_pod((void **)&h->bias, sizeof(mlx_array), 1) != 0) {
-            if (h->weight) {
-                *h->weight = warr;
-            } else
-                mlx_array_free(warr);
-            if (h->bias) {
-                *h->bias = barr;
-            } else
-                mlx_array_free(barr);
-            if (h->weight)
-                mlx_free_pod((void **)&h->weight);
-            if (h->bias)
-                mlx_free_pod((void **)&h->bias);
-            mlx_free_pod((void **)&h);
-            return NULL;
-        }
-        *h->weight = warr;
-        *h->bias = barr;
     }
 
     return (void *)h;
@@ -253,6 +302,7 @@ mlx_array *mlx_nn_instancenorm_get_bias(void *handle) {
 struct MLXConvBlock {
     int use_norm;
     void *conv; /* pointer to mlx_array weight (allocated) */
+    mlx_array *conv_bias; /* pointer to mlx_array bias (allocated) */
     void *norm; /* underlying instance norm handle */
     MLXLeakyReLU *activation;
     int stride;
@@ -269,6 +319,7 @@ MLXConvBlock *mlx_convblock_create(int in_ch, int out_ch, int kernel_size,
         return NULL;
     m->use_norm = use_norm;
     m->conv = NULL; /* will store pointer to mlx_array weight */
+    m->conv_bias = NULL;
     m->norm = NULL; /* create instance norm if requested */
     if (use_norm) {
         /* Create an mlx-c InstanceNorm module handle if available.
@@ -294,6 +345,8 @@ MLXConvBlock *mlx_convblock_create(int in_ch, int out_ch, int kernel_size,
     } else {
         mlx_array_free(w);
     }
+    /* Allocate conv bias (zero-initialised, shape [out_ch]) */
+    m->conv_bias = mlx_alloc_array_ptr(mlx_init_conv_bias(out_ch));
     return m;
 }
 
@@ -307,6 +360,7 @@ void mlx_convblock_free(MLXConvBlock *m) {
         mlx_free_pod((void **)&wptr);
         m->conv = NULL;
     }
+    mlx_free_array_ptr((void **)&m->conv_bias);
     /* free instance norm handle if created (signature:
      * mlx_nn_instancenorm_free(void*)) */
     if (m->norm) {
@@ -329,7 +383,18 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
         if (safe_mlx_conv2d(&y, x, *wptr, m->stride, m->stride, m->padding,
                             m->padding, 1, 1, 1, s) != 0) {
             /* conv failed: fallback to input */
+            mlx_stream_free(s);
             return x;
+        }
+        /* Apply bias: y = y + bias (matching Python nn.Conv2d) */
+        if (m->conv_bias) {
+            mlx_array biased = mlx_array_new();
+            if (mlx_add(&biased, y, *m->conv_bias, s) == 0) {
+                mlx_array_free(y);
+                y = biased;
+            } else {
+                mlx_array_free(biased);
+            }
         }
     } else {
         y = x;
@@ -397,6 +462,7 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
     mlx_array activated = mlx_leakyrelu_forward(m->activation, y);
     if (y.ctx != x.ctx && y.ctx != activated.ctx)
         mlx_array_free(y);
+    mlx_stream_free(s);
     return activated;
 }
 
@@ -438,8 +504,10 @@ mlx_array_t mlx_upsample_forward(MLXUpsample *m, mlx_array_t x) {
     mlx_stream s = mlx_default_gpu_stream_new();
 
     size_t ndim = mlx_array_ndim(x);
-    if (ndim != 4)
+    if (ndim != 4) {
+        mlx_stream_free(s);
         return x; /* expect NHWC */
+    }
     const int *shape = mlx_array_shape(x);
     int b = shape[0];
     int in_h = shape[1];
@@ -449,8 +517,10 @@ mlx_array_t mlx_upsample_forward(MLXUpsample *m, mlx_array_t x) {
     int out_h = m->out_h;
     int out_w = m->out_w;
 
-    if (in_h == out_h && in_w == out_w)
+    if (in_h == out_h && in_w == out_w) {
+        mlx_stream_free(s);
         return x;
+    }
 
     /* ALWAYS use bilinear interpolation (align_corners=True) for parity with Python.
      * Previous implementation used mlx_repeat_axis (nearest-neighbor) for integer
@@ -683,6 +753,7 @@ mlx_array_t mlx_upsample_forward(MLXUpsample *m, mlx_array_t x) {
     mlx_array_free(sum1);
     mlx_array_free(sum2);
 
+    mlx_stream_free(s);
     return out;
 }
 
@@ -697,8 +768,11 @@ struct MLXSPADE {
     /* weight arrays for convs: pointers to mlx_array allocated with
      * mlx_array_new_data */
     mlx_array *mlp_shared_w; /* shape: (hidden_nc, K, K, cond_nc) */
+    mlx_array *mlp_shared_b; /* shape: (hidden_nc,) */
     mlx_array *mlp_gamma_w;  /* shape: (norm_nc, K, K, hidden_nc) */
+    mlx_array *mlp_gamma_b;  /* shape: (norm_nc,) */
     mlx_array *mlp_beta_w;   /* shape: (norm_nc, K, K, hidden_nc) */
+    mlx_array *mlp_beta_b;   /* shape: (norm_nc,) */
     /* cache omitted for simplicity */
 };
 
@@ -714,8 +788,11 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
     m->padding = kernel_size / 2;
     m->norm = NULL;
     m->mlp_shared_w = NULL;
+    m->mlp_shared_b = NULL;
     m->mlp_gamma_w = NULL;
+    m->mlp_gamma_b = NULL;
     m->mlp_beta_w = NULL;
+    m->mlp_beta_b = NULL;
 
     /* Create InstanceNorm with affine=True to match Python */
     m->norm = mlx_nn_instancenorm_create(norm_nc, 1);
@@ -731,6 +808,7 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
     } else {
         mlx_array_free(sw);
     }
+    m->mlp_shared_b = mlx_alloc_array_ptr(mlx_init_conv_bias(hidden_nc));
 
     /* canonical: (out_ch=norm_nc, KH, KW, in_ch=hidden_nc) */
     int gshape[4] = {norm_nc, kernel_size, kernel_size, hidden_nc};
@@ -742,6 +820,7 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
     } else {
         mlx_array_free(gw);
     }
+    m->mlp_gamma_b = mlx_alloc_array_ptr(mlx_init_conv_bias(norm_nc));
 
     /* canonical: (out_ch=norm_nc, KH, KW, in_ch=hidden_nc) */
     int bshape[4] = {norm_nc, kernel_size, kernel_size, hidden_nc};
@@ -753,6 +832,7 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
     } else {
         mlx_array_free(bw);
     }
+    m->mlp_beta_b = mlx_alloc_array_ptr(mlx_init_conv_bias(norm_nc));
     return m;
 }
 
@@ -767,14 +847,17 @@ void mlx_spade_free(MLXSPADE *m) {
         mlx_array_free(*m->mlp_shared_w);
         mlx_free_pod((void **)&m->mlp_shared_w);
     }
+    mlx_free_array_ptr((void **)&m->mlp_shared_b);
     if (m->mlp_gamma_w) {
         mlx_array_free(*m->mlp_gamma_w);
         mlx_free_pod((void **)&m->mlp_gamma_w);
     }
+    mlx_free_array_ptr((void **)&m->mlp_gamma_b);
     if (m->mlp_beta_w) {
         mlx_array_free(*m->mlp_beta_w);
         mlx_free_pod((void **)&m->mlp_beta_w);
     }
+    mlx_free_array_ptr((void **)&m->mlp_beta_b);
     mlx_free_pod((void **)&m);
 }
 
@@ -786,8 +869,10 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     mlx_stream s = mlx_default_gpu_stream_new();
 
     /* Expect NHWC */
-    if (mlx_array_ndim(x) != 4 || mlx_array_ndim(conditioning_input) != 4)
+    if (mlx_array_ndim(x) != 4 || mlx_array_ndim(conditioning_input) != 4) {
+        mlx_stream_free(s);
         return x;
+    }
     const int *xshape = mlx_array_shape(x);
     const int *cshape = mlx_array_shape(conditioning_input);
     int bx = xshape[0], hx = xshape[1], wx = xshape[2], cx = xshape[3];
@@ -835,13 +920,25 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     if (!m->mlp_shared_w) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
+        mlx_stream_free(s);
         return x;
     }
     if (safe_mlx_conv2d(&shared, cond_up, *m->mlp_shared_w, 1, 1, m->padding,
                         m->padding, 1, 1, 1, s) != 0) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
+        mlx_stream_free(s);
         return x;
+    }
+    /* Apply shared conv bias */
+    if (m->mlp_shared_b) {
+        mlx_array tmp_b = mlx_array_new();
+        if (mlx_add(&tmp_b, shared, *m->mlp_shared_b, s) == 0) {
+            mlx_array_free(shared);
+            shared = tmp_b;
+        } else {
+            mlx_array_free(tmp_b);
+        }
     }
 
     /* activation */
@@ -857,6 +954,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
             mlx_array_free(cond_up);
         mlx_array_free(shared);
         mlx_array_free(shared_act);
+        mlx_stream_free(s);
         return x;
     }
     if (safe_mlx_conv2d(&gamma, shared_act, *m->mlp_gamma_w, 1, 1, m->padding,
@@ -865,7 +963,18 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
             mlx_array_free(cond_up);
         mlx_array_free(shared);
         mlx_array_free(shared_act);
+        mlx_stream_free(s);
         return x;
+    }
+    /* Apply gamma conv bias */
+    if (m->mlp_gamma_b) {
+        mlx_array tmp_b = mlx_array_new();
+        if (mlx_add(&tmp_b, gamma, *m->mlp_gamma_b, s) == 0) {
+            mlx_array_free(gamma);
+            gamma = tmp_b;
+        } else {
+            mlx_array_free(tmp_b);
+        }
     }
     if (safe_mlx_conv2d(&beta, shared_act, *m->mlp_beta_w, 1, 1, m->padding,
                         m->padding, 1, 1, 1, s) != 0) {
@@ -874,7 +983,18 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(shared);
         mlx_array_free(shared_act);
         mlx_array_free(gamma);
+        mlx_stream_free(s);
         return x;
+    }
+    /* Apply beta conv bias */
+    if (m->mlp_beta_b) {
+        mlx_array tmp_b = mlx_array_new();
+        if (mlx_add(&tmp_b, beta, *m->mlp_beta_b, s) == 0) {
+            mlx_array_free(beta);
+            beta = tmp_b;
+        } else {
+            mlx_array_free(tmp_b);
+        }
     }
 
     if (cond_up_alloc)
@@ -889,6 +1009,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     if (mlx_mean_axes(&mean, x, axes, 2, true, s) != 0) {
         mlx_array_free(gamma);
         mlx_array_free(beta);
+        mlx_stream_free(s);
         return x;
     }
     mlx_array centered = mlx_array_new();
@@ -896,6 +1017,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(mean);
         mlx_array_free(gamma);
         mlx_array_free(beta);
+        mlx_stream_free(s);
         return x;
     }
     mlx_array sq = mlx_array_new();
@@ -904,6 +1026,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(centered);
         mlx_array_free(gamma);
         mlx_array_free(beta);
+        mlx_stream_free(s);
         return x;
     }
     mlx_array var = mlx_array_new();
@@ -913,6 +1036,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(sq);
         mlx_array_free(gamma);
         mlx_array_free(beta);
+        mlx_stream_free(s);
         return x;
     }
     mlx_array eps = mlx_array_new_float(1e-5f);
@@ -925,6 +1049,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
+        mlx_stream_free(s);
         return x;
     }
     mlx_array std = mlx_array_new();
@@ -937,6 +1062,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
+        mlx_stream_free(s);
         return x;
     }
     mlx_array x_norm = mlx_array_new();
@@ -950,6 +1076,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
+        mlx_stream_free(s);
         return x;
     }
 
@@ -983,6 +1110,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(beta);
         mlx_array_free(eps);
         mlx_array_free(one);
+        mlx_stream_free(s);
         return x;
     }
 
@@ -1001,6 +1129,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(eps);
         mlx_array_free(one);
         mlx_array_free(one_plus_gamma);
+        mlx_stream_free(s);
         return x;
     }
 
@@ -1020,6 +1149,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(one);
         mlx_array_free(one_plus_gamma);
         mlx_array_free(scaled);
+        mlx_stream_free(s);
         return x;
     }
 
@@ -1044,6 +1174,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         if (out_ndim == 4) {
             const int *osh = mlx_array_shape(out);
         }
+        mlx_stream_free(s);
         return out;
     }
 }
@@ -1074,6 +1205,7 @@ void *mlx_spade_get_norm(MLXSPADE *m) {
 struct MLXSPADEConvBlock {
     MLXSPADE *spade;
     void *conv;
+    void *conv_bias; /* pointer to mlx_array bias */
     MLXLeakyReLU *activation;
     int stride;
     int padding;
@@ -1102,6 +1234,7 @@ MLXSPADEConvBlock *mlx_spadeconv_create(int in_ch, int out_ch, int cond_ch,
         return NULL;
     m->spade = mlx_spade_create(in_ch, cond_ch, spade_hidden, kernel_size);
     m->conv = NULL; /* will store pointer to mlx_array weight */
+    m->conv_bias = NULL;
     m->activation = mlx_leakyrelu_create(0.2f);
     m->stride = stride;
     m->padding = padding;
@@ -1119,6 +1252,8 @@ MLXSPADEConvBlock *mlx_spadeconv_create(int in_ch, int out_ch, int cond_ch,
     } else {
         mlx_array_free(w);
     }
+    /* Allocate conv bias (zero-initialised, shape [out_ch]) to match Python nn.Conv2d */
+    m->conv_bias = mlx_alloc_array_ptr(mlx_init_conv_bias(out_ch));
     return m;
 }
 
@@ -1131,6 +1266,7 @@ void mlx_spadeconv_free(MLXSPADEConvBlock *m) {
         mlx_free_pod((void **)&wptr);
         m->conv = NULL;
     }
+    mlx_free_array_ptr(&m->conv_bias);
     mlx_spade_free(m->spade);
     mlx_leakyrelu_free(m->activation);
     mlx_free_pod((void **)&m);
@@ -1170,7 +1306,19 @@ mlx_array_t mlx_spadeconv_forward(MLXSPADEConvBlock *m, mlx_array_t x,
                             m->padding, 1, 1, 1, s) != 0) {
             /* conv failed: cleanup and return input x */
             mlx_array_free(y);
+            mlx_stream_free(s);
             return x;
+        }
+        /* Apply conv bias */
+        if (m->conv_bias) {
+            mlx_array *bptr = (mlx_array *)m->conv_bias;
+            mlx_array biased = mlx_array_new();
+            if (mlx_add(&biased, out, *bptr, s) == 0) {
+                mlx_array_free(out);
+                out = biased;
+            } else {
+                mlx_array_free(biased);
+            }
         }
         /* debug: print conv output shape */
         {
@@ -1181,18 +1329,22 @@ mlx_array_t mlx_spadeconv_forward(MLXSPADEConvBlock *m, mlx_array_t x,
         }
         /* free intermediate activation result */
         mlx_array_free(y);
+        mlx_stream_free(s);
         return out;
     }
 
     /* no conv: return activated/spade-modulated tensor */
+    mlx_stream_free(s);
     return y;
 }
 
 struct MLXSPADEGenerator {
     void *init_conv;     /* pointer to mlx_array weight */
+    void *init_conv_bias; /* pointer to mlx_array bias */
     void **spade_blocks; /* array of pointers to MLXSPADEConvBlock */
     int n_blocks;
     void *tail_conv; /* pointer to mlx_array weight */
+    void *tail_conv_bias; /* pointer to mlx_array bias */
     MLXLeakyReLU *leaky_relu;
     void *activation; /* tanh handle (unused) */
     int padding_size;
@@ -1208,10 +1360,12 @@ MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
     if (mlx_alloc_pod((void **)&m, sizeof(MLXSPADEGenerator), 1) != 0)
         return NULL;
     m->init_conv = NULL; /* conv weight pointer */
+    m->init_conv_bias = NULL;
     int body_count = (num_layer - 2) > 0 ? (num_layer - 2) : 0;
     m->n_blocks = body_count;
     m->spade_blocks = NULL;
     m->tail_conv = NULL;
+    m->tail_conv_bias = NULL;
     m->padding_size = padding_size;
     m->kernel_size = kernel_size;
     /* Allocate init conv weights: (num_features, KH, KW, input_channels) */
@@ -1225,6 +1379,8 @@ MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
     } else {
         mlx_array_free(iw);
     }
+    /* init_conv bias (zero-initialised, shape [num_features]) */
+    m->init_conv_bias = mlx_alloc_array_ptr(mlx_init_conv_bias(num_features));
     if (body_count > 0) {
         m->spade_blocks = NULL;
         /* prefer helper allocation but fall back to calloc to match previous
@@ -1258,6 +1414,8 @@ MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
         } else {
             mlx_array_free(tw);
         }
+        /* tail_conv bias (zero-initialised, shape [output_channels]) */
+        m->tail_conv_bias = mlx_alloc_array_ptr(mlx_init_conv_bias(output_channels));
     }
     m->leaky_relu = mlx_leakyrelu_create(0.2f);
     m->activation = NULL; /* tanh handle if available */
@@ -1279,11 +1437,13 @@ void mlx_spadegen_free(MLXSPADEGenerator *m) {
         mlx_array_free(*iw);
         mlx_free_pod((void **)&iw);
     }
+    mlx_free_array_ptr(&m->init_conv_bias);
     if (m->tail_conv) {
         mlx_array *tw = (mlx_array *)m->tail_conv;
         mlx_array_free(*tw);
         mlx_free_pod((void **)&tw);
     }
+    mlx_free_array_ptr(&m->tail_conv_bias);
     mlx_leakyrelu_free(m->leaky_relu);
     mlx_free_pod((void **)&m);
 }
@@ -1308,7 +1468,19 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
         /* Use padding_size (not kernel_size/2) to match Python */
         int pad = m->padding_size;
         if (safe_mlx_conv2d(&x, cond, *iw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
+            mlx_stream_free(s);
             return cond;
+        }
+        /* Apply init_conv bias */
+        if (m->init_conv_bias) {
+            mlx_array *bptr = (mlx_array *)m->init_conv_bias;
+            mlx_array biased = mlx_array_new();
+            if (mlx_add(&biased, x, *bptr, s) == 0) {
+                mlx_array_free(x);
+                x = biased;
+            } else {
+                mlx_array_free(biased);
+            }
         }
         /* debug: print init conv output shape */
         {
@@ -1358,7 +1530,19 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
         if (safe_mlx_conv2d(&out, x, *tw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
             if (x.ctx != cond.ctx)
                 mlx_array_free(x);
+            mlx_stream_free(s);
             return cond;
+        }
+        /* Apply tail_conv bias */
+        if (m->tail_conv_bias) {
+            mlx_array *bptr = (mlx_array *)m->tail_conv_bias;
+            mlx_array biased = mlx_array_new();
+            if (mlx_add(&biased, out, *bptr, s) == 0) {
+                mlx_array_free(out);
+                out = biased;
+            } else {
+                mlx_array_free(biased);
+            }
         }
         /* tanh */
         mlx_array out_t = mlx_array_new();
@@ -1366,14 +1550,17 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
             mlx_array_free(out);
             if (x.ctx != cond.ctx)
                 mlx_array_free(x);
+            mlx_stream_free(s);
             return cond;
         }
         mlx_array_free(out);
         if (x.ctx != cond.ctx)
             mlx_array_free(x);
+        mlx_stream_free(s);
         return out_t;
     }
 
+    mlx_stream_free(s);
     return x;
 }
 
@@ -1498,6 +1685,7 @@ struct MLXSPADEDiscriminator {
     void **body;         /* array of MLXConvBlock pointers */
     int n_body;
     void *tail;          /* tail conv weight pointer */
+    void *tail_bias;     /* tail conv bias pointer */
     int kernel_size;
     int padding_size;
 };
@@ -1514,6 +1702,7 @@ MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
     m->n_body = body_count;
     m->body = NULL;
     m->tail = NULL;
+    m->tail_bias = NULL;
     m->kernel_size = kernel_size;
     m->padding_size = padding_size;
 
@@ -1550,6 +1739,8 @@ MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
         } else {
             mlx_array_free(tw);
         }
+        /* tail bias (zero-initialised, shape [1] since out_ch=1 for disc) */
+        m->tail_bias = mlx_alloc_array_ptr(mlx_init_conv_bias(1));
     }
     return m;
 }
@@ -1574,6 +1765,7 @@ void mlx_spadedisc_free(MLXSPADEDiscriminator *m) {
         mlx_free_pod((void **)&tw);
         m->tail = NULL;
     }
+    mlx_free_array_ptr(&m->tail_bias);
     mlx_free_pod((void **)&m);
 }
 
@@ -1590,38 +1782,136 @@ mlx_array *mlx_convblock_get_conv_weight(MLXConvBlock *m) {
     return m->conv;
 }
 
+mlx_array *mlx_convblock_get_conv_bias(MLXConvBlock *m) {
+    if (!m)
+        return NULL;
+    return (mlx_array *)m->conv_bias;
+}
+
+mlx_array *mlx_convblock_get_norm_weight(MLXConvBlock *m) {
+    if (!m || !m->norm)
+        return NULL;
+    return mlx_nn_instancenorm_get_weight(m->norm);
+}
+
+mlx_array *mlx_convblock_get_norm_bias(MLXConvBlock *m) {
+    if (!m || !m->norm)
+        return NULL;
+    return mlx_nn_instancenorm_get_bias(m->norm);
+}
+
+mlx_array *mlx_spadeconv_get_conv_bias(MLXSPADEConvBlock *m) {
+    if (!m)
+        return NULL;
+    return (mlx_array *)m->conv_bias;
+}
+
+mlx_array *mlx_spade_get_mlp_shared_b(MLXSPADE *m) {
+    if (!m)
+        return NULL;
+    return (mlx_array *)m->mlp_shared_b;
+}
+
+mlx_array *mlx_spade_get_mlp_gamma_b(MLXSPADE *m) {
+    if (!m)
+        return NULL;
+    return (mlx_array *)m->mlp_gamma_b;
+}
+
+mlx_array *mlx_spade_get_mlp_beta_b(MLXSPADE *m) {
+    if (!m)
+        return NULL;
+    return (mlx_array *)m->mlp_beta_b;
+}
+
+mlx_array *mlx_spadegen_get_init_conv_bias(MLXSPADEGenerator *m) {
+    if (!m)
+        return NULL;
+    return (mlx_array *)m->init_conv_bias;
+}
+
+mlx_array *mlx_spadegen_get_tail_conv_bias(MLXSPADEGenerator *m) {
+    if (!m)
+        return NULL;
+    return (mlx_array *)m->tail_conv_bias;
+}
+
+mlx_array *mlx_spadedisc_get_tail_bias(MLXSPADEDiscriminator *m) {
+    if (!m)
+        return NULL;
+    return (mlx_array *)m->tail_bias;
+}
+
 mlx_array **mlx_spadegen_get_parameters(MLXSPADEGenerator *m, int *out_count) {
     if (!m || !out_count)
         return NULL;
+
+    /* Helper: count all trainable parameters matching Python's nn.Module.parameters() */
+#define COUNT_IF(ptr) do { if ((ptr)) total++; } while(0)
+#define ADD_IF(ptr) do { if ((ptr)) list[idx++] = (mlx_array *)(ptr); } while(0)
+
+    /* --- Counting pass --- */
     int total = 0;
-    if (m->init_conv)
-        total++;
+    COUNT_IF(m->init_conv);
+    COUNT_IF(m->init_conv_bias);
     for (int i = 0; i < m->n_blocks; ++i) {
         MLXSPADEConvBlock *cb = (MLXSPADEConvBlock *)m->spade_blocks[i];
-        if (cb && cb->conv)
-            total++;
+        if (!cb) continue;
+        MLXSPADE *sp = cb->spade;
+        if (sp) {
+            COUNT_IF(mlx_nn_instancenorm_get_weight(sp->norm));
+            COUNT_IF(mlx_nn_instancenorm_get_bias(sp->norm));
+            COUNT_IF(sp->mlp_shared_w);
+            COUNT_IF(sp->mlp_shared_b);
+            COUNT_IF(sp->mlp_gamma_w);
+            COUNT_IF(sp->mlp_gamma_b);
+            COUNT_IF(sp->mlp_beta_w);
+            COUNT_IF(sp->mlp_beta_b);
+        }
+        COUNT_IF(cb->conv);
+        COUNT_IF(cb->conv_bias);
     }
-    if (m->tail_conv)
-        total++;
+    COUNT_IF(m->tail_conv);
+    COUNT_IF(m->tail_conv_bias);
+
     if (total == 0) {
         *out_count = 0;
         return NULL;
     }
+
     mlx_array **list = NULL;
     if (mlx_alloc_pod((void **)&list, sizeof(mlx_array *), total) != 0) {
         *out_count = 0;
         return NULL;
     }
+
+    /* --- Filling pass --- */
     int idx = 0;
-    if (m->init_conv)
-        list[idx++] = (mlx_array *)m->init_conv;
+    ADD_IF(m->init_conv);
+    ADD_IF(m->init_conv_bias);
     for (int i = 0; i < m->n_blocks; ++i) {
         MLXSPADEConvBlock *cb = (MLXSPADEConvBlock *)m->spade_blocks[i];
-        if (cb && cb->conv)
-            list[idx++] = (mlx_array *)cb->conv;
+        if (!cb) continue;
+        MLXSPADE *sp = cb->spade;
+        if (sp) {
+            ADD_IF(mlx_nn_instancenorm_get_weight(sp->norm));
+            ADD_IF(mlx_nn_instancenorm_get_bias(sp->norm));
+            ADD_IF(sp->mlp_shared_w);
+            ADD_IF(sp->mlp_shared_b);
+            ADD_IF(sp->mlp_gamma_w);
+            ADD_IF(sp->mlp_gamma_b);
+            ADD_IF(sp->mlp_beta_w);
+            ADD_IF(sp->mlp_beta_b);
+        }
+        ADD_IF(cb->conv);
+        ADD_IF(cb->conv_bias);
     }
-    if (m->tail_conv)
-        list[idx++] = (mlx_array *)m->tail_conv;
+    ADD_IF(m->tail_conv);
+    ADD_IF(m->tail_conv_bias);
+
+#undef COUNT_IF
+#undef ADD_IF
+
     *out_count = idx;
     return list;
 }
@@ -1635,36 +1925,69 @@ mlx_array **mlx_spadedisc_get_parameters(MLXSPADEDiscriminator *m,
         int *out_count) {
     if (!m || !out_count)
         return NULL;
+
+#define COUNT_IF(ptr) do { if ((ptr)) total++; } while(0)
+#define ADD_IF(ptr) do { if ((ptr)) list[idx++] = (mlx_array *)(ptr); } while(0)
+
+    /* --- Counting pass --- */
     int total = 0;
-    /* head is now a MLXConvBlock */
-    if (m->head && m->head->conv)
-        total++;
+    /* head ConvBlock: conv weight + bias + norm weight + bias */
+    if (m->head) {
+        COUNT_IF(m->head->conv);
+        COUNT_IF(m->head->conv_bias);
+        COUNT_IF(m->head->norm ? mlx_nn_instancenorm_get_weight(m->head->norm) : NULL);
+        COUNT_IF(m->head->norm ? mlx_nn_instancenorm_get_bias(m->head->norm) : NULL);
+    }
+    /* body ConvBlocks */
     for (int i = 0; i < m->n_body; ++i) {
         MLXConvBlock *cb = (MLXConvBlock *)m->body[i];
-        if (cb && cb->conv)
-            total++;
+        if (!cb) continue;
+        COUNT_IF(cb->conv);
+        COUNT_IF(cb->conv_bias);
+        COUNT_IF(cb->norm ? mlx_nn_instancenorm_get_weight(cb->norm) : NULL);
+        COUNT_IF(cb->norm ? mlx_nn_instancenorm_get_bias(cb->norm) : NULL);
     }
-    if (m->tail)
-        total++;
+    /* tail conv weight + bias */
+    COUNT_IF(m->tail);
+    COUNT_IF(m->tail_bias);
+
     if (total == 0) {
         *out_count = 0;
         return NULL;
     }
+
     mlx_array **list = NULL;
     if (mlx_alloc_pod((void **)&list, sizeof(mlx_array *), total) != 0) {
         *out_count = 0;
         return NULL;
     }
+
+    /* --- Filling pass --- */
     int idx = 0;
-    if (m->head && m->head->conv)
-        list[idx++] = (mlx_array *)m->head->conv;
+    if (m->head) {
+        ADD_IF(m->head->conv);
+        ADD_IF(m->head->conv_bias);
+        if (m->head->norm) {
+            ADD_IF(mlx_nn_instancenorm_get_weight(m->head->norm));
+            ADD_IF(mlx_nn_instancenorm_get_bias(m->head->norm));
+        }
+    }
     for (int i = 0; i < m->n_body; ++i) {
         MLXConvBlock *cb = (MLXConvBlock *)m->body[i];
-        if (cb && cb->conv)
-            list[idx++] = (mlx_array *)cb->conv;
+        if (!cb) continue;
+        ADD_IF(cb->conv);
+        ADD_IF(cb->conv_bias);
+        if (cb->norm) {
+            ADD_IF(mlx_nn_instancenorm_get_weight(cb->norm));
+            ADD_IF(mlx_nn_instancenorm_get_bias(cb->norm));
+        }
     }
-    if (m->tail)
-        list[idx++] = (mlx_array *)m->tail;
+    ADD_IF(m->tail);
+    ADD_IF(m->tail_bias);
+
+#undef COUNT_IF
+#undef ADD_IF
+
     *out_count = idx;
     return list;
 }
@@ -1679,6 +2002,12 @@ mlx_array *mlx_spadedisc_get_head_conv(MLXSPADEDiscriminator *m) {
     if (!m || !m->head)
         return NULL;
     return (mlx_array *)m->head->conv;
+}
+
+MLXConvBlock *mlx_spadedisc_get_head_block(MLXSPADEDiscriminator *m) {
+    if (!m)
+        return NULL;
+    return m->head;
 }
 
 int mlx_spadedisc_get_body_count(MLXSPADEDiscriminator *m) {
@@ -1728,13 +2057,27 @@ mlx_array_t mlx_spadedisc_forward(MLXSPADEDiscriminator *m, mlx_array_t x) {
                             1, 1, 1, s) != 0) {
             if (cur.ctx != x.ctx)
                 mlx_array_free(cur);
+            mlx_stream_free(s);
             return x;
+        }
+        /* Apply tail bias */
+        if (m->tail_bias) {
+            mlx_array *bptr = (mlx_array *)m->tail_bias;
+            mlx_array biased = mlx_array_new();
+            if (mlx_add(&biased, out, *bptr, s) == 0) {
+                mlx_array_free(out);
+                out = biased;
+            } else {
+                mlx_array_free(biased);
+            }
         }
         if (cur.ctx != x.ctx)
             mlx_array_free(cur);
+        mlx_stream_free(s);
         return out;
     }
 
+    mlx_stream_free(s);
     return cur;
 }
 

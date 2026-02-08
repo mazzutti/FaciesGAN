@@ -32,6 +32,7 @@ static int process_optional(mlx_vector_array *out_vec,
             }
             mlx_array elem = mlx_array_new();
             if (mlx_vector_array_get(&elem, sample_v, si)) {
+                mlx_array_free(elem);
                 mlx_vector_array_free(scale_vec);
                 mlx_vector_array_free(sample_v);
                 return 1;
@@ -95,13 +96,22 @@ int facies_collate(mlx_vector_array *out_facies, mlx_vector_array *out_wells,
                    const mlx_vector_vector_array wells_samples,
                    const mlx_vector_vector_array seismic_samples,
                    const mlx_stream s) {
-    // Initialize outputs to empty vectors
-    if (out_facies)
+    // Initialize outputs to empty vectors (free any prior handle first)
+    if (out_facies) {
+        if ((*out_facies).ctx)
+            mlx_vector_array_free(*out_facies);
         *out_facies = mlx_vector_array_new();
-    if (out_wells)
+    }
+    if (out_wells) {
+        if ((*out_wells).ctx)
+            mlx_vector_array_free(*out_wells);
         *out_wells = mlx_vector_array_new();
-    if (out_seismic)
+    }
+    if (out_seismic) {
+        if ((*out_seismic).ctx)
+            mlx_vector_array_free(*out_seismic);
         *out_seismic = mlx_vector_array_new();
+    }
 
     size_t batch = mlx_vector_vector_array_size(facies_samples);
     if (batch == 0)
@@ -126,6 +136,7 @@ int facies_collate(mlx_vector_array *out_facies, mlx_vector_array *out_wells,
             }
             mlx_array elem = mlx_array_new();
             if (mlx_vector_array_get(&elem, sample_fac, si)) {
+                mlx_array_free(elem);
                 mlx_vector_array_free(scale_vec);
                 mlx_vector_array_free(sample_fac);
                 return 1;
@@ -203,10 +214,18 @@ int facies_collate(mlx_vector_array *out_facies, mlx_vector_array *out_wells,
     }
 
     // Process wells and seismic
-    if (process_optional(out_wells, wells_samples, s))
+    if (process_optional(out_wells, wells_samples, s)) {
+        if (out_facies) mlx_vector_array_free(*out_facies);
+        if (out_wells) mlx_vector_array_free(*out_wells);
+        if (out_seismic) mlx_vector_array_free(*out_seismic);
         return 1;
-    if (process_optional(out_seismic, seismic_samples, s))
+    }
+    if (process_optional(out_seismic, seismic_samples, s)) {
+        if (out_facies) mlx_vector_array_free(*out_facies);
+        if (out_wells) mlx_vector_array_free(*out_wells);
+        if (out_seismic) mlx_vector_array_free(*out_seismic);
         return 1;
+    }
 
     return 0;
 }

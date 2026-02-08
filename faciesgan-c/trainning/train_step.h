@@ -66,10 +66,20 @@ typedef struct MLXResults
     MLXScaleResults *scales; /* malloc'd array of length n_scales */
 } MLXResults;
 
+/* Mode flags for collect_metrics_and_grads_native: control which
+   gradient computations are performed per call.  Using DISC_ONLY in
+   the discriminator loop and GEN_ONLY in the generator loop avoids
+   wasted forward/backward passes and keeps the RNG state aligned
+   with the Python implementation. */
+#define MLX_COLLECT_BOTH      0
+#define MLX_COLLECT_DISC_ONLY 1
+#define MLX_COLLECT_GEN_ONLY  2
+
 /* Collect per-scale metrics and gradient arrays for generator and
    discriminator using MLX's native value_and_grad.
    Caller receives malloc'd MLXResults and must free it via
-   `mlx_results_free`. Returns 0 on success. */
+   `mlx_results_free`. Returns 0 on success.
+   `mode` selects which gradients to compute (see MLX_COLLECT_* above). */
 int mlx_faciesgan_collect_metrics_and_grads_native(
     MLXFaciesGAN *m,
     const int *indexes,
@@ -85,6 +95,7 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
     float well_loss_penalty,
     float alpha,
     float lambda_grad,
+    int mode,
     MLXResults **out_results);
 
 void mlx_results_free(MLXResults *res);

@@ -210,11 +210,15 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
                  local_n, opts->num_img_channels, use_wells, use_seismic,
                  opts->manual_seed, cache_npz, sizeof(cache_npz), &actual_samples);
     if (rc != 0) {
+        if (local_alloc)
+            free(local_scales);
         return -1;
     }
 
     mlx_array *fac = NULL;
     if (mlx_alloc_mlx_array_vals(&fac, local_n) != 0) {
+        if (local_alloc)
+            free(local_scales);
         return -1;
     }
 
@@ -340,6 +344,8 @@ int to_facies_pyramids(const TrainningOptions *opts, int channels_last,
     }
     *out = fac;
     *out_count = local_n;
+    if (local_alloc)
+        free(local_scales);
     return 0;
 }
 
@@ -376,6 +382,8 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
 
     mlx_array *seis = NULL;
     if (mlx_alloc_mlx_array_vals(&seis, local_n) != 0) {
+        if (local_alloc)
+            free(local_scales);
         return -1;
     }
 
@@ -495,6 +503,8 @@ int to_seismic_pyramids(const TrainningOptions *opts, int channels_last,
     }
     *out = seis;
     *out_count = local_n;
+    if (local_alloc)
+        free(local_scales);
     return 0;
 }
 
@@ -531,6 +541,8 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
 
     mlx_array *wells = NULL;
     if (mlx_alloc_mlx_array_vals(&wells, local_n) != 0) {
+        if (local_alloc)
+            free(local_scales);
         return -1;
     }
 
@@ -652,5 +664,7 @@ int to_wells_pyramids(const TrainningOptions *opts, int channels_last,
 
     *out = wells;
     *out_count = local_n;
+    if (local_alloc)
+        free(local_scales);
     return 0;
 }

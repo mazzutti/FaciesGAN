@@ -141,6 +141,14 @@ int mlx_faciesgan_get_use_create_graph_gp(void);
    arrays, preventing memory accumulation during training. */
 int mlx_faciesgan_eval_all_parameters(MLXFaciesGAN *m);
 
+/* Store a reconstruction noise tensor for the given scale.
+   Mirrors Python: self.model.rec_noise.append(z_rec).
+   The array is deep-copied. */
+int mlx_faciesgan_store_rec_noise(MLXFaciesGAN *m, int scale,
+                                  const mlx_array *noise);
+/* Return the number of stored rec_noise entries. */
+int mlx_faciesgan_get_n_rec_noise(MLXFaciesGAN *m);
+
 #ifdef __cplusplus
 }
 #endif

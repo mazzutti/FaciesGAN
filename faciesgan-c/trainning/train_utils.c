@@ -97,7 +97,9 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
 int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
                                int n_indexes, const mlx_array *real,
                                mlx_array **wells_pyramid,
-                               mlx_array **seismic_pyramid) {
+                               mlx_array **seismic_pyramid,
+                               float scale0_noise_amp, float noise_amp_factor,
+                               float min_noise_amp) {
     if (!m || !real)
         return -1;
     if (scale < 0)
@@ -106,48 +108,96 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     /* Acquire global MLX lock for all MLX operations in this function */
     mlx_global_lock();
 
-    /* if noise amps already set up to this scale, nothing to do */
-    float *amps = NULL;
-    int n_amps = 0;
-    if (mlx_faciesgan_get_noise_amps(m, &amps, &n_amps) == 0) {
-        if (amps) {
-            if (n_amps > scale) {
-                mlx_free_float_buf(&amps, &n_amps);
-                mlx_global_unlock();
-                return 0;
+    /* Mirror Python: if len(self.model.rec_noise) > scale: return
+     * i.e. if we already stored rec noise (and therefore amp) for this scale,
+     * nothing to do. */
+    if (mlx_faciesgan_get_n_rec_noise(m) > scale) {
+        mlx_global_unlock();
+        return 0;
+    }
+
+    /* === Generate and store reconstruction noise for this scale ===
+     * Mirrors Python:
+     *   scale 0: z_rec = generate_noise((*real.shape[1:3], noise_channels))
+     *            → ALL channels are pure random noise (no actual conditioning)
+     *   scale>0: z_rec = generate_noise(reduced_shape) + concat(wells, seismic)
+     *            → noise channels + actual conditioning data
+     * Python pads with zero_padding in both cases. */
+    {
+        mlx_array **rec_gen = NULL;
+        int n_rec_gen = 0;
+        /* FIX 33: At scale 0, Python generates z_rec as ALL random noise with
+         * noise_channels total channels — it does NOT concatenate actual
+         * conditioning data. Passing NULL wells/seismic to get_pyramid_noise
+         * produces gen_input_channels of pure noise, matching Python. */
+        mlx_array **rec_wells = (scale == 0) ? NULL : wells_pyramid;
+        mlx_array **rec_seis  = (scale == 0) ? NULL : seismic_pyramid;
+        if (mlx_faciesgan_get_pyramid_noise(m, scale, indexes, n_indexes,
+                                            &rec_gen, &n_rec_gen,
+                                            rec_wells, rec_seis,
+                                            0) == 0 && n_rec_gen > scale) {
+            /* Store noise for THIS scale (rec_gen[scale]) */
+            mlx_faciesgan_store_rec_noise(m, scale, rec_gen[scale]);
+            /* Free the generated noise arrays */
+            for (int ri = 0; ri < n_rec_gen; ++ri) {
+                if (rec_gen[ri]) {
+                    mlx_array_free(*rec_gen[ri]);
+                    mlx_free_pod((void **)&rec_gen[ri]);
+                }
             }
-            mlx_free_float_buf(&amps, &n_amps);
+            mlx_free_pod((void **)&rec_gen);
         }
     }
 
-    /* Defaults (match Python defaults in options.c) */
-    const double default_scale0_noise_amp = 1.0;
-    const double default_noise_amp = 0.1;
-    const double default_min_noise_amp = 0.1;
-
-    /* get pyramid noises */
+    /* get pyramid noises for amp computation.
+     * Python scale 0: get_pyramid_noise(scale, indexes) - NO wells/seismic
+     * Python scale>0: get_pyramid_noise(scale, indexes, wells, seismic) */
     mlx_array **noises = NULL;
     int n_noises = 0;
-    if (mlx_faciesgan_get_pyramid_noise(m, scale, indexes, n_indexes, &noises,
-                                        &n_noises, wells_pyramid, seismic_pyramid,
-                                        0) != 0) {
-        mlx_global_unlock();
-        return -1;
+    if (scale == 0) {
+        /* Scale 0: no conditioning in noise for amp computation */
+        if (mlx_faciesgan_get_pyramid_noise(m, scale, indexes, n_indexes, &noises,
+                                            &n_noises, NULL, NULL, 0) != 0) {
+            mlx_global_unlock();
+            return -1;
+        }
+    } else {
+        /* Scale > 0: include conditioning */
+        if (mlx_faciesgan_get_pyramid_noise(m, scale, indexes, n_indexes, &noises,
+                                            &n_noises, wells_pyramid, seismic_pyramid,
+                                            0) != 0) {
+            mlx_global_unlock();
+            return -1;
+        }
     }
 
-    /* obtain amplitude list for generation (will be freed) */
+    /* obtain amplitude list for generation.
+     * Python scale 0: [1.0] * (scale + 1) = [1.0]
+     * Python scale>0: self.model.noise_amps + [1.0] */
     float *use_amps = NULL;
     int use_n = 0;
-    if (mlx_faciesgan_get_noise_amplitude(m, scale, &use_amps, &use_n) != 0) {
-        /* fallback to ones */
-        if (mlx_alloc_float_buf(&use_amps, scale + 1) != 0) {
+    if (scale == 0) {
+        /* Scale 0: all amps are 1.0 */
+        use_n = 1;
+        if (mlx_alloc_float_buf(&use_amps, use_n) != 0) {
             mlx_free_mlx_array_ptrs(&noises, n_noises);
             mlx_global_unlock();
             return -1;
         }
-        for (int i = 0; i < scale + 1; ++i)
-            use_amps[i] = 1.0f;
-        use_n = scale + 1;
+        use_amps[0] = 1.0f;
+    } else {
+        /* Scale > 0: existing amps + [1.0] for new scale */
+        if (mlx_faciesgan_get_noise_amplitude(m, scale, &use_amps, &use_n) != 0) {
+            /* fallback to ones */
+            use_n = scale + 1;
+            if (mlx_alloc_float_buf(&use_amps, use_n) != 0) {
+                mlx_free_mlx_array_ptrs(&noises, n_noises);
+                mlx_global_unlock();
+                return -1;
+            }
+            for (int i = 0; i < use_n; ++i)
+                use_amps[i] = 1.0f;
+        }
     }
 
     /* generate fake for this scale (numeric forward) */
@@ -163,70 +213,46 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
             return -1;
         }
         for (int i = 0; i < n_noises; ++i) {
-            /* Create an independent mlx_array value for each noise entry to avoid
-               sharing underlying buffers with `noises` which would lead to
-               double-free when both containers are freed. Prefer a deep copy via
-               `mlx_copy` onto a CPU stream; fall back to `mlx_array_set` if copy
-               fails. */
             mlx_stream _s = mlx_default_gpu_stream_new();
             mlx_array tmp_dst = mlx_array_new();
             if (mlx_copy(&tmp_dst, *noises[i], _s) == 0) {
-                /* replace the initially-allocated element with the copied value */
                 mlx_array_free(zvals[i]);
                 zvals[i] = tmp_dst;
             } else {
-                /* copy failed: fallback to aliasing via set (less safe) */
                 mlx_array_free(tmp_dst);
                 mlx_array_free(zvals[i]);
                 mlx_array_set(&zvals[i], *noises[i]);
             }
             mlx_stream_free(_s);
         }
-        /* Ensure none of the zvals are empty -- replace empty entries with zeros */
+        /* Ensure none of the zvals are empty */
         for (int i = 0; i < n_noises; ++i) {
             if (mlx_array_ndim(zvals[i]) == 0) {
                 mlx_stream _s = mlx_default_gpu_stream_new();
                 int shape0[4] = {1, 32, 32, 1};
                 mlx_array tmp = mlx_array_new();
                 if (mlx_zeros(&tmp, shape0, 4, MLX_FLOAT32, _s) == 0) {
-                    mlx_array_free(zvals[i]);  /* free old empty array before replacing */
+                    mlx_array_free(zvals[i]);
                     zvals[i] = tmp;
                 } else {
-                    mlx_array_free(tmp);  /* free tmp if zeros failed */
+                    mlx_array_free(tmp);
                 }
                 mlx_stream_free(_s);
             }
         }
     }
 
-    /* pick an initial in_noise: prefer a zero array sized from the first noise
-       minus the full_zero_padding so the generator starts with the expected
-       spatial dims. If generator info isn't available, fall back to empty. */
-    mlx_array in_noise = mlx_array_new();
-    if (n_noises > 0) {
-        /* Prefer deriving initial in_noise spatial size from the provided `real`
-           image so fake and real match for RMSE. Fall back to leaving in_noise
-           empty if real shape is unavailable. */
-        if (real) {
-            const int *rshape = mlx_array_shape(*real);
-            if (rshape) {
-                int osh[4] = {rshape[0], rshape[1], rshape[2], rshape[3]};
-                mlx_stream _s = mlx_default_gpu_stream_new();
-                mlx_array tmp = mlx_array_new();
-                if (mlx_zeros(&tmp, osh, 4, MLX_FLOAT32, _s) == 0) {
-                    mlx_array_free(in_noise);  /* free original empty before replacing */
-                    in_noise = tmp;
-                } else {
-                    mlx_array_free(tmp);  /* free tmp if zeros failed */
-                }
-                mlx_stream_free(_s);
-            }
-        }
-    }
+    /* FIX: Python uses in_noise=None (default) and start_scale=0 (default)
+     * for BOTH scale 0 and scale > 0. This runs the FULL progressive chain
+     * from scale 0 to stop_scale, which is critical for correct RMSE at
+     * scale > 0.
+     *
+     * Previously C used: in_noise=zeros(real_shape), start_scale=scale,
+     * stop_scale=scale which only ran the current scale with zero input. */
+    mlx_array in_noise = mlx_array_new();  /* empty = no in_noise (Python None) */
 
-    /* Print shapes for real and pyramids to help debug broadcasting issues */
     mlx_array_t fake = mlx_faciesgan_generate_fake(m, zvals, n_noises, use_amps,
-                       use_n, in_noise, scale, scale);
+                       use_n, in_noise, 0 /* start_scale=0 */, scale);
 
     /* free noises (we free underlying arrays and the pointer container) */
     mlx_free_mlx_array_ptrs(&noises, n_noises);
@@ -235,47 +261,19 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     if (use_amps)
         mlx_free_float_buf(&use_amps, &use_n);
 
-    /* compute rmse = sqrt(mean((fake - real)^2)) */
+    /* compute rmse = sqrt(mean((fake - real)^2))
+     * Python: rmse = mx.sqrt(nn.losses.mse_loss(fake, real))
+     * No padding of real - shapes should match since we now use the full
+     * progressive chain (start_scale=0). */
     mlx_stream s = mlx_default_gpu_stream_new();
-    /* Ensure `real` matches `fake` spatial dims by padding `real` symmetrically
-       when needed. Use the padded copy for subtraction to compute RMSE. */
-    const int *fshape = mlx_array_shape(fake);
-    const int *rshape = mlx_array_shape(*real);
-    mlx_array real_to_use = *real;
-    int created_real_pad = 0;
-    if (fshape && rshape && (fshape[1] != rshape[1] || fshape[2] != rshape[2])) {
-        int dh = fshape[1] - rshape[1];
-        int dw = fshape[2] - rshape[2];
-        int low_h = dh > 0 ? dh / 2 : 0;
-        int high_h = dh > 0 ? dh - low_h : 0;
-        int low_w = dw > 0 ? dw / 2 : 0;
-        int high_w = dw > 0 ? dw - low_w : 0;
-        int axes[2] = {1, 2};
-        int low_pad[2] = {low_h, low_w};
-        int high_pad[2] = {high_h, high_w};
-        mlx_array pad_zero = mlx_array_new_float(0.0f);
-        mlx_array padded_real = mlx_array_new();
-        if (mlx_pad(&padded_real, *real, axes, 2, low_pad, 2, high_pad, 2, pad_zero,
-                    "constant", s) == 0) {
-            real_to_use = padded_real;
-            created_real_pad = 1;
-        } else {
-            mlx_array_free(padded_real);
-        }
-        mlx_array_free(pad_zero);
-    }
     mlx_array diff = mlx_array_new();
-    if (mlx_subtract(&diff, fake, real_to_use, s) != 0) {
-        if (created_real_pad)
-            mlx_array_free(real_to_use);
+    if (mlx_subtract(&diff, fake, *real, s) != 0) {
         mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
         mlx_global_unlock();
         return -1;
     }
-    if (created_real_pad)
-        mlx_array_free(real_to_use);
     mlx_array sq = mlx_array_new();
     int sq_rc = mlx_square(&sq, diff, s);
     if (sq_rc != 0) {
@@ -310,26 +308,29 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     }
     mlx_array_free(mean);
 
-    /* extract scalar value (skip host eval when disabled via env var to avoid
-       invoking device schedulers in smoke runs) */
+    /* FIX: Force evaluation before reading the scalar value.
+     * MLX uses lazy evaluation - without eval, the computation graph
+     * may not be materialized and mlx_array_data_float32 returns NULL. */
+    mlx_array_eval(root);
+
     double rmse = 0.0;
-    /* Prefer reading host value only when available to avoid forcing device eval
-     */
-    bool ok_root = false;
-    if (_mlx_array_is_available(&ok_root, root) == 0 && ok_root) {
+    {
         const float *pdata = mlx_array_data_float32(root);
         if (pdata)
             rmse = (double)pdata[0];
-    } else {
-        rmse = 0.0;
     }
 
-    /* compute new amp */
-    double amp = default_noise_amp * rmse;
-    if (scale == 0)
-        amp = default_scale0_noise_amp * rmse;
-    if (amp < default_min_noise_amp)
-        amp = default_min_noise_amp;
+    /* Compute new amp matching Python exactly:
+     * Scale 0: amp = scale0_noise_amp * rmse (NO min clamping)
+     * Scale>0: amp = max(noise_amp * rmse, min_noise_amp) */
+    double amp = 0.0;
+    if (scale == 0) {
+        amp = (double)scale0_noise_amp * rmse;
+    } else {
+        amp = (double)noise_amp_factor * rmse;
+        if (amp < (double)min_noise_amp)
+            amp = (double)min_noise_amp;
+    }
 
     /* Build new amp array (scale+1) by copying existing amps if present */
     float *new_amps = NULL;
@@ -342,8 +343,12 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         return -1;
     }
     /* try to read existing amps to preserve previous values */
+    float *amps = NULL;
+    int n_amps = 0;
+    int prev_n_amps = 0;  /* remember count before free zeroes it */
     if (mlx_faciesgan_get_noise_amps(m, &amps, &n_amps) == 0 && amps &&
             n_amps > 0) {
+        prev_n_amps = n_amps;
         for (int i = 0; i < scale + 1; ++i)
             new_amps[i] = (i < n_amps) ? amps[i] : 1.0f;
         mlx_free_float_buf(&amps, &n_amps);
@@ -351,7 +356,14 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         for (int i = 0; i < scale + 1; ++i)
             new_amps[i] = 1.0f;
     }
-    new_amps[scale] = (float)amp;
+
+    /* FIX: For scale > 0 when amp already exists, AVERAGE with existing value
+     * matching Python: self.model.noise_amps[scale] = (amp + existing) / 2 */
+    if (scale > 0 && scale < prev_n_amps && prev_n_amps > 0) {
+        new_amps[scale] = (float)((amp + (double)new_amps[scale]) / 2.0);
+    } else {
+        new_amps[scale] = (float)amp;
+    }
 
     /* set on model */
     int res = mlx_faciesgan_set_noise_amps(m, new_amps, scale + 1);

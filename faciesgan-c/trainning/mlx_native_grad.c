@@ -132,15 +132,61 @@ static int gen_loss_closure(mlx_vector_array *result,
         mlx_array_free(traced_param);
     }
 
-    /* Forward pass: generate fake using generator */
+    /* ================================================================
+     * FIX 34: Generate ALL diversity samples FIRST, then use fakes[0]
+     * for adversarial + well loss.  This matches Python exactly:
+     *   fake_samples = self.generate_diverse_samples(indexes, scale, wells, seismic)
+     *   fake = fake_samples[0]
+     *   metrics.fake = compute_adversarial_loss(scale, fake)
+     *   metrics.well = compute_masked_loss(fake, real, well, mask)
+     *   metrics.div  = compute_diversity_loss(fake_samples)
+     * ================================================================ */
     MLXGenerator *gen = mlx_faciesgan_build_generator(p->model);
-    mlx_array fake = mlx_generator_forward(gen, p->z_list, p->z_count,
-                                           p->amp, p->amp_count,
-    (mlx_array) {
-        0
-    }, 0, p->scale);
+    int n_samples = p->num_diversity_samples > 0 ? p->num_diversity_samples : 1;
+    mlx_array *fakes = malloc(n_samples * sizeof(mlx_array));
+    if (!fakes) {
+        fprintf(stderr, "[gen_loss_closure] malloc failed for fakes\n");
+        mlx_stream_free(s);
+        return 1;
+    }
+    for (int di = 0; di < n_samples; ++di) {
+        /* Generate fresh pyramid noise with conditioning (like Python's
+         * generate_diverse_samples → get_pyramid_noise per sample) */
+        mlx_array **noise_ptrs = NULL;
+        int n_noises = 0;
+        if (mlx_faciesgan_get_pyramid_noise(
+                p->model, p->scale, p->indexes, p->n_indexes,
+                &noise_ptrs, &n_noises,
+                p->wells_pyramid, p->seismic_pyramid, /*rec=*/0) == 0 && n_noises > 0) {
+            mlx_array *z_list_d = malloc(n_noises * sizeof(mlx_array));
+            if (z_list_d) {
+                for (int ni = 0; ni < n_noises; ++ni)
+                    z_list_d[ni] = noise_ptrs[ni] ? *noise_ptrs[ni] : (mlx_array){0};
+                fakes[di] = mlx_generator_forward(gen, z_list_d, n_noises,
+                    p->amp, p->amp_count, (mlx_array){0}, 0, p->scale);
+                free(z_list_d);
+            } else {
+                fakes[di] = mlx_array_new();
+            }
+            for (int ni = 0; ni < n_noises; ++ni) {
+                if (noise_ptrs[ni]) {
+                    mlx_array_free(*noise_ptrs[ni]);
+                    free(noise_ptrs[ni]);
+                }
+            }
+            free(noise_ptrs);
+        } else {
+            fakes[di] = mlx_array_new();
+        }
+    }
+
+    /* Python: fake = fake_samples[0] */
+    mlx_array fake = fakes[0]; /* alias — freed with fakes array later */
     if (!fake.ctx) {
         fprintf(stderr, "[gen_loss_closure] generator forward failed\n");
+        for (int di = 0; di < n_samples; ++di)
+            if (fakes[di].ctx) mlx_array_free(fakes[di]);
+        free(fakes);
         mlx_stream_free(s);
         return 1;
     }
@@ -173,19 +219,23 @@ static int gen_loss_closure(mlx_vector_array *result,
     mlx_array div_loss = mlx_array_new_float(0.0f);
 
     /* Compute well/masked loss if provided:
-     * well_loss_penalty * mean(mask * (fake - real)^2) */
+     * Python: well_loss_penalty * mse_loss(fake * mask, real * mask)
+     *       = well_loss_penalty * mean((fake * mask - real * mask)^2) */
     if (p->well.ctx && p->mask.ctx && p->well_loss_penalty > 0.0f) {
+        mlx_array fake_masked = mlx_array_new();
+        mlx_multiply(&fake_masked, fake, p->mask, s);
+
+        mlx_array real_masked = mlx_array_new();
+        mlx_multiply(&real_masked, p->real, p->mask, s);
+
         mlx_array diff = mlx_array_new();
-        mlx_subtract(&diff, fake, p->real, s);
+        mlx_subtract(&diff, fake_masked, real_masked, s);
 
         mlx_array diff_sq = mlx_array_new();
         mlx_square(&diff_sq, diff, s);
 
-        mlx_array masked = mlx_array_new();
-        mlx_multiply(&masked, p->mask, diff_sq, s);
-
         mlx_array masked_mean = mlx_array_new();
-        mlx_mean(&masked_mean, masked, false, s);
+        mlx_mean(&masked_mean, diff_sq, false, s);
 
         mlx_array penalty_arr = mlx_array_new_float(p->well_loss_penalty);
 
@@ -198,9 +248,10 @@ static int gen_loss_closure(mlx_vector_array *result,
         mlx_array_free(total_loss);
         total_loss = new_total;
 
+        mlx_array_free(fake_masked);
+        mlx_array_free(real_masked);
         mlx_array_free(diff);
         mlx_array_free(diff_sq);
-        mlx_array_free(masked);
         mlx_array_free(masked_mean);
         mlx_array_free(penalty_arr);
     }
@@ -211,73 +262,70 @@ static int gen_loss_closure(mlx_vector_array *result,
         mlx_array_set(&p->out_metrics->well, well_loss);
     }
 
-    /* Compute diversity loss: -lambda * mean(|fake1 - fake2|)
-     * Encourages different outputs for different noise inputs.
-     * We need to generate fake2 with DIFFERENT random noise than fake1. */
-    if (p->num_diversity_samples > 1 && p->lambda_diversity > 0.0f) {
-        /* Generate new random noise for diversity sample */
-        mlx_array *z_list2 = malloc(p->z_count * sizeof(mlx_array));
-        int z_list2_valid = (z_list2 != NULL);
-
-        if (z_list2_valid) {
-            for (int zi = 0; zi < p->z_count; ++zi) {
-                /* Get shape from original noise */
-                int ndim = (int)mlx_array_ndim(p->z_list[zi]);
-                const int *shape = mlx_array_shape(p->z_list[zi]);
-
-                /* Generate new random noise with same shape */
-                z_list2[zi] = mlx_array_new();
-                mlx_array zero = mlx_array_new_float(0.0f);
-                mlx_array one = mlx_array_new_float(1.0f);
-                mlx_array empty_key = {0};
-                mlx_random_normal(&z_list2[zi], shape, ndim, MLX_FLOAT32, 0.0f, 1.0f, empty_key, s);
-                mlx_array_free(zero);
-                mlx_array_free(one);
-            }
-        }
-
-        if (z_list2_valid) {
-            mlx_array fake2 = mlx_generator_forward(gen, z_list2, p->z_count,
-                                                    p->amp, p->amp_count,
-            (mlx_array) {
-                0
-            }, 0, p->scale);
-            if (fake2.ctx) {
+    /* Compute diversity loss matching Python exactly:
+     *   For each pair (i,j) of diversity samples:
+     *     sq_diffs = mean((fake_i - fake_j)^2)
+     *     diversity = exp(-10 * sq_diffs)
+     *   loss = lambda * mean(all pairwise diversity values)
+     *
+     * fakes[] was already generated above (all samples with fresh noise). */
+    if (n_samples > 1 && p->lambda_diversity > 0.0f) {
+        /* Compute pairwise exp(-10 * mean((fi-fj)^2)) */
+        mlx_array acc = mlx_array_new_float(0.0f);
+        int pairs = 0;
+        for (int i = 0; i < n_samples; ++i) {
+            for (int j = i + 1; j < n_samples; ++j) {
+                if (!fakes[i].ctx || !fakes[j].ctx) continue;
                 mlx_array diff = mlx_array_new();
-                mlx_subtract(&diff, fake, fake2, s);
-
-                mlx_array abs_diff = mlx_array_new();
-                mlx_abs(&abs_diff, diff, s);
-
-                mlx_array mean_diff = mlx_array_new();
-                mlx_mean(&mean_diff, abs_diff, false, s);
-
-                /* -lambda * mean_diff (negative because we want to maximize diversity) */
-                float neg_lambda = -p->lambda_diversity;
-                mlx_array lambda_arr = mlx_array_new_float(neg_lambda);
-
-                mlx_array_free(div_loss);
-                div_loss = mlx_array_new();
-                mlx_multiply(&div_loss, lambda_arr, mean_diff, s);
-
-                mlx_array new_total = mlx_array_new();
-                mlx_add(&new_total, total_loss, div_loss, s);
-                mlx_array_free(total_loss);
-                total_loss = new_total;
-
+                mlx_subtract(&diff, fakes[i], fakes[j], s);
+                mlx_array sq = mlx_array_new();
+                mlx_square(&sq, diff, s);
+                mlx_array mean_sq = mlx_array_new();
+                mlx_mean(&mean_sq, sq, false, s);
+                /* exp(-10 * mean_sq) */
+                mlx_array neg10 = mlx_array_new_float(-10.0f);
+                mlx_array scaled = mlx_array_new();
+                mlx_multiply(&scaled, mean_sq, neg10, s);
+                mlx_array expval = mlx_array_new();
+                mlx_exp(&expval, scaled, s);
+                /* accumulate */
+                mlx_array new_acc = mlx_array_new();
+                if (mlx_add(&new_acc, acc, expval, s) == 0) {
+                    mlx_array_free(acc);
+                    acc = new_acc;
+                } else {
+                    mlx_array_free(new_acc);
+                }
                 mlx_array_free(diff);
-                mlx_array_free(abs_diff);
-                mlx_array_free(mean_diff);
-                mlx_array_free(lambda_arr);
-                mlx_array_free(fake2);
+                mlx_array_free(sq);
+                mlx_array_free(mean_sq);
+                mlx_array_free(neg10);
+                mlx_array_free(scaled);
+                mlx_array_free(expval);
+                pairs++;
             }
-
-            /* Cleanup z_list2 */
-            for (int zi = 0; zi < p->z_count; ++zi) {
-                mlx_array_free(z_list2[zi]);
-            }
-            free(z_list2);
         }
+
+        if (pairs > 0) {
+            /* mean of pairwise values */
+            mlx_array denom = mlx_array_new_float((float)pairs);
+            mlx_array mean_div = mlx_array_new();
+            mlx_divide(&mean_div, acc, denom, s);
+            /* lambda * mean_div */
+            mlx_array lambda_arr = mlx_array_new_float(p->lambda_diversity);
+            mlx_array_free(div_loss);
+            div_loss = mlx_array_new();
+            mlx_multiply(&div_loss, lambda_arr, mean_div, s);
+            /* add to total loss */
+            mlx_array new_total = mlx_array_new();
+            mlx_add(&new_total, total_loss, div_loss, s);
+            mlx_array_free(total_loss);
+            total_loss = new_total;
+            mlx_array_free(denom);
+            mlx_array_free(mean_div);
+            mlx_array_free(lambda_arr);
+        }
+        mlx_array_free(acc);
     }
 
     /* Store diversity loss in metrics */
@@ -375,7 +423,10 @@ static int gen_loss_closure(mlx_vector_array *result,
     mlx_vector_array_append_value(*result, total_loss);
 
     /* Cleanup */
-    mlx_array_free(fake);
+    /* fake is an alias for fakes[0] — free the whole fakes array instead */
+    for (int di = 0; di < n_samples; ++di)
+        if (fakes[di].ctx) mlx_array_free(fakes[di]);
+    free(fakes);
     mlx_array_free(d_fake);
     mlx_array_free(mean_d_fake);
     mlx_array_free(neg_one_arr);
@@ -425,6 +476,7 @@ static int gp_disc_forward_closure(mlx_vector_array *result,
     *result = mlx_vector_array_new();
     mlx_vector_array_append_value(*result, d_sum);
 
+    mlx_array_free(d_sum);
     mlx_array_free(x_interp);
     mlx_array_free(d_out);
     mlx_stream_free(s);
@@ -688,7 +740,12 @@ static int disc_loss_closure(mlx_vector_array *result,
     mlx_array_free(mean_fake);
     mlx_array_free(neg_one_arr);
     mlx_array_free(neg_real);
-    /* wgan_loss is same as total_loss, don't double-free */
+    /* wgan_loss was copied into total_loss via mlx_array_set; if GP was
+     * computed total_loss was replaced (and the shared ref freed) but
+     * wgan_loss still holds a dangling handle.  Free it unconditionally –
+     * mlx_array_free on an already-released handle is safe. */
+    mlx_array_free(wgan_loss);
+    mlx_array_free(total_loss);
     mlx_stream_free(s);
 
     return 0;
@@ -750,8 +807,13 @@ int mlx_native_compute_gen_loss_and_grads(
         return -1;
     }
 
-    if (!z_list_in || z_count_in <= 0 || !amp_in || amp_count_in <= 0) {
-        fprintf(stderr, "[mlx_native_compute_gen_loss_and_grads] noise arrays required\n");
+    if (!z_list_in || z_count_in <= 0) {
+        /* z_list is optional after Fix 34 — gen_loss_closure generates its
+         * own noise internally.  Only amp is strictly required. */
+    }
+
+    if (!amp_in || amp_count_in <= 0) {
+        fprintf(stderr, "[mlx_native_compute_gen_loss_and_grads] amp arrays required\n");
         return -1;
     }
 
@@ -772,22 +834,29 @@ int mlx_native_compute_gen_loss_and_grads(
         return -1;
     }
 
-    /* Copy z_list to internal storage (payload dtor will free these copies) */
-    mlx_array *z_list = malloc(z_count_in * sizeof(mlx_array));
-    if (!z_list) {
-        mlx_generator_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
-        return -1;
-    }
-    for (int i = 0; i < z_count_in; ++i) {
-        z_list[i] = mlx_array_new();
-        mlx_array_set(&z_list[i], z_list_in[i]);
+    /* Copy z_list to internal storage if provided (payload dtor handles NULL).
+     * After Fix 34 the gen_loss_closure generates its own noise, so z_list
+     * may be NULL when called from the GEN_ONLY path. */
+    mlx_array *z_list = NULL;
+    int z_count_copy = 0;
+    if (z_list_in && z_count_in > 0) {
+        z_list = malloc(z_count_in * sizeof(mlx_array));
+        if (!z_list) {
+            mlx_generator_free_parameters_list(param_ptrs);
+            mlx_stream_free(s);
+            return -1;
+        }
+        for (int i = 0; i < z_count_in; ++i) {
+            z_list[i] = mlx_array_new();
+            mlx_array_set(&z_list[i], z_list_in[i]);
+        }
+        z_count_copy = z_count_in;
     }
 
     /* Copy amp array */
     float *amp = malloc(amp_count_in * sizeof(float));
     if (!amp) {
-        for (int i = 0; i < z_count_in; ++i) mlx_array_free(z_list[i]);
+        for (int i = 0; i < z_count_copy; ++i) mlx_array_free(z_list[i]);
         free(z_list);
         mlx_generator_free_parameters_list(param_ptrs);
         mlx_stream_free(s);
@@ -798,7 +867,7 @@ int mlx_native_compute_gen_loss_and_grads(
     /* Create payload */
     GenClosurePayload *payload = calloc(1, sizeof(GenClosurePayload));
     if (!payload) {
-        for (int i = 0; i < z_count_in; ++i) mlx_array_free(z_list[i]);
+        for (int i = 0; i < z_count_copy; ++i) mlx_array_free(z_list[i]);
         free(z_list);
         free(amp);
         mlx_generator_free_parameters_list(param_ptrs);
@@ -819,7 +888,7 @@ int mlx_native_compute_gen_loss_and_grads(
         0
     };
     payload->z_list = z_list;
-    payload->z_count = z_count_in;
+    payload->z_count = z_count_copy;
     payload->amp = amp;
     payload->amp_count = amp_count_in;
     payload->lambda_diversity = lambda_diversity;

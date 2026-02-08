@@ -105,6 +105,7 @@ mlx_array **mlx_spadedisc_get_parameters(MLXSPADEDiscriminator *m, int *out_coun
 void mlx_spadedisc_free_parameters_list(mlx_array **list);
 /* Accessors for discriminator internals (useful for AG tracing) */
 mlx_array *mlx_spadedisc_get_head_conv(MLXSPADEDiscriminator *m);
+MLXConvBlock *mlx_spadedisc_get_head_block(MLXSPADEDiscriminator *m);
 int mlx_spadedisc_get_body_count(MLXSPADEDiscriminator *m);
 MLXConvBlock *mlx_spadedisc_get_body_at(MLXSPADEDiscriminator *m, int idx);
 mlx_array *mlx_spadedisc_get_tail_conv(MLXSPADEDiscriminator *m);
@@ -116,6 +117,24 @@ void mlx_colorquant_free(MLXColorQuantization *m);
 mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x, int training);
 
 /* (Instrumentation removed) */
+
+/* Bias / array helpers (used by generator.c etc.) */
+mlx_array mlx_init_conv_weight(const int *shape, int ndim, float std);
+mlx_array mlx_init_conv_bias(int out_ch);
+mlx_array *mlx_alloc_array_ptr(mlx_array arr);
+void mlx_free_array_ptr(void **pptr);
+
+/* Bias accessors for parameter collection */
+mlx_array *mlx_convblock_get_conv_bias(MLXConvBlock *m);
+mlx_array *mlx_convblock_get_norm_weight(MLXConvBlock *m);
+mlx_array *mlx_convblock_get_norm_bias(MLXConvBlock *m);
+mlx_array *mlx_spadeconv_get_conv_bias(MLXSPADEConvBlock *m);
+mlx_array *mlx_spade_get_mlp_shared_b(MLXSPADE *m);
+mlx_array *mlx_spade_get_mlp_gamma_b(MLXSPADE *m);
+mlx_array *mlx_spade_get_mlp_beta_b(MLXSPADE *m);
+mlx_array *mlx_spadegen_get_init_conv_bias(MLXSPADEGenerator *m);
+mlx_array *mlx_spadegen_get_tail_conv_bias(MLXSPADEGenerator *m);
+mlx_array *mlx_spadedisc_get_tail_bias(MLXSPADEDiscriminator *m);
 
 #ifdef __cplusplus
 }

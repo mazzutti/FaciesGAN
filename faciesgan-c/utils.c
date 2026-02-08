@@ -590,6 +590,9 @@ int mlx_apply_well_mask_array(const mlx_array facies, mlx_array *out,
         return -1;
     bool ok_mask = false;
     if (_mlx_array_is_available(&ok_mask, mask) != 0 || !ok_mask) {
+        mlx_free_float_buf(&fac_buf, NULL);
+        if (fac_shape)
+            mlx_free_int_array(&fac_shape, NULL);
         return -1;
     }
     int m_dtype = mlx_array_dtype(mask);
@@ -1279,6 +1282,8 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
                                   &real_out_shape) != 0) {
         free(pixels);
         mlx_stream_free(s);
+        if (real_out_shape)
+            mlx_free_int_array(&real_out_shape, NULL);
         return -1;
     }
 
@@ -1350,6 +1355,9 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
                 DRAW_CELL(fake_buf, offset, row, fi + 1);
             }
             mlx_free_float_buf(&fake_buf, NULL);
+            if (fake_out_shape)
+                mlx_free_int_array(&fake_out_shape, NULL);
+        } else {
             if (fake_out_shape)
                 mlx_free_int_array(&fake_out_shape, NULL);
         }
@@ -1470,6 +1478,8 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
                                   &real_out_shape) != 0) {
         free(pixels);
         mlx_stream_free(s);
+        if (real_out_shape)
+            mlx_free_int_array(&real_out_shape, NULL);
         return -1;
     }
 
@@ -1530,6 +1540,9 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
                 mask_w = mask_shape[1];
                 mask_c = mask_shape[2];
             }
+        } else {
+            if (mask_shape)
+                mlx_free_int_array(&mask_shape, NULL);
         }
     }
 
@@ -1690,66 +1703,11 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
             int *fake_out_shape = NULL;
             if (mlx_array_to_float_buffer(all_fakes[fake_idx], &fake_buf, &fake_elems,
                                           &fake_out_ndim, &fake_out_shape) == 0) {
-                /* Fake is shape (1, H, W, C) or (H, W, C), use first batch item */
-                int fake_h, fake_w, fake_c;
-                if (fake_out_ndim == 4) {
-                    fake_h = fake_out_shape[1];
-                    fake_w = fake_out_shape[2];
-                    fake_c = fake_out_shape[3];
-                } else {
-                    fake_h = fake_out_shape[0];
-                    fake_w = fake_out_shape[1];
-                    fake_c = fake_out_shape[2];
-                }
-
-                /* Draw with mask overlay (use row's real facies as well source) */
-                DRAW_CELL_WITH_MASK(fake_buf, fake_h, fake_w, fake_c, row, gen + 1,
-                                    row_mask, mask_h, mask_w, mask_c,
-                                    row_real_buf, h, w, c);
-
-                /* Draw column label "Gen N" above each generated cell (per row) */
-                {
-                    char col_label[32];
-                    snprintf(col_label, sizeof(col_label), "Gen %d", gen + 1);
-                    int col_font_scale = 2;
-                    int col_label_w = string_width(col_label, col_font_scale);
-                    int col_x = margin + (gen + 1) * (cell_size + spacing);
-                    int col_y = margin + main_title_height + row * (cell_size + title_height + spacing);
-                    int col_label_x = col_x + (cell_size - col_label_w) / 2;
-                    draw_string(pixels, grid_w, grid_h, col_label_x, col_y, col_label, col_font_scale, 0, 0, 0);
-
-                    /* Draw well arrow if masks are available */
-                    if (has_masks && mask_buf) {
-                        int mask_idx = selected_indices[row];
-                        if (mask_idx < mask_batch) {
-                            /* Find center of well columns by summing mask vertically */
-                            size_t mask_offset = (size_t)mask_idx * mask_h * mask_w * mask_c;
-                            float *sample_mask = mask_buf + mask_offset;
-                            float col_sum = 0;
-                            int well_count = 0;
-                            for (int mx = 0; mx < mask_w; mx++) {
-                                float col_val = 0;
-                                for (int my = 0; my < mask_h; my++) {
-                                    col_val += sample_mask[my * mask_w * mask_c + mx * mask_c];
-                                }
-                                if (col_val > 0) {
-                                    col_sum += mx;
-                                    well_count++;
-                                }
-                            }
-                            if (well_count > 0) {
-                                float center_col = col_sum / well_count;
-                                /* Map from mask coords to cell coords */
-                                float center_x = (center_col + 0.5f) * ((float)cell_size / (float)mask_w);
-                                int arrow_x = col_x + (int)center_x;
-                                int arrow_y = col_y + title_height - 3;  /* Just above the cell */
-                                draw_arrow_down(pixels, grid_w, grid_h, arrow_x, arrow_y, 10, 255, 0, 0);
-                            }
-                        }
-                    }
-                }
-
+                /* ...existing code... */
                 mlx_free_float_buf(&fake_buf, NULL);
+                if (fake_out_shape)
+                    mlx_free_int_array(&fake_out_shape, NULL);
+            } else {
                 if (fake_out_shape)
                     mlx_free_int_array(&fake_out_shape, NULL);
             }

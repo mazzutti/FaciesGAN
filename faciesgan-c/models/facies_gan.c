@@ -37,6 +37,10 @@ struct MLXFaciesGAN {
     /* optional wells storage (loaded from M_FILE) */
     mlx_array **wells;
     int n_wells;
+    /* Stored reconstruction noise (one per scale, generated once and reused).
+     * Mirrors Python's self.rec_noise list. */
+    mlx_array **rec_noise;
+    int n_rec_noise;
 };
 
 /* Global runtime flag: use create-graph for GP by default. */
@@ -78,6 +82,8 @@ MLXFaciesGAN *mlx_faciesgan_create(int num_layer, int kernel_size,
     m->n_shapes = 0;
     m->noise_amps = NULL;
     m->n_noise_amps = 0;
+    m->rec_noise = NULL;
+    m->n_rec_noise = 0;
     return m;
 }
 
@@ -182,8 +188,8 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
             }
             mlx_free_int_array(&axes, &ndim);
 
-            /* approximate exp(-10 * mean_sq) with 1 / (1 + 10 * mean_sq) */
-            mlx_array coef = mlx_array_new_float(10.0f);
+            /* exp(-10 * mean_sq) to match Python exactly */
+            mlx_array coef = mlx_array_new_float(-10.0f);
             mlx_array prod = mlx_array_new();
             if (mlx_multiply(&prod, mean, coef, s) != 0) {
                 mlx_array_free(diff);
@@ -193,27 +199,13 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
                 mlx_array_free(prod);
                 continue;
             }
-            mlx_array one = mlx_array_new_float(1.0f);
-            mlx_array den = mlx_array_new();
-            if (mlx_add(&den, one, prod, s) != 0) {
-                mlx_array_free(diff);
-                mlx_array_free(sq);
-                mlx_array_free(mean);
-                mlx_array_free(coef);
-                mlx_array_free(prod);
-                mlx_array_free(one);
-                mlx_array_free(den);
-                continue;
-            }
             mlx_array val = mlx_array_new();
-            if (mlx_divide(&val, one, den, s) != 0) {
+            if (mlx_exp(&val, prod, s) != 0) {
                 mlx_array_free(diff);
                 mlx_array_free(sq);
                 mlx_array_free(mean);
                 mlx_array_free(coef);
                 mlx_array_free(prod);
-                mlx_array_free(one);
-                mlx_array_free(den);
                 mlx_array_free(val);
                 continue;
             }
@@ -229,8 +221,6 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
 
             mlx_array_free(coef);
             mlx_array_free(prod);
-            mlx_array_free(one);
-            mlx_array_free(den);
             mlx_array_free(val);
 
             mlx_array_free(diff);
@@ -378,7 +368,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
     *out_loss = NULL;
     if (mlx_alloc_pod((void **)out_loss, sizeof(mlx_array), 1) != 0) {
         mlx_array_free(outv);
-        mlx_stream_free(s);
         mlx_array_free(fmasked);
         mlx_array_free(rmasked);
         mlx_array_free(diff);
@@ -389,6 +378,14 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
         return -1;
     }
     **out_loss = outv;
+    /* Cleanup intermediates on success path */
+    mlx_array_free(fmasked);
+    mlx_array_free(rmasked);
+    mlx_array_free(diff);
+    mlx_array_free(sq);
+    mlx_array_free(mean);
+    mlx_array_free(lambda_arr);
+    mlx_stream_free(s);
     return 0;
 }
 
@@ -417,6 +414,17 @@ void mlx_faciesgan_free(MLXFaciesGAN *m) {
         mlx_free_pod((void **)&m->wells);
         m->wells = NULL;
         m->n_wells = 0;
+    }
+    if (m->rec_noise) {
+        for (int i = 0; i < m->n_rec_noise; ++i) {
+            if (m->rec_noise[i]) {
+                mlx_array_free(*m->rec_noise[i]);
+                mlx_free_pod((void **)&m->rec_noise[i]);
+            }
+        }
+        mlx_free_pod((void **)&m->rec_noise);
+        m->rec_noise = NULL;
+        m->n_rec_noise = 0;
     }
     mlx_free_pod((void **)&m);
 }
@@ -676,14 +684,61 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                                     mlx_array ***out_noises, int *out_n,
                                     mlx_array **wells_pyramid,
                                     mlx_array **seismic_pyramid, int rec) {
-    /* unused parameters in this helper; no-op */
-    (void)indexes;
-    (void)seismic_pyramid;
-    (void)rec;
     if (!m || !out_noises || !out_n)
         return -1;
     if (scale < 0)
         return -1;
+
+    /* If rec=1 and stored reconstruction noise exists, return copies of stored
+     * noise.  This mirrors Python's get_pyramid_noise(rec=True) which calls
+     * get_rec_noise(scale) returning self.rec_noise[:scale+1]. */
+    if (rec && m->rec_noise && m->n_rec_noise > 0) {
+        int n = scale + 1;
+        mlx_array **arr = NULL;
+        if (mlx_alloc_pod((void **)&arr, sizeof(mlx_array *), n) != 0)
+            return -1;
+        for (int i = 0; i < n; ++i)
+            arr[i] = NULL;
+
+        mlx_stream s = mlx_default_gpu_stream_new();
+        for (int i = 0; i < n; ++i) {
+            mlx_array *a = NULL;
+            if (mlx_alloc_pod((void **)&a, sizeof(mlx_array), 1) != 0) {
+                for (int j = 0; j < n; ++j) {
+                    if (arr[j]) {
+                        mlx_array_free(*arr[j]);
+                        mlx_free_pod((void **)&arr[j]);
+                    }
+                }
+                mlx_free_pod((void **)&arr);
+                mlx_stream_free(s);
+                return -1;
+            }
+            *a = mlx_array_new();
+            if (i < m->n_rec_noise && m->rec_noise[i]) {
+                /* Return a copy of the stored rec noise (like Python's mx.array(tensor)) */
+                mlx_copy(a, *m->rec_noise[i], s);
+            } else {
+                /* Fallback: generate zeros if rec noise not available for this scale.
+                 * Rec noise is stored AFTER padding, so spatial dims should include
+                 * padding. Channels should be gen_input_channels (noise + conditioning). */
+                int shape[4] = {1, 32, 32, m->gen_input_channels};
+                if (m->shapes && m->n_shapes > i) {
+                    const int *s0 = &m->shapes[i * 4];
+                    shape[0] = s0[0];
+                    shape[1] = s0[1] + 2 * m->padding_size;
+                    shape[2] = s0[2] + 2 * m->padding_size;
+                    shape[3] = m->gen_input_channels;
+                }
+                mlx_zeros(a, shape, 4, MLX_FLOAT32, s);
+            }
+            arr[i] = a;
+        }
+        mlx_stream_free(s);
+        *out_noises = arr;
+        *out_n = n;
+        return 0;
+    }
 
     int n = scale + 1;
     mlx_array **arr = NULL;
@@ -700,39 +755,41 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
         int w = 32;
         /* Determine whether conditioning (wells/seismic) is provided for this scale
          */
-        int cond_present = (indexes && n_indexes > 0 &&
-                            ((wells_pyramid && wells_pyramid[i]) ||
-                             (seismic_pyramid && seismic_pyramid[i])))
+        int cond_present = ((wells_pyramid && wells_pyramid[i]) ||
+                            (seismic_pyramid && seismic_pyramid[i]))
                            ? 1
                            : 0;
         int c = 0;
 
-        /* When conditioning is present, derive spatial dimensions from the conditioning
-           arrays themselves to ensure compatibility. Otherwise use m->shapes. */
-        if (cond_present && wells_pyramid && wells_pyramid[i]) {
+        /* FIX: batch = len(indexes) in Python — always use n_indexes when
+         * available, regardless of conditioning presence. */
+        if (n_indexes > 0)
+            batch = n_indexes;
+
+        /* Derive spatial dims from stored shapes (Python: self.shapes[scale]).
+         * Fall back to conditioning shape only if shapes not available. */
+        if (m->shapes && m->n_shapes > i) {
+            const int *s0 = &m->shapes[i * 4];
+            if (batch <= 1) batch = s0[0];
+            h = s0[1];
+            w = s0[2];
+            /* If conditioning is present, use base_channel (noise-only channels),
+               otherwise use gen_input_channels to match Python semantics. */
+            c = cond_present ? m->base_channel : m->gen_input_channels;
+        } else if (cond_present && wells_pyramid && wells_pyramid[i]) {
             const int *cond_shape = mlx_array_shape(*wells_pyramid[i]);
             if (cond_shape) {
-                batch = cond_shape[0];
                 h = cond_shape[1];
                 w = cond_shape[2];
-                c = m->base_channel;  /* base_channel includes both noise + conditioning */
             }
+            c = m->base_channel;
         } else if (cond_present && seismic_pyramid && seismic_pyramid[i]) {
             const int *cond_shape = mlx_array_shape(*seismic_pyramid[i]);
             if (cond_shape) {
-                batch = cond_shape[0];
                 h = cond_shape[1];
                 w = cond_shape[2];
-                c = m->base_channel;
             }
-        } else if (m->shapes && m->n_shapes > i) {
-            const int *s0 = &m->shapes[i * 4];
-            batch = s0[0];
-            h = s0[1];
-            w = s0[2];
-            /* If conditioning is present, use stored base_channel (shapes' channel)
-               otherwise use generator input channels to match Python semantics. */
-            c = cond_present ? s0[3] : m->gen_input_channels;
+            c = m->base_channel;
         } else {
             /* Fallback defaults: base_channel vs gen_input_channels */
             c = cond_present ? m->base_channel : m->gen_input_channels;
@@ -761,13 +818,18 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
            With conditioning: noise_channels = 3, cond_channels = 3, total = 6 after concat
            Without conditioning: total_channels = gen_input_channels (typically 3)
         */
-        int final_h, final_w;
-        int noise_only_c = 3;  /* Always 3 channels for pure noise */
+        /* FIX: Use m->base_channel for noise-only channels (Python: self.base_channel
+         * which equals noise_channels, typically 3). Never hardcode. */
+        int noise_only_c = m->base_channel;
 
+        /* FIX: BOTH conditioning and no-conditioning paths create noise at
+         * (batch, H, W, C) WITHOUT padding. The common padding code at the
+         * end adds zero-padding once, matching Python's generate_padding().
+         *
+         * Previously the no-conditioning path pre-padded with random values
+         * then padded AGAIN → double padding + random in border region. */
         if (cond_present) {
-            /* Create noise with 3 channels and unpadded spatial dims to match conditioning */
-            final_h = h;
-            final_w = w;
+            /* Conditioning path: noise at base_channel channels */
             int noise_shape[4] = {batch, h, w, noise_only_c};
             if (mlx_random_normal(a, noise_shape, 4, MLX_FLOAT32, 0.0f, 1.0f, mlx_array_empty,
                                   s) != 0) {
@@ -785,10 +847,9 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                 }
             }
         } else {
-            /* Create noise with padded spatial dims and gen_input_channels (no conditioning case) */
-            final_h = h + 2 * m->padding_size;
-            final_w = w + 2 * m->padding_size;
-            int shape[4] = {batch, final_h, final_w, c};
+            /* No-conditioning path: noise at gen_input_channels,
+             * unpadded spatial dims (padding applied at end) */
+            int shape[4] = {batch, h, w, c};
             if (mlx_random_normal(a, shape, 4, MLX_FLOAT32, 0.0f, 1.0f, mlx_array_empty,
                                   s) != 0) {
                 if (mlx_zeros(a, shape, 4, MLX_FLOAT32, s) != 0) {
@@ -914,6 +975,58 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
     *out_noises = arr;
     *out_n = n;
     return 0;
+}
+
+/* Store a reconstruction noise tensor for the given scale.
+ * Mirrors Python: self.model.rec_noise.append(z_rec)
+ * The array is deep-copied so the caller retains ownership of `noise`. */
+int mlx_faciesgan_store_rec_noise(MLXFaciesGAN *m, int scale,
+                                  const mlx_array *noise) {
+    if (!m || !noise || scale < 0)
+        return -1;
+    /* Ensure capacity for scale+1 entries */
+    int need = scale + 1;
+    if (need > m->n_rec_noise) {
+        mlx_array **tmp = NULL;
+        if (mlx_alloc_pod((void **)&tmp, sizeof(mlx_array *), need) != 0)
+            return -1;
+        for (int i = 0; i < need; ++i)
+            tmp[i] = NULL;
+        /* Copy existing pointers */
+        if (m->rec_noise) {
+            for (int i = 0; i < m->n_rec_noise; ++i)
+                tmp[i] = m->rec_noise[i];
+            mlx_free_pod((void **)&m->rec_noise);
+        }
+        m->rec_noise = tmp;
+        m->n_rec_noise = need;
+    }
+    /* Free previous entry if overwriting */
+    if (m->rec_noise[scale]) {
+        mlx_array_free(*m->rec_noise[scale]);
+        mlx_free_pod((void **)&m->rec_noise[scale]);
+    }
+    /* Deep copy the noise array */
+    mlx_array *a = NULL;
+    if (mlx_alloc_pod((void **)&a, sizeof(mlx_array), 1) != 0)
+        return -1;
+    *a = mlx_array_new();
+    mlx_stream s = mlx_default_gpu_stream_new();
+    if (mlx_copy(a, *noise, s) != 0) {
+        mlx_array_free(*a);
+        mlx_free_pod((void **)&a);
+        mlx_stream_free(s);
+        return -1;
+    }
+    /* Evaluate to materialise the copy */
+    mlx_array_eval(*a);
+    mlx_stream_free(s);
+    m->rec_noise[scale] = a;
+    return 0;
+}
+
+int mlx_faciesgan_get_n_rec_noise(MLXFaciesGAN *m) {
+    return m ? m->n_rec_noise : 0;
 }
 
 /* ---------------------- Checkpoint I/O helpers ------------------------- */

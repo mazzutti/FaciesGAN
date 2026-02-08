@@ -57,7 +57,9 @@ typedef struct MLXTrainerOps {
                       const char *checkpoint_dir);
     int (*save_generated_facies)(struct MLXTrainer *trainer, int scale, int epoch,
                                  const char *results_path, mlx_array real_facies,
-                                 mlx_array masks);
+                                 mlx_array masks,
+                                 mlx_array **wells_pyramid, int n_wells,
+                                 mlx_array **seismic_pyramid, int n_seismic);
     void *(*get_model_ctx)(struct MLXTrainer *trainer);
     int (*get_shapes_flat)(struct MLXTrainer *t, int **out_shapes, int *out_n);
     int (*set_shapes)(struct MLXTrainer *t, const int *shapes, int n_scales);
@@ -213,7 +215,9 @@ int MLXTrainer_load_model(MLXTrainer *trainer, int scale,
 /* Save generated facies for visualization (best-effort). */
 int MLXTrainer_save_generated_facies(MLXTrainer *trainer, int scale, int epoch,
                                      const char *results_path, mlx_array real_facies,
-                                     mlx_array masks);
+                                     mlx_array masks,
+                                     mlx_array **wells_pyramid, int n_wells,
+                                     mlx_array **seismic_pyramid, int n_seismic);
 
 /* Expose underlying MLXFaciesGAN pointer for advanced use. */
 void *MLXTrainer_get_model_ctx(MLXTrainer *trainer);
