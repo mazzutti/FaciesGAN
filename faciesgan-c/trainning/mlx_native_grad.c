@@ -642,15 +642,8 @@ static int disc_loss_closure(mlx_vector_array *result,
 
                 if (mlx_closure_value_and_grad_apply(&gp_values, &gp_grads, gp_vag, gp_inputs) == 0) {
                     /* Extract gradient w.r.t. x_interp */
-                    mlx_array grad_x_raw = mlx_array_new();
-                    mlx_vector_array_get(&grad_x_raw, gp_grads, 0);
-
-                    /* stop_gradient on GP gradients to avoid expensive 2nd-order
-                     * derivatives through the outer value_and_grad.  This matches
-                     * common GAN GP practice and the effective Python behavior. */
                     mlx_array grad_x = mlx_array_new();
-                    mlx_stop_gradient(&grad_x, grad_x_raw, s);
-                    mlx_array_free(grad_x_raw);
+                    mlx_vector_array_get(&grad_x, gp_grads, 0);
 
                     if (grad_x.ctx) {
                         /* 3. Compute ||grad||_2 per pixel (matching Python)
