@@ -617,7 +617,11 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
             return mx.sum(out)  # type: ignore
 
         # Calculate gradients of the output w.r.t. the interpolates
-        gradients = cast(mx.array, mx.grad(grad_fn)(interpolates))  # type: ignore
+        # stop_gradient prevents expensive 2nd-order derivatives through the
+        # outer value_and_grad; this is standard practice for WGAN-GP.
+        gradients = mx.stop_gradient(
+            cast(mx.array, mx.grad(grad_fn)(interpolates))  # type: ignore
+        )
         grad_norm = mx.sqrt(mx.sum(mx.square(gradients), axis=-1) + 1e-12)
         gradient_penalty = mx.mean(mx.square(grad_norm - 1.0)) * self.lambda_grad
         return gradient_penalty

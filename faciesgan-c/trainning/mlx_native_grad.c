@@ -623,95 +623,106 @@ static int disc_loss_closure(mlx_vector_array *result,
             mlx_closure gp_cls = mlx_closure_new_func_payload(
                                      gp_disc_forward_closure, gp_payload, free);
 
-            /* Primals: [x_interp] */
-            mlx_vector_array primals = mlx_vector_array_new();
-            mlx_vector_array_append_value(primals, x_interp);
+            /* Use value_and_grad (matching Python's mx.grad which uses
+             * value_and_grad internally) instead of mlx_vjp. */
+            int gp_argnums[1] = {0};
+            mlx_closure_value_and_grad gp_vag = mlx_closure_value_and_grad_new();
+            if (mlx_value_and_grad(&gp_vag, gp_cls, gp_argnums, 1) != 0) {
+                mlx_closure_value_and_grad_free(gp_vag);
+                mlx_closure_free(gp_cls);
+            } else {
 
-            /* Cotangents: [1.0] - scalar because closure output is scalar sum */
-            mlx_array one_scalar = mlx_array_new_float(1.0f);
-            mlx_vector_array cotangents = mlx_vector_array_new();
-            mlx_vector_array_append_value(cotangents, one_scalar);
+                /* Inputs: [x_interp] */
+                mlx_vector_array gp_inputs = mlx_vector_array_new();
+                mlx_vector_array_append_value(gp_inputs, x_interp);
 
-            /* vjp returns (values, gradients) where gradients[0] = ∂D/∂x_interp */
-            mlx_vector_array vjp_values = mlx_vector_array_new();
-            mlx_vector_array vjp_grads = mlx_vector_array_new();
+                /* Apply value_and_grad to get gradients w.r.t. x_interp */
+                mlx_vector_array gp_values = mlx_vector_array_new();
+                mlx_vector_array gp_grads = mlx_vector_array_new();
 
-            if (mlx_vjp(&vjp_values, &vjp_grads, gp_cls, primals, cotangents) == 0) {
-                /* Extract gradient w.r.t. x_interp */
-                mlx_array grad_x = mlx_array_new();
-                mlx_vector_array_get(&grad_x, vjp_grads, 0);
+                if (mlx_closure_value_and_grad_apply(&gp_values, &gp_grads, gp_vag, gp_inputs) == 0) {
+                    /* Extract gradient w.r.t. x_interp */
+                    mlx_array grad_x_raw = mlx_array_new();
+                    mlx_vector_array_get(&grad_x_raw, gp_grads, 0);
 
-                if (grad_x.ctx) {
-                    /* 3. Compute ||grad||_2 per pixel (matching Python)
-                     * grad_x shape is [batch, H, W, C]
-                     * Python: grad_norm = sqrt(sum(grad^2, axis=-1) + 1e-12)
-                     * So we sum over axis 3 (channels) only, NOT H, W */
+                    /* stop_gradient on GP gradients to avoid expensive 2nd-order
+                     * derivatives through the outer value_and_grad.  This matches
+                     * common GAN GP practice and the effective Python behavior. */
+                    mlx_array grad_x = mlx_array_new();
+                    mlx_stop_gradient(&grad_x, grad_x_raw, s);
+                    mlx_array_free(grad_x_raw);
 
-                    /* grad^2 */
-                    mlx_array grad_sq = mlx_array_new();
-                    mlx_square(&grad_sq, grad_x, s);
+                    if (grad_x.ctx) {
+                        /* 3. Compute ||grad||_2 per pixel (matching Python)
+                         * grad_x shape is [batch, H, W, C]
+                         * Python: grad_norm = sqrt(sum(grad^2, axis=-1) + 1e-12)
+                         * So we sum over axis 3 (channels) only, NOT H, W */
 
-                    /* Sum over C only (axis 3) - NOT H, W
-                     * This gives per-pixel gradient norms with shape [batch, H, W] */
-                    int axes[1] = {3};
-                    mlx_array grad_sum = mlx_array_new();
-                    mlx_sum_axes(&grad_sum, grad_sq, axes, 1, false, s);
+                        /* grad^2 */
+                        mlx_array grad_sq = mlx_array_new();
+                        mlx_square(&grad_sq, grad_x, s);
 
-                    /* Add epsilon for numerical stability (matching Python) */
-                    mlx_array eps_arr = mlx_array_new_float(1e-12f);
-                    mlx_array grad_sum_eps = mlx_array_new();
-                    mlx_add(&grad_sum_eps, grad_sum, eps_arr, s);
+                        /* Sum over C only (axis 3) - NOT H, W
+                         * This gives per-pixel gradient norms with shape [batch, H, W] */
+                        int axes[1] = {3};
+                        mlx_array grad_sum = mlx_array_new();
+                        mlx_sum_axes(&grad_sum, grad_sq, axes, 1, false, s);
 
-                    /* sqrt to get L2 norm per pixel */
-                    mlx_array grad_norm = mlx_array_new();
-                    mlx_sqrt(&grad_norm, grad_sum_eps, s);
+                        /* Add epsilon for numerical stability (matching Python) */
+                        mlx_array eps_arr = mlx_array_new_float(1e-12f);
+                        mlx_array grad_sum_eps = mlx_array_new();
+                        mlx_add(&grad_sum_eps, grad_sum, eps_arr, s);
 
-                    /* 4. (grad_norm - 1)^2 */
-                    mlx_array norm_minus_1 = mlx_array_new();
-                    mlx_subtract(&norm_minus_1, grad_norm, one_arr, s);
+                        /* sqrt to get L2 norm per pixel */
+                        mlx_array grad_norm = mlx_array_new();
+                        mlx_sqrt(&grad_norm, grad_sum_eps, s);
 
-                    mlx_array penalty_sq = mlx_array_new();
-                    mlx_square(&penalty_sq, norm_minus_1, s);
+                        /* 4. (grad_norm - 1)^2 */
+                        mlx_array norm_minus_1 = mlx_array_new();
+                        mlx_subtract(&norm_minus_1, grad_norm, one_arr, s);
 
-                    /* Mean over all dimensions (batch, H, W) */
-                    mlx_array gp_mean = mlx_array_new();
-                    mlx_mean(&gp_mean, penalty_sq, false, s);
+                        mlx_array penalty_sq = mlx_array_new();
+                        mlx_square(&penalty_sq, norm_minus_1, s);
 
-                    /* Cleanup additional arrays */
-                    mlx_array_free(eps_arr);
-                    mlx_array_free(grad_sum_eps);
+                        /* Mean over all dimensions (batch, H, W) */
+                        mlx_array gp_mean = mlx_array_new();
+                        mlx_mean(&gp_mean, penalty_sq, false, s);
 
-                    /* lambda * gp_mean */
-                    mlx_array lambda_arr = mlx_array_new_float(p->lambda_grad);
-                    mlx_array_free(gp_loss);
-                    gp_loss = mlx_array_new();
-                    mlx_multiply(&gp_loss, lambda_arr, gp_mean, s);
+                        /* Cleanup additional arrays */
+                        mlx_array_free(eps_arr);
+                        mlx_array_free(grad_sum_eps);
 
-                    /* Add to total loss */
-                    mlx_array new_total = mlx_array_new();
-                    mlx_add(&new_total, total_loss, gp_loss, s);
-                    mlx_array_free(total_loss);
-                    total_loss = new_total;
+                        /* lambda * gp_mean */
+                        mlx_array lambda_arr = mlx_array_new_float(p->lambda_grad);
+                        mlx_array_free(gp_loss);
+                        gp_loss = mlx_array_new();
+                        mlx_multiply(&gp_loss, lambda_arr, gp_mean, s);
 
-                    /* Cleanup GP computation */
-                    mlx_array_free(grad_sq);
-                    mlx_array_free(grad_sum);
-                    mlx_array_free(grad_norm);
-                    mlx_array_free(norm_minus_1);
-                    mlx_array_free(penalty_sq);
-                    mlx_array_free(gp_mean);
-                    mlx_array_free(lambda_arr);
+                        /* Add to total loss */
+                        mlx_array new_total = mlx_array_new();
+                        mlx_add(&new_total, total_loss, gp_loss, s);
+                        mlx_array_free(total_loss);
+                        total_loss = new_total;
+
+                        /* Cleanup GP computation */
+                        mlx_array_free(grad_sq);
+                        mlx_array_free(grad_sum);
+                        mlx_array_free(grad_norm);
+                        mlx_array_free(norm_minus_1);
+                        mlx_array_free(penalty_sq);
+                        mlx_array_free(gp_mean);
+                        mlx_array_free(lambda_arr);
+                    }
+                    mlx_array_free(grad_x);
                 }
-                mlx_array_free(grad_x);
-            }
 
-            /* Cleanup VJP arrays */
-            mlx_vector_array_free(vjp_values);
-            mlx_vector_array_free(vjp_grads);
-            mlx_array_free(one_scalar);
-            mlx_vector_array_free(primals);
-            mlx_vector_array_free(cotangents);
-            mlx_closure_free(gp_cls);
+                /* Cleanup VaG arrays */
+                mlx_vector_array_free(gp_values);
+                mlx_vector_array_free(gp_grads);
+                mlx_vector_array_free(gp_inputs);
+                mlx_closure_value_and_grad_free(gp_vag);
+                mlx_closure_free(gp_cls);
+            } /* end if mlx_value_and_grad succeeded */
         }
 
         /* Cleanup interpolation arrays */
