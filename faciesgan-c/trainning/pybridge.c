@@ -18,6 +18,28 @@
 static PyObject *g_visualizer = NULL;
 static PyObject *g_background_worker = NULL;
 
+/* Saved thread state so we can release the GIL between Python calls.
+ * When the main thread is in C/Metal land, the GIL must be released
+ * so that Python background threads (e.g. ProcessPoolExecutor's manager
+ * daemon) can run.  Without this, those threads are starved and the
+ * BG worker process is never spawned until shutdown. */
+static PyThreadState *g_saved_tstate = NULL;
+
+/* Acquire the GIL before making Python API calls.
+ * Must be paired with pybridge_release_gil(). */
+static void pybridge_acquire_gil(void) {
+    if (g_saved_tstate) {
+        PyEval_RestoreThread(g_saved_tstate);
+        g_saved_tstate = NULL;
+    }
+}
+
+/* Release the GIL after Python API calls complete.
+ * Allows Python background threads to run. */
+static void pybridge_release_gil(void) {
+    g_saved_tstate = PyEval_SaveThread();
+}
+
 static void pybridge_print_py_err(void) {
     if (PyErr_Occurred())
         PyErr_Print();
@@ -44,19 +66,19 @@ int pybridge_initialize(void) {
         venv = venv_res;
         setenv("VIRTUAL_ENV", venv, 1);
     }
-        if (venv && venv[0]) {
-            /* Prefer classic APIs to avoid getpath.py failures with venv embeds. */
-            char py_path[PATH_MAX];
-            snprintf(py_path, sizeof(py_path), "%s/bin/python", venv);
-    #if PY_VERSION_HEX < 0x03080000
-            static wchar_t py_w[PATH_MAX];
-            mbstowcs(py_w, py_path, PATH_MAX - 1);
-            Py_SetProgramName(py_w);
-    #endif
-            Py_Initialize();
-        } else {
-            Py_Initialize();
-        }
+    if (venv && venv[0]) {
+        /* Prefer classic APIs to avoid getpath.py failures with venv embeds. */
+        char py_path[PATH_MAX];
+        snprintf(py_path, sizeof(py_path), "%s/bin/python", venv);
+#if PY_VERSION_HEX < 0x03080000
+        static wchar_t py_w[PATH_MAX];
+        mbstowcs(py_w, py_path, PATH_MAX - 1);
+        Py_SetProgramName(py_w);
+#endif
+        Py_Initialize();
+    } else {
+        Py_Initialize();
+    }
 
     if (!Py_IsInitialized())
         return 0;
@@ -123,12 +145,18 @@ int pybridge_initialize(void) {
         "    pass\n"
     );
 
+    /* Release the GIL so background Python threads can run while the
+     * main thread is in C/Metal code.  Every subsequent pybridge_*
+     * function must acquire/release the GIL around Python API calls. */
+    pybridge_release_gil();
+
     return 1;
 }
 
 int pybridge_finalize(void) {
     if (!Py_IsInitialized())
         return 0;
+    pybridge_acquire_gil();
     if (g_visualizer) {
         Py_DECREF(g_visualizer);
         g_visualizer = NULL;
@@ -145,9 +173,11 @@ int pybridge_create_visualizer(int num_scales, const char *output_dir,
                                const char *log_dir, int update_interval) {
     if (!Py_IsInitialized() && !pybridge_initialize())
         return 0;
+    pybridge_acquire_gil();
     PyObject *mod = PyImport_ImportModule("tensorboard_visualizer");
     if (!mod) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     PyObject *cls = PyObject_GetAttrString(mod, "TensorBoardVisualizer");
@@ -155,6 +185,7 @@ int pybridge_create_visualizer(int num_scales, const char *output_dir,
     if (!cls || !PyCallable_Check(cls)) {
         Py_XDECREF(cls);
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     PyObject *pargs = PyTuple_New(4);
@@ -167,10 +198,12 @@ int pybridge_create_visualizer(int num_scales, const char *output_dir,
     Py_DECREF(pargs);
     if (!inst) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     Py_XDECREF(g_visualizer);
     g_visualizer = inst;
+    pybridge_release_gil();
     return 1;
 }
 
@@ -178,9 +211,11 @@ int pybridge_update_visualizer_from_json(int epoch, const char *metrics_json,
         int samples_processed) {
     if (!Py_IsInitialized() || !g_visualizer || !metrics_json)
         return 0;
+    pybridge_acquire_gil();
     PyObject *json_mod = PyImport_ImportModule("json");
     if (!json_mod) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     PyObject *loads = PyObject_GetAttrString(json_mod, "loads");
@@ -188,6 +223,7 @@ int pybridge_update_visualizer_from_json(int epoch, const char *metrics_json,
     if (!loads || !PyCallable_Check(loads)) {
         Py_XDECREF(loads);
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     PyObject *py_json_str = PyUnicode_FromString(metrics_json);
@@ -196,6 +232,7 @@ int pybridge_update_visualizer_from_json(int epoch, const char *metrics_json,
     Py_DECREF(loads);
     if (!metrics) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     PyObject *none = Py_None;
@@ -206,32 +243,39 @@ int pybridge_update_visualizer_from_json(int epoch, const char *metrics_json,
     Py_DECREF(metrics);
     if (!res) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     Py_DECREF(res);
+    pybridge_release_gil();
     return 1;
 }
 
 int pybridge_close_visualizer(void) {
     if (!Py_IsInitialized() || !g_visualizer)
         return 0;
+    pybridge_acquire_gil();
     PyObject *res = PyObject_CallMethod(g_visualizer, "close", NULL);
     if (!res) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     Py_DECREF(res);
     Py_DECREF(g_visualizer);
     g_visualizer = NULL;
+    pybridge_release_gil();
     return 1;
 }
 
 int pybridge_create_background_worker(int max_workers, int max_pending) {
     if (!Py_IsInitialized() && !pybridge_initialize())
         return 0;
+    pybridge_acquire_gil();
     PyObject *mod = PyImport_ImportModule("background_workers");
     if (!mod) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     PyObject *cls = PyObject_GetAttrString(mod, "BackgroundWorker");
@@ -239,6 +283,7 @@ int pybridge_create_background_worker(int max_workers, int max_pending) {
     if (!cls || !PyCallable_Check(cls)) {
         Py_XDECREF(cls);
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     PyObject *pargs = PyTuple_New(2);
@@ -249,28 +294,34 @@ int pybridge_create_background_worker(int max_workers, int max_pending) {
     Py_DECREF(pargs);
     if (!inst) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     Py_XDECREF(g_background_worker);
     g_background_worker = inst;
+    pybridge_release_gil();
     return 1;
 }
 
 int pybridge_background_pending_count(void) {
     if (!Py_IsInitialized() || !g_background_worker)
         return -1;
+    pybridge_acquire_gil();
     PyObject *res =
         PyObject_CallMethod(g_background_worker, "pending_count", NULL);
     if (!res) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return -1;
     }
     if (!PyLong_Check(res)) {
         Py_DECREF(res);
+        pybridge_release_gil();
         return -1;
     }
     long val = PyLong_AsLong(res);
     Py_DECREF(res);
+    pybridge_release_gil();
     return (int)val;
 }
 
@@ -278,16 +329,19 @@ int pybridge_shutdown_background_worker(int wait) {
     if (!Py_IsInitialized() || !g_background_worker) {
         return 0;
     }
+    pybridge_acquire_gil();
     PyObject *wait_obj = wait ? Py_True : Py_False;
     PyObject *res =
         PyObject_CallMethod(g_background_worker, "shutdown", "O", wait_obj);
     if (!res) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     Py_DECREF(res);
     Py_DECREF(g_background_worker);
     g_background_worker = NULL;
+    pybridge_release_gil();
     return 1;
 }
 
@@ -298,6 +352,7 @@ int pybridge_submit_plot_generated_facies(const char *fake_path,
     if (!Py_IsInitialized() || !g_background_worker) {
         return 0;
     }
+    pybridge_acquire_gil();
     /* Call submit_plot_generated_facies_from_npy on the background worker.
      * Signature: (fake_path, real_path, stage, index, out_dir, masks_path) */
     PyObject *res = PyObject_CallMethod(
@@ -311,10 +366,10 @@ int pybridge_submit_plot_generated_facies(const char *fake_path,
                     );
     if (!res) {
         pybridge_print_py_err();
+        pybridge_release_gil();
         return 0;
     }
     Py_DECREF(res);
+    pybridge_release_gil();
     return 1;
 }
-
-

@@ -42,7 +42,6 @@
 #else
 #include <sys/resource.h>
 #endif
-#include <time.h>
 #include <unistd.h>
 #include "trainning/progress.h"
 
@@ -1520,6 +1519,7 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
         mlx_free_ptr_array((void ***)&tmp_masks, need_n);
     if (tmp_rec)
         mlx_free_ptr_array((void ***)&tmp_rec, need_n);
+
     return overall == 0 ? 0 : -1;
 }
 
@@ -1986,10 +1986,15 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
                             } /* end 3D mask handling */
                         } /* end masks.ctx != NULL */
 
-                        /* Call pybridge to generate the plot with matplotlib fonts */
-                        rc = pybridge_submit_plot_generated_facies(
-                                 fake_npy_path, real_npy_path, scale, epoch,
-                                 scale_results_path, masks_path_arg) ? 0 : -1;
+                        /* Call pybridge to generate the plot with matplotlib fonts
+                         * — only when facies plotting is enabled (--no-plot-facies skips). */
+                        if (trainer->enable_plot_facies) {
+                            rc = pybridge_submit_plot_generated_facies(
+                                     fake_npy_path, real_npy_path, scale, epoch,
+                                     scale_results_path, masks_path_arg) ? 0 : -1;
+                        } else {
+                            rc = 0;  /* skip plotting, NPY files are already saved */
+                        }
 
                         if (rc == 0) {
                         } else {
@@ -2227,6 +2232,8 @@ int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
     /* Starting C-native trainer print removed */
 
     pybridge_create_visualizer(num_scales, ".", NULL, 1);
+    /* NOTE: bg worker created unconditionally here for legacy path;
+     * the main training path (train_impl) gates this on enable_plot_facies. */
     pybridge_create_background_worker(2, 32);
 
     mlx_stream s = mlx_default_gpu_stream_new();
@@ -2416,8 +2423,13 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         pybridge_create_visualizer(
             n_scales, opts->output_path ? opts->output_path : ".", NULL, 1);
     }
-    /* Always create background worker for PNG plotting */
-    pybridge_create_background_worker(2, 32);
+    /* Only create background worker when facies plotting is enabled.
+     * The ProcessPoolExecutor spawns separate processes; skipping creation
+     * when --no-plot-facies avoids 8+ seconds of process startup/shutdown
+     * overhead. */
+    if (trainer->enable_plot_facies) {
+        pybridge_create_background_worker(2, 32);
+    }
 
     /* Build an explicit contiguous list of scale indices (0..n_scales-1)
      * to mirror Python trainer behavior where scales are integer indices.
@@ -2473,17 +2485,9 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
 #ifdef FG_PROGRESS
     fg_progress_init("Train", (size_t)total_batches * (size_t)max_batches, 0);
 #endif
-    const char *clear_cache_env = getenv("MLX_MEM_CLEAR_CACHE");
-    /* Default to clearing cache unless explicitly disabled (0 or false) */
-    bool clear_cache = !clear_cache_env ||
-                       !(strcmp(clear_cache_env, "0") == 0 ||
-                         strcmp(clear_cache_env, "false") == 0);
-
-    /* Set a cache limit to prevent unbounded GPU memory growth.
-     * This limits how much memory MLX keeps in its cache for reuse. */
-    size_t cache_limit_result = 0;
-    size_t cache_limit = 512 * 1024 * 1024;  /* 512 MB cache limit */
-    mlx_set_cache_limit(&cache_limit_result, cache_limit);
+    /* MLX defaults to caching up to system memory; do NOT artificially
+     * constrain it — the previous 512 MB limit forced constant re-allocation
+     * of Metal buffers and was the main cause of the C ↔ Python speed gap. */
 
     while (batches < total_batches) {
         PrefetchedPyramidsBatch *pb = NULL;
@@ -2781,14 +2785,14 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
                 }
             }
 
-            /* Sync only when we need to (save epochs), or periodically
-             * every 4 epochs to bound Metal command-buffer accumulation
-             * without draining the pipeline every single epoch. */
+            /* Periodic synchronize every 4 epochs (and on save / last epoch)
+             * to keep Metal memory pressure bounded.  Without periodic sync
+             * the CPU races ahead building lazy graphs far faster than the GPU
+             * can retire them, causing a ~2× wall-time regression. */
             if (should_save || (epoch & 3) == 3 || epoch == num_iter - 1) {
                 mlx_synchronize(s);
-                if (clear_cache)
-                    mlx_clear_cache();
             }
+
         } /* end epoch loop */
 
         /* Free batch resources AFTER all epochs on this batch complete */
@@ -2825,6 +2829,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     }
 
     mlx_stream_free(s);
+
     /* Free local dataset/dataloader only when they were created by this
      * function. If trainer owns them (created in MLXTrainer_new) they will be
      * freed by MLXTrainer_destroy below. */
@@ -2833,9 +2838,13 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     /* Do not destroy the trainer here; ownership/deallocation is the caller's
      * responsibility (avoids double-free when callers also destroy). */
     pybridge_close_visualizer();
-    /* Shutdown background worker and wait for pending tasks (e.g., pybridge
-     * plot submissions) to complete before exiting. */
+
+    /* Shutdown background worker and wait for pending plot tasks to complete.
+     * Note: when plotting is disabled (--no-plot-facies) no bg worker is
+     * created, so this is a no-op.  Using wait=0 would cause a hang at
+     * process exit due to Python's ProcessPoolExecutor atexit handler. */
     pybridge_shutdown_background_worker(1);
+
     /* If a batch prefetcher/iterator were created, stop producers and
      * destroy iterator/prefetcher to avoid leaving background threads
      * running after trainer teardown. Use `prefetcher_stop` to join
@@ -2856,5 +2865,6 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         int _sn = n_scales;
         mlx_free_int_array(&scale_idxs, &_sn);
     }
+
     return 0;
 }

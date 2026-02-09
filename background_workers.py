@@ -90,6 +90,23 @@ def _save_plot_task(
     return True
 
 
+def _warmup_worker() -> bool:
+    """Pre-import heavy dependencies in the worker process.
+
+    Called once at pool creation time so that the first real plotting task
+    does not pay the ~3-4 second matplotlib/numpy import cost.
+    """
+    import os
+
+    os.environ["FG_NO_TORCH_IMPORT"] = "1"
+    # Import the plotting module which pulls in matplotlib, numpy, etc.
+    try:
+        from utils import plot_generated_facies  # noqa: F401
+    except Exception:
+        pass
+    return True
+
+
 def _save_plot_task_from_npy(
     fake_path: str,
     real_path: str,
@@ -172,6 +189,20 @@ class BackgroundWorker:
         self._pending_cond = threading.Condition()
         self._max_pending = int(max_pending)
         self._initialized = True
+
+        # Pre-warm: spawn worker processes now so they are ready when the
+        # first real task is submitted.  Without this, the first submit()
+        # triggers a fork+reimport that takes several seconds (importing
+        # matplotlib, numpy, etc.).  The warmup task also imports the
+        # plotting dependencies so subsequent tasks start instantly.
+        # Fire-and-forget: don't block init; the worker starts in parallel
+        # with training so it's ready by the time plots are needed.
+        try:
+            self._warmup_future: Future[bool] | None = self._executor.submit(
+                _warmup_worker
+            )
+        except Exception:
+            self._warmup_future = None
 
     def _on_done(self, fut: Future[bool]) -> None:
         # Callback executed in the main process thread when a Future completes

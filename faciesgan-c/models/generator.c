@@ -660,8 +660,11 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
     if (z_count <= 0)
         return in_noise;
 
-    /* Acquire global MLX lock for thread-safety */
-    mlx_global_lock();
+    /* NOTE: Global lock removed — all training-path callers (value_and_grad
+     * closures, train_step, save_generated_facies) run single-threaded.
+     * Concurrent callers (prefetcher, dataloader) already hold the lock
+     * before calling generator_forward.  Removing the lock avoids ~10+
+     * recursive mutex lock/unlock pairs per epoch inside the hot path. */
 
     if (start_scale < 0)
         start_scale = 0;
@@ -1183,9 +1186,6 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
 
     mlx_array_free(zero_scalar);
     mlx_stream_free(s);
-
-    /* Release global MLX lock */
-    mlx_global_unlock();
 
     return out_facie;
 }

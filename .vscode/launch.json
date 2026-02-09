@@ -105,12 +105,11 @@
         "--no-tensorboard",
         "--use-wells",
         "--use-seismic",
-        "--use-mlx",
-        "--compile-backend"
+        "--use-mlx"
+        // "--compile-backend"
       ],
       "cwd": "${workspaceFolder}",
       "env": {
-        "NUM_STEPS": "200",
         "OUTPUT_PATH": "${workspaceFolder}/results/",
         "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
         "PYTHONEXECUTABLE": "${workspaceFolder}/.venv/bin/python",
@@ -127,10 +126,8 @@
         "FACIESGAN_ALLOW_PARALLEL_SCALES": "7",
         "FACIESGAN_PROCESS_WORKERS": "1",
         "FACIESGAN_PROC_SYNC_IO": "1",
-        "FACIESGAN_ALLOW_COMPILE_BACKEND": "1",
         "FACIESGAN_USE_WELLS": "1",
-        "FACIESGAN_USE_SEISMIC": "1",
-        "FACIESGAN_PROFILE": "1"
+        "FACIESGAN_USE_SEISMIC": "1"
       },
       "stopOnEntry": false,
       "terminal": "integrated",

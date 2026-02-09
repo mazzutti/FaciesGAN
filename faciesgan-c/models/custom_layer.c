@@ -400,60 +400,56 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
         y = x;
     }
 
-    /* Instance normalization (NHWC): normalize across H and W axes, then apply affine */
+    /* Instance normalization (NHWC): var_axes + rsqrt (matches Python nn.InstanceNorm) */
     if (m->use_norm && m->norm) {
         mlx_nn_instancenorm *norm = (mlx_nn_instancenorm *)m->norm;
         const int axes[] = {1, 2};
         mlx_array mean = mlx_array_new();
         if (mlx_mean_axes(&mean, y, axes, 2, true, s) == 0) {
-            mlx_array centered = mlx_array_new();
-            if (mlx_subtract(&centered, y, mean, s) == 0) {
-                mlx_array sq = mlx_array_new();
-                if (mlx_square(&sq, centered, s) == 0) {
-                    mlx_array var = mlx_array_new();
-                    if (mlx_mean_axes(&var, sq, axes, 2, true, s) == 0) {
-                        mlx_array eps = mlx_array_new_float(1e-5f);
-                        mlx_array var_eps = mlx_array_new();
-                        if (mlx_add(&var_eps, var, eps, s) == 0) {
-                            mlx_array std = mlx_array_new();
-                            if (mlx_sqrt(&std, var_eps, s) == 0) {
-                                mlx_array y_norm = mlx_array_new();
-                                if (mlx_divide(&y_norm, centered, std, s) == 0) {
-                                    /* Apply affine: y = y_norm * weight + bias */
-                                    if (norm->affine && norm->weight && norm->bias) {
-                                        mlx_array scaled = mlx_array_new();
-                                        if (mlx_multiply(&scaled, y_norm, *norm->weight, s) == 0) {
-                                            mlx_array affined = mlx_array_new();
-                                            if (mlx_add(&affined, scaled, *norm->bias, s) == 0) {
-                                                mlx_array_free(y);
-                                                mlx_array_free(y_norm);
-                                                y = affined;
-                                            } else {
-                                                mlx_array_free(y);
-                                                y = y_norm;
-                                            }
-                                            mlx_array_free(scaled);
+            mlx_array var = mlx_array_new();
+            if (mlx_var_axes(&var, y, axes, 2, true, 0, s) == 0) {
+                mlx_array centered = mlx_array_new();
+                if (mlx_subtract(&centered, y, mean, s) == 0) {
+                    mlx_array eps = mlx_array_new_float(1e-5f);
+                    mlx_array var_eps = mlx_array_new();
+                    if (mlx_add(&var_eps, var, eps, s) == 0) {
+                        mlx_array inv_std = mlx_array_new();
+                        if (mlx_rsqrt(&inv_std, var_eps, s) == 0) {
+                            mlx_array y_norm = mlx_array_new();
+                            if (mlx_multiply(&y_norm, centered, inv_std, s) == 0) {
+                                /* Apply affine: y = y_norm * weight + bias */
+                                if (norm->affine && norm->weight && norm->bias) {
+                                    mlx_array scaled = mlx_array_new();
+                                    if (mlx_multiply(&scaled, y_norm, *norm->weight, s) == 0) {
+                                        mlx_array affined = mlx_array_new();
+                                        if (mlx_add(&affined, scaled, *norm->bias, s) == 0) {
+                                            mlx_array_free(y);
+                                            mlx_array_free(y_norm);
+                                            y = affined;
                                         } else {
                                             mlx_array_free(y);
                                             y = y_norm;
                                         }
+                                        mlx_array_free(scaled);
                                     } else {
-                                        /* No affine: just use normalized */
                                         mlx_array_free(y);
                                         y = y_norm;
                                     }
+                                } else {
+                                    /* No affine: just use normalized */
+                                    mlx_array_free(y);
+                                    y = y_norm;
                                 }
-                                mlx_array_free(std);
                             }
-                            mlx_array_free(var_eps);
+                            mlx_array_free(inv_std);
                         }
-                        mlx_array_free(eps);
-                        mlx_array_free(var);
+                        mlx_array_free(var_eps);
                     }
-                    mlx_array_free(sq);
+                    mlx_array_free(eps);
                 }
                 mlx_array_free(centered);
             }
+            mlx_array_free(var);
             mlx_array_free(mean);
         }
     }
@@ -1002,7 +998,9 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     mlx_array_free(shared);
     mlx_array_free(shared_act);
 
-    /* Instance normalize x across H and W axes, then apply affine (like Python self.norm) */
+    /* Instance normalize x across H and W axes (matches Python nn.InstanceNorm:
+     * mean, var, (x-mean)*rsqrt(var+eps), then affine).  Uses mlx_var_axes +
+     * mlx_rsqrt so the graph is identical to Python's InstanceNorm.__call__. */
     mlx_nn_instancenorm *norm = (mlx_nn_instancenorm *)m->norm;
     const int axes[] = {1, 2};
     mlx_array mean = mlx_array_new();
@@ -1012,28 +1010,18 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_stream_free(s);
         return x;
     }
+    mlx_array var = mlx_array_new();
+    if (mlx_var_axes(&var, x, axes, 2, true, 0, s) != 0) {
+        mlx_array_free(mean);
+        mlx_array_free(gamma);
+        mlx_array_free(beta);
+        mlx_stream_free(s);
+        return x;
+    }
     mlx_array centered = mlx_array_new();
     if (mlx_subtract(&centered, x, mean, s) != 0) {
         mlx_array_free(mean);
-        mlx_array_free(gamma);
-        mlx_array_free(beta);
-        mlx_stream_free(s);
-        return x;
-    }
-    mlx_array sq = mlx_array_new();
-    if (mlx_square(&sq, centered, s) != 0) {
-        mlx_array_free(mean);
-        mlx_array_free(centered);
-        mlx_array_free(gamma);
-        mlx_array_free(beta);
-        mlx_stream_free(s);
-        return x;
-    }
-    mlx_array var = mlx_array_new();
-    if (mlx_mean_axes(&var, sq, axes, 2, true, s) != 0) {
-        mlx_array_free(mean);
-        mlx_array_free(centered);
-        mlx_array_free(sq);
+        mlx_array_free(var);
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_stream_free(s);
@@ -1043,21 +1031,19 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     mlx_array var_eps = mlx_array_new();
     if (mlx_add(&var_eps, var, eps, s) != 0) {
         mlx_array_free(mean);
-        mlx_array_free(centered);
-        mlx_array_free(sq);
         mlx_array_free(var);
+        mlx_array_free(centered);
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
         mlx_stream_free(s);
         return x;
     }
-    mlx_array std = mlx_array_new();
-    if (mlx_sqrt(&std, var_eps, s) != 0) {
+    mlx_array inv_std = mlx_array_new();
+    if (mlx_rsqrt(&inv_std, var_eps, s) != 0) {
         mlx_array_free(mean);
-        mlx_array_free(centered);
-        mlx_array_free(sq);
         mlx_array_free(var);
+        mlx_array_free(centered);
         mlx_array_free(var_eps);
         mlx_array_free(gamma);
         mlx_array_free(beta);
@@ -1066,13 +1052,12 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         return x;
     }
     mlx_array x_norm = mlx_array_new();
-    if (mlx_divide(&x_norm, centered, std, s) != 0) {
+    if (mlx_multiply(&x_norm, centered, inv_std, s) != 0) {
         mlx_array_free(mean);
-        mlx_array_free(centered);
-        mlx_array_free(sq);
         mlx_array_free(var);
+        mlx_array_free(centered);
         mlx_array_free(var_eps);
-        mlx_array_free(std);
+        mlx_array_free(inv_std);
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
@@ -1101,10 +1086,9 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         /* cleanup */
         mlx_array_free(mean);
         mlx_array_free(centered);
-        mlx_array_free(sq);
         mlx_array_free(var);
         mlx_array_free(var_eps);
-        mlx_array_free(std);
+        mlx_array_free(inv_std);
         mlx_array_free(normalized);
         mlx_array_free(gamma);
         mlx_array_free(beta);
@@ -1119,10 +1103,9 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         /* cleanup */
         mlx_array_free(mean);
         mlx_array_free(centered);
-        mlx_array_free(sq);
         mlx_array_free(var);
         mlx_array_free(var_eps);
-        mlx_array_free(std);
+        mlx_array_free(inv_std);
         mlx_array_free(normalized);
         mlx_array_free(gamma);
         mlx_array_free(beta);
@@ -1138,10 +1121,9 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         /* cleanup */
         mlx_array_free(mean);
         mlx_array_free(centered);
-        mlx_array_free(sq);
         mlx_array_free(var);
         mlx_array_free(var_eps);
-        mlx_array_free(std);
+        mlx_array_free(inv_std);
         mlx_array_free(normalized);
         mlx_array_free(gamma);
         mlx_array_free(beta);
@@ -1156,10 +1138,9 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     /* cleanup temporaries */
     mlx_array_free(mean);
     mlx_array_free(centered);
-    mlx_array_free(sq);
     mlx_array_free(var);
     mlx_array_free(var_eps);
-    mlx_array_free(std);
+    mlx_array_free(inv_std);
     mlx_array_free(normalized);
     mlx_array_free(gamma);
     mlx_array_free(beta);
