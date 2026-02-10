@@ -31,7 +31,9 @@ void mlx_gpu_stream_destroy(void) {
     if (!atomic_load(&g_stream_alive))
         return;
     mlx_stream_free(g_cached_gpu_stream);
-    g_cached_gpu_stream = (mlx_stream){0};
+    g_cached_gpu_stream = (mlx_stream) {
+        0
+    };
     atomic_store(&g_stream_alive, 0);
 }
 

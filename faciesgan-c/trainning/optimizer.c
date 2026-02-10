@@ -180,17 +180,17 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
      * the alloc→free→realloc churn of the old pattern.  These are
      * freed at the end of this function. */
     mlx_array scal_b1 = (opt->beta1 != 0.0f)
-        ? mlx_array_new_float(opt->beta1) : mlx_array_new();
+                        ? mlx_array_new_float(opt->beta1) : mlx_array_new();
     mlx_array scal_1mb1 = (opt->beta1 != 0.0f)
-        ? mlx_array_new_float(1.0f - opt->beta1) : mlx_array_new();
+                          ? mlx_array_new_float(1.0f - opt->beta1) : mlx_array_new();
     mlx_array scal_b2 = (opt->beta2 != 0.0f)
-        ? mlx_array_new_float(opt->beta2) : mlx_array_new();
+                        ? mlx_array_new_float(opt->beta2) : mlx_array_new();
     mlx_array scal_1mb2 = (opt->beta2 != 0.0f)
-        ? mlx_array_new_float(1.0f - opt->beta2) : mlx_array_new();
+                          ? mlx_array_new_float(1.0f - opt->beta2) : mlx_array_new();
     mlx_array eps_arr = mlx_array_new_float(opt->eps);
     mlx_array lr_arr = mlx_array_new_float(effective_lr);
     mlx_array decay_scale_arr = (opt->weight_decay != 0.0f)
-        ? mlx_array_new_float(opt->lr * opt->weight_decay) : mlx_array_new();
+                                ? mlx_array_new_float(opt->lr * opt->weight_decay) : mlx_array_new();
 
     /* Gradients are left lazy — they will be transitively evaluated
      * when the caller batch-evals model params + optimizer state at the
