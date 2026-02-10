@@ -168,7 +168,32 @@ struct MLXGenerator {
     MLXColorQuantization *color_quant;
     int eval_mode;
     mlx_vector_int spade_scales;
+    /* Per-scale and all-params caches — invalidated by create_scale */
+    mlx_array ***scale_param_cache;   /* [scale_cache_cap] array of mlx_array** */
+    int         *scale_param_count;   /* [scale_cache_cap] array of counts */
+    int          scale_cache_cap;
+    mlx_array  **all_param_cache;
+    int          all_param_count;
 };
+
+static void invalidate_gen_caches(MLXGenerator *m) {
+    if (m->scale_param_cache) {
+        for (int i = 0; i < m->scale_cache_cap; ++i) {
+            if (m->scale_param_cache[i])
+                mlx_free_pod((void **)&m->scale_param_cache[i]);
+        }
+        free(m->scale_param_cache);
+        free(m->scale_param_count);
+        m->scale_param_cache = NULL;
+        m->scale_param_count = NULL;
+        m->scale_cache_cap = 0;
+    }
+    if (m->all_param_cache) {
+        mlx_free_pod((void **)&m->all_param_cache);
+        m->all_param_cache = NULL;
+        m->all_param_count = 0;
+    }
+}
 
 MLXGenerator *mlx_generator_create(int num_layer, int kernel_size,
                                    int padding_size, int input_channels,
@@ -190,12 +215,18 @@ MLXGenerator *mlx_generator_create(int num_layer, int kernel_size,
     m->color_quant = mlx_colorquant_create(0.1f);
     m->eval_mode = 0;
     m->spade_scales = mlx_vector_int_new();
+    m->scale_param_cache = NULL;
+    m->scale_param_count = NULL;
+    m->scale_cache_cap = 0;
+    m->all_param_cache = NULL;
+    m->all_param_count = 0;
     return m;
 }
 
 void mlx_generator_free(MLXGenerator *m) {
     if (!m)
         return;
+    invalidate_gen_caches(m);
     if (m->spade_scales.ctx)
         mlx_vector_int_free(m->spade_scales);
     if (m->gens) {
@@ -237,6 +268,8 @@ int mlx_generator_create_scale(MLXGenerator *m, int scale, int num_features,
                                int min_num_features) {
     if (!m)
         return -1;
+    /* Invalidate parameter caches — new scale changes parameter set */
+    invalidate_gen_caches(m);
     struct ScaleModule *s =
         (struct ScaleModule *)calloc(1, sizeof(struct ScaleModule));
     if (!s)
@@ -533,6 +566,11 @@ static int fill_nonspade_params(struct ScaleModule *sm, mlx_array **list, int id
 mlx_array **mlx_generator_get_parameters(MLXGenerator *m, int *out_count) {
     if (!m || !out_count)
         return NULL;
+    /* Return cached all-params list if available */
+    if (m->all_param_cache) {
+        *out_count = m->all_param_count;
+        return m->all_param_cache;
+    }
     int total = 0;
     for (int i = 0; i < m->n_gens; ++i) {
         struct ScaleModule *sm = (struct ScaleModule *)m->gens[i];
@@ -577,6 +615,9 @@ mlx_array **mlx_generator_get_parameters(MLXGenerator *m, int *out_count) {
             idx = fill_nonspade_params(sm, list, idx);
         }
     }
+    /* Cache the all-params list */
+    m->all_param_cache = list;
+    m->all_param_count = idx;
     *out_count = idx;
     return list;
 }
@@ -585,6 +626,13 @@ mlx_array **mlx_generator_get_parameters(MLXGenerator *m, int *out_count) {
 mlx_array **mlx_generator_get_parameters_for_scale(MLXGenerator *m, int scale_index, int *out_count) {
     if (!m || !out_count || scale_index < 0 || scale_index >= m->n_gens)
         return NULL;
+
+    /* Return cached per-scale list if available */
+    if (m->scale_param_cache && scale_index < m->scale_cache_cap
+            && m->scale_param_cache[scale_index]) {
+        *out_count = m->scale_param_count[scale_index];
+        return m->scale_param_cache[scale_index];
+    }
 
     struct ScaleModule *sm = (struct ScaleModule *)m->gens[scale_index];
     if (!sm) {
@@ -630,13 +678,33 @@ mlx_array **mlx_generator_get_parameters_for_scale(MLXGenerator *m, int scale_in
         idx = fill_nonspade_params(sm, list, idx);
     }
 
+    /* Cache the per-scale list */
+    if (!m->scale_param_cache || scale_index >= m->scale_cache_cap) {
+        int newcap = m->n_gens > (scale_index + 1) ? m->n_gens : (scale_index + 1);
+        mlx_array ***nc = (mlx_array ***)calloc(newcap, sizeof(mlx_array **));
+        int *nn = (int *)calloc(newcap, sizeof(int));
+        if (m->scale_param_cache) {
+            for (int i = 0; i < m->scale_cache_cap; ++i) {
+                nc[i] = m->scale_param_cache[i];
+                nn[i] = m->scale_param_count[i];
+            }
+            free(m->scale_param_cache);
+            free(m->scale_param_count);
+        }
+        m->scale_param_cache = nc;
+        m->scale_param_count = nn;
+        m->scale_cache_cap = newcap;
+    }
+    m->scale_param_cache[scale_index] = list;
+    m->scale_param_count[scale_index] = idx;
+
     *out_count = idx;
     return list;
 }
 
 void mlx_generator_free_parameters_list(mlx_array **list) {
-    if (list)
-        mlx_free_pod((void **)&list);
+    /* No-op: list is now cached on the struct and freed in mlx_generator_free */
+    (void)list;
 }
 
 /* Full forward implementation ported from Python `models/mlx/generator.py`.

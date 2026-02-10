@@ -16,6 +16,11 @@ extern "C" {
  */
 int npz_create_from_memory(const char *npz_path, const char **member_names, const void **member_bufs, const size_t *member_sizes, int n_members);
 
+/* Pack all .npy files in `dir` into `<dir>/archive_name` (e.g. "generator.npz").
+ * After packing, individual .npy files are removed.
+ * Returns 0 on success. */
+int npz_pack_npy_dir(const char *dir, const char *archive_name);
+
 #ifdef __cplusplus
 }
 #endif

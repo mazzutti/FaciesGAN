@@ -783,17 +783,20 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
 
 
     /* allocate arrays aligned to n_scales and fill entries from internal vectors
-       where available; otherwise leave empty mlx_array objects */
-    mlx_global_lock(); /* protect all MLX operations from concurrent access */
+       where available; otherwise leave empty mlx_array objects.
+       MLX operations (vector_array_get, array_new, array_set, array_free,
+       vector_array_free) are done under the global lock.  Pure-C pointer-array
+       setup happens AFTER the lock is released to reduce contention. */
+    mlx_global_lock();
+
+    /* --- Extract facies --- */
     int nf = mlx_vector_array_size(ib.facies_vec);
     if (mlx_alloc_mlx_array_raw(&out->facies, n_scales) != 0)
         out->facies = NULL;
     for (int i = 0; i < n_scales; ++i) {
         if (i < nf) {
-            /* get element, then set it into output array */
             mlx_array tmp = mlx_array_new();
             mlx_vector_array_get(&tmp, ib.facies_vec, i);
-            /* Use array_set instead of copy to avoid potential stream issues */
             out->facies[i] = mlx_array_new();
             mlx_array_set(&out->facies[i], tmp);
             mlx_array_free(tmp);
@@ -802,21 +805,7 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
         }
     }
 
-    /* Create pointer arrays that reference the allocated mlx_array values
-     * so callers that expect `mlx_array **` can use them directly without
-     * performing per-batch pointer loops. Use generic pointer-array helpers
-     * so we don't attempt to free pointees twice. */
-    if (out->facies) {
-        if (mlx_alloc_ptr_array((void ***)&out->facies_ptrs, n_scales) == 0) {
-            for (int i = 0; i < n_scales; ++i)
-                out->facies_ptrs[i] = &out->facies[i];
-        } else {
-            out->facies_ptrs = NULL;
-        }
-    } else {
-        out->facies_ptrs = NULL;
-    }
-
+    /* --- Extract wells --- */
     int nw = mlx_vector_array_size(ib.wells_vec);
     if (nw > 0) {
         if (mlx_alloc_mlx_array_raw(&out->wells, n_scales) != 0)
@@ -833,19 +822,10 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
             }
         }
     } else {
-        out->wells = NULL; /* match Python: empty dict semantics */
-    }
-    if (out->wells) {
-        if (mlx_alloc_ptr_array((void ***)&out->wells_ptrs, n_scales) == 0) {
-            for (int i = 0; i < n_scales; ++i)
-                out->wells_ptrs[i] = &out->wells[i];
-        } else {
-            out->wells_ptrs = NULL;
-        }
-    } else {
-        out->wells_ptrs = NULL;
+        out->wells = NULL;
     }
 
+    /* --- Extract masks --- */
     int nm = mlx_vector_array_size(ib.masks_vec);
     if (nm > 0) {
         if (mlx_alloc_mlx_array_raw(&out->masks, n_scales) != 0)
@@ -862,19 +842,10 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
             }
         }
     } else {
-        out->masks = NULL; /* match Python: empty dict semantics */
-    }
-    if (out->masks) {
-        if (mlx_alloc_ptr_array((void ***)&out->masks_ptrs, n_scales) == 0) {
-            for (int i = 0; i < n_scales; ++i)
-                out->masks_ptrs[i] = &out->masks[i];
-        } else {
-            out->masks_ptrs = NULL;
-        }
-    } else {
-        out->masks_ptrs = NULL;
+        out->masks = NULL;
     }
 
+    /* --- Extract seismic --- */
     int ns = mlx_vector_array_size(ib.seismic_vec);
     if (ns > 0) {
         if (mlx_alloc_mlx_array_raw(&out->seismic, n_scales) != 0)
@@ -891,7 +862,46 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
             }
         }
     } else {
-        out->seismic = NULL; /* match Python: empty dict semantics */
+        out->seismic = NULL;
+    }
+
+    /* Free internal vectors (still under lock — these are MLX objects) */
+    mlx_vector_array_free(ib.facies_vec);
+    mlx_vector_array_free(ib.wells_vec);
+    mlx_vector_array_free(ib.masks_vec);
+    mlx_vector_array_free(ib.seismic_vec);
+    mlx_global_unlock();
+
+    /* --- Build pointer arrays (pure C, no lock needed) --- */
+    if (out->facies) {
+        if (mlx_alloc_ptr_array((void ***)&out->facies_ptrs, n_scales) == 0) {
+            for (int i = 0; i < n_scales; ++i)
+                out->facies_ptrs[i] = &out->facies[i];
+        } else {
+            out->facies_ptrs = NULL;
+        }
+    } else {
+        out->facies_ptrs = NULL;
+    }
+    if (out->wells) {
+        if (mlx_alloc_ptr_array((void ***)&out->wells_ptrs, n_scales) == 0) {
+            for (int i = 0; i < n_scales; ++i)
+                out->wells_ptrs[i] = &out->wells[i];
+        } else {
+            out->wells_ptrs = NULL;
+        }
+    } else {
+        out->wells_ptrs = NULL;
+    }
+    if (out->masks) {
+        if (mlx_alloc_ptr_array((void ***)&out->masks_ptrs, n_scales) == 0) {
+            for (int i = 0; i < n_scales; ++i)
+                out->masks_ptrs[i] = &out->masks[i];
+        } else {
+            out->masks_ptrs = NULL;
+        }
+    } else {
+        out->masks_ptrs = NULL;
     }
     if (out->seismic) {
         if (mlx_alloc_ptr_array((void ***)&out->seismic_ptrs, n_scales) == 0) {
@@ -903,13 +913,6 @@ PrefetchedPyramidsBatch *prefetcher_pop_pyramids(PrefetcherHandle h) {
     } else {
         out->seismic_ptrs = NULL;
     }
-
-    /* free internal vectors */
-    mlx_vector_array_free(ib.facies_vec);
-    mlx_vector_array_free(ib.wells_vec);
-    mlx_vector_array_free(ib.masks_vec);
-    mlx_vector_array_free(ib.seismic_vec);
-    mlx_global_unlock();
 
     return out;
 }

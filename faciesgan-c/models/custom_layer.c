@@ -1302,6 +1302,9 @@ struct MLXSPADEGenerator {
     void *activation; /* tanh handle (unused) */
     int padding_size;
     int kernel_size;
+    /* Cached parameter pointer list (lazy, immutable after creation) */
+    mlx_array **cached_params;
+    int         cached_params_n;
 };
 
 MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
@@ -1378,6 +1381,10 @@ MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
 void mlx_spadegen_free(MLXSPADEGenerator *m) {
     if (!m)
         return;
+    if (m->cached_params) {
+        mlx_free_pod((void **)&m->cached_params);
+        m->cached_params_n = 0;
+    }
     if (m->spade_blocks) {
         for (int i = 0; i < m->n_blocks; ++i) {
             mlx_spadeconv_free((MLXSPADEConvBlock *)m->spade_blocks[i]);
@@ -1636,6 +1643,9 @@ struct MLXSPADEDiscriminator {
     void *tail_bias;     /* tail conv bias pointer */
     int kernel_size;
     int padding_size;
+    /* Cached parameter pointer list (lazy, immutable after creation) */
+    mlx_array **cached_params;
+    int         cached_params_n;
 };
 
 MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
@@ -1696,6 +1706,10 @@ MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
 void mlx_spadedisc_free(MLXSPADEDiscriminator *m) {
     if (!m)
         return;
+    if (m->cached_params) {
+        mlx_free_pod((void **)&m->cached_params);
+        m->cached_params_n = 0;
+    }
     if (m->head) {
         mlx_convblock_free(m->head);
         m->head = NULL;
@@ -1794,6 +1808,12 @@ mlx_array **mlx_spadegen_get_parameters(MLXSPADEGenerator *m, int *out_count) {
     if (!m || !out_count)
         return NULL;
 
+    /* Return cached list if available */
+    if (m->cached_params) {
+        *out_count = m->cached_params_n;
+        return m->cached_params;
+    }
+
     /* Helper: count all trainable parameters matching Python's nn.Module.parameters() */
 #define COUNT_IF(ptr) do { if ((ptr)) total++; } while(0)
 #define ADD_IF(ptr) do { if ((ptr)) list[idx++] = (mlx_array *)(ptr); } while(0)
@@ -1860,19 +1880,29 @@ mlx_array **mlx_spadegen_get_parameters(MLXSPADEGenerator *m, int *out_count) {
 #undef COUNT_IF
 #undef ADD_IF
 
+    /* Cache the list for future calls */
+    m->cached_params = list;
+    m->cached_params_n = idx;
+
     *out_count = idx;
     return list;
 }
 
 void mlx_spadegen_free_parameters_list(mlx_array **list) {
-    if (list)
-        mlx_free_pod((void **)&list);
+    /* No-op: list is now cached on the struct and freed in mlx_spadegen_free */
+    (void)list;
 }
 
 mlx_array **mlx_spadedisc_get_parameters(MLXSPADEDiscriminator *m,
         int *out_count) {
     if (!m || !out_count)
         return NULL;
+
+    /* Return cached list if available */
+    if (m->cached_params) {
+        *out_count = m->cached_params_n;
+        return m->cached_params;
+    }
 
 #define COUNT_IF(ptr) do { if ((ptr)) total++; } while(0)
 #define ADD_IF(ptr) do { if ((ptr)) list[idx++] = (mlx_array *)(ptr); } while(0)
@@ -1936,13 +1966,17 @@ mlx_array **mlx_spadedisc_get_parameters(MLXSPADEDiscriminator *m,
 #undef COUNT_IF
 #undef ADD_IF
 
+    /* Cache the list for future calls */
+    m->cached_params = list;
+    m->cached_params_n = idx;
+
     *out_count = idx;
     return list;
 }
 
 void mlx_spadedisc_free_parameters_list(mlx_array **list) {
-    if (list)
-        mlx_free_pod((void **)&list);
+    /* No-op: list is now cached on the struct and freed in mlx_spadedisc_free */
+    (void)list;
 }
 
 /* Accessors for discriminator internals */

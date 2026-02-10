@@ -129,16 +129,11 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
         return 0;
     }
 
-    /* Use CPU stream for numeric ops */
     mlx_stream s = mlx_gpu_stream();
 
-    /* Determine element count from first sample.
-     * mlx_array_size reads shape metadata only — no eval needed. */
-    mlx_array *first = fake_samples[0];
-    if (!first) {
-        return -1;
-    }
-    size_t total_elems = (size_t)mlx_array_size(*first);
+    /* Validate first sample exists */
+    if (!fake_samples[0]) return -1;
+    size_t total_elems = (size_t)mlx_array_size(*fake_samples[0]);
     if (total_elems == 0) {
         *out_loss = NULL;
         if (mlx_alloc_pod((void **)out_loss, sizeof(mlx_array), 1) != 0)
@@ -147,114 +142,132 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
         return 0;
     }
 
-    /* Accumulate sum of exp(-10 * mean_sq) over pairs */
-    mlx_array acc = mlx_array_new_float(0.0f);
-    int pairs = 0;
+    /* --- Vectorized diversity loss via broadcasting ---
+     * 1. Flatten each sample to [M] and stack → [n, M]
+     * 2. Expand dims:  a=[n,1,M]  b=[1,n,M]
+     * 3. diff = a - b  → [n,n,M]  (broadcast)
+     * 4. sq = diff²    → [n,n,M]
+     * 5. mean_sq = mean(sq, axis=2) → [n,n]
+     * 6. vals = exp(-10 * mean_sq)  → [n,n]
+     * 7. loss = lambda * (sum(vals) - n) / (n*(n-1))
+     *    (diagonal entries are exp(0)=1, matrix is symmetric)
+     */
+    int rc = 0;
+
+    /* 1. Flatten and stack */
+    int flat_shape[1] = {(int)total_elems};
+    mlx_vector_array sample_vec = mlx_vector_array_new();
     for (int i = 0; i < n_samples; ++i) {
-        for (int j = i + 1; j < n_samples; ++j) {
-            if (!fake_samples[i] || !fake_samples[j])
-                continue;
-            mlx_array diff = mlx_array_new();
-            if (mlx_subtract(&diff, *fake_samples[i], *fake_samples[j], s) != 0) {
-                mlx_array_free(diff);
-                continue;
-            }
-            mlx_array sq = mlx_array_new();
-            if (mlx_square(&sq, diff, s) != 0) {
-                mlx_array_free(diff);
-                mlx_array_free(sq);
-                continue;
-            }
-            /* mean over all axes */
-            int ndim = (int)mlx_array_ndim(diff);
-            int *axes = NULL;
-            if (ndim > 0) {
-                if (mlx_alloc_int_array(&axes, ndim) != 0) {
-                    mlx_array_free(diff);
-                    mlx_array_free(sq);
-                    continue;
-                }
-                for (int a = 0; a < ndim; ++a)
-                    axes[a] = a;
-            }
-            mlx_array mean = mlx_array_new();
-            if (mlx_mean_axes(&mean, sq, axes, ndim, true, s) != 0) {
-                mlx_free_int_array(&axes, &ndim);
-                mlx_array_free(diff);
-                mlx_array_free(sq);
-                mlx_array_free(mean);
-                continue;
-            }
-            mlx_free_int_array(&axes, &ndim);
-
-            /* exp(-10 * mean_sq) to match Python exactly */
-            mlx_array prod = mlx_array_new();
-            if (mlx_multiply(&prod, mean, mlx_scalar_neg_ten(), s) != 0) {
-                mlx_array_free(diff);
-                mlx_array_free(sq);
-                mlx_array_free(mean);
-                mlx_array_free(prod);
-                continue;
-            }
-            mlx_array val = mlx_array_new();
-            if (mlx_exp(&val, prod, s) != 0) {
-                mlx_array_free(diff);
-                mlx_array_free(sq);
-                mlx_array_free(mean);
-                mlx_array_free(prod);
-                mlx_array_free(val);
-                continue;
-            }
-
-            /* accumulate into acc */
-            mlx_array tmp = mlx_array_new();
-            if (mlx_add(&tmp, acc, val, s) == 0) {
-                mlx_array_free(acc);
-                acc = tmp;
-            } else {
-                mlx_array_free(tmp);
-            }
-
-            mlx_array_free(prod);
-            mlx_array_free(val);
-
-            mlx_array_free(diff);
-            mlx_array_free(sq);
-            mlx_array_free(mean);
-            pairs++;
-        }
-    }
-
-    if (pairs == 0) {
-        mlx_array_free(acc);
-        *out_loss = NULL;
-        if (mlx_alloc_pod((void **)out_loss, sizeof(mlx_array), 1) != 0)
+        if (!fake_samples[i]) {
+            mlx_vector_array_free(sample_vec);
             return -1;
-        **out_loss = mlx_array_new_float(0.0f);
-        return 0;
+        }
+        mlx_array flat = mlx_array_new();
+        if (mlx_reshape(&flat, *fake_samples[i], flat_shape, 1, s) != 0) {
+            mlx_array_free(flat);
+            mlx_vector_array_free(sample_vec);
+            return -1;
+        }
+        mlx_vector_array_append_value(sample_vec, flat);
+        mlx_array_free(flat);
     }
-
-    /* divide acc by number of pairs, multiply by lambda_diversity */
-    mlx_array denom = mlx_array_new_float((float)pairs);
-    mlx_array mean_acc = mlx_array_new();
-    int rc = mlx_divide(&mean_acc, acc, denom, s);
+    mlx_array stacked = mlx_array_new();  /* [n, M] */
+    rc = mlx_stack_axis(&stacked, sample_vec, 0, s);
+    mlx_vector_array_free(sample_vec);
     if (rc != 0) {
-        mlx_array_free(acc);
-        mlx_array_free(denom);
+        mlx_array_free(stacked);
         return -1;
     }
-    mlx_array_free(acc);
-    mlx_array_free(denom);
 
-    mlx_array lambda_arr = mlx_array_new_float(lambda_diversity);
-    mlx_array outv = mlx_array_new();
-    if (mlx_multiply(&outv, mean_acc, lambda_arr, s) != 0) {
-        mlx_array_free(mean_acc);
-        mlx_array_free(lambda_arr);
+    /* 2. expand_dims: a=[n,1,M]  b=[1,n,M] */
+    mlx_array a = mlx_array_new();
+    mlx_array b = mlx_array_new();
+    if (mlx_expand_dims(&a, stacked, 1, s) != 0 ||
+            mlx_expand_dims(&b, stacked, 0, s) != 0) {
+        mlx_array_free(stacked);
+        mlx_array_free(a);
+        mlx_array_free(b);
         return -1;
     }
-    mlx_array_free(mean_acc);
-    mlx_array_free(lambda_arr);
+    mlx_array_free(stacked);
+
+    /* 3-4. diff = a - b, sq = diff² */
+    mlx_array diff = mlx_array_new();
+    if (mlx_subtract(&diff, a, b, s) != 0) {
+        mlx_array_free(a);
+        mlx_array_free(b);
+        mlx_array_free(diff);
+        return -1;
+    }
+    mlx_array_free(a);
+    mlx_array_free(b);
+
+    mlx_array sq = mlx_array_new();
+    if (mlx_square(&sq, diff, s) != 0) {
+        mlx_array_free(diff);
+        mlx_array_free(sq);
+        return -1;
+    }
+    mlx_array_free(diff);
+
+    /* 5. mean over spatial axis (last axis, index 2) */
+    mlx_array mean_sq = mlx_array_new();
+    if (mlx_mean_axis(&mean_sq, sq, 2, false, s) != 0) {
+        mlx_array_free(sq);
+        mlx_array_free(mean_sq);
+        return -1;
+    }
+    mlx_array_free(sq);
+
+    /* 6. vals = exp(-10 * mean_sq) */
+    mlx_array scaled = mlx_array_new();
+    if (mlx_multiply(&scaled, mean_sq, mlx_scalar_neg_ten(), s) != 0) {
+        mlx_array_free(mean_sq);
+        mlx_array_free(scaled);
+        return -1;
+    }
+    mlx_array_free(mean_sq);
+
+    mlx_array vals = mlx_array_new();
+    if (mlx_exp(&vals, scaled, s) != 0) {
+        mlx_array_free(scaled);
+        mlx_array_free(vals);
+        return -1;
+    }
+    mlx_array_free(scaled);
+
+    /* 7. sum_all, subtract diagonal (n ones), divide by n*(n-1) pairs×2 */
+    mlx_array sum_all = mlx_array_new();
+    if (mlx_sum(&sum_all, vals, false, s) != 0) {
+        mlx_array_free(vals);
+        mlx_array_free(sum_all);
+        return -1;
+    }
+    mlx_array_free(vals);
+
+    mlx_array n_arr = mlx_array_new_float((float)n_samples);
+    mlx_array sum_off = mlx_array_new();
+    if (mlx_subtract(&sum_off, sum_all, n_arr, s) != 0) {
+        mlx_array_free(sum_all);
+        mlx_array_free(n_arr);
+        mlx_array_free(sum_off);
+        return -1;
+    }
+    mlx_array_free(sum_all);
+    mlx_array_free(n_arr);
+
+    /* Divide by n*(n-1) and multiply by lambda */
+    float scale_factor = lambda_diversity / (float)(n_samples * (n_samples - 1));
+    mlx_array scale_arr = mlx_array_new_float(scale_factor);
+    mlx_array outv = mlx_array_new();
+    if (mlx_multiply(&outv, sum_off, scale_arr, s) != 0) {
+        mlx_array_free(sum_off);
+        mlx_array_free(scale_arr);
+        mlx_array_free(outv);
+        return -1;
+    }
+    mlx_array_free(sum_off);
+    mlx_array_free(scale_arr);
 
     *out_loss = NULL;
     if (mlx_alloc_pod((void **)out_loss, sizeof(mlx_array), 1) != 0) {
