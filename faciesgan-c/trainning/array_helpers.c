@@ -116,10 +116,9 @@ int mlx_alloc_int_array(int **out, int n) {
     *out = NULL;
     if (n <= 0)
         return 0;
-    int *buf = (int *)malloc(sizeof(int) * (size_t)n);
+    int *buf = (int *)calloc((size_t)n, sizeof(int));
     if (!buf)
         return -1;
-    memset(buf, 0, sizeof(int) * (size_t)n);
     *out = buf;
     return 0;
 }
@@ -130,11 +129,9 @@ int mlx_alloc_ptr_array(void ***out, int n) {
     *out = NULL;
     if (n <= 0)
         return 0;
-    void **buf = (void **)malloc(sizeof(void *) * (size_t)n);
+    void **buf = (void **)calloc((size_t)n, sizeof(void *));
     if (!buf)
         return -1;
-    for (int i = 0; i < n; ++i)
-        buf[i] = NULL;
     *out = buf;
     return 0;
 }
@@ -155,10 +152,9 @@ int mlx_alloc_float_buf(float **out, int n) {
     *out = NULL;
     if (n <= 0)
         return 0;
-    float *buf = (float *)malloc(sizeof(float) * (size_t)n);
+    float *buf = (float *)calloc((size_t)n, sizeof(float));
     if (!buf)
         return -1;
-    memset(buf, 0, sizeof(float) * (size_t)n);
     *out = buf;
     return 0;
 }
@@ -257,10 +253,11 @@ int mlx_alloc_pod(void **out, size_t elem_size, int n) {
         return 0;
     if (elem_size == 0)
         return -1;
-    void *buf = malloc(elem_size * (size_t)n);
+    /* calloc leverages macOS VM zero-page optimisation and is faster than
+     * malloc+memset for large allocations. */
+    void *buf = calloc((size_t)n, elem_size);
     if (!buf)
         return -1;
-    memset(buf, 0, elem_size * (size_t)n);
     *out = buf;
     return 0;
 }

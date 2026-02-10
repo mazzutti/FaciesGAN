@@ -381,7 +381,7 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
     if (m->conv) {
         mlx_array *wptr = (mlx_array *)m->conv;
         if (cached_mlx_conv2d(&y, x, *wptr, m->stride, m->stride, m->padding,
-                            m->padding, 1, 1, 1, &m->conv_layout, s) != 0) {
+                              m->padding, 1, 1, 1, &m->conv_layout, s) != 0) {
             /* conv failed: fallback to input */
             return x;
         }
@@ -917,7 +917,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         return x;
     }
     if (cached_mlx_conv2d(&shared, cond_up, *m->mlp_shared_w, 1, 1, m->padding,
-                        m->padding, 1, 1, 1, &m->shared_layout, s) != 0) {
+                          m->padding, 1, 1, 1, &m->shared_layout, s) != 0) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
         return x;
@@ -949,7 +949,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         return x;
     }
     if (cached_mlx_conv2d(&gamma, shared_act, *m->mlp_gamma_w, 1, 1, m->padding,
-                        m->padding, 1, 1, 1, &m->gamma_layout, s) != 0) {
+                          m->padding, 1, 1, 1, &m->gamma_layout, s) != 0) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
         mlx_array_free(shared);
@@ -967,7 +967,7 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         }
     }
     if (cached_mlx_conv2d(&beta, shared_act, *m->mlp_beta_w, 1, 1, m->padding,
-                        m->padding, 1, 1, 1, &m->beta_layout, s) != 0) {
+                          m->padding, 1, 1, 1, &m->beta_layout, s) != 0) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
         mlx_array_free(shared);
@@ -1269,7 +1269,7 @@ mlx_array_t mlx_spadeconv_forward(MLXSPADEConvBlock *m, mlx_array_t x,
         mlx_array out = mlx_array_new();
         mlx_array *wptr = (mlx_array *)m->conv;
         if (cached_mlx_conv2d(&out, y, *wptr, m->stride, m->stride, m->padding,
-                            m->padding, 1, 1, 1, &m->conv_layout, s) != 0) {
+                              m->padding, 1, 1, 1, &m->conv_layout, s) != 0) {
             /* conv failed: cleanup and return input x */
             mlx_array_free(y);
             return x;
@@ -1443,7 +1443,7 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
         /* Use padding_size (not kernel_size/2) to match Python */
         int pad = m->padding_size;
         if (cached_mlx_conv2d(&x, cond, *iw, 1, 1, pad, pad, 1, 1, 1,
-                             &m->init_conv_layout, s) != 0) {
+                              &m->init_conv_layout, s) != 0) {
             return cond;
         }
         /* Apply init_conv bias */
@@ -1503,7 +1503,7 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
         /* Use padding_size (not kernel_size/2) to match Python */
         int pad = m->padding_size;
         if (cached_mlx_conv2d(&out, x, *tw, 1, 1, pad, pad, 1, 1, 1,
-                             &m->tail_conv_layout, s) != 0) {
+                              &m->tail_conv_layout, s) != 0) {
             if (x.ctx != cond.ctx)
                 mlx_array_free(x);
             return cond;
@@ -2056,7 +2056,7 @@ mlx_array_t mlx_spadedisc_forward(MLXSPADEDiscriminator *m, mlx_array_t x) {
         mlx_array out = mlx_array_new();
         mlx_array *tw = (mlx_array *)m->tail;
         if (cached_mlx_conv2d(&out, cur, *tw, 1, 1, m->padding_size, m->padding_size,
-                            1, 1, 1, &m->tail_layout, s) != 0) {
+                              1, 1, 1, &m->tail_layout, s) != 0) {
             if (cur.ctx != x.ctx)
                 mlx_array_free(cur);
             return x;

@@ -27,9 +27,9 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes, mlx_arra
 	 Returns 0 on success, non-zero on error.
 */
 int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
-    int n_indexes, const mlx_array *real, mlx_array **wells_pyramid,
-    mlx_array **seismic_pyramid, float scale0_noise_amp, float noise_amp,
-    float min_noise_amp);
+                               int n_indexes, const mlx_array *real, mlx_array **wells_pyramid,
+                               mlx_array **seismic_pyramid, float scale0_noise_amp, float noise_amp,
+                               float min_noise_amp);
 
 #ifdef __cplusplus
 }

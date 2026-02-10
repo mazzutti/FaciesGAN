@@ -1084,8 +1084,8 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                 if (smod->tail_conv) {
                     mlx_array outc = mlx_array_new();
                     if (cached_mlx_conv2d(&outc, cur, *smod->tail_conv, 1, 1,
-                                        m->padding_size, m->padding_size, 1, 1, 1,
-                                        &smod->tail_conv_layout, s) == 0) {
+                                          m->padding_size, m->padding_size, 1, 1, 1,
+                                          &smod->tail_conv_layout, s) == 0) {
                         /* Apply tail_conv bias */
                         if (smod->tail_conv_bias) {
                             mlx_array biased = mlx_array_new();

@@ -101,7 +101,7 @@ def _warmup_worker() -> bool:
     os.environ["FG_NO_TORCH_IMPORT"] = "1"
     # Import the plotting module which pulls in matplotlib, numpy, etc.
     try:
-        from utils import plot_generated_facies  # noqa: F401
+        from utils import plot_generated_facies  # type: ignore[import]
     except Exception:
         pass
     return True

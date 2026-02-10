@@ -13,7 +13,7 @@ import numpy as np
 import os
 import sys
 import atexit
-import joblib
+import joblib  # type: ignore[import]
 
 # Ensure the project root is on sys.path so imports like `datasets.*` work
 # when this script is executed from the `tools/` directory or elsewhere.
@@ -107,7 +107,7 @@ def _load_joblib_cached(
                 args.get("scale_list") == target_scale
                 and args.get("channels_last") == target_channels
             ):
-                return joblib.load(out)
+                return joblib.load(out)  # type: ignore[call-arg]
         except Exception:
             continue
     return None
@@ -218,7 +218,7 @@ def main():
 
             mx.random.seed(manual_seed)
             perm = mx.random.permutation(mx.arange(total_samples))
-            mx.eval(perm)
+            mx.eval(perm)  # type: ignore[attr-defined]
             selected_indices = [
                 int(perm[i]) for i in range(min(num_train, num_to_store))
             ]
