@@ -741,7 +741,8 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
         stop_scale = m->n_gens - 1;
 
     mlx_stream s = mlx_gpu_stream();
-    mlx_array zero_scalar = mlx_array_new_float(0.0f);
+    /* Perf: use pooled zero scalar instead of per-call allocation */
+    mlx_array zero_scalar = mlx_scalar_zero();
 
     /* Initialize out_facie */
     mlx_array_t out_facie = in_noise;
@@ -1048,11 +1049,6 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                     }
                     cur = nx;
                     cur_is_alias = 0;
-                    /* Debug: head output shape */
-                    {
-                        int c_ndim = (int)mlx_array_ndim(cur);
-                        const int *csh = mlx_array_shape(cur);
-                    }
                 }
                 /* body */
                 if (smod->body) {
@@ -1073,11 +1069,6 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                         }
                         cur = nx;
                         cur_is_alias = 0;
-                        /* Debug: body output shape after body[%d] */
-                        {
-                            int b_ndim = (int)mlx_array_ndim(cur);
-                            const int *bsh = mlx_array_shape(cur);
-                        }
                     }
                 }
                 /* tail conv + tanh if present */
@@ -1106,11 +1097,6 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                     } else {
                         out_mod = cur;
                     }
-                    /* Debug: tail/out_mod shape */
-                    {
-                        int o_ndim = (int)mlx_array_ndim(out_mod);
-                        const int *osh = mlx_array_shape(out_mod);
-                    }
                     if (cur.ctx && cur.ctx != out_mod.ctx) {
                         if (cur_is_alias) {
                             if (z_in.ctx) {
@@ -1124,21 +1110,8 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                     }
                 } else {
                     out_mod = cur;
-                    /* Debug: out_mod (no tail) shape */
-                    {
-                        int o_ndim = (int)mlx_array_ndim(out_mod);
-                        const int *osh = mlx_array_shape(out_mod);
-                    }
                 }
             }
-        }
-
-        /* Debug: shapes before adding module output to current facie */
-        {
-            int mo_ndim = (int)mlx_array_ndim(out_mod);
-            const int *mos = mlx_array_shape(out_mod);
-            int up_ndim = (int)mlx_array_ndim(upsampled_for_residual);
-            const int *ups = mlx_array_shape(upsampled_for_residual);
         }
 
         /* Ensure spatial shapes match between out_mod and upsampled_for_residual before adding.
@@ -1251,7 +1224,7 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
         out_facie = q;
     }
 
-    mlx_array_free(zero_scalar);
+    /* Perf: zero_scalar is from scalar pool, do NOT free it */
 
     return out_facie;
 }

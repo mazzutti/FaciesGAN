@@ -18,6 +18,8 @@ mlx_array mlx_scalar_neg_one(void);   /* -1.0f */
 mlx_array mlx_scalar_eps(void);       /* 1e-5f (instance-norm epsilon) */
 mlx_array mlx_scalar_neg_ten(void);   /* -10.0f (diversity loss coeff) */
 mlx_array mlx_scalar_half(void);      /* 0.5f  */
+mlx_array mlx_scalar_gp_eps(void);    /* 1e-12f (gradient-penalty epsilon) */
+mlx_array mlx_scalar_two(void);       /* 2.0f  */
 
 /**
  * Release all cached scalars.  Call once at program shutdown if desired;

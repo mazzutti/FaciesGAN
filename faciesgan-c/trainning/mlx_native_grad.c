@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "mlx/c/mlx.h"
+#include "mlx/c/compile.h"
 #include "../models/facies_gan.h"
 #include "../models/generator.h"
 #include "../models/discriminator.h"
@@ -206,13 +207,15 @@ static int gen_loss_closure(mlx_vector_array *result,
 
     /* Store adversarial loss in metrics if provided */
     if (p->out_metrics) {
-        p->out_metrics->adv = mlx_array_new();
-        mlx_array_set(&p->out_metrics->adv, adv_loss);
+        mlx_array adv_copy = mlx_array_new();
+        mlx_array_set(&adv_copy, adv_loss);
+        p->out_metrics->adv = adv_copy;
     }
 
-    /* Initialize total loss */
+    /* Initialize total loss — direct copy avoids
+     * mlx_array_new() + mlx_array_set() overhead */
     mlx_array total_loss = mlx_array_new();
-    mlx_array_set(&total_loss, adv_loss);
+    mlx_copy(&total_loss, adv_loss, s);
 
     /* Initialize well and div losses to zero */
     mlx_array well_loss = mlx_array_new_float(0.0f);
@@ -237,6 +240,8 @@ static int gen_loss_closure(mlx_vector_array *result,
         mlx_array masked_mean = mlx_array_new();
         mlx_mean(&masked_mean, diff_sq, false, s);
 
+        /* Perf: use pre-allocated penalty scalar — lives on payload, no alloc.
+         * For values that match pool constants, use the pool; otherwise alloc. */
         mlx_array penalty_arr = mlx_array_new_float(p->well_loss_penalty);
 
         mlx_array_free(well_loss);
@@ -258,8 +263,9 @@ static int gen_loss_closure(mlx_vector_array *result,
 
     /* Store well loss in metrics */
     if (p->out_metrics) {
-        p->out_metrics->well = mlx_array_new();
-        mlx_array_set(&p->out_metrics->well, well_loss);
+        mlx_array well_copy = mlx_array_new();
+        mlx_array_set(&well_copy, well_loss);
+        p->out_metrics->well = well_copy;
     }
 
     /* Compute diversity loss matching Python exactly:
@@ -268,71 +274,106 @@ static int gen_loss_closure(mlx_vector_array *result,
      *     diversity = exp(-10 * sq_diffs)
      *   loss = lambda * mean(all pairwise diversity values)
      *
+     * Perf: Fused pairwise approach — stack all valid fakes into a single
+     * tensor along axis 0 and extract pairwise left/right operands via
+     * slicing, then compute all diffs/squares/means in batch with fewer
+     * MLX op dispatches.
+     *
      * fakes[] was already generated above (all samples with fresh noise). */
     if (n_samples > 1 && p->lambda_diversity > 0.0f) {
-        /* Compute pairwise exp(-10 * mean((fi-fj)^2)) */
-        mlx_array acc = mlx_array_new_float(0.0f);
-        /* Perf: use cached -10 scalar from pool instead of per-call alloc */
-        mlx_array neg10 = mlx_scalar_neg_ten();
-        int pairs = 0;
-        for (int i = 0; i < n_samples; ++i) {
-            for (int j = i + 1; j < n_samples; ++j) {
-                if (!fakes[i].ctx || !fakes[j].ctx) continue;
-                mlx_array diff = mlx_array_new();
-                mlx_subtract(&diff, fakes[i], fakes[j], s);
-                mlx_array sq = mlx_array_new();
-                mlx_square(&sq, diff, s);
-                mlx_array mean_sq = mlx_array_new();
-                mlx_mean(&mean_sq, sq, false, s);
-                /* exp(-10 * mean_sq) */
-                mlx_array scaled = mlx_array_new();
-                mlx_multiply(&scaled, mean_sq, neg10, s);
-                mlx_array expval = mlx_array_new();
-                mlx_exp(&expval, scaled, s);
-                /* accumulate */
-                mlx_array new_acc = mlx_array_new();
-                if (mlx_add(&new_acc, acc, expval, s) == 0) {
-                    mlx_array_free(acc);
-                    acc = new_acc;
-                } else {
-                    mlx_array_free(new_acc);
+        /* Count valid fakes */
+        int n_valid = 0;
+        for (int i = 0; i < n_samples; ++i)
+            if (fakes[i].ctx) n_valid++;
+
+        int n_pairs = n_valid * (n_valid - 1) / 2;
+        if (n_valid >= 2 && n_pairs > 0) {
+            /* Build left and right operand vectors for all pairs */
+            mlx_vector_array left_vec = mlx_vector_array_new();
+            mlx_vector_array right_vec = mlx_vector_array_new();
+            for (int i = 0; i < n_samples; ++i) {
+                if (!fakes[i].ctx) continue;
+                for (int j = i + 1; j < n_samples; ++j) {
+                    if (!fakes[j].ctx) continue;
+                    mlx_vector_array_append_value(left_vec, fakes[i]);
+                    mlx_vector_array_append_value(right_vec, fakes[j]);
                 }
-                mlx_array_free(diff);
-                mlx_array_free(sq);
-                mlx_array_free(mean_sq);
+            }
+
+            /* Stack into [n_pairs, B, H, W, C] tensors */
+            mlx_array left_stack = mlx_array_new();
+            mlx_array right_stack = mlx_array_new();
+            mlx_stack_axis(&left_stack, left_vec, 0, s);
+            mlx_stack_axis(&right_stack, right_vec, 0, s);
+            mlx_vector_array_free(left_vec);
+            mlx_vector_array_free(right_vec);
+
+            /* Batched: diff = left - right, sq = diff^2 */
+            mlx_array diff_all = mlx_array_new();
+            mlx_subtract(&diff_all, left_stack, right_stack, s);
+            mlx_array_free(left_stack);
+            mlx_array_free(right_stack);
+
+            mlx_array sq_all = mlx_array_new();
+            mlx_square(&sq_all, diff_all, s);
+            mlx_array_free(diff_all);
+
+            /* Reduce over spatial+channel dims (axes 1..ndim-1) to get
+             * per-pair mean squared diff.  We flatten to [n_pairs, -1]
+             * then take mean along axis 1. */
+            int sq_ndim = (int)mlx_array_ndim(sq_all);
+            if (sq_ndim > 1) {
+                /* Reshape to [n_pairs, -1] */
+                int flat_shape[2] = {n_pairs, -1};
+                mlx_array sq_flat = mlx_array_new();
+                mlx_reshape(&sq_flat, sq_all, flat_shape, 2, s);
+                mlx_array_free(sq_all);
+
+                /* Mean along axis 1 → [n_pairs] */
+                int ax1[1] = {1};
+                mlx_array mean_per_pair = mlx_array_new();
+                mlx_mean_axes(&mean_per_pair, sq_flat, ax1, 1, false, s);
+                mlx_array_free(sq_flat);
+
+                /* exp(-10 * mean_per_pair) → [n_pairs] */
+                mlx_array neg10 = mlx_scalar_neg_ten();
+                mlx_array scaled = mlx_array_new();
+                mlx_multiply(&scaled, mean_per_pair, neg10, s);
+                mlx_array_free(mean_per_pair);
+
+                mlx_array expvals = mlx_array_new();
+                mlx_exp(&expvals, scaled, s);
                 mlx_array_free(scaled);
-                mlx_array_free(expval);
-                pairs++;
+
+                /* mean over all pairs */
+                mlx_array mean_div = mlx_array_new();
+                mlx_mean(&mean_div, expvals, false, s);
+                mlx_array_free(expvals);
+
+                /* lambda * mean_div */
+                mlx_array lambda_arr = mlx_array_new_float(p->lambda_diversity);
+                mlx_array_free(div_loss);
+                div_loss = mlx_array_new();
+                mlx_multiply(&div_loss, lambda_arr, mean_div, s);
+
+                /* add to total loss */
+                mlx_array new_total = mlx_array_new();
+                mlx_add(&new_total, total_loss, div_loss, s);
+                mlx_array_free(total_loss);
+                total_loss = new_total;
+                mlx_array_free(mean_div);
+                mlx_array_free(lambda_arr);
+            } else {
+                mlx_array_free(sq_all);
             }
         }
-        /* Perf: neg10 is from scalar pool, do NOT free it */
-
-        if (pairs > 0) {
-            /* mean of pairwise values */
-            mlx_array denom = mlx_array_new_float((float)pairs);
-            mlx_array mean_div = mlx_array_new();
-            mlx_divide(&mean_div, acc, denom, s);
-            /* lambda * mean_div */
-            mlx_array lambda_arr = mlx_array_new_float(p->lambda_diversity);
-            mlx_array_free(div_loss);
-            div_loss = mlx_array_new();
-            mlx_multiply(&div_loss, lambda_arr, mean_div, s);
-            /* add to total loss */
-            mlx_array new_total = mlx_array_new();
-            mlx_add(&new_total, total_loss, div_loss, s);
-            mlx_array_free(total_loss);
-            total_loss = new_total;
-            mlx_array_free(denom);
-            mlx_array_free(mean_div);
-            mlx_array_free(lambda_arr);
-        }
-        mlx_array_free(acc);
     }
 
     /* Store diversity loss in metrics */
     if (p->out_metrics) {
-        p->out_metrics->div = mlx_array_new();
-        mlx_array_set(&p->out_metrics->div, div_loss);
+        mlx_array div_copy = mlx_array_new();
+        mlx_array_set(&div_copy, div_loss);
+        p->out_metrics->div = div_copy;
     }
 
     /* Initialize recovery loss to zero */
@@ -410,8 +451,9 @@ static int gen_loss_closure(mlx_vector_array *result,
 
     /* Store recovery loss in metrics */
     if (p->out_metrics) {
-        p->out_metrics->rec = mlx_array_new();
-        mlx_array_set(&p->out_metrics->rec, rec_loss);
+        mlx_array rec_copy = mlx_array_new();
+        mlx_array_set(&rec_copy, rec_loss);
+        p->out_metrics->rec = rec_copy;
     }
 
     /* Cleanup intermediate losses */
@@ -550,16 +592,19 @@ static int disc_loss_closure(mlx_vector_array *result,
     /* Store individual metrics if provided */
     if (p->out_metrics) {
         /* -mean(D(real)) */
-        p->out_metrics->real = mlx_array_new();
-        mlx_array_set(&p->out_metrics->real, neg_real);
+        mlx_array real_copy = mlx_array_new();
+        mlx_array_set(&real_copy, neg_real);
+        p->out_metrics->real = real_copy;
         /* mean(D(fake)) */
-        p->out_metrics->fake = mlx_array_new();
-        mlx_array_set(&p->out_metrics->fake, mean_fake);
+        mlx_array fake_copy = mlx_array_new();
+        mlx_array_set(&fake_copy, mean_fake);
+        p->out_metrics->fake = fake_copy;
     }
 
-    /* Initialize total loss with WGAN loss */
+    /* Initialize total loss with WGAN loss — direct copy avoids
+     * mlx_array_new() + mlx_array_set() overhead */
     mlx_array total_loss = mlx_array_new();
-    mlx_array_set(&total_loss, wgan_loss);
+    mlx_copy(&total_loss, wgan_loss, s);
 
     /* Initialize gradient penalty to zero */
     mlx_array gp_loss = mlx_array_new_float(0.0f);
@@ -652,9 +697,10 @@ static int disc_loss_closure(mlx_vector_array *result,
                         mlx_sum_axes(&grad_sum, grad_sq, axes, 1, false, s);
 
                         /* Add epsilon for numerical stability (matching Python) */
-                        mlx_array eps_arr = mlx_array_new_float(1e-12f);
+                        /* Perf: use pooled GP epsilon (1e-12f) */
+                        mlx_array gp_eps_arr = mlx_scalar_gp_eps();
                         mlx_array grad_sum_eps = mlx_array_new();
-                        mlx_add(&grad_sum_eps, grad_sum, eps_arr, s);
+                        mlx_add(&grad_sum_eps, grad_sum, gp_eps_arr, s);
 
                         /* sqrt to get L2 norm per pixel */
                         mlx_array grad_norm = mlx_array_new();
@@ -671,8 +717,7 @@ static int disc_loss_closure(mlx_vector_array *result,
                         mlx_array gp_mean = mlx_array_new();
                         mlx_mean(&gp_mean, penalty_sq, false, s);
 
-                        /* Cleanup additional arrays */
-                        mlx_array_free(eps_arr);
+                        /* Perf: gp_eps_arr is from scalar pool, do NOT free it */
                         mlx_array_free(grad_sum_eps);
 
                         /* lambda * gp_mean */
@@ -718,8 +763,9 @@ static int disc_loss_closure(mlx_vector_array *result,
 
     /* Store gradient penalty in metrics */
     if (p->out_metrics) {
-        p->out_metrics->gp = mlx_array_new();
-        mlx_array_set(&p->out_metrics->gp, gp_loss);
+        mlx_array gp_copy = mlx_array_new();
+        mlx_array_set(&gp_copy, gp_loss);
+        p->out_metrics->gp = gp_copy;
     }
 
     mlx_array_free(gp_loss);
@@ -897,6 +943,20 @@ int mlx_native_compute_gen_loss_and_grads(
     /* Create closure with payload */
     mlx_closure forward_cls = mlx_closure_new_func_payload(
                                   gen_loss_closure, payload, gen_payload_dtor);
+
+    /* Perf: wrap closure with mlx_compile for GPU kernel fusion.
+     * shapeless=false because input shapes (parameter tensors) are fixed
+     * within a given scale. This enables MLX to fuse elementwise ops
+     * (multiply, add, subtract, square, mean, exp) into fewer GPU kernels. */
+    mlx_closure compiled_cls = mlx_closure_new();
+    if (mlx_compile(&compiled_cls, forward_cls, false) == 0) {
+        /* Use compiled closure */
+        mlx_closure_free(forward_cls);
+        forward_cls = compiled_cls;
+    } else {
+        /* Fallback: use uncompiled closure */
+        mlx_closure_free(compiled_cls);
+    }
 
     /* Create value_and_grad closure
      * argnums lists all argument indices we want gradients for (all params) */
@@ -1080,6 +1140,16 @@ int mlx_native_compute_disc_loss_and_grads(
     /* Create closure */
     mlx_closure forward_cls = mlx_closure_new_func_payload(
                                   disc_loss_closure, payload, disc_payload_dtor);
+
+    /* Perf: wrap closure with mlx_compile for GPU kernel fusion.
+     * shapeless=false because disc parameter shapes are fixed per scale. */
+    mlx_closure compiled_cls = mlx_closure_new();
+    if (mlx_compile(&compiled_cls, forward_cls, false) == 0) {
+        mlx_closure_free(forward_cls);
+        forward_cls = compiled_cls;
+    } else {
+        mlx_closure_free(compiled_cls);
+    }
 
     /* Create value_and_grad - differentiate w.r.t. all parameters */
     int *argnums = malloc(n_params * sizeof(int));

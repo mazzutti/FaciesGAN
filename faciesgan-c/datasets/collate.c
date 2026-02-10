@@ -9,6 +9,27 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
+/* Perf: cache env var lookups that are checked every collate call.
+ * These are read-once from the environment and cached in statics. */
+static inline int collate_use_vectorize(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("FACIESGAN_COLLATE_VECTORIZE") != NULL;
+    return cached;
+}
+static inline int collate_use_validate(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("FACIESGAN_COLLATE_VALIDATE") != NULL;
+    return cached;
+}
+static inline int collate_no_copy(void) {
+    static int cached = -1;
+    if (cached < 0)
+        cached = getenv("FACIESGAN_COLLATE_NO_COPY") != NULL;
+    return cached;
+}
+
 static int process_scales_vectorized(mlx_vector_array *out_vec,
                                      const mlx_vector_vector_array samples,
                                      const mlx_stream s,
@@ -67,7 +88,7 @@ static int process_optional(mlx_vector_array *out_vec,
         /* Optional diagnostic check: ensure `stacked` is available and sane
          * before appending into the output vector. Disabled by default for
          * performance; enable by setting FACIESGAN_COLLATE_VALIDATE=1. */
-        if (getenv("FACIESGAN_COLLATE_VALIDATE")) {
+        if (collate_use_validate()) {
             bool ok = false;
             /* Evaluate the array to ensure it's materialized before checking */
             mlx_array_eval(stacked);
@@ -311,9 +332,9 @@ int facies_collate(mlx_vector_array *out_facies, mlx_vector_array *out_wells,
     size_t scales = mlx_vector_array_size(first_sample);
     mlx_vector_array_free(first_sample);
 
-    int deep_copy = getenv("FACIESGAN_COLLATE_NO_COPY") ? 0 : 1;
+    int deep_copy = collate_no_copy() ? 0 : 1;
     int use_facies_fallback = 1;
-    if (getenv("FACIESGAN_COLLATE_VECTORIZE")) {
+    if (collate_use_vectorize()) {
         int vrc = process_scales_vectorized(out_facies, facies_samples, s, deep_copy);
         if (vrc == 0) {
             use_facies_fallback = 0;
@@ -418,7 +439,7 @@ int facies_collate(mlx_vector_array *out_facies, mlx_vector_array *out_wells,
 
 process_optional_inputs:
     // Process wells and seismic
-    if (getenv("FACIESGAN_COLLATE_VECTORIZE")) {
+    if (collate_use_vectorize()) {
         int wrc = process_scales_vectorized(out_wells, wells_samples, s, 0);
         if (wrc != 0) {
             if (out_wells) {
@@ -438,7 +459,7 @@ process_optional_inputs:
         if (out_seismic) mlx_vector_array_free(*out_seismic);
         return 1;
     }
-    if (getenv("FACIESGAN_COLLATE_VECTORIZE")) {
+    if (collate_use_vectorize()) {
         int src = process_scales_vectorized(out_seismic, seismic_samples, s, 0);
         if (src != 0) {
             if (out_seismic) {

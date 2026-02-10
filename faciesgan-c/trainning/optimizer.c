@@ -53,6 +53,18 @@ struct MLXOptimizer {
     mlx_array cached_decay;   /* lr * weight_decay */
     float cached_lr_val;      /* tracks last LR value to detect changes */
     int scalars_initialised;  /* 1 once scalars have been created */
+
+    /* Perf: pre-allocated deferred parameter update buffers to avoid
+     * calloc/free churn every optimizer step. Sized to param_n. */
+    mlx_array *deferred_new_p;
+    mlx_array **deferred_param_ptr;
+    int deferred_cap;         /* current allocation capacity */
+
+    /* Perf: cached bias-correction denominators — recomputed only when
+     * step changes, shared across all params in the same step. */
+    mlx_array cached_bc1;     /* 1 - beta1^step */
+    mlx_array cached_bc2;     /* 1 - beta2^step */
+    int cached_bc_step;       /* step for which bc1/bc2 are valid */
 };
 
 MLXOptimizer *mlx_adam_create(float lr, float beta1, float beta2, float eps) {
@@ -72,6 +84,10 @@ MLXOptimizer *mlx_adam_create(float lr, float beta1, float beta2, float eps) {
     o->m = NULL;
     o->v = NULL;
     o->scalars_initialised = 0;
+    o->deferred_new_p = NULL;
+    o->deferred_param_ptr = NULL;
+    o->deferred_cap = 0;
+    o->cached_bc_step = -1;
     return o;
 }
 
@@ -93,6 +109,10 @@ MLXOptimizer *mlx_adam_create_ext(float lr, float beta1, float beta2, float eps,
     o->m = NULL;
     o->v = NULL;
     o->scalars_initialised = 0;
+    o->deferred_new_p = NULL;
+    o->deferred_param_ptr = NULL;
+    o->deferred_cap = 0;
+    o->cached_bc_step = -1;
     return o;
 }
 
@@ -114,6 +134,14 @@ void mlx_adam_free(MLXOptimizer *opt) {
         mlx_array_free(opt->cached_lr);
         mlx_array_free(opt->cached_decay);
     }
+    /* Free cached bias-correction denominators */
+    if (opt->cached_bc_step >= 0) {
+        mlx_array_free(opt->cached_bc1);
+        mlx_array_free(opt->cached_bc2);
+    }
+    /* Free pre-allocated deferred buffers */
+    free(opt->deferred_new_p);
+    free(opt->deferred_param_ptr);
     if (opt->m) {
         mlx_free_mlx_array_ptrs(&opt->m, opt->param_n);
     }
@@ -244,8 +272,20 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
     /* Collect new parameter values for deferred lazy set.
      * Adam updates are independent per-parameter, so we can build
      * the entire lazy graph and eval once at the end. */
-    mlx_array *deferred_new_p = calloc(n, sizeof(mlx_array));
-    mlx_array **deferred_param_ptr = calloc(n, sizeof(mlx_array *));
+    /* Perf: reuse pre-allocated deferred buffers instead of calloc/free
+     * each step. Grow only when parameter count changes. */
+    if (opt->deferred_cap < n) {
+        free(opt->deferred_new_p);
+        free(opt->deferred_param_ptr);
+        opt->deferred_new_p = calloc(n, sizeof(mlx_array));
+        opt->deferred_param_ptr = calloc(n, sizeof(mlx_array *));
+        opt->deferred_cap = n;
+    } else {
+        memset(opt->deferred_new_p, 0, n * sizeof(mlx_array));
+        memset(opt->deferred_param_ptr, 0, n * sizeof(mlx_array *));
+    }
+    mlx_array *deferred_new_p = opt->deferred_new_p;
+    mlx_array **deferred_param_ptr = opt->deferred_param_ptr;
     int n_deferred = 0;
 
     for (int i = 0; i < n; ++i) {
@@ -320,29 +360,33 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
         /* compute the `update` array (lr * adjusted moment / denom) */
         mlx_array update = mlx_array_new();
         if (opt->bias_correction) {
-            /* bias-corrected moments */
-            float bias_correction1 = 1.0f - powf(opt->beta1, (float)opt->step);
-            float bias_correction2 = 1.0f - powf(opt->beta2, (float)opt->step);
-            mlx_array denom1 = mlx_array_new_float(bias_correction1);
-            mlx_array denom2 = mlx_array_new_float(bias_correction2);
+            /* Perf: cache bias-correction denominators across all params
+             * in the same step — they only depend on beta^step, not on
+             * individual parameters. Recompute only when step changes. */
+            if (opt->cached_bc_step != opt->step) {
+                if (opt->cached_bc_step >= 0) {
+                    mlx_array_free(opt->cached_bc1);
+                    mlx_array_free(opt->cached_bc2);
+                }
+                float bc1 = 1.0f - powf(opt->beta1, (float)opt->step);
+                float bc2 = 1.0f - powf(opt->beta2, (float)opt->step);
+                opt->cached_bc1 = mlx_array_new_float(bc1);
+                opt->cached_bc2 = mlx_array_new_float(bc2);
+                opt->cached_bc_step = opt->step;
+            }
+            /* bias-corrected moments using cached denominators */
             mlx_array m_hat = mlx_array_new();
             mlx_array v_hat = mlx_array_new();
-            if (mlx_divide(&m_hat, *opt->m[i], denom1, s) != 0) {
-                mlx_array_free(denom1);
-                mlx_array_free(denom2);
+            if (mlx_divide(&m_hat, *opt->m[i], opt->cached_bc1, s) != 0) {
                 mlx_array_free(m_hat);
                 mlx_array_free(v_hat);
                 continue;
             }
-            if (mlx_divide(&v_hat, *opt->v[i], denom2, s) != 0) {
-                mlx_array_free(denom1);
-                mlx_array_free(denom2);
+            if (mlx_divide(&v_hat, *opt->v[i], opt->cached_bc2, s) != 0) {
                 mlx_array_free(m_hat);
                 mlx_array_free(v_hat);
                 continue;
             }
-            mlx_array_free(denom1);
-            mlx_array_free(denom2);
 
             /* denom = sqrt(v_hat) + eps */
             mlx_array sqrt_v = mlx_array_new();
@@ -454,8 +498,7 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
         mlx_array_set(deferred_param_ptr[i], deferred_new_p[i]);
         mlx_array_free(deferred_new_p[i]);
     }
-    free(deferred_new_p);
-    free(deferred_param_ptr);
+    /* Perf: deferred buffers are pre-allocated on the struct — no free() needed */
 
     /* Cached scalars are NOT freed here — they persist on the struct
      * across optimizer steps for reuse (freed in mlx_adam_free). */

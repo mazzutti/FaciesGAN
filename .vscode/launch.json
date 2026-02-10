@@ -85,7 +85,7 @@
         "--batch-size",
         "1",
         "--num-workers",
-        "2",
+        "0",
         "--num-iter",
         "100",
         "--num-parallel-scales",

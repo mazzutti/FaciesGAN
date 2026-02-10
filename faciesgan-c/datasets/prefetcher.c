@@ -292,10 +292,12 @@ static void *prefetcher_dataloader_producer(void *v) {
 
         /* Avoid holding the global MLX lock while waiting on process workers,
          * which can deadlock when the optimizer also acquires the lock. */
-        int use_mlx_lock = 1;
-        const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
-        if (proc_env && strcmp(proc_env, "1") == 0)
-            use_mlx_lock = 0;
+        static int cached_proc_workers = -1;
+        if (cached_proc_workers < 0) {
+            const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+            cached_proc_workers = (proc_env && strcmp(proc_env, "1") == 0) ? 1 : 0;
+        }
+        int use_mlx_lock = !cached_proc_workers;
         if (use_mlx_lock)
             mlx_global_lock();
         int rc = facies_dataloader_next(dl, &facs, &wells_out, &seis_out, s);
@@ -324,7 +326,7 @@ static void *prefetcher_dataloader_producer(void *v) {
             break;
         }
 
-        int use_vector_push = (proc_env && strcmp(proc_env, "1") == 0);
+        int use_vector_push = cached_proc_workers;
         if (use_vector_push) {
             mlx_vector_array masks_vec = mlx_vector_array_new();
             if (prefetcher_push_vectors(ph, facs, wells_out, masks_vec, seis_out) != 0) {
@@ -1331,9 +1333,14 @@ static void *iterator_preload_thread(void *arg) {
 int prefetcher_iterator_preload(PrefetcherIteratorHandle it_h) {
     if (!it_h)
         return -1;
-    const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
-    if (proc_env && strcmp(proc_env, "1") == 0) {
-        return 0;
+    {
+        static int cached_proc = -1;
+        if (cached_proc < 0) {
+            const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+            cached_proc = (proc_env && strcmp(proc_env, "1") == 0) ? 1 : 0;
+        }
+        if (cached_proc)
+            return 0;
     }
     PrefetcherIterator *it = (PrefetcherIterator *)it_h;
     pthread_mutex_lock(&it->mutex);

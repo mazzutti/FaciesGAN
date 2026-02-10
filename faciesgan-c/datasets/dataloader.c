@@ -245,9 +245,14 @@ struct MLXDataloader {
 };
 
 static const char *resolve_worker_exe(void) {
-    const char *env_path = getenv("FACIESGAN_WORKER_PATH");
-    if (env_path && env_path[0] != '\0')
-        return env_path;
+    static const char *cached = NULL;
+    static int checked = 0;
+    if (!checked) {
+        cached = getenv("FACIESGAN_WORKER_PATH");
+        checked = 1;
+    }
+    if (cached && cached[0] != '\0')
+        return cached;
     if (access("./build/facies_worker", X_OK) == 0)
         return "./build/facies_worker";
     return "./facies_worker";
@@ -387,17 +392,25 @@ static int build_tasks(struct MLXDataloader *dl) {
         return 1;
     size_t n = dl->n_indices;
     size_t bs = dl->batch_size;
-    const char *bs_override = getenv("FACIESGAN_BATCH_SIZE");
-    if (bs_override) {
-        long v = atol(bs_override);
-        if (v > 0)
-            bs = (size_t)v;
-    }
-    const char *bs_scale = getenv("FACIESGAN_BATCH_SCALE");
-    if (bs_scale) {
-        long s = atol(bs_scale);
-        if (s > 1)
-            bs *= (size_t)s;
+    {
+        static const char *cached_bs = NULL;
+        static const char *cached_sc = NULL;
+        static int bs_checked = 0;
+        if (!bs_checked) {
+            cached_bs = getenv("FACIESGAN_BATCH_SIZE");
+            cached_sc = getenv("FACIESGAN_BATCH_SCALE");
+            bs_checked = 1;
+        }
+        if (cached_bs) {
+            long v = atol(cached_bs);
+            if (v > 0)
+                bs = (size_t)v;
+        }
+        if (cached_sc) {
+            long s = atol(cached_sc);
+            if (s > 1)
+                bs *= (size_t)s;
+        }
     }
     if (bs == 0)
         return 1;
@@ -748,15 +761,24 @@ static int ipc_use_shm(void) {
 }
 
 static int proc_sync_io_enabled(void) {
+    static int cached = -1;
+    if (cached >= 0)
+        return cached;
     const char *env = getenv("FACIESGAN_PROC_SYNC_IO");
     if (!env || env[0] == '\0')
-        return 1;
-    return atoi(env) != 0;
+        cached = 1;
+    else
+        cached = atoi(env) != 0;
+    return cached;
 }
 
 static void ipc_advise_hugepages(void *mem, size_t size) {
-    const char *env = getenv("FACIESGAN_HUGEPAGE");
-    if (!env || atoi(env) == 0)
+    static int cached = -1;
+    if (cached < 0) {
+        const char *env = getenv("FACIESGAN_HUGEPAGE");
+        cached = (env && atoi(env) != 0) ? 1 : 0;
+    }
+    if (!cached)
         return;
 #ifdef MADV_HUGEPAGE
     madvise(mem, size, MADV_HUGEPAGE);
@@ -951,10 +973,18 @@ static void *proc_reader_thread(void *arg) {
     struct MLXDataloader *dl = ra->dl;
     int worker = ra->worker;
     int fd = dl->result_rfds[worker];
-    const char *log_env = getenv("FACIESGAN_WORKER_LOG");
-    int log_enabled = log_env && atoi(log_env) != 0;
-    const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
-    int use_mlx_lock = (proc_env && strcmp(proc_env, "1") == 0);
+    static int cached_log = -1;
+    static int cached_proc_lock = -1;
+    if (cached_log < 0) {
+        const char *log_env = getenv("FACIESGAN_WORKER_LOG");
+        cached_log = (log_env && atoi(log_env) != 0) ? 1 : 0;
+    }
+    if (cached_proc_lock < 0) {
+        const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+        cached_proc_lock = (proc_env && strcmp(proc_env, "1") == 0) ? 1 : 0;
+    }
+    int log_enabled = cached_log;
+    int use_mlx_lock = cached_proc_lock;
     while (1) {
         int32_t status = 0;
         if (read_all(fd, &status, sizeof(status)) <= 0)
@@ -1166,8 +1196,12 @@ static void *proc_reader_thread(void *arg) {
 
 static void *proc_dispatcher_thread(void *arg) {
     struct MLXDataloader *dl = (struct MLXDataloader *)arg;
-    const char *log_env = getenv("FACIESGAN_WORKER_LOG");
-    int log_enabled = log_env && atoi(log_env) != 0;
+    static int cached_disp_log = -1;
+    if (cached_disp_log < 0) {
+        const char *log_env = getenv("FACIESGAN_WORKER_LOG");
+        cached_disp_log = (log_env && atoi(log_env) != 0) ? 1 : 0;
+    }
+    int log_enabled = cached_disp_log;
     while (1) {
         pthread_mutex_lock(&dl->task_mutex);
         if (dl->next_task >= dl->n_tasks) {
@@ -1236,8 +1270,12 @@ static int proc_sync_next(struct MLXDataloader *dl,
                           mlx_vector_array *out_seismic) {
     if (!dl)
         return 1;
-    const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
-    int use_mlx_lock = (proc_env && strcmp(proc_env, "1") == 0);
+    static int cached_sync_lock = -1;
+    if (cached_sync_lock < 0) {
+        const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
+        cached_sync_lock = (proc_env && strcmp(proc_env, "1") == 0) ? 1 : 0;
+    }
+    int use_mlx_lock = cached_sync_lock;
     pthread_mutex_lock(&dl->task_mutex);
     if (dl->next_task >= dl->n_tasks) {
         pthread_mutex_unlock(&dl->task_mutex);
@@ -2261,8 +2299,12 @@ int facies_dataloader_new_ex(
 
     if (dl->num_workers > 0) {
 #ifdef __APPLE__
-        const char *force_proc = getenv("FACIESGAN_PROCESS_WORKERS");
-        bool use_process = force_proc && atoi(force_proc) != 0;
+        static int cached_force_proc = -1;
+        if (cached_force_proc < 0) {
+            const char *force_proc = getenv("FACIESGAN_PROCESS_WORKERS");
+            cached_force_proc = (force_proc && atoi(force_proc) != 0) ? 1 : 0;
+        }
+        bool use_process = cached_force_proc;
         bool skip_mlx_init = use_process;
 #else
         bool skip_mlx_init = false;
