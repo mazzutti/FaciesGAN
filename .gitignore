@@ -15,6 +15,7 @@ build_dbg/
 build-asan/
 tools/
 !tools/gen_mlx_cache.py
+!faciesgan-c/tools/facies_worker.c
 scripts/
 results/**
 **/events.out.tfevents*
