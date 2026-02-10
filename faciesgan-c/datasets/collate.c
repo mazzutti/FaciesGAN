@@ -225,48 +225,30 @@ static int process_scales_vectorized(mlx_vector_array *out_vec,
 
     int ndim = (int)mlx_array_ndim(batch_stacked);
     const int *bsh = mlx_array_shape(batch_stacked);
-    if (ndim < 2 || !bsh) {
+    if (ndim < 2 || !bsh || ndim > 8) {
         mlx_array_free(batch_stacked);
         return 1;
     }
 
-    int *start = (int *)malloc((size_t)ndim * sizeof(int));
-    int *stop = (int *)malloc((size_t)ndim * sizeof(int));
-    int *strides = (int *)malloc((size_t)ndim * sizeof(int));
-    if (!start || !stop || !strides) {
-        if (start) free(start);
-        if (stop) free(stop);
-        if (strides) free(strides);
-        mlx_array_free(batch_stacked);
-        return 1;
-    }
+    int start[8];
+    int stop[8];
+    int strides_buf[8];
     for (int i = 0; i < ndim; ++i) {
         start[i] = 0;
         stop[i] = bsh[i];
-        strides[i] = 1;
+        strides_buf[i] = 1;
     }
 
     int out_ndim = ndim - 1;
-    int *out_shape = (int *)malloc((size_t)out_ndim * sizeof(int));
-    if (!out_shape) {
-        free(start);
-        free(stop);
-        free(strides);
-        mlx_array_free(batch_stacked);
-        return 1;
-    }
+    int out_shape[8];
 
     for (size_t si = 0; si < scales; ++si) {
         start[1] = (int)si;
         stop[1] = (int)si + 1;
         mlx_array slice = mlx_array_new();
-        if (mlx_slice(&slice, batch_stacked, start, ndim, stop, ndim, strides,
+        if (mlx_slice(&slice, batch_stacked, start, ndim, stop, ndim, strides_buf,
                       ndim, s) != 0) {
             mlx_array_free(slice);
-            free(out_shape);
-            free(start);
-            free(stop);
-            free(strides);
             mlx_array_free(batch_stacked);
             return 1;
         }
@@ -280,29 +262,17 @@ static int process_scales_vectorized(mlx_vector_array *out_vec,
         if (mlx_reshape(&reshaped, slice, out_shape, (size_t)out_ndim, s) != 0) {
             mlx_array_free(slice);
             mlx_array_free(reshaped);
-            free(out_shape);
-            free(start);
-            free(stop);
-            free(strides);
             mlx_array_free(batch_stacked);
             return 1;
         }
         mlx_array_free(slice);
         if (append_stacked_out(out_vec, reshaped, deep_copy)) {
             mlx_array_free(reshaped);
-            free(out_shape);
-            free(start);
-            free(stop);
-            free(strides);
             mlx_array_free(batch_stacked);
             return 1;
         }
         mlx_array_free(reshaped);
     }
-    free(out_shape);
-    free(start);
-    free(stop);
-    free(strides);
     mlx_array_free(batch_stacked);
     return 0;
 }

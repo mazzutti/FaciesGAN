@@ -1295,28 +1295,25 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
      * heights (e.g. 12,20) were passed as scale ids; attempt a best-effort
      * mapping by matching those values to trainer shapes (height or width).
      */
+    int san_active_buf[8];
     int *san_active = NULL;
-    if (active_scales && n_active_scales > 0) {
-        if (mlx_alloc_int_array(&san_active, n_active_scales) == 0) {
-            for (int ai = 0; ai < n_active_scales; ++ai) {
-                int val = active_scales[ai];
-                int mapped = val;
-                if (trainer->n_scales > 0 && (val < 0 || val >= trainer->n_scales)) {
-                    /* try to match against configured shapes (height/width) */
-                    for (int tsi = 0; tsi < trainer->n_scales; ++tsi) {
-                        int h = trainer->scales[tsi * 4 + 1];
-                        int w = trainer->scales[tsi * 4 + 2];
-                        if (val == h || val == w) {
-                            mapped = tsi;
-                            break;
-                        }
+    if (active_scales && n_active_scales > 0 && n_active_scales <= 8) {
+        san_active = san_active_buf;
+        for (int ai = 0; ai < n_active_scales; ++ai) {
+            int val = active_scales[ai];
+            int mapped = val;
+            if (trainer->n_scales > 0 && (val < 0 || val >= trainer->n_scales)) {
+                /* try to match against configured shapes (height/width) */
+                for (int tsi = 0; tsi < trainer->n_scales; ++tsi) {
+                    int h = trainer->scales[tsi * 4 + 1];
+                    int w = trainer->scales[tsi * 4 + 2];
+                    if (val == h || val == w) {
+                        mapped = tsi;
+                        break;
                     }
-                    /* mapped/val used for defensive mapping above */
                 }
-                san_active[ai] = mapped;
             }
-        } else {
-            san_active = NULL; /* allocation failed; fall back to original */
+            san_active[ai] = mapped;
         }
     }
 
@@ -1501,12 +1498,8 @@ int MLXTrainer_optimization_step_impl(MLXTrainer *trainer, const int *indexes,
                                     trainer->disc_opts ? trainer->disc_opts[sc] : NULL);
     }
 
-    /* Free sanitized active scales copy if we created one */
-    if (san_active) {
-        int _tmpn = n_active_scales;
-        mlx_free_int_array(&san_active, &_tmpn);
-        san_active = NULL;
-    }
+    /* san_active is stack-allocated; no free needed */
+    san_active = NULL;
 
     if (tmp_wells)
         mlx_free_ptr_array((void ***)&tmp_wells, need_n);

@@ -324,22 +324,12 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
     }
 
     int ndim = (int)mlx_array_ndim(diff);
-    int *axes = NULL;
-    if (ndim > 0) {
-        if (mlx_alloc_int_array(&axes, ndim) != 0) {
-            mlx_array_free(fmasked);
-            mlx_array_free(rmasked);
-            mlx_array_free(diff);
-            mlx_array_free(sq);
-            return -1;
-        }
-        for (int a = 0; a < ndim; ++a)
-            axes[a] = a;
-    }
+    int axes[8];
+    for (int a = 0; a < ndim && a < 8; ++a)
+        axes[a] = a;
 
     mlx_array mean = mlx_array_new();
     if (mlx_mean_axes(&mean, sq, axes, ndim, true, s) != 0) {
-        mlx_free_int_array(&axes, &ndim);
         mlx_array_free(fmasked);
         mlx_array_free(rmasked);
         mlx_array_free(diff);
@@ -347,7 +337,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
         mlx_array_free(mean);
         return -1;
     }
-    mlx_free_int_array(&axes, &ndim);
 
     mlx_array lambda_arr = mlx_array_new_float(well_loss_penalty);
     mlx_array outv = mlx_array_new();
@@ -1314,25 +1303,16 @@ int mlx_faciesgan_compute_recovery_loss(
         return -1;
     }
     int ndim = (int)mlx_array_ndim(diff);
-    int *axes = NULL;
-    if (ndim > 0) {
-        if (mlx_alloc_int_array(&axes, ndim) != 0) {
-            mlx_array_free(diff);
-            mlx_array_free(sq);
-            return -1;
-        }
-        for (int a = 0; a < ndim; ++a)
-            axes[a] = a;
-    }
+    int axes[8];
+    for (int a = 0; a < ndim && a < 8; ++a)
+        axes[a] = a;
     mlx_array mean = mlx_array_new();
     if (mlx_mean_axes(&mean, sq, axes, ndim, true, s) != 0) {
-        mlx_free_int_array(&axes, &ndim);
         mlx_array_free(diff);
         mlx_array_free(sq);
         mlx_array_free(mean);
         return -1;
     }
-    mlx_free_int_array(&axes, &ndim);
 
     mlx_array alpha_arr = mlx_array_new_float(alpha);
     mlx_array outv = mlx_array_new();

@@ -28,9 +28,10 @@ int train_cb(MLXBaseManager *bm, int step, void *ctx,
     if (!g_opts_by_scale || g_num_parallel_scales <= 0)
         return -1;
 
-    int *active = NULL;
-    if (mlx_alloc_int_array(&active, g_num_parallel_scales) != 0)
+    int active_buf[8];
+    if (g_num_parallel_scales > 8)
         return -1;
+    int *active = active_buf;
     for (int i = 0; i < g_num_parallel_scales; ++i)
         active[i] = i;
 
@@ -41,7 +42,7 @@ int train_cb(MLXBaseManager *bm, int step, void *ctx,
                                             NULL, NULL, NULL, NULL, active,
                                             g_num_parallel_scales);
 
-    mlx_free_int_array(&active, &g_num_parallel_scales);
+    /* active is stack-allocated; no free needed */
     if (out_gen_n)
         *out_gen_n = 0;
     if (out_disc_n)

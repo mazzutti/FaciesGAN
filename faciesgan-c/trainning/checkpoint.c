@@ -67,8 +67,13 @@ static int read_array(FILE *f, mlx_array *out) {
   int ndim = 0;
   if (fread(&ndim, sizeof(int), 1, f) != 1)
     return -1;
+  int shape_buf[8];
   int *shape = NULL;
-  if (ndim > 0) {
+  if (ndim > 0 && ndim <= 8) {
+    shape = shape_buf;
+    if (fread(shape, sizeof(int), ndim, f) != (size_t)ndim)
+      return -1;
+  } else if (ndim > 8) {
     if (mlx_alloc_int_array(&shape, ndim) != 0)
       return -1;
     if (fread(shape, sizeof(int), ndim, f) != (size_t)ndim) {
@@ -78,25 +83,25 @@ static int read_array(FILE *f, mlx_array *out) {
   }
   long long nb = 0;
   if (fread(&nb, sizeof(long long), 1, f) != 1) {
-    if (shape)
+    if (shape && shape != shape_buf)
       mlx_free_int_array(&shape, &ndim);
     return -1;
   }
   void *buf = malloc((size_t)nb);
   if (!buf) {
-    if (shape)
+    if (shape && shape != shape_buf)
       mlx_free_int_array(&shape, &ndim);
     return -1;
   }
   if (fread(buf, 1, (size_t)nb, f) != (size_t)nb) {
     free(buf);
-    if (shape)
+    if (shape && shape != shape_buf)
       mlx_free_int_array(&shape, &ndim);
     return -1;
   }
   int rc = mlx_array_set_data(out, buf, shape, ndim, (mlx_dtype)dtype);
   free(buf);
-  if (shape)
+  if (shape && shape != shape_buf)
     mlx_free_int_array(&shape, &ndim);
   return rc == 0 ? 0 : -1;
 }

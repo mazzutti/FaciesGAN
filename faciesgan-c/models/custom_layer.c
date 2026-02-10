@@ -308,6 +308,7 @@ struct MLXConvBlock {
     int kernel_size;
     int in_ch;
     int out_ch;
+    int conv_layout; /* CONV_LAYOUT_* cached layout state */
 };
 
 MLXConvBlock *mlx_convblock_create(int in_ch, int out_ch, int kernel_size,
@@ -332,6 +333,7 @@ MLXConvBlock *mlx_convblock_create(int in_ch, int out_ch, int kernel_size,
     m->kernel_size = kernel_size;
     m->in_ch = in_ch;
     m->out_ch = out_ch;
+    m->conv_layout = CONV_LAYOUT_DIRECT; /* canonical layout at creation */
 
     /* MLX canonical conv-weight layout: (out_ch, KH, KW, in_ch) */
     int wshape[4] = {out_ch, kernel_size, kernel_size, in_ch};
@@ -378,8 +380,8 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
     mlx_array y = mlx_array_new();
     if (m->conv) {
         mlx_array *wptr = (mlx_array *)m->conv;
-        if (safe_mlx_conv2d(&y, x, *wptr, m->stride, m->stride, m->padding,
-                            m->padding, 1, 1, 1, s) != 0) {
+        if (cached_mlx_conv2d(&y, x, *wptr, m->stride, m->stride, m->padding,
+                            m->padding, 1, 1, 1, &m->conv_layout, s) != 0) {
             /* conv failed: fallback to input */
             return x;
         }
@@ -760,7 +762,10 @@ struct MLXSPADE {
     mlx_array *mlp_gamma_b;  /* shape: (norm_nc,) */
     mlx_array *mlp_beta_w;   /* shape: (norm_nc, K, K, hidden_nc) */
     mlx_array *mlp_beta_b;   /* shape: (norm_nc,) */
-    /* cache omitted for simplicity */
+    /* Cached conv layout states (CONV_LAYOUT_*) */
+    int shared_layout;
+    int gamma_layout;
+    int beta_layout;
 };
 
 MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
@@ -780,6 +785,9 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
     m->mlp_gamma_b = NULL;
     m->mlp_beta_w = NULL;
     m->mlp_beta_b = NULL;
+    m->shared_layout = CONV_LAYOUT_DIRECT;
+    m->gamma_layout = CONV_LAYOUT_DIRECT;
+    m->beta_layout = CONV_LAYOUT_DIRECT;
 
     /* Create InstanceNorm with affine=True to match Python */
     m->norm = mlx_nn_instancenorm_create(norm_nc, 1);
@@ -908,8 +916,8 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
             mlx_array_free(cond_up);
         return x;
     }
-    if (safe_mlx_conv2d(&shared, cond_up, *m->mlp_shared_w, 1, 1, m->padding,
-                        m->padding, 1, 1, 1, s) != 0) {
+    if (cached_mlx_conv2d(&shared, cond_up, *m->mlp_shared_w, 1, 1, m->padding,
+                        m->padding, 1, 1, 1, &m->shared_layout, s) != 0) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
         return x;
@@ -940,8 +948,8 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(shared_act);
         return x;
     }
-    if (safe_mlx_conv2d(&gamma, shared_act, *m->mlp_gamma_w, 1, 1, m->padding,
-                        m->padding, 1, 1, 1, s) != 0) {
+    if (cached_mlx_conv2d(&gamma, shared_act, *m->mlp_gamma_w, 1, 1, m->padding,
+                        m->padding, 1, 1, 1, &m->gamma_layout, s) != 0) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
         mlx_array_free(shared);
@@ -958,8 +966,8 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
             mlx_array_free(tmp_b);
         }
     }
-    if (safe_mlx_conv2d(&beta, shared_act, *m->mlp_beta_w, 1, 1, m->padding,
-                        m->padding, 1, 1, 1, s) != 0) {
+    if (cached_mlx_conv2d(&beta, shared_act, *m->mlp_beta_w, 1, 1, m->padding,
+                        m->padding, 1, 1, 1, &m->beta_layout, s) != 0) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
         mlx_array_free(shared);
@@ -1168,6 +1176,7 @@ struct MLXSPADEConvBlock {
     int kernel_size;
     int in_ch;
     int out_ch;
+    int conv_layout; /* CONV_LAYOUT_* cached layout state */
 };
 
 int mlx_spadeconv_get_stride(MLXSPADEConvBlock *m) {
@@ -1197,6 +1206,7 @@ MLXSPADEConvBlock *mlx_spadeconv_create(int in_ch, int out_ch, int cond_ch,
     m->kernel_size = kernel_size;
     m->in_ch = in_ch;
     m->out_ch = out_ch;
+    m->conv_layout = CONV_LAYOUT_DIRECT; /* canonical layout at creation */
 
     /* MLX canonical conv-weight layout: (out_ch, KH, KW, in_ch) */
     int wshape[4] = {out_ch, kernel_size, kernel_size, in_ch};
@@ -1258,8 +1268,8 @@ mlx_array_t mlx_spadeconv_forward(MLXSPADEConvBlock *m, mlx_array_t x,
     if (m->conv) {
         mlx_array out = mlx_array_new();
         mlx_array *wptr = (mlx_array *)m->conv;
-        if (safe_mlx_conv2d(&out, y, *wptr, m->stride, m->stride, m->padding,
-                            m->padding, 1, 1, 1, s) != 0) {
+        if (cached_mlx_conv2d(&out, y, *wptr, m->stride, m->stride, m->padding,
+                            m->padding, 1, 1, 1, &m->conv_layout, s) != 0) {
             /* conv failed: cleanup and return input x */
             mlx_array_free(y);
             return x;
@@ -1305,6 +1315,9 @@ struct MLXSPADEGenerator {
     /* Cached parameter pointer list (lazy, immutable after creation) */
     mlx_array **cached_params;
     int         cached_params_n;
+    /* Cached conv layout states (CONV_LAYOUT_*) */
+    int init_conv_layout;
+    int tail_conv_layout;
 };
 
 MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
@@ -1324,6 +1337,8 @@ MLXSPADEGenerator *mlx_spadegen_create(int num_layer, int kernel_size,
     m->tail_conv_bias = NULL;
     m->padding_size = padding_size;
     m->kernel_size = kernel_size;
+    m->init_conv_layout = CONV_LAYOUT_DIRECT;
+    m->tail_conv_layout = CONV_LAYOUT_DIRECT;
     /* Allocate init conv weights: (num_features, KH, KW, input_channels) */
     /* canonical: (out_ch=num_features, KH, KW, in_ch=input_channels) */
     int ishape[4] = {num_features, kernel_size, kernel_size, input_channels};
@@ -1427,7 +1442,8 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
         }
         /* Use padding_size (not kernel_size/2) to match Python */
         int pad = m->padding_size;
-        if (safe_mlx_conv2d(&x, cond, *iw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
+        if (cached_mlx_conv2d(&x, cond, *iw, 1, 1, pad, pad, 1, 1, 1,
+                             &m->init_conv_layout, s) != 0) {
             return cond;
         }
         /* Apply init_conv bias */
@@ -1486,7 +1502,8 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
         mlx_array *tw = (mlx_array *)m->tail_conv;
         /* Use padding_size (not kernel_size/2) to match Python */
         int pad = m->padding_size;
-        if (safe_mlx_conv2d(&out, x, *tw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
+        if (cached_mlx_conv2d(&out, x, *tw, 1, 1, pad, pad, 1, 1, 1,
+                             &m->tail_conv_layout, s) != 0) {
             if (x.ctx != cond.ctx)
                 mlx_array_free(x);
             return cond;
@@ -1646,6 +1663,8 @@ struct MLXSPADEDiscriminator {
     /* Cached parameter pointer list (lazy, immutable after creation) */
     mlx_array **cached_params;
     int         cached_params_n;
+    /* Cached conv layout state for tail conv (CONV_LAYOUT_*) */
+    int tail_layout;
 };
 
 MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
@@ -1663,6 +1682,7 @@ MLXSPADEDiscriminator *mlx_spadedisc_create(int num_features,
     m->tail_bias = NULL;
     m->kernel_size = kernel_size;
     m->padding_size = padding_size;
+    m->tail_layout = CONV_LAYOUT_DIRECT;
 
     /* Head is a MLXConvBlock (conv + norm + leakyrelu) matching Python */
     m->head = mlx_convblock_create(input_channels, num_features, kernel_size,
@@ -2035,8 +2055,8 @@ mlx_array_t mlx_spadedisc_forward(MLXSPADEDiscriminator *m, mlx_array_t x) {
     if (m->tail) {
         mlx_array out = mlx_array_new();
         mlx_array *tw = (mlx_array *)m->tail;
-        if (safe_mlx_conv2d(&out, cur, *tw, 1, 1, m->padding_size, m->padding_size,
-                            1, 1, 1, s) != 0) {
+        if (cached_mlx_conv2d(&out, cur, *tw, 1, 1, m->padding_size, m->padding_size,
+                            1, 1, 1, &m->tail_layout, s) != 0) {
             if (cur.ctx != x.ctx)
                 mlx_array_free(cur);
             return x;

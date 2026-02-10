@@ -151,6 +151,7 @@ struct ScaleModule {
     int n_body;
     mlx_array *tail_conv; /* pointer to mlx_array weights */
     mlx_array *tail_conv_bias; /* pointer to mlx_array bias */
+    int tail_conv_layout; /* CONV_LAYOUT_* cached state */
 };
 
 struct MLXGenerator {
@@ -323,6 +324,7 @@ int mlx_generator_create_scale(MLXGenerator *m, int scale, int num_features,
                 }
                 /* Allocate tail_conv bias (zero-initialised, shape [output_channels]) */
                 s->tail_conv_bias = mlx_alloc_array_ptr(mlx_init_conv_bias(m->output_channels));
+                s->tail_conv_layout = CONV_LAYOUT_DIRECT;
             }
         }
     }
@@ -1081,9 +1083,9 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
                 /* tail conv + tanh if present */
                 if (smod->tail_conv) {
                     mlx_array outc = mlx_array_new();
-                    if (safe_mlx_conv2d(&outc, cur, *smod->tail_conv, 1, 1,
+                    if (cached_mlx_conv2d(&outc, cur, *smod->tail_conv, 1, 1,
                                         m->padding_size, m->padding_size, 1, 1, 1,
-                                        s) == 0) {
+                                        &smod->tail_conv_layout, s) == 0) {
                         /* Apply tail_conv bias */
                         if (smod->tail_conv_bias) {
                             mlx_array biased = mlx_array_new();

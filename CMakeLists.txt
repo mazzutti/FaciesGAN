@@ -118,8 +118,16 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/third_party/miniz_zip.c
   # faciesgan-c/trainning/c_trainer_api.c
 )
-set_source_files_properties(faciesgan-c/utils.c PROPERTIES
-  COMPILE_OPTIONS "-O3;-march=native;-ffast-math"
+# Hot-path files: aggressive optimisation flags (-O3 -march=native -ffast-math)
+set_source_files_properties(
+  faciesgan-c/utils.c
+  faciesgan-c/models/custom_layer.c
+  faciesgan-c/models/generator.c
+  faciesgan-c/models/facies_gan.c
+  faciesgan-c/trainning/optimizer.c
+  faciesgan-c/trainning/train_step.c
+  faciesgan-c/trainning/mlx_native_grad.c
+  PROPERTIES COMPILE_OPTIONS "-O3;-march=native;-ffast-math"
 )
 set_source_files_properties(faciesgan-c/trainning/mem_debug.c PROPERTIES
   COMPILE_DEFINITIONS MLX_MEM_NO_WRAP=1
