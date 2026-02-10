@@ -38,8 +38,9 @@ struct option facies_long_options[] = {
     {"lr-decay", required_argument, 0, OPT_LR_DECAY},
     {"save-interval", required_argument, 0, OPT_SAVE_INTERVAL},
     {"num-real-facies", required_argument, 0, OPT_NUM_REAL_FACIES},
-    {"num-generated-per-real", required_argument, 0,
-     OPT_NUM_GENERATED_PER_REAL},
+    {   "num-generated-per-real", required_argument, 0,
+        OPT_NUM_GENERATED_PER_REAL
+    },
     {"num-iter", required_argument, 0, OPT_NUM_ITER},
     {"wells-mask-columns", required_argument, 0, OPT_WELLS_MASK_COLUMNS},
     {"use-wells", no_argument, 0, OPT_USE_WELLS},
@@ -48,9 +49,11 @@ struct option facies_long_options[] = {
     {"no-tensorboard", no_argument, 0, OPT_NO_TENSORBOARD},
     {"no-plot-facies", no_argument, 0, OPT_NO_PLOT_FACIES},
     {"compile-backend", no_argument, 0, OPT_COMPILE_BACKEND},
+    {"no-compile-backend", no_argument, 0, OPT_NO_COMPILE_BACKEND},
     {"use-mlx", no_argument, 0, OPT_USE_MLX},
     {"hand-off-to-c", no_argument, 0, OPT_HAND_OFF_TO_C},
-    {0, 0, 0, 0}};
+    {0, 0, 0, 0}
+};
 
 const char *facies_help_lines[] = {
     "faciesgan usage:",
@@ -101,8 +104,10 @@ const char *facies_help_lines[] = {
     "      --use-seismic                  Use seismic data during training",
     "      --no-tensorboard               Disable tensorboard logging",
     "      --no-plot-facies               Disable facies plotting",
-    "      --compile-backend              Compile C backend before running",
+    "      --compile-backend              Enable MLX JIT compilation (default)",
+    "      --no-compile-backend           Disable MLX JIT compilation",
     "      --use-mlx                      Use MLX backend instead of CUDA",
     "      --hand-off-to-c                Hand off execution to compiled C "
     "trainer",
-    NULL};
+    NULL
+};

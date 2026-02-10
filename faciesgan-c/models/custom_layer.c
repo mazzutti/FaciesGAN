@@ -766,6 +766,10 @@ struct MLXSPADE {
     int shared_layout;
     int gamma_layout;
     int beta_layout;
+    /* Perf: cached LeakyReLU and epsilon scalar to avoid per-forward alloc */
+    MLXLeakyReLU *cached_activation;
+    mlx_array cached_eps; /* 1e-5f for InstanceNorm */
+    mlx_array cached_one; /* 1.0f for SPADE output formula */
 };
 
 MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
@@ -788,6 +792,10 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
     m->shared_layout = CONV_LAYOUT_DIRECT;
     m->gamma_layout = CONV_LAYOUT_DIRECT;
     m->beta_layout = CONV_LAYOUT_DIRECT;
+    /* Perf: pre-allocate cached activation, epsilon and one scalars */
+    m->cached_activation = mlx_leakyrelu_create(0.2f);
+    m->cached_eps = mlx_array_new_float(1e-5f);
+    m->cached_one = mlx_array_new_float(1.0f);
 
     /* Create InstanceNorm with affine=True to match Python */
     m->norm = mlx_nn_instancenorm_create(norm_nc, 1);
@@ -834,6 +842,14 @@ MLXSPADE *mlx_spade_create(int norm_nc, int cond_nc, int hidden_nc,
 void mlx_spade_free(MLXSPADE *m) {
     if (!m)
         return;
+    if (m->cached_activation) {
+        mlx_leakyrelu_free(m->cached_activation);
+        m->cached_activation = NULL;
+    }
+    if (m->cached_eps.ctx)
+        mlx_array_free(m->cached_eps);
+    if (m->cached_one.ctx)
+        mlx_array_free(m->cached_one);
     if (m->norm) {
         mlx_nn_instancenorm_free(m->norm);
         m->norm = NULL;
@@ -933,10 +949,8 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         }
     }
 
-    /* activation */
-    MLXLeakyReLU *tmp_act = mlx_leakyrelu_create(0.2f);
-    mlx_array shared_act = mlx_leakyrelu_forward(tmp_act, shared);
-    mlx_leakyrelu_free(tmp_act);
+    /* activation — use cached LeakyReLU to avoid per-call alloc/free */
+    mlx_array shared_act = mlx_leakyrelu_forward(m->cached_activation, shared);
 
     /* gamma and beta */
     mlx_array gamma = mlx_array_new();
@@ -1017,15 +1031,14 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(beta);
         return x;
     }
-    mlx_array eps = mlx_array_new_float(1e-5f);
+    /* Use cached epsilon scalar to avoid per-call allocation */
     mlx_array var_eps = mlx_array_new();
-    if (mlx_add(&var_eps, var, eps, s) != 0) {
+    if (mlx_add(&var_eps, var, m->cached_eps, s) != 0) {
         mlx_array_free(mean);
         mlx_array_free(var);
         mlx_array_free(centered);
         mlx_array_free(gamma);
         mlx_array_free(beta);
-        mlx_array_free(eps);
         return x;
     }
     mlx_array inv_std = mlx_array_new();
@@ -1036,7 +1049,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(var_eps);
         mlx_array_free(gamma);
         mlx_array_free(beta);
-        mlx_array_free(eps);
         return x;
     }
     mlx_array x_norm = mlx_array_new();
@@ -1048,7 +1060,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(inv_std);
         mlx_array_free(gamma);
         mlx_array_free(beta);
-        mlx_array_free(eps);
         return x;
     }
 
@@ -1066,10 +1077,9 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         }
     }
 
-    /* out = normalized * (1 + gamma) + beta */
-    mlx_array one = mlx_array_new_float(1.0f);
+    /* out = normalized * (1 + gamma) + beta — use cached one scalar */
     mlx_array one_plus_gamma = mlx_array_new();
-    if (mlx_add(&one_plus_gamma, gamma, one, s) != 0) {
+    if (mlx_add(&one_plus_gamma, gamma, m->cached_one, s) != 0) {
         /* cleanup */
         mlx_array_free(mean);
         mlx_array_free(centered);
@@ -1079,8 +1089,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(normalized);
         mlx_array_free(gamma);
         mlx_array_free(beta);
-        mlx_array_free(eps);
-        mlx_array_free(one);
         return x;
     }
 
@@ -1095,8 +1103,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(normalized);
         mlx_array_free(gamma);
         mlx_array_free(beta);
-        mlx_array_free(eps);
-        mlx_array_free(one);
         mlx_array_free(one_plus_gamma);
         return x;
     }
@@ -1112,14 +1118,12 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(normalized);
         mlx_array_free(gamma);
         mlx_array_free(beta);
-        mlx_array_free(eps);
-        mlx_array_free(one);
         mlx_array_free(one_plus_gamma);
         mlx_array_free(scaled);
         return x;
     }
 
-    /* cleanup temporaries */
+    /* cleanup temporaries (cached scalars owned by struct, not freed here) */
     mlx_array_free(mean);
     mlx_array_free(centered);
     mlx_array_free(var);
@@ -1128,8 +1132,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     mlx_array_free(normalized);
     mlx_array_free(gamma);
     mlx_array_free(beta);
-    mlx_array_free(eps);
-    mlx_array_free(one);
     mlx_array_free(one_plus_gamma);
     mlx_array_free(scaled);
 

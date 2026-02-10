@@ -94,7 +94,13 @@ TrainningOptions *trainning_options_from_cli(CLIArgs *args) {
     topt->gpu_device = args->gpu_device;
     topt->enable_tensorboard = !args->no_tensorboard;
     topt->enable_plot_facies = !args->no_plot_facies;
-    topt->compile_backend = args->compile_backend;
+    /* compile_backend defaults to true in options.c; --no-compile-backend disables it,
+     * --compile-backend is a no-op (already true) but kept for backward compat. */
+    if (args->no_compile_backend)
+        topt->compile_backend = false;
+    else if (args->compile_backend)
+        topt->compile_backend = true;
+    /* else: keep the default (true) */
     topt->use_profiler = args->use_profiler;
     topt->hand_off_to_c = args->hand_off_to_c;
     topt->wells_mask_columns = args->wells_mask_columns;

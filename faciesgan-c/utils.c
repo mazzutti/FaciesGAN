@@ -269,39 +269,15 @@ int mlx_clamp(mlx_array *res, const mlx_array a, float min_val, float max_val,
     if (!res)
         return -1;
 
-    /* Create scalar arrays for min and max */
+    /* Perf: use mlx_clip which performs clamp in a single graph node,
+     * replacing the previous 5-temporary pattern (full_like + maximum + minimum). */
     mlx_array min_scalar = mlx_array_new_float(min_val);
     mlx_array max_scalar = mlx_array_new_float(max_val);
 
-    int rc = 0;
-    mlx_array min_arr = mlx_array_new();
-    mlx_array max_arr = mlx_array_new();
-    mlx_array tmp = mlx_array_new();
+    int rc = mlx_clip(res, a, min_scalar, max_scalar, s);
 
-    /* Fill arrays with scalar values matching `a` shape */
-    rc = mlx_full_like(&min_arr, a, min_scalar, mlx_array_dtype(a), s);
-    if (rc != 0)
-        goto cleanup;
-    rc = mlx_full_like(&max_arr, a, max_scalar, mlx_array_dtype(a), s);
-    if (rc != 0)
-        goto cleanup;
-
-    /* tmp = maximum(a, min_arr) */
-    rc = mlx_maximum(&tmp, a, min_arr, s);
-    if (rc != 0)
-        goto cleanup;
-
-    /* res = minimum(tmp, max_arr) */
-    rc = mlx_minimum(res, tmp, max_arr, s);
-
-cleanup:
-    /* Free temporaries and scalars */
     mlx_array_free(min_scalar);
     mlx_array_free(max_scalar);
-    /* mlx_array_free returns int but we ignore errors during cleanup */
-    mlx_array_free(min_arr);
-    mlx_array_free(max_arr);
-    mlx_array_free(tmp);
     return rc;
 }
 

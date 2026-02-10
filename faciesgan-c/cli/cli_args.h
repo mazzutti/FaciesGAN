@@ -52,6 +52,7 @@ typedef struct CLIArgs {
   bool no_tensorboard;
   bool no_plot_facies;
   bool compile_backend;
+  bool no_compile_backend;
   bool use_profiler;
   bool hand_off_to_c;
 } CLIArgs;

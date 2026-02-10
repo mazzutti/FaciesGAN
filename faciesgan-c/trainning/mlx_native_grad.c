@@ -272,7 +272,8 @@ static int gen_loss_closure(mlx_vector_array *result,
     if (n_samples > 1 && p->lambda_diversity > 0.0f) {
         /* Compute pairwise exp(-10 * mean((fi-fj)^2)) */
         mlx_array acc = mlx_array_new_float(0.0f);
-        mlx_array neg10 = mlx_array_new_float(-10.0f);  /* hoist out of loop */
+        /* Perf: use cached -10 scalar from pool instead of per-call alloc */
+        mlx_array neg10 = mlx_scalar_neg_ten();
         int pairs = 0;
         for (int i = 0; i < n_samples; ++i) {
             for (int j = i + 1; j < n_samples; ++j) {
@@ -304,7 +305,7 @@ static int gen_loss_closure(mlx_vector_array *result,
                 pairs++;
             }
         }
-        mlx_array_free(neg10);
+        /* Perf: neg10 is from scalar pool, do NOT free it */
 
         if (pairs > 0) {
             /* mean of pairwise values */
@@ -579,15 +580,15 @@ static int disc_loss_closure(mlx_vector_array *result,
         }
 
         /* 1. Generate alpha ~ U(0,1) with shape [batch, 1, 1, 1] for broadcasting */
-        mlx_array alpha_lo = mlx_array_new_float(0.0f);
-        mlx_array alpha_hi = mlx_array_new_float(1.0f);
+        mlx_array alpha_lo = mlx_scalar_zero();  /* Perf: use pool */
+        mlx_array alpha_hi = mlx_scalar_one();    /* Perf: use pool */
         int alpha_shape[4] = {batch, 1, 1, 1};
         mlx_array alpha_rand = mlx_array_new();
         mlx_array empty_key = {0};  /* empty key means use global RNG */
         mlx_random_uniform(&alpha_rand, alpha_lo, alpha_hi, alpha_shape, 4, MLX_FLOAT32, empty_key, s);
 
         /* one_minus_alpha = 1 - alpha */
-        mlx_array one_arr = mlx_array_new_float(1.0f);
+        mlx_array one_arr = mlx_scalar_one();  /* Perf: use pool */
         mlx_array one_minus_alpha = mlx_array_new();
         mlx_subtract(&one_minus_alpha, one_arr, alpha_rand, s);
 
@@ -661,7 +662,7 @@ static int disc_loss_closure(mlx_vector_array *result,
 
                         /* 4. (grad_norm - 1)^2 */
                         mlx_array norm_minus_1 = mlx_array_new();
-                        mlx_subtract(&norm_minus_1, grad_norm, one_arr, s);
+                        mlx_subtract(&norm_minus_1, grad_norm, mlx_scalar_one(), s);
 
                         mlx_array penalty_sq = mlx_array_new();
                         mlx_square(&penalty_sq, norm_minus_1, s);
@@ -707,11 +708,8 @@ static int disc_loss_closure(mlx_vector_array *result,
             } /* end if mlx_value_and_grad succeeded */
         }
 
-        /* Cleanup interpolation arrays */
-        mlx_array_free(alpha_lo);
-        mlx_array_free(alpha_hi);
+        /* Cleanup interpolation arrays — pool scalars are NOT freed */
         mlx_array_free(alpha_rand);
-        mlx_array_free(one_arr);
         mlx_array_free(one_minus_alpha);
         mlx_array_free(term1);
         mlx_array_free(term2);

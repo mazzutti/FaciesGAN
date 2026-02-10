@@ -265,6 +265,9 @@ int CLIArgs_parse_from_argv(CLIArgs *args, int argc, char **argv) {
         case OPT_COMPILE_BACKEND:
             args->compile_backend = true;
             break;
+        case OPT_NO_COMPILE_BACKEND:
+            args->no_compile_backend = true;
+            break;
         case OPT_USE_MLX:
             args->use_mlx = true;
             break;

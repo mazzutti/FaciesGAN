@@ -40,6 +40,19 @@ struct MLXOptimizer {
     int param_n;
     mlx_array **m; /* first moment */
     mlx_array **v; /* second moment */
+
+    /* Perf: cached scalar arrays to avoid per-step alloc/free churn.
+     * These are created once and reused across all optimizer steps.
+     * Only lr_cached and decay_scale_cached need updating when LR changes. */
+    mlx_array cached_b1;      /* beta1 */
+    mlx_array cached_1mb1;    /* 1-beta1 */
+    mlx_array cached_b2;      /* beta2 */
+    mlx_array cached_1mb2;    /* 1-beta2 */
+    mlx_array cached_eps;     /* eps */
+    mlx_array cached_lr;      /* effective LR */
+    mlx_array cached_decay;   /* lr * weight_decay */
+    float cached_lr_val;      /* tracks last LR value to detect changes */
+    int scalars_initialised;  /* 1 once scalars have been created */
 };
 
 MLXOptimizer *mlx_adam_create(float lr, float beta1, float beta2, float eps) {
@@ -58,6 +71,7 @@ MLXOptimizer *mlx_adam_create(float lr, float beta1, float beta2, float eps) {
     o->param_n = 0;
     o->m = NULL;
     o->v = NULL;
+    o->scalars_initialised = 0;
     return o;
 }
 
@@ -78,6 +92,7 @@ MLXOptimizer *mlx_adam_create_ext(float lr, float beta1, float beta2, float eps,
     o->param_n = 0;
     o->m = NULL;
     o->v = NULL;
+    o->scalars_initialised = 0;
     return o;
 }
 
@@ -89,6 +104,16 @@ MLXOptimizer *mlx_adam_create_with_defaults(float lr) {
 void mlx_adam_free(MLXOptimizer *opt) {
     if (!opt)
         return;
+    /* Free cached scalars */
+    if (opt->scalars_initialised) {
+        mlx_array_free(opt->cached_b1);
+        mlx_array_free(opt->cached_1mb1);
+        mlx_array_free(opt->cached_b2);
+        mlx_array_free(opt->cached_1mb2);
+        mlx_array_free(opt->cached_eps);
+        mlx_array_free(opt->cached_lr);
+        mlx_array_free(opt->cached_decay);
+    }
     if (opt->m) {
         mlx_free_mlx_array_ptrs(&opt->m, opt->param_n);
     }
@@ -176,21 +201,41 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
     float effective_lr = opt->lr;
     opt->last_used_lr = effective_lr;
 
-    /* Pre-allocate scalar temporaries — created directly to avoid
-     * the alloc→free→realloc churn of the old pattern.  These are
-     * freed at the end of this function. */
-    mlx_array scal_b1 = (opt->beta1 != 0.0f)
-                        ? mlx_array_new_float(opt->beta1) : mlx_array_new();
-    mlx_array scal_1mb1 = (opt->beta1 != 0.0f)
-                          ? mlx_array_new_float(1.0f - opt->beta1) : mlx_array_new();
-    mlx_array scal_b2 = (opt->beta2 != 0.0f)
-                        ? mlx_array_new_float(opt->beta2) : mlx_array_new();
-    mlx_array scal_1mb2 = (opt->beta2 != 0.0f)
-                          ? mlx_array_new_float(1.0f - opt->beta2) : mlx_array_new();
-    mlx_array eps_arr = mlx_array_new_float(opt->eps);
-    mlx_array lr_arr = mlx_array_new_float(effective_lr);
-    mlx_array decay_scale_arr = (opt->weight_decay != 0.0f)
-                                ? mlx_array_new_float(opt->lr * opt->weight_decay) : mlx_array_new();
+    /* Perf: lazily initialise cached scalar arrays on first step.
+     * Only recreate lr/decay scalars when LR actually changes. */
+    if (!opt->scalars_initialised) {
+        opt->cached_b1 = (opt->beta1 != 0.0f)
+                         ? mlx_array_new_float(opt->beta1) : mlx_array_new();
+        opt->cached_1mb1 = (opt->beta1 != 0.0f)
+                           ? mlx_array_new_float(1.0f - opt->beta1) : mlx_array_new();
+        opt->cached_b2 = (opt->beta2 != 0.0f)
+                         ? mlx_array_new_float(opt->beta2) : mlx_array_new();
+        opt->cached_1mb2 = (opt->beta2 != 0.0f)
+                           ? mlx_array_new_float(1.0f - opt->beta2) : mlx_array_new();
+        opt->cached_eps = mlx_array_new_float(opt->eps);
+        opt->cached_lr = mlx_array_new_float(effective_lr);
+        opt->cached_decay = (opt->weight_decay != 0.0f)
+                            ? mlx_array_new_float(opt->lr * opt->weight_decay) : mlx_array_new();
+        opt->cached_lr_val = effective_lr;
+        opt->scalars_initialised = 1;
+    } else if (effective_lr != opt->cached_lr_val) {
+        /* LR changed (scheduler step) — update only lr and decay scalars */
+        mlx_array_free(opt->cached_lr);
+        opt->cached_lr = mlx_array_new_float(effective_lr);
+        mlx_array_free(opt->cached_decay);
+        opt->cached_decay = (opt->weight_decay != 0.0f)
+                            ? mlx_array_new_float(opt->lr * opt->weight_decay) : mlx_array_new();
+        opt->cached_lr_val = effective_lr;
+    }
+
+    /* Alias cached scalars for readability */
+    mlx_array scal_b1 = opt->cached_b1;
+    mlx_array scal_1mb1 = opt->cached_1mb1;
+    mlx_array scal_b2 = opt->cached_b2;
+    mlx_array scal_1mb2 = opt->cached_1mb2;
+    mlx_array eps_arr = opt->cached_eps;
+    mlx_array lr_arr = opt->cached_lr;
+    mlx_array decay_scale_arr = opt->cached_decay;
 
     /* Gradients are left lazy — they will be transitively evaluated
      * when the caller batch-evals model params + optimizer state at the
@@ -412,14 +457,8 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
     free(deferred_new_p);
     free(deferred_param_ptr);
 
-    /* Free shared scalar temporaries */
-    mlx_array_free(scal_b1);
-    mlx_array_free(scal_1mb1);
-    mlx_array_free(scal_b2);
-    mlx_array_free(scal_1mb2);
-    mlx_array_free(eps_arr);
-    mlx_array_free(lr_arr);
-    mlx_array_free(decay_scale_arr);
+    /* Cached scalars are NOT freed here — they persist on the struct
+     * across optimizer steps for reuse (freed in mlx_adam_free). */
 
     return 0;
 }

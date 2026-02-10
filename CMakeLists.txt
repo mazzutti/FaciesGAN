@@ -50,6 +50,62 @@ if(ENABLE_LTO)
   endif()
 endif()
 
+# ── Profile-Guided Optimization (PGO) ──────────────────────────────────────
+# Usage:
+#   Phase 1 – instrument:  cmake -S . -B build -DENABLE_PGO=generate -DCMAKE_BUILD_TYPE=Release
+#                           cmake --build build -- -j4
+#                           ./build/faciesgan <short training args>
+#   Phase 2 – optimise:    cmake -S . -B build -DENABLE_PGO=use -DCMAKE_BUILD_TYPE=Release
+#                           cmake --build build -- -j4
+#   Disable:               cmake -S . -B build -DENABLE_PGO=OFF
+#
+# Profile data is stored under build/pgo-profiles/.
+set(ENABLE_PGO "OFF" CACHE STRING "Profile-Guided Optimization: OFF | generate | use")
+set_property(CACHE ENABLE_PGO PROPERTY STRINGS OFF generate use)
+
+set(PGO_PROFILE_DIR "${CMAKE_BINARY_DIR}/pgo-profiles")
+
+if(ENABLE_PGO STREQUAL "generate")
+  message(STATUS "PGO: instrumented build (profiles → ${PGO_PROFILE_DIR})")
+  file(MAKE_DIRECTORY "${PGO_PROFILE_DIR}")
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    add_compile_options(-fprofile-instr-generate="${PGO_PROFILE_DIR}/default-%p.profraw")
+    add_link_options(-fprofile-instr-generate="${PGO_PROFILE_DIR}/default-%p.profraw")
+  elseif(CMAKE_C_COMPILER_ID MATCHES "GNU")
+    add_compile_options(-fprofile-generate="${PGO_PROFILE_DIR}")
+    add_link_options(-fprofile-generate="${PGO_PROFILE_DIR}")
+  else()
+    message(WARNING "PGO generate: unsupported compiler ${CMAKE_C_COMPILER_ID}")
+  endif()
+
+elseif(ENABLE_PGO STREQUAL "use")
+  if(CMAKE_C_COMPILER_ID MATCHES "Clang")
+    # Merge raw profiles into a single .profdata
+    set(PGO_MERGED "${PGO_PROFILE_DIR}/merged.profdata")
+    if(NOT EXISTS "${PGO_MERGED}")
+      message(STATUS "PGO: merging raw profiles …")
+      execute_process(
+        COMMAND xcrun llvm-profdata merge -output=${PGO_MERGED}
+                ${PGO_PROFILE_DIR}
+        RESULT_VARIABLE pgo_merge_result
+      )
+      if(NOT pgo_merge_result EQUAL 0)
+        message(FATAL_ERROR "PGO merge failed (exit ${pgo_merge_result}). "
+                            "Did you run the instrumented binary first?")
+      endif()
+    endif()
+    message(STATUS "PGO: optimised build using ${PGO_MERGED}")
+    add_compile_options(-fprofile-instr-use="${PGO_MERGED}")
+    add_link_options(-fprofile-instr-use="${PGO_MERGED}")
+  elseif(CMAKE_C_COMPILER_ID MATCHES "GNU")
+    message(STATUS "PGO: optimised build using profiles in ${PGO_PROFILE_DIR}")
+    add_compile_options(-fprofile-use="${PGO_PROFILE_DIR}" -fprofile-correction)
+    add_link_options(-fprofile-use="${PGO_PROFILE_DIR}")
+  else()
+    message(WARNING "PGO use: unsupported compiler ${CMAKE_C_COMPILER_ID}")
+  endif()
+endif()
+
 # Option to enable the small C progress bar (fg_progress)
 option(ENABLE_FG_PROGRESS "Enable FaciesGAN C progress bar (fg_progress)" ON)
 
@@ -118,7 +174,7 @@ target_sources(custom_layer PRIVATE
   faciesgan-c/third_party/miniz_zip.c
   # faciesgan-c/trainning/c_trainer_api.c
 )
-# Hot-path files: aggressive optimisation flags (-O3 -march=native -ffast-math)
+# Hot-path files: aggressive optimisation flags (-O3 -march=native -ffast-math -funroll-loops)
 set_source_files_properties(
   faciesgan-c/utils.c
   faciesgan-c/models/custom_layer.c
@@ -127,7 +183,7 @@ set_source_files_properties(
   faciesgan-c/trainning/optimizer.c
   faciesgan-c/trainning/train_step.c
   faciesgan-c/trainning/mlx_native_grad.c
-  PROPERTIES COMPILE_OPTIONS "-O3;-march=native;-ffast-math"
+  PROPERTIES COMPILE_OPTIONS "-O3;-march=native;-ffast-math;-funroll-loops"
 )
 set_source_files_properties(faciesgan-c/trainning/mem_debug.c PROPERTIES
   COMPILE_DEFINITIONS MLX_MEM_NO_WRAP=1
