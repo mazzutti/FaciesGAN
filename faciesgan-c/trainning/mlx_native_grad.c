@@ -27,6 +27,7 @@
 #include "../models/custom_layer.h"
 #include "../utils.h"
 #include "array_helpers.h"
+#include "scalar_pool.h"
 #include "mlx_native_grad.h"
 
 /* ============================================================================
@@ -110,7 +111,7 @@ static int gen_loss_closure(mlx_vector_array *result,
         return 1;
     }
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* === CRITICAL: Update model parameters with traced inputs ===
      * This is the C equivalent of Python's model.update(params).
@@ -120,7 +121,6 @@ static int gen_loss_closure(mlx_vector_array *result,
     if (vec_size != p->n_params) {
         fprintf(stderr, "[gen_loss_closure] param count mismatch: got %d, expected %d\n",
                 vec_size, p->n_params);
-        mlx_stream_free(s);
         return 1;
     }
 
@@ -146,7 +146,6 @@ static int gen_loss_closure(mlx_vector_array *result,
     mlx_array *fakes = malloc(n_samples * sizeof(mlx_array));
     if (!fakes) {
         fprintf(stderr, "[gen_loss_closure] malloc failed for fakes\n");
-        mlx_stream_free(s);
         return 1;
     }
     for (int di = 0; di < n_samples; ++di) {
@@ -191,7 +190,6 @@ static int gen_loss_closure(mlx_vector_array *result,
         for (int di = 0; di < n_samples; ++di)
             if (fakes[di].ctx) mlx_array_free(fakes[di]);
         free(fakes);
-        mlx_stream_free(s);
         return 1;
     }
 
@@ -203,10 +201,8 @@ static int gen_loss_closure(mlx_vector_array *result,
     mlx_array mean_d_fake = mlx_array_new();
     mlx_mean(&mean_d_fake, d_fake, false, s);
 
-    mlx_array neg_one_arr = mlx_array_new_float(-1.0f);
-
     mlx_array adv_loss = mlx_array_new();
-    mlx_multiply(&adv_loss, neg_one_arr, mean_d_fake, s);
+    mlx_multiply(&adv_loss, mlx_scalar_neg_one(), mean_d_fake, s);
 
     /* Store adversarial loss in metrics if provided */
     if (p->out_metrics) {
@@ -433,10 +429,8 @@ static int gen_loss_closure(mlx_vector_array *result,
     free(fakes);
     mlx_array_free(d_fake);
     mlx_array_free(mean_d_fake);
-    mlx_array_free(neg_one_arr);
     mlx_array_free(adv_loss);
     mlx_array_free(total_loss);
-    mlx_stream_free(s);
 
     return 0;
 }
@@ -473,7 +467,7 @@ static int gp_disc_forward_closure(mlx_vector_array *result,
     }
 
     /* Sum the output to get scalar (required for vjp) */
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_array d_sum = mlx_array_new();
     mlx_sum(&d_sum, d_out, false, s);
 
@@ -483,7 +477,6 @@ static int gp_disc_forward_closure(mlx_vector_array *result,
     mlx_array_free(d_sum);
     mlx_array_free(x_interp);
     mlx_array_free(d_out);
-    mlx_stream_free(s);
 
     return 0;
 }
@@ -511,14 +504,13 @@ static int disc_loss_closure(mlx_vector_array *result,
         return 1;
     }
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* === CRITICAL: Update discriminator parameters with traced inputs === */
     int vec_size = mlx_vector_array_size(inputs);
     if (vec_size != p->n_params) {
         fprintf(stderr, "[disc_loss_closure] param count mismatch: got %d, expected %d\n",
                 vec_size, p->n_params);
-        mlx_stream_free(s);
         return 1;
     }
 
@@ -538,7 +530,6 @@ static int disc_loss_closure(mlx_vector_array *result,
         fprintf(stderr, "[disc_loss_closure] discriminator forward failed\n");
         mlx_array_free(d_real);
         mlx_array_free(d_fake);
-        mlx_stream_free(s);
         return 1;
     }
 
@@ -549,10 +540,8 @@ static int disc_loss_closure(mlx_vector_array *result,
     mlx_mean(&mean_real, d_real, false, s);
     mlx_mean(&mean_fake, d_fake, false, s);
 
-    mlx_array neg_one_arr = mlx_array_new_float(-1.0f);
-
     mlx_array neg_real = mlx_array_new();
-    mlx_multiply(&neg_real, neg_one_arr, mean_real, s);
+    mlx_multiply(&neg_real, mlx_scalar_neg_one(), mean_real, s);
 
     mlx_array wgan_loss = mlx_array_new();
     mlx_add(&wgan_loss, neg_real, mean_fake, s);
@@ -746,7 +735,6 @@ static int disc_loss_closure(mlx_vector_array *result,
     mlx_array_free(d_fake);
     mlx_array_free(mean_real);
     mlx_array_free(mean_fake);
-    mlx_array_free(neg_one_arr);
     mlx_array_free(neg_real);
     /* wgan_loss was copied into total_loss via mlx_array_set; if GP was
      * computed total_loss was replaced (and the shared ref freed) but
@@ -754,7 +742,6 @@ static int disc_loss_closure(mlx_vector_array *result,
      * mlx_array_free on an already-released handle is safe. */
     mlx_array_free(wgan_loss);
     mlx_array_free(total_loss);
-    mlx_stream_free(s);
 
     return 0;
 }
@@ -825,12 +812,11 @@ int mlx_native_compute_gen_loss_and_grads(
         return -1;
     }
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* Get generator and its parameters for this scale */
     MLXGenerator *gen = mlx_faciesgan_build_generator(m);
     if (!gen) {
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -838,7 +824,6 @@ int mlx_native_compute_gen_loss_and_grads(
     mlx_array **param_ptrs = mlx_generator_get_parameters_for_scale(gen, scale, &n_params);
     if (!param_ptrs || n_params == 0) {
         if (param_ptrs) mlx_generator_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -851,7 +836,6 @@ int mlx_native_compute_gen_loss_and_grads(
         z_list = malloc(z_count_in * sizeof(mlx_array));
         if (!z_list) {
             mlx_generator_free_parameters_list(param_ptrs);
-            mlx_stream_free(s);
             return -1;
         }
         for (int i = 0; i < z_count_in; ++i) {
@@ -867,7 +851,6 @@ int mlx_native_compute_gen_loss_and_grads(
         for (int i = 0; i < z_count_copy; ++i) mlx_array_free(z_list[i]);
         free(z_list);
         mlx_generator_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
     memcpy(amp, amp_in, amp_count_in * sizeof(float));
@@ -879,7 +862,6 @@ int mlx_native_compute_gen_loss_and_grads(
         free(z_list);
         free(amp);
         mlx_generator_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -924,7 +906,6 @@ int mlx_native_compute_gen_loss_and_grads(
     if (!argnums) {
         mlx_closure_free(forward_cls);
         mlx_generator_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
     for (int i = 0; i < n_params; ++i) {
@@ -937,7 +918,6 @@ int mlx_native_compute_gen_loss_and_grads(
         free(argnums);
         mlx_closure_free(forward_cls);
         mlx_generator_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
     free(argnums);
@@ -960,7 +940,6 @@ int mlx_native_compute_gen_loss_and_grads(
         mlx_closure_value_and_grad_free(vag);
         mlx_closure_free(forward_cls);
         mlx_generator_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -981,7 +960,6 @@ int mlx_native_compute_gen_loss_and_grads(
         mlx_closure_value_and_grad_free(vag);
         mlx_closure_free(forward_cls);
         mlx_generator_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1036,7 +1014,6 @@ int mlx_native_compute_gen_loss_and_grads(
     mlx_closure_value_and_grad_free(vag);
     mlx_closure_free(forward_cls);
     mlx_generator_free_parameters_list(param_ptrs);
-    mlx_stream_free(s);
 
     return 0;
 }
@@ -1062,18 +1039,16 @@ int mlx_native_compute_disc_loss_and_grads(
         return -1;
     }
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* Get discriminator parameters for this scale */
     MLXDiscriminator *disc = mlx_faciesgan_build_discriminator(m);
     if (!disc) {
-        mlx_stream_free(s);
         return -1;
     }
 
     void *disc_ptr = mlx_discriminator_get_disc_ptr(disc, scale);
     if (!disc_ptr) {
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1082,7 +1057,6 @@ int mlx_native_compute_disc_loss_and_grads(
     mlx_array **param_ptrs = mlx_spadedisc_get_parameters(spade_disc, &n_params);
     if (!param_ptrs || n_params == 0) {
         if (param_ptrs) mlx_spadedisc_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1090,7 +1064,6 @@ int mlx_native_compute_disc_loss_and_grads(
     DiscClosurePayload *payload = calloc(1, sizeof(DiscClosurePayload));
     if (!payload) {
         mlx_spadedisc_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1115,7 +1088,6 @@ int mlx_native_compute_disc_loss_and_grads(
     if (!argnums) {
         mlx_closure_free(forward_cls);
         mlx_spadedisc_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
     for (int i = 0; i < n_params; ++i) {
@@ -1128,7 +1100,6 @@ int mlx_native_compute_disc_loss_and_grads(
         free(argnums);
         mlx_closure_free(forward_cls);
         mlx_spadedisc_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
     free(argnums);
@@ -1151,7 +1122,6 @@ int mlx_native_compute_disc_loss_and_grads(
         mlx_closure_value_and_grad_free(vag);
         mlx_closure_free(forward_cls);
         mlx_spadedisc_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1172,7 +1142,6 @@ int mlx_native_compute_disc_loss_and_grads(
         mlx_closure_value_and_grad_free(vag);
         mlx_closure_free(forward_cls);
         mlx_spadedisc_free_parameters_list(param_ptrs);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1218,7 +1187,6 @@ int mlx_native_compute_disc_loss_and_grads(
     mlx_closure_value_and_grad_free(vag);
     mlx_closure_free(forward_cls);
     mlx_spadedisc_free_parameters_list(param_ptrs);
-    mlx_stream_free(s);
 
     return 0;
 }

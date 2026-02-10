@@ -272,7 +272,7 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
         return -1;
     }
 
-    mlx_stream stream = mlx_default_gpu_stream_new();
+    mlx_stream stream = mlx_gpu_stream();
 
     for (int si = 0; si < n_active_scales; ++si) {
         int scale = active_scales[si];
@@ -503,7 +503,6 @@ int mlx_faciesgan_collect_metrics_and_grads_native(
         mlx_array_free(fake);
     }
 
-    mlx_stream_free(stream);
     *out_results = res;
     return 0;
 }

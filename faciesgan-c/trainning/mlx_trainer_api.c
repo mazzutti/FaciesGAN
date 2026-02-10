@@ -913,13 +913,13 @@ MLXTrainer_create_batch_iterator_impl(MLXTrainer *trainer,
     const char *proc_env = getenv("FACIESGAN_PROCESS_WORKERS");
     int use_cpu_stream = (proc_env && strcmp(proc_env, "1") == 0);
     mlx_stream s = use_cpu_stream ? mlx_default_cpu_stream_new()
-                   : mlx_default_gpu_stream_new();
+                   : mlx_gpu_stream();
     /* scales and n_scales are used below when creating prefetcher */
 
     PrefetcherHandle ph =
         prefetcher_create_with_stream(qcap, s, (const int *)scales, n_scales);
     if (!ph) {
-        if (s.ctx)
+        if (use_cpu_stream && s.ctx)
             mlx_stream_free(s);
         return NULL;
     }
@@ -929,9 +929,9 @@ MLXTrainer_create_batch_iterator_impl(MLXTrainer *trainer,
      * the dataloader and push into the prefetcher. The helper detaches the
      * thread and will free the provided stream when finished. */
     mlx_stream prod_stream = use_cpu_stream ? mlx_default_cpu_stream_new()
-                             : mlx_default_gpu_stream_new();
+                             : mlx_gpu_stream();
     if (prefetcher_start_from_dataloader(ph, dl, prod_stream) != 0) {
-        if (prod_stream.ctx)
+        if (use_cpu_stream && prod_stream.ctx)
             mlx_stream_free(prod_stream);
         prefetcher_destroy(ph);
         trainer->batch_prefetcher = NULL;
@@ -1151,7 +1151,7 @@ int MLXTrainer_generate_visualization_samples_impl(
             /* Ensure none of the zvals are empty; replace empties with zeros. */
             for (int j = 0; j < n_noises; ++j) {
                 if (mlx_array_ndim(zvals[j]) == 0) {
-                    mlx_stream _s = mlx_default_gpu_stream_new();
+                    mlx_stream _s = mlx_gpu_stream();
                     int shape0[4] = {
                         1, trainer->opts.crop_size > 0 ? trainer->opts.crop_size : 32,
                         trainer->opts.crop_size > 0 ? trainer->opts.crop_size : 32,
@@ -1166,7 +1166,6 @@ int MLXTrainer_generate_visualization_samples_impl(
                     } else {
                         mlx_array_free(tmp);
                     }
-                    mlx_stream_free(_s);
                 }
             }
             /* Free the noises container (pointer wrappers) but NOT the arrays,
@@ -1564,7 +1563,6 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
     /* Select num_real random indices from batch (like Python: indexes = randint(batch_size, (num_real_facies,))) */
     int *selected_indices = (int *)malloc(num_real * sizeof(int));
     if (!selected_indices) {
-        mlx_stream_free(s);
         return -1;
     }
     for (int i = 0; i < num_real; i++) {
@@ -1578,7 +1576,6 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
     mlx_array *all_fakes = (mlx_array *)malloc(total_gen * sizeof(mlx_array));
     if (!all_fakes) {
         free(selected_indices);
-        mlx_stream_free(s);
         return -1;
     }
     for (int i = 0; i < total_gen; i++)
@@ -1606,7 +1603,6 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
                 mlx_array_free(all_fakes[j]);
             free(all_fakes);
             free(selected_indices);
-            mlx_stream_free(s);
             return -1;
         }
 
@@ -1624,7 +1620,6 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
                     mlx_array_free(all_fakes[j]);
                 free(all_fakes);
                 free(selected_indices);
-                mlx_stream_free(s);
                 return -1;
             }
             for (int i = 0; i < scale + 1; ++i)
@@ -1645,7 +1640,6 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
                     mlx_array_free(all_fakes[j]);
                 free(all_fakes);
                 free(selected_indices);
-                mlx_stream_free(s);
                 return -1;
             }
             for (int j = 0; j < n_noises; ++j) {
@@ -2042,7 +2036,6 @@ cleanup:
     free(all_fakes);
     free(selected_indices);
 
-    mlx_stream_free(s);
     return rc;
 }
 
@@ -2182,12 +2175,11 @@ int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
         for (int sc = 0; sc < num_scales; ++sc) {
             int shape[3] = {height, width, channels};
             mlx_array a = mlx_array_new();
-            mlx_stream s = mlx_default_gpu_stream_new();
+            mlx_stream s = mlx_gpu_stream();
             if (mlx_random_normal(&a, shape, 3, MLX_FLOAT32, 0.0f, 1.0f,
                                   mlx_array_empty, s) != 0) {
                 mlx_zeros(&a, shape, 3, MLX_FLOAT32, s);
             }
-            mlx_stream_free(s);
             if (mlx_vector_array_append_value(sample, a) != 0) {
                 fprintf(stderr, "failed to append sample array\n");
                 mlx_array_free(a);
@@ -2236,7 +2228,7 @@ int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
      * the main training path (train_impl) gates this on enable_plot_facies. */
     pybridge_create_background_worker(2, 32);
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     int batch_idx = 0;
     while (1) {
@@ -2280,7 +2272,6 @@ int MLXTrainer_run(int num_samples, int num_scales, int channels, int height,
         batch_idx++;
     }
 
-    mlx_stream_free(s);
     facies_dataloader_free(dl);
     facies_dataset_free(ds);
     mlx_vector_vector_array_free(facies_pyramids);
@@ -2464,7 +2455,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
     }
 
     /* Training loop: consume prepared pyramids from prefetcher iterator */
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     if (pit)
         prefetcher_iterator_preload(pit);
 
@@ -2577,7 +2568,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         if (well_pyr && nsc > 0 && (!mask_pyr || !mask_pyr[0] || !(*mask_pyr[0]).ctx)) {
             computed_masks = (mlx_array **)calloc((size_t)nsc, sizeof(mlx_array *));
             if (computed_masks) {
-                mlx_stream mask_s = mlx_default_gpu_stream_new();
+                mlx_stream mask_s = mlx_gpu_stream();
                 for (int wi = 0; wi < nsc; ++wi) {
                     if (!well_pyr[wi] || !(*well_pyr[wi]).ctx) {
                         computed_masks[wi] = NULL;
@@ -2652,7 +2643,6 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
                     mlx_eval(mvec);
                     mlx_vector_array_free(mvec);
                 }
-                mlx_stream_free(mask_s);
             }
         }
 
@@ -2828,7 +2818,6 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
         /* MLX lock already released above */
     }
 
-    mlx_stream_free(s);
 
     /* Free local dataset/dataloader only when they were created by this
      * function. If trainer owns them (created in MLXTrainer_new) they will be

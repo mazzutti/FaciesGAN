@@ -1,5 +1,6 @@
 #include "generator.h"
 #include "../trainning/mlx_compat.h"
+#include "../trainning/scalar_pool.h"
 #include "custom_layer.h"
 #include "trainning/array_helpers.h"
 #include <limits.h>
@@ -42,16 +43,14 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
             int axes_pad[2] = {1, 2};
             int low_pad[2] = {low_h, low_w};
             int high_pad[2] = {high_h, high_w};
-            mlx_array zero = mlx_array_new_float(0.0f);
             mlx_array padded = mlx_array_new();
-            if (mlx_pad(&padded, a, axes_pad, 2, low_pad, 2, high_pad, 2, zero,
-                        "constant", s) == 0) {
+            if (mlx_pad(&padded, a, axes_pad, 2, low_pad, 2, high_pad, 2,
+                        mlx_scalar_zero(), "constant", s) == 0) {
                 a_copy = padded;
                 a_padded = 1;
             } else {
                 mlx_array_safe_free(&padded);
             }
-            mlx_array_safe_free(&zero);
         } else if (dh <= 0 && dw <= 0) {
             int pdh = -dh;
             int pdw = -dw;
@@ -62,16 +61,14 @@ static int safe_add(mlx_array *out, mlx_array a, mlx_array b, mlx_stream s) {
             int axes_pad[2] = {1, 2};
             int low_pad[2] = {low_h, low_w};
             int high_pad[2] = {high_h, high_w};
-            mlx_array zero = mlx_array_new_float(0.0f);
             mlx_array padded = mlx_array_new();
-            if (mlx_pad(&padded, b, axes_pad, 2, low_pad, 2, high_pad, 2, zero,
-                        "constant", s) == 0) {
+            if (mlx_pad(&padded, b, axes_pad, 2, low_pad, 2, high_pad, 2,
+                        mlx_scalar_zero(), "constant", s) == 0) {
                 b_copy = padded;
                 b_padded = 1;
             } else {
                 mlx_array_safe_free(&padded);
             }
-            mlx_array_safe_free(&zero);
         }
     }
     int rc = 0;
@@ -673,7 +670,7 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
     if (stop_scale >= m->n_gens)
         stop_scale = m->n_gens - 1;
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_array zero_scalar = mlx_array_new_float(0.0f);
 
     /* Initialize out_facie */
@@ -1185,7 +1182,6 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
     }
 
     mlx_array_free(zero_scalar);
-    mlx_stream_free(s);
 
     return out_facie;
 }

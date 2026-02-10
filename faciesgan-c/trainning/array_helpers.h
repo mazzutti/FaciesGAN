@@ -102,4 +102,19 @@ void mlx_free_pod(void **out);
 void mlx_global_lock(void);
 void mlx_global_unlock(void);
 
+/**
+ * Cached default GPU stream.
+ *
+ * Returns a lazily-initialised mlx_stream handle that is reused for the
+ * lifetime of the process.  Callers must NOT call mlx_stream_free() on
+ * the returned handle.  Thread-safe (initialised via pthread_once).
+ */
+mlx_stream mlx_gpu_stream(void);
+
+/**
+ * Release the cached GPU stream.  Call once at program shutdown if
+ * desired; omitting the call is safe (OS reclaims it).
+ */
+void mlx_gpu_stream_destroy(void);
+
 #endif

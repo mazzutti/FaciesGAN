@@ -29,12 +29,11 @@ void mlx_metric_accumulator_free(MLXMetricAccumulator *acc) {
 void mlx_metric_accumulator_add(MLXMetricAccumulator *acc, mlx_array val) {
   if (!acc)
     return;
-  mlx_stream s = mlx_default_gpu_stream_new();
+  mlx_stream s = mlx_gpu_stream();
   if (!acc->initialized) {
     mlx_array_set(&acc->sum, val);
     acc->initialized = 1;
     acc->count = 1;
-    mlx_stream_free(s);
     return;
   }
   mlx_array tmp = mlx_array_new();
@@ -43,21 +42,19 @@ void mlx_metric_accumulator_add(MLXMetricAccumulator *acc, mlx_array val) {
     acc->count += 1;
   }
   mlx_array_free(tmp);
-  mlx_stream_free(s);
 }
 
 mlx_array mlx_metric_accumulator_mean(MLXMetricAccumulator *acc) {
   mlx_array out = mlx_array_new();
   if (!acc || acc->count == 0)
     return out;
-  mlx_stream s = mlx_default_gpu_stream_new();
+  mlx_stream s = mlx_gpu_stream();
   mlx_array denom = mlx_array_new_float((float)acc->count);
   if (mlx_divide(&out, acc->sum, denom, s) != 0) {
     mlx_array_free(out);
     out = mlx_array_new();
   }
   mlx_array_free(denom);
-  mlx_stream_free(s);
   return out;
 }
 

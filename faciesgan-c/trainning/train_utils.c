@@ -17,28 +17,24 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
         return -1;
 
     /* create a default CPU stream for MLX ops and ensure it's freed */
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* scale 0 -> zeros_like(real) */
     if (scale == 0) {
         if (!facies_pyramid[0]) {
-            mlx_stream_free(s);
             return -1;
         }
         mlx_array z = mlx_array_new();
         if (mlx_zeros_like(&z, *facies_pyramid[0], s) != 0) {
-            mlx_stream_free(s);
             return -1;
         }
         mlx_array *res = NULL;
         if (mlx_alloc_pod((void **)&res, sizeof(mlx_array), 1) != 0) {
             mlx_array_free(z);
-            mlx_stream_free(s);
             return -1;
         }
         *res = z;
         *out = res;
-        mlx_stream_free(s);
         return 0;
     }
 
@@ -55,7 +51,6 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
     /* Use mlx_take_axis to select indices along batch axis (axis=0) */
     if (mlx_take_axis(&sel, *facies_pyramid[scale - 1], idx, 0, s) != 0) {
         mlx_array_free(idx);
-        mlx_stream_free(s);
         return -1;
     }
     mlx_array_free(idx);
@@ -72,7 +67,6 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
     MLXUpsample *u = mlx_upsample_create(target_h, target_w, "linear", 1);
     if (!u) {
         mlx_array_free(sel);
-        mlx_stream_free(s);
         return -1;
     }
     mlx_array up = mlx_upsample_forward(u, sel);
@@ -85,12 +79,10 @@ int mlx_compute_rec_input(int scale, const int *indexes, int n_indexes,
     mlx_array *res = NULL;
     if (mlx_alloc_pod((void **)&res, sizeof(mlx_array), 1) != 0) {
         mlx_array_free(up);
-        mlx_stream_free(s);
         return -1;
     }
     *res = up;
     *out = res;
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -230,7 +222,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         /* Ensure none of the zvals are empty */
         for (int i = 0; i < n_noises; ++i) {
             if (mlx_array_ndim(zvals[i]) == 0) {
-                mlx_stream _s = mlx_default_gpu_stream_new();
+                mlx_stream _s = mlx_gpu_stream();
                 int shape0[4] = {1, 32, 32, 1};
                 mlx_array tmp = mlx_array_new();
                 if (mlx_zeros(&tmp, shape0, 4, MLX_FLOAT32, _s) == 0) {
@@ -239,7 +231,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
                 } else {
                     mlx_array_free(tmp);
                 }
-                mlx_stream_free(_s);
             }
         }
     }
@@ -267,7 +258,7 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
      * Python: rmse = mx.sqrt(nn.losses.mse_loss(fake, real))
      * No padding of real - shapes should match since we now use the full
      * progressive chain (start_scale=0). */
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* Ensure fake and real shapes match (H/W) before subtract to avoid
      * broadcast errors when parallel scales are active. */
@@ -278,7 +269,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
         int real_ndim = mlx_array_ndim(*real);
         if (fake_ndim == 4 && real_ndim == 4) {
             if (fake_shape[0] != real_shape[0] || fake_shape[3] != real_shape[3]) {
-                mlx_stream_free(s);
                 mlx_array_free(fake);
                 mlx_array_free(in_noise);
                 mlx_global_unlock();
@@ -287,7 +277,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
             if (fake_shape[1] != real_shape[1] || fake_shape[2] != real_shape[2]) {
                 MLXUpsample *u = mlx_upsample_create(real_shape[1], real_shape[2], "linear", 1);
                 if (!u) {
-                    mlx_stream_free(s);
                     mlx_array_free(fake);
                     mlx_array_free(in_noise);
                     mlx_global_unlock();
@@ -303,7 +292,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
 
     mlx_array diff = mlx_array_new();
     if (mlx_subtract(&diff, fake, *real, s) != 0) {
-        mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
         mlx_global_unlock();
@@ -313,7 +301,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     int sq_rc = mlx_square(&sq, diff, s);
     if (sq_rc != 0) {
         mlx_array_free(diff);
-        mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
         mlx_global_unlock();
@@ -324,7 +311,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     mlx_array mean = mlx_array_new();
     if (mlx_mean(&mean, sq, false, s) != 0) {
         mlx_array_free(sq);
-        mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
         mlx_global_unlock();
@@ -335,7 +321,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     mlx_array root = mlx_array_new();
     if (mlx_sqrt(&root, mean, s) != 0) {
         mlx_array_free(mean);
-        mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
         mlx_global_unlock();
@@ -371,7 +356,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
     float *new_amps = NULL;
     if (mlx_alloc_float_buf(&new_amps, scale + 1) != 0) {
         mlx_array_free(root);
-        mlx_stream_free(s);
         mlx_array_free(fake);
         mlx_array_free(in_noise);
         mlx_global_unlock();
@@ -405,7 +389,6 @@ int mlx_init_rec_noise_and_amp(MLXFaciesGAN *m, int scale, const int *indexes,
 
     mlx_free_float_buf(&new_amps, NULL);
     mlx_array_free(root);
-    mlx_stream_free(s);
     mlx_array_free(fake);
     mlx_array_free(in_noise);
 

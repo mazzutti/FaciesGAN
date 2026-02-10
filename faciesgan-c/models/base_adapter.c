@@ -1,6 +1,7 @@
 #include "base_manager.h"
 #include "facies_gan.h"
 #include "options.h"
+#include "trainning/array_helpers.h"
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -147,7 +148,7 @@ static void fg_finalize_generator_scale(void *mgr, int scale, int reinit) {
 static void reinit_convblock_weights(MLXConvBlock *cb) {
     if (!cb)
         return;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* --- Conv2d weight: N(0, 0.02) --- */
     mlx_array *w = mlx_convblock_get_conv_weight(cb);
@@ -196,7 +197,6 @@ static void reinit_convblock_weights(MLXConvBlock *cb) {
         mlx_array_free(new_nb);
     }
 
-    mlx_stream_free(s);
 }
 
 static void fg_finalize_discriminator_scale(void *mgr, int scale) {

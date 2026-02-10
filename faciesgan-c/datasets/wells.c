@@ -175,7 +175,7 @@ int datasets_load_wells_mapping(const char *data_root, const char *subdir,
     return -1;
   }
 
-  mlx_stream s = mlx_default_gpu_stream_new();
+  mlx_stream s = mlx_gpu_stream();
   mlx_array col_arr = mlx_array_new();
   mlx_array cnt_arr = mlx_array_new();
   int rc = 0;
@@ -209,7 +209,6 @@ int datasets_load_wells_mapping(const char *data_root, const char *subdir,
       mlx_io_reader_free(counts_reader);
     mlx_array_free(col_arr);
     mlx_array_free(cnt_arr);
-    mlx_stream_free(s);
     /* free image list */
     for (int i = 0; i < img_count; ++i)
       free(image_list[i]);
@@ -254,7 +253,6 @@ int datasets_load_wells_mapping(const char *data_root, const char *subdir,
   /* cleanup temp files and mlx objects */
   mlx_array_free(col_arr);
   mlx_array_free(cnt_arr);
-  mlx_stream_free(s);
   if (cols_reader.ctx)
     mlx_io_reader_free(cols_reader);
   if (counts_reader.ctx)

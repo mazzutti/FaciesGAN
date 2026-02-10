@@ -111,7 +111,7 @@ PrefetcherHandle prefetcher_create(int max_queue, int device_index,
         p->stream = mlx_stream_new_device(p->device);
         p->use_device = 1;
     } else {
-        p->stream = mlx_default_gpu_stream_new();
+        p->stream = mlx_gpu_stream();
         p->use_device = 0;
     }
     return (PrefetcherHandle)p;
@@ -426,8 +426,6 @@ static void *prefetcher_dataloader_producer(void *v) {
     }
 
     prefetcher_mark_finished(ph);
-    if (a->s.ctx)
-        mlx_stream_free(a->s);
     Prefetcher *p = (Prefetcher *)ph;
     pthread_mutex_lock(&p->mutex);
     p->producer_count--;
@@ -1164,8 +1162,6 @@ void prefetcher_destroy(PrefetcherHandle h) {
             }
         }
     }
-    if (p->stream.ctx)
-        mlx_stream_free(p->stream);
     if (p->use_device && p->device.ctx)
         mlx_device_free(p->device);
     if (p->scales)
@@ -1360,9 +1356,7 @@ int prefetcher_set_stream(PrefetcherHandle h, mlx_stream stream) {
     Prefetcher *p = (Prefetcher *)h;
     if (!p)
         return -1;
-    /* free old stream if present */
-    if (p->stream.ctx)
-        mlx_stream_free(p->stream);
+    /* Stream is now cached — nothing to free. */
     p->stream = stream;
     p->use_device = 0;
     if (p->device.ctx)

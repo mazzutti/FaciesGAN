@@ -518,9 +518,8 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
             // Create mlx_array and save
             int shape[3] = {target, target, num_img_channels};
             mlx_array a = mlx_array_new();
-            mlx_stream s = mlx_default_gpu_stream_new();
+            mlx_stream s = mlx_gpu_stream();
             if (mlx_array_set_data(&a, fdata, shape, 3, MLX_FLOAT32) != 0) {
-                mlx_stream_free(s);
                 if (nelem > (size_t)INT_MAX)
                     free(fdata);
                 else
@@ -539,7 +538,6 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
             snprintf(fname, PATH_MAX, "%s/facies_%d.npy", sample_dir, scale);
             if (save_on_cpu(fname, a) != 0) {
                 mlx_array_free(a);
-                mlx_stream_free(s);
                 if (nelem > (size_t)INT_MAX)
                     free(fdata);
                 else
@@ -553,7 +551,6 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
             }
 
             mlx_array_free(a);
-            mlx_stream_free(s);
             if (nelem > (size_t)INT_MAX)
                 free(fdata);
             else
@@ -678,9 +675,8 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
 
                     int shape[3] = {target, target, num_img_channels};
                     mlx_array a = mlx_array_new();
-                    mlx_stream s = mlx_default_gpu_stream_new();
+                    mlx_stream s = mlx_gpu_stream();
                     if (mlx_array_set_data(&a, fdata, shape, 3, MLX_FLOAT32) != 0) {
-                        mlx_stream_free(s);
                         if (nelem > (size_t)INT_MAX)
                             free(fdata);
                         else
@@ -697,7 +693,6 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
                     snprintf(fname, PATH_MAX, "%s/seismic_%d.npy", sample_dir, scale);
                     if (save_on_cpu(fname, a) != 0) {
                         mlx_array_free(a);
-                        mlx_stream_free(s);
                         if (nelem > (size_t)INT_MAX)
                             free(fdata);
                         else
@@ -711,7 +706,6 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
                     }
 
                     mlx_array_free(a);
-                    mlx_stream_free(s);
                     if (nelem > (size_t)INT_MAX)
                         free(fdata);
                     else
@@ -840,9 +834,8 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
 
                     int shape[3] = {target, target, num_img_channels};
                     mlx_array a = mlx_array_new();
-                    mlx_stream s = mlx_default_gpu_stream_new();
+                    mlx_stream s = mlx_gpu_stream();
                     if (mlx_array_set_data(&a, fdata, shape, 3, MLX_FLOAT32) != 0) {
-                        mlx_stream_free(s);
                         if (nelem > (size_t)INT_MAX)
                             free(fdata);
                         else
@@ -859,7 +852,6 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
                     snprintf(fname, PATH_MAX, "%s/wells_%d.npy", sample_dir, scale);
                     if (save_on_cpu(fname, a) != 0) {
                         mlx_array_free(a);
-                        mlx_stream_free(s);
                         if (nelem > (size_t)INT_MAX)
                             free(fdata);
                         else
@@ -873,7 +865,6 @@ int generate_pyramids_cache(const char *input_path, const char *cache_dir,
                     }
 
                     mlx_array_free(a);
-                    mlx_stream_free(s);
                     if (nelem > (size_t)INT_MAX)
                         free(fdata);
                     else

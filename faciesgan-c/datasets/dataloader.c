@@ -644,7 +644,7 @@ static void *worker_thread(void *arg) {
     struct pthread_worker_arg *wa = (struct pthread_worker_arg *)arg;
     struct MLXDataloader *dl = wa->dl;
     int worker_id = wa->worker_id;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     /* worker-local epoch tracking */
     uint64_t local_epoch = (uint64_t)-1;
     while (1) {
@@ -728,7 +728,6 @@ static void *worker_thread(void *arg) {
     dl->finished = true;
     pthread_cond_broadcast(&dl->q_nonempty);
     pthread_mutex_unlock(&dl->q_mutex);
-    mlx_stream_free(s);
     return NULL;
 }
 
@@ -1791,10 +1790,9 @@ static int worker_process_loop(int task_fd, int result_fd,
         mlx_vector_array out_s = mlx_vector_array_new();
         facies_collate_fn cb =
             collate_cb ? collate_cb : (facies_collate_fn)facies_collate;
-        mlx_stream collate_s = mlx_default_gpu_stream_new();
+        mlx_stream collate_s = mlx_gpu_stream();
         int rc = cb(&out_fac, &out_w, &out_s, batch_fac, batch_wells, batch_seis,
                     collate_s, collate_ctx);
-        mlx_stream_free(collate_s);
         mlx_vector_vector_array_free(batch_fac);
         mlx_vector_vector_array_free(batch_wells);
         mlx_vector_vector_array_free(batch_seis);
@@ -2272,8 +2270,7 @@ int facies_dataloader_new_ex(
         /* ensure MLX runtime globals are initialized in main thread before
          * spawning worker threads/processes to avoid concurrent static init */
         if (!skip_mlx_init) {
-            mlx_stream _init_s = mlx_default_gpu_stream_new();
-            mlx_stream_free(_init_s);
+            mlx_stream _init_s = mlx_gpu_stream();
         }
 #ifdef __APPLE__
         if (use_process) {

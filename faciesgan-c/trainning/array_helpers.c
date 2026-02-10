@@ -1,6 +1,7 @@
 #include "array_helpers.h"
 #include <string.h>
 #include <pthread.h>
+#include <stdatomic.h>
 
 #include <stdio.h>
 
@@ -10,6 +11,29 @@
 static pthread_mutex_t g_mlx_mutex;
 static pthread_once_t g_mlx_mutex_once = PTHREAD_ONCE_INIT;
 static _Atomic int g_lock_depth = 0;
+
+/* Cached default GPU stream – initialised once, reused everywhere. */
+static mlx_stream g_cached_gpu_stream = {0};
+static pthread_once_t g_stream_once = PTHREAD_ONCE_INIT;
+static atomic_int g_stream_alive = 0;
+
+static void init_cached_stream(void) {
+    g_cached_gpu_stream = mlx_default_gpu_stream_new();
+    atomic_store(&g_stream_alive, 1);
+}
+
+mlx_stream mlx_gpu_stream(void) {
+    pthread_once(&g_stream_once, init_cached_stream);
+    return g_cached_gpu_stream;
+}
+
+void mlx_gpu_stream_destroy(void) {
+    if (!atomic_load(&g_stream_alive))
+        return;
+    mlx_stream_free(g_cached_gpu_stream);
+    g_cached_gpu_stream = (mlx_stream){0};
+    atomic_store(&g_stream_alive, 0);
+}
 
 static void init_mlx_mutex(void) {
     pthread_mutexattr_t attr;

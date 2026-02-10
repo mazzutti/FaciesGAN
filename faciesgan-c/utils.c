@@ -752,7 +752,6 @@ int mlx_save_png(const char *path, mlx_array arr) {
         c = shape[2];
     } else {
         fprintf(stderr, "[mlx_save_png] Unsupported array ndim=%d\n", ndim);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -762,7 +761,6 @@ int mlx_save_png(const char *path, mlx_array arr) {
     int out_ndim = 0;
     int *out_shape = NULL;
     if (mlx_array_to_float_buffer(arr, &buf, &elems, &out_ndim, &out_shape) != 0) {
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -772,7 +770,6 @@ int mlx_save_png(const char *path, mlx_array arr) {
         mlx_free_float_buf(&buf, NULL);
         if (out_shape)
             mlx_free_int_array(&out_shape, NULL);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -799,7 +796,6 @@ int mlx_save_png(const char *path, mlx_array arr) {
 
     if (!png_data) {
         fprintf(stderr, "[mlx_save_png] PNG compression failed\n");
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -808,13 +804,11 @@ int mlx_save_png(const char *path, mlx_array arr) {
     if (!f) {
         fprintf(stderr, "[mlx_save_png] Cannot open %s for writing\n", path);
         mz_free(png_data);
-        mlx_stream_free(s);
         return -1;
     }
     fwrite(png_data, 1, png_len, f);
     fclose(f);
     mz_free(png_data);
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -850,7 +844,6 @@ int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
     } else {
         fprintf(stderr, "[mlx_save_facies_comparison_png] Unsupported ndim=%d\n",
                 fake_ndim);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -862,7 +855,6 @@ int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
 
     if (mlx_array_to_float_buffer(fake, &fake_buf, &fake_elems, &fake_out_ndim,
                                   &fake_out_shape) != 0) {
-        mlx_stream_free(s);
         return -1;
     }
     if (mlx_array_to_float_buffer(real, &real_buf, &real_elems, &real_out_ndim,
@@ -870,7 +862,6 @@ int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
         mlx_free_float_buf(&fake_buf, NULL);
         if (fake_out_shape)
             mlx_free_int_array(&fake_out_shape, NULL);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -886,7 +877,6 @@ int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
             mlx_free_int_array(&fake_out_shape, NULL);
         if (real_out_shape)
             mlx_free_int_array(&real_out_shape, NULL);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -937,7 +927,6 @@ int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
 
     if (!png_data) {
         fprintf(stderr, "[mlx_save_facies_comparison_png] PNG compression failed\n");
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -945,13 +934,11 @@ int mlx_save_facies_comparison_png(const char *path, mlx_array fake,
     if (!f) {
         fprintf(stderr, "[mlx_save_facies_comparison_png] Cannot open %s\n", path);
         mz_free(png_data);
-        mlx_stream_free(s);
         return -1;
     }
     fwrite(png_data, 1, png_len, f);
     fclose(f);
     mz_free(png_data);
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -1248,7 +1235,6 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
     } else {
         fprintf(stderr, "[mlx_save_facies_grid_png] Unsupported ndim=%d\n",
                 real_ndim);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1268,7 +1254,6 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
     /* Allocate output image (white background) */
     unsigned char *pixels = (unsigned char *)malloc(grid_h * grid_w * 3);
     if (!pixels) {
-        mlx_stream_free(s);
         return -1;
     }
     memset(pixels, 255, grid_h * grid_w * 3); /* White background */
@@ -1281,7 +1266,6 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
     if (mlx_array_to_float_buffer(real, &real_buf, &real_elems, &real_out_ndim,
                                   &real_out_shape) != 0) {
         free(pixels);
-        mlx_stream_free(s);
         if (real_out_shape)
             mlx_free_int_array(&real_out_shape, NULL);
         return -1;
@@ -1299,7 +1283,6 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
             free(cell_buf);
         if (quant_buf)
             free(quant_buf);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1380,7 +1363,6 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
 
     if (!png_data) {
         fprintf(stderr, "[mlx_save_facies_grid_png] PNG compression failed\n");
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1388,13 +1370,11 @@ int mlx_save_facies_grid_png(const char *path, mlx_array *fake_samples,
     if (!f) {
         fprintf(stderr, "[mlx_save_facies_grid_png] Cannot open %s\n", path);
         mz_free(png_data);
-        mlx_stream_free(s);
         return -1;
     }
     fwrite(png_data, 1, png_len, f);
     fclose(f);
     mz_free(png_data);
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -1435,7 +1415,6 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
     } else {
         fprintf(stderr, "[mlx_save_facies_grid_png_v2] Unsupported ndim=%d\n",
                 real_ndim);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1454,7 +1433,6 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
     /* Allocate output image (white background) */
     unsigned char *pixels = (unsigned char *)malloc(grid_h * grid_w * 3);
     if (!pixels) {
-        mlx_stream_free(s);
         return -1;
     }
     memset(pixels, 255, grid_h * grid_w * 3); /* White background */
@@ -1477,7 +1455,6 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
     if (mlx_array_to_float_buffer(real, &real_buf, &real_elems, &real_out_ndim,
                                   &real_out_shape) != 0) {
         free(pixels);
-        mlx_stream_free(s);
         if (real_out_shape)
             mlx_free_int_array(&real_out_shape, NULL);
         return -1;
@@ -1495,7 +1472,6 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
             free(cell_buf);
         if (quant_buf)
             free(quant_buf);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1735,7 +1711,6 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
 
     if (!png_data) {
         fprintf(stderr, "[mlx_save_facies_grid_png_v2] PNG compression failed\n");
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1743,12 +1718,10 @@ int mlx_save_facies_grid_png_v2(const char *path, mlx_array *all_fakes,
     if (!f) {
         fprintf(stderr, "[mlx_save_facies_grid_png_v2] Cannot open %s\n", path);
         mz_free(png_data);
-        mlx_stream_free(s);
         return -1;
     }
     fwrite(png_data, 1, png_len, f);
     fclose(f);
     mz_free(png_data);
-    mlx_stream_free(s);
     return 0;
 }

@@ -26,6 +26,7 @@
 
 /* Project helpers */
 #include "../trainning/array_helpers.h"
+#include "../trainning/scalar_pool.h"
 #include "../trainning/mlx_compat.h"
 #include "utils.h"
 
@@ -35,7 +36,7 @@
  * where std defaults to 0.02
  */
 mlx_array mlx_init_conv_weight(const int *shape, int ndim, float std) {
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_array result = mlx_array_new();
 
     /* Generate random normal with mean=0 and scale=std directly
@@ -46,7 +47,6 @@ mlx_array mlx_init_conv_weight(const int *shape, int ndim, float std) {
         mlx_zeros(&result, shape, ndim, MLX_FLOAT32, s);
     }
 
-    mlx_stream_free(s);
     return result;
 }
 
@@ -55,11 +55,10 @@ mlx_array mlx_init_conv_weight(const int *shape, int ndim, float std) {
  * bias = mx.zeros((out_channels,))
  */
 mlx_array mlx_init_conv_bias(int out_ch) {
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     int shape[1] = {out_ch};
     mlx_array result = mlx_array_new();
     mlx_zeros(&result, shape, 1, MLX_FLOAT32, s);
-    mlx_stream_free(s);
     return result;
 }
 
@@ -124,7 +123,7 @@ mlx_array_t mlx_leakyrelu_forward(MLXLeakyReLU *m, mlx_array_t x) {
     if (!m)
         return x;
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     mlx_array scaled = mlx_array_new();
     mlx_array out = mlx_array_new();
@@ -153,7 +152,6 @@ cleanup:
         mlx_array_free(scaled);
 
     /* Free the stream we created */
-    mlx_stream_free(s);
 
     if (err) {
         /* If something failed, return input unchanged (caller owns input) */
@@ -374,7 +372,7 @@ void mlx_convblock_free(MLXConvBlock *m) {
 mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* If conv weights are present, run conv; otherwise pass-through */
     mlx_array y = mlx_array_new();
@@ -383,7 +381,6 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
         if (safe_mlx_conv2d(&y, x, *wptr, m->stride, m->stride, m->padding,
                             m->padding, 1, 1, 1, s) != 0) {
             /* conv failed: fallback to input */
-            mlx_stream_free(s);
             return x;
         }
         /* Apply bias: y = y + bias (matching Python nn.Conv2d) */
@@ -410,9 +407,8 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
             if (mlx_var_axes(&var, y, axes, 2, true, 0, s) == 0) {
                 mlx_array centered = mlx_array_new();
                 if (mlx_subtract(&centered, y, mean, s) == 0) {
-                    mlx_array eps = mlx_array_new_float(1e-5f);
                     mlx_array var_eps = mlx_array_new();
-                    if (mlx_add(&var_eps, var, eps, s) == 0) {
+                    if (mlx_add(&var_eps, var, mlx_scalar_eps(), s) == 0) {
                         mlx_array inv_std = mlx_array_new();
                         if (mlx_rsqrt(&inv_std, var_eps, s) == 0) {
                             mlx_array y_norm = mlx_array_new();
@@ -445,7 +441,6 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
                         }
                         mlx_array_free(var_eps);
                     }
-                    mlx_array_free(eps);
                 }
                 mlx_array_free(centered);
             }
@@ -458,7 +453,6 @@ mlx_array_t mlx_convblock_forward(MLXConvBlock *m, mlx_array_t x) {
     mlx_array activated = mlx_leakyrelu_forward(m->activation, y);
     if (y.ctx != x.ctx && y.ctx != activated.ctx)
         mlx_array_free(y);
-    mlx_stream_free(s);
     return activated;
 }
 
@@ -497,11 +491,10 @@ void mlx_upsample_free(MLXUpsample *m) {
 mlx_array_t mlx_upsample_forward(MLXUpsample *m, mlx_array_t x) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     size_t ndim = mlx_array_ndim(x);
     if (ndim != 4) {
-        mlx_stream_free(s);
         return x; /* expect NHWC */
     }
     const int *shape = mlx_array_shape(x);
@@ -514,7 +507,6 @@ mlx_array_t mlx_upsample_forward(MLXUpsample *m, mlx_array_t x) {
     int out_w = m->out_w;
 
     if (in_h == out_h && in_w == out_w) {
-        mlx_stream_free(s);
         return x;
     }
 
@@ -749,7 +741,6 @@ mlx_array_t mlx_upsample_forward(MLXUpsample *m, mlx_array_t x) {
     mlx_array_free(sum1);
     mlx_array_free(sum2);
 
-    mlx_stream_free(s);
     return out;
 }
 
@@ -862,11 +853,10 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
                               int align_corners) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* Expect NHWC */
     if (mlx_array_ndim(x) != 4 || mlx_array_ndim(conditioning_input) != 4) {
-        mlx_stream_free(s);
         return x;
     }
     const int *xshape = mlx_array_shape(x);
@@ -916,14 +906,12 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     if (!m->mlp_shared_w) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
-        mlx_stream_free(s);
         return x;
     }
     if (safe_mlx_conv2d(&shared, cond_up, *m->mlp_shared_w, 1, 1, m->padding,
                         m->padding, 1, 1, 1, s) != 0) {
         if (cond_up_alloc)
             mlx_array_free(cond_up);
-        mlx_stream_free(s);
         return x;
     }
     /* Apply shared conv bias */
@@ -950,7 +938,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
             mlx_array_free(cond_up);
         mlx_array_free(shared);
         mlx_array_free(shared_act);
-        mlx_stream_free(s);
         return x;
     }
     if (safe_mlx_conv2d(&gamma, shared_act, *m->mlp_gamma_w, 1, 1, m->padding,
@@ -959,7 +946,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
             mlx_array_free(cond_up);
         mlx_array_free(shared);
         mlx_array_free(shared_act);
-        mlx_stream_free(s);
         return x;
     }
     /* Apply gamma conv bias */
@@ -979,7 +965,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(shared);
         mlx_array_free(shared_act);
         mlx_array_free(gamma);
-        mlx_stream_free(s);
         return x;
     }
     /* Apply beta conv bias */
@@ -1007,7 +992,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
     if (mlx_mean_axes(&mean, x, axes, 2, true, s) != 0) {
         mlx_array_free(gamma);
         mlx_array_free(beta);
-        mlx_stream_free(s);
         return x;
     }
     mlx_array var = mlx_array_new();
@@ -1015,7 +999,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(mean);
         mlx_array_free(gamma);
         mlx_array_free(beta);
-        mlx_stream_free(s);
         return x;
     }
     mlx_array centered = mlx_array_new();
@@ -1024,7 +1007,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(var);
         mlx_array_free(gamma);
         mlx_array_free(beta);
-        mlx_stream_free(s);
         return x;
     }
     mlx_array eps = mlx_array_new_float(1e-5f);
@@ -1036,7 +1018,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
-        mlx_stream_free(s);
         return x;
     }
     mlx_array inv_std = mlx_array_new();
@@ -1048,7 +1029,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
-        mlx_stream_free(s);
         return x;
     }
     mlx_array x_norm = mlx_array_new();
@@ -1061,7 +1041,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(gamma);
         mlx_array_free(beta);
         mlx_array_free(eps);
-        mlx_stream_free(s);
         return x;
     }
 
@@ -1094,7 +1073,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(beta);
         mlx_array_free(eps);
         mlx_array_free(one);
-        mlx_stream_free(s);
         return x;
     }
 
@@ -1112,7 +1090,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(eps);
         mlx_array_free(one);
         mlx_array_free(one_plus_gamma);
-        mlx_stream_free(s);
         return x;
     }
 
@@ -1131,7 +1108,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         mlx_array_free(one);
         mlx_array_free(one_plus_gamma);
         mlx_array_free(scaled);
-        mlx_stream_free(s);
         return x;
     }
 
@@ -1155,7 +1131,6 @@ mlx_array_t mlx_spade_forward(MLXSPADE *m, mlx_array_t x,
         if (out_ndim == 4) {
             const int *osh = mlx_array_shape(out);
         }
-        mlx_stream_free(s);
         return out;
     }
 }
@@ -1257,7 +1232,7 @@ mlx_array_t mlx_spadeconv_forward(MLXSPADEConvBlock *m, mlx_array_t x,
                                   mlx_array_t cond) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* 1) SPADE modulation */
     mlx_array y = mlx_spade_forward(m->spade, x, cond, "linear", 1);
@@ -1287,7 +1262,6 @@ mlx_array_t mlx_spadeconv_forward(MLXSPADEConvBlock *m, mlx_array_t x,
                             m->padding, 1, 1, 1, s) != 0) {
             /* conv failed: cleanup and return input x */
             mlx_array_free(y);
-            mlx_stream_free(s);
             return x;
         }
         /* Apply conv bias */
@@ -1310,12 +1284,10 @@ mlx_array_t mlx_spadeconv_forward(MLXSPADEConvBlock *m, mlx_array_t x,
         }
         /* free intermediate activation result */
         mlx_array_free(y);
-        mlx_stream_free(s);
         return out;
     }
 
     /* no conv: return activated/spade-modulated tensor */
-    mlx_stream_free(s);
     return y;
 }
 
@@ -1432,7 +1404,7 @@ void mlx_spadegen_free(MLXSPADEGenerator *m) {
 mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
     if (!m)
         return cond;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     if (mlx_array_ndim(cond) == 4) {
         const int *cshape = mlx_array_shape(cond);
@@ -1449,7 +1421,6 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
         /* Use padding_size (not kernel_size/2) to match Python */
         int pad = m->padding_size;
         if (safe_mlx_conv2d(&x, cond, *iw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
-            mlx_stream_free(s);
             return cond;
         }
         /* Apply init_conv bias */
@@ -1511,7 +1482,6 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
         if (safe_mlx_conv2d(&out, x, *tw, 1, 1, pad, pad, 1, 1, 1, s) != 0) {
             if (x.ctx != cond.ctx)
                 mlx_array_free(x);
-            mlx_stream_free(s);
             return cond;
         }
         /* Apply tail_conv bias */
@@ -1531,17 +1501,14 @@ mlx_array_t mlx_spadegen_forward(MLXSPADEGenerator *m, mlx_array_t cond) {
             mlx_array_free(out);
             if (x.ctx != cond.ctx)
                 mlx_array_free(x);
-            mlx_stream_free(s);
             return cond;
         }
         mlx_array_free(out);
         if (x.ctx != cond.ctx)
             mlx_array_free(x);
-        mlx_stream_free(s);
         return out_t;
     }
 
-    mlx_stream_free(s);
     return x;
 }
 
@@ -2015,7 +1982,7 @@ mlx_array *mlx_spadedisc_get_tail_conv(MLXSPADEDiscriminator *m) {
 mlx_array_t mlx_spadedisc_forward(MLXSPADEDiscriminator *m, mlx_array_t x) {
     if (!m)
         return x;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* Head: MLXConvBlock (conv + norm + leakyrelu) */
     mlx_array cur = mlx_convblock_forward(m->head, x);
@@ -2038,7 +2005,6 @@ mlx_array_t mlx_spadedisc_forward(MLXSPADEDiscriminator *m, mlx_array_t x) {
                             1, 1, 1, s) != 0) {
             if (cur.ctx != x.ctx)
                 mlx_array_free(cur);
-            mlx_stream_free(s);
             return x;
         }
         /* Apply tail bias */
@@ -2054,11 +2020,9 @@ mlx_array_t mlx_spadedisc_forward(MLXSPADEDiscriminator *m, mlx_array_t x) {
         }
         if (cur.ctx != x.ctx)
             mlx_array_free(cur);
-        mlx_stream_free(s);
         return out;
     }
 
-    mlx_stream_free(s);
     return cur;
 }
 
@@ -2101,7 +2065,7 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
         return x;
 
     /* Use default CPU stream */
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_array pure = mlx_array_new();
     mlx_array neg2 = mlx_array_new();
     mlx_array temp_arr = mlx_array_new();
@@ -2117,7 +2081,6 @@ mlx_array_t mlx_colorquant_forward(MLXColorQuantization *m, mlx_array_t x,
             mlx_array_free(temp_arr);                                         \
         if (neg.ctx)                                                          \
             mlx_array_free(neg);                                              \
-        mlx_stream_free(s);                                                   \
         return (ret);                                                         \
     } while (0)
 

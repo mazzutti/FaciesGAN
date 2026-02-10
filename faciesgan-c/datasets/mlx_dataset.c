@@ -214,7 +214,7 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
     for (int si = 0; si < N; ++si) {
         mlx_vector_array fac_sample = mlx_vector_array_new();
         for (int sidx = 0; sidx < n_fac_scales; ++sidx) {
-            mlx_stream s = mlx_default_gpu_stream_new();
+            mlx_stream s = mlx_gpu_stream();
             mlx_array elem = mlx_array_new();
             int appended = 0;
             if (fac_scales && mlx_array_ndim(fac_scales[sidx]) > 0) {
@@ -275,13 +275,11 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                     if (mlx_vector_array_append_value(fac_sample, elem) != 0) {
                         mlx_array_free(elem);
                         mlx_vector_array_free(fac_sample);
-                        mlx_stream_free(s);
                         gen_rc = -1;
                         goto gen_cleanup;
                     }
                     mlx_array_free(elem);
                 }
-                mlx_stream_free(s);
             }
 
             /* end per-scale loop for facies */
@@ -301,7 +299,7 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
             mlx_vector_array well_sample = mlx_vector_array_new();
             mlx_vector_array mask_sample = mlx_vector_array_new();
             for (int sidx = 0; sidx < n_wells_scales; ++sidx) {
-                mlx_stream s = mlx_default_gpu_stream_new();
+                mlx_stream s = mlx_gpu_stream();
                 mlx_array elem = mlx_array_new();
                 int appended = 0;
                 if (wells_scales && mlx_array_ndim(wells_scales[sidx]) > 0) {
@@ -359,7 +357,6 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                         mlx_array_free(elem);
                         mlx_vector_array_free(well_sample);
                         mlx_vector_array_free(mask_sample);
-                        mlx_stream_free(s);
                         gen_rc = -1;
                         goto gen_cleanup;
                     }
@@ -381,7 +378,6 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                                 mlx_array_free(m);
                                 mlx_vector_array_free(well_sample);
                                 mlx_vector_array_free(mask_sample);
-                                mlx_stream_free(s);
                                 gen_rc = -1;
                                 goto gen_cleanup;
                             }
@@ -416,7 +412,6 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                                                 mlx_array_free(abs_arr);
                                                 mlx_vector_array_free(well_sample);
                                                 mlx_vector_array_free(mask_sample);
-                                                mlx_stream_free(s);
                                                 gen_rc = -1;
                                                 goto gen_cleanup;
                                             }
@@ -433,7 +428,6 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
 
                     mlx_array_free(elem);
                 }
-                mlx_stream_free(s);
             }
 
             if (mlx_vector_vector_array_append_value(ds->wells, well_sample) != 0) {
@@ -456,7 +450,7 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
         if (n_seis_scales > 0 && seis_scales) {
             mlx_vector_array seis_sample = mlx_vector_array_new();
             for (int sidx = 0; sidx < n_seis_scales; ++sidx) {
-                mlx_stream s = mlx_default_gpu_stream_new();
+                mlx_stream s = mlx_gpu_stream();
                 mlx_array elem = mlx_array_new();
                 int appended = 0;
                 if (seis_scales && mlx_array_ndim(seis_scales[sidx]) > 0) {
@@ -512,13 +506,11 @@ static int generate_pyramids(MLXPyramidsDataset *ds, const char *npz_path,
                     if (mlx_vector_array_append_value(seis_sample, elem) != 0) {
                         mlx_array_free(elem);
                         mlx_vector_array_free(seis_sample);
-                        mlx_stream_free(s);
                         gen_rc = -1;
                         goto gen_cleanup;
                     }
                     mlx_array_free(elem);
                 }
-                mlx_stream_free(s);
             }
             if (mlx_vector_vector_array_append_value(ds->seismic, seis_sample) != 0) {
                 mlx_vector_array_free(seis_sample);
@@ -931,24 +923,20 @@ int mlx_pyramids_dataset_get_scale_stack(MLXPyramidsDataset *ds, int scale,
         mlx_vector_array_free(sample);
     }
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_array stacked = mlx_array_new();
     size_t vec_n = mlx_vector_array_size(scale_vec);
     if (vec_n == 0) {
         mlx_vector_array_free(scale_vec);
-        mlx_stream_free(s);
         mlx_array_free(stacked);
         int shape0[4] = {0, h, w, c};
-        mlx_stream s2 = mlx_default_gpu_stream_new();
+        mlx_stream s2 = mlx_gpu_stream();
         if (mlx_zeros(&stacked, shape0, 4, MLX_FLOAT32, s2) != 0) {
-            mlx_stream_free(s2);
             return -1;
         }
-        mlx_stream_free(s2);
     } else {
         int rc = mlx_stack(&stacked, scale_vec, s);
         mlx_vector_array_free(scale_vec);
-        mlx_stream_free(s);
         if (rc != 0) {
             mlx_array_free(stacked);
             return -1;
@@ -1012,10 +1000,9 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         int dtype = (int)mlx_array_dtype(first);
         mlx_array_free(first);
         mlx_vector_array_free(sample0);
-        mlx_stream s = mlx_default_gpu_stream_new();
+        mlx_stream s = mlx_gpu_stream();
         mlx_array z = mlx_array_new();
         int rc = mlx_zeros(&z, zeros_shape, 4, dtype, s);
-        mlx_stream_free(s);
         if (rc != 0) {
             mlx_array_free(z);
             return -1;
@@ -1049,13 +1036,12 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         mlx_vector_array_free(sample);
     }
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_array stacked = mlx_array_new();
     size_t vec_n = mlx_vector_array_size(scale_vec);
     if (vec_n == 0) {
         /* derive fallback shape from ds->facies first sample */
         mlx_vector_array_free(scale_vec);
-        mlx_stream_free(s);
         mlx_array_free(stacked);
         mlx_vector_array sample0;
         if (mlx_vector_vector_array_get(&sample0, ds->facies, 0) != 0)
@@ -1075,18 +1061,15 @@ static int build_stack_from_source(mlx_vector_vector_array src,
         mlx_array_free(first);
         mlx_vector_array_free(sample0);
         mlx_array z = mlx_array_new();
-        mlx_stream s2 = mlx_default_gpu_stream_new();
+        mlx_stream s2 = mlx_gpu_stream();
         if (mlx_zeros(&z, zeros_shape, 4, dtype, s2) != 0) {
-            mlx_stream_free(s2);
             return -1;
         }
-        mlx_stream_free(s2);
         *out = z;
         return 0;
     } else {
         int rc = mlx_stack(&stacked, scale_vec, s);
         mlx_vector_array_free(scale_vec);
-        mlx_stream_free(s);
         if (rc != 0) {
             mlx_array_free(stacked);
             return -1;

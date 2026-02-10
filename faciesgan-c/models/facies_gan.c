@@ -6,6 +6,7 @@
 /* Standard string/memory functions provided by <string.h> */
 #include "custom_layer.h"
 #include "trainning/array_helpers.h"
+#include "trainning/scalar_pool.h"
 #include "trainning/mlx_compat.h"
 #include <limits.h>
 #include <mlx/c/io.h>
@@ -129,18 +130,16 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
     }
 
     /* Use CPU stream for numeric ops */
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     /* Determine element count from first sample.
      * mlx_array_size reads shape metadata only — no eval needed. */
     mlx_array *first = fake_samples[0];
     if (!first) {
-        mlx_stream_free(s);
         return -1;
     }
     size_t total_elems = (size_t)mlx_array_size(*first);
     if (total_elems == 0) {
-        mlx_stream_free(s);
         *out_loss = NULL;
         if (mlx_alloc_pod((void **)out_loss, sizeof(mlx_array), 1) != 0)
             return -1;
@@ -189,13 +188,11 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
             mlx_free_int_array(&axes, &ndim);
 
             /* exp(-10 * mean_sq) to match Python exactly */
-            mlx_array coef = mlx_array_new_float(-10.0f);
             mlx_array prod = mlx_array_new();
-            if (mlx_multiply(&prod, mean, coef, s) != 0) {
+            if (mlx_multiply(&prod, mean, mlx_scalar_neg_ten(), s) != 0) {
                 mlx_array_free(diff);
                 mlx_array_free(sq);
                 mlx_array_free(mean);
-                mlx_array_free(coef);
                 mlx_array_free(prod);
                 continue;
             }
@@ -204,7 +201,6 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
                 mlx_array_free(diff);
                 mlx_array_free(sq);
                 mlx_array_free(mean);
-                mlx_array_free(coef);
                 mlx_array_free(prod);
                 mlx_array_free(val);
                 continue;
@@ -219,7 +215,6 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
                 mlx_array_free(tmp);
             }
 
-            mlx_array_free(coef);
             mlx_array_free(prod);
             mlx_array_free(val);
 
@@ -232,7 +227,6 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
 
     if (pairs == 0) {
         mlx_array_free(acc);
-        mlx_stream_free(s);
         *out_loss = NULL;
         if (mlx_alloc_pod((void **)out_loss, sizeof(mlx_array), 1) != 0)
             return -1;
@@ -247,7 +241,6 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
     if (rc != 0) {
         mlx_array_free(acc);
         mlx_array_free(denom);
-        mlx_stream_free(s);
         return -1;
     }
     mlx_array_free(acc);
@@ -258,7 +251,6 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
     if (mlx_multiply(&outv, mean_acc, lambda_arr, s) != 0) {
         mlx_array_free(mean_acc);
         mlx_array_free(lambda_arr);
-        mlx_stream_free(s);
         return -1;
     }
     mlx_array_free(mean_acc);
@@ -267,11 +259,9 @@ int mlx_faciesgan_compute_diversity_loss(MLXFaciesGAN *m,
     *out_loss = NULL;
     if (mlx_alloc_pod((void **)out_loss, sizeof(mlx_array), 1) != 0) {
         mlx_array_free(outv);
-        mlx_stream_free(s);
         return -1;
     }
     **out_loss = outv;
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -292,7 +282,7 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
         return 0;
     }
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
 
     mlx_array fmasked = mlx_array_new();
     mlx_array rmasked = mlx_array_new();
@@ -300,7 +290,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
             mlx_multiply(&rmasked, *real, *mask, s) != 0) {
         mlx_array_free(fmasked);
         mlx_array_free(rmasked);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -309,7 +298,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
         mlx_array_free(fmasked);
         mlx_array_free(rmasked);
         mlx_array_free(diff);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -319,7 +307,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
         mlx_array_free(rmasked);
         mlx_array_free(diff);
         mlx_array_free(sq);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -331,7 +318,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
             mlx_array_free(rmasked);
             mlx_array_free(diff);
             mlx_array_free(sq);
-            mlx_stream_free(s);
             return -1;
         }
         for (int a = 0; a < ndim; ++a)
@@ -346,7 +332,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
         mlx_array_free(diff);
         mlx_array_free(sq);
         mlx_array_free(mean);
-        mlx_stream_free(s);
         return -1;
     }
     mlx_free_int_array(&axes, &ndim);
@@ -361,7 +346,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
         mlx_array_free(mean);
         mlx_array_free(lambda_arr);
         mlx_array_free(outv);
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -374,7 +358,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
         mlx_array_free(sq);
         mlx_array_free(mean);
         mlx_array_free(lambda_arr);
-        mlx_stream_free(s);
         return -1;
     }
     **out_loss = outv;
@@ -385,7 +368,6 @@ int mlx_faciesgan_compute_masked_loss(MLXFaciesGAN *m, const mlx_array *fake,
     mlx_array_free(sq);
     mlx_array_free(mean);
     mlx_array_free(lambda_arr);
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -700,7 +682,7 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
         for (int i = 0; i < n; ++i)
             arr[i] = NULL;
 
-        mlx_stream s = mlx_default_gpu_stream_new();
+        mlx_stream s = mlx_gpu_stream();
         for (int i = 0; i < n; ++i) {
             mlx_array *a = NULL;
             if (mlx_alloc_pod((void **)&a, sizeof(mlx_array), 1) != 0) {
@@ -711,7 +693,6 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                     }
                 }
                 mlx_free_pod((void **)&arr);
-                mlx_stream_free(s);
                 return -1;
             }
             *a = mlx_array_new();
@@ -734,7 +715,6 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
             }
             arr[i] = a;
         }
-        mlx_stream_free(s);
         *out_noises = arr;
         *out_n = n;
         return 0;
@@ -794,7 +774,7 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
             /* Fallback defaults: base_channel vs gen_input_channels */
             c = cond_present ? m->base_channel : m->gen_input_channels;
         }
-        mlx_stream s = mlx_default_gpu_stream_new();
+        mlx_stream s = mlx_gpu_stream();
         mlx_array *a = NULL;
         if (mlx_alloc_pod((void **)&a, sizeof(mlx_array), 1) != 0) {
             for (int j = 0; j < n; ++j) {
@@ -842,7 +822,6 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                         }
                     }
                     mlx_free_mlx_array_ptrs(&arr, n);
-                    mlx_stream_free(s);
                     return -1;
                 }
             }
@@ -861,7 +840,6 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
                         }
                     }
                     mlx_free_mlx_array_ptrs(&arr, n);
-                    mlx_stream_free(s);
                     return -1;
                 }
             }
@@ -968,7 +946,6 @@ int mlx_faciesgan_get_pyramid_noise(MLXFaciesGAN *m, int scale,
         }
         mlx_array_free(pad_val);
 
-        mlx_stream_free(s);
         arr[i] = a;
     }
 
@@ -1011,16 +988,14 @@ int mlx_faciesgan_store_rec_noise(MLXFaciesGAN *m, int scale,
     if (mlx_alloc_pod((void **)&a, sizeof(mlx_array), 1) != 0)
         return -1;
     *a = mlx_array_new();
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     if (mlx_copy(a, *noise, s) != 0) {
         mlx_array_free(*a);
         mlx_free_pod((void **)&a);
-        mlx_stream_free(s);
         return -1;
     }
     /* Evaluate to materialise the copy */
     mlx_array_eval(*a);
-    mlx_stream_free(s);
     m->rec_noise[scale] = a;
     return 0;
 }
@@ -1112,11 +1087,10 @@ int mlx_faciesgan_load_generator_state(MLXFaciesGAN *m, const char *scale_path,
     char file[1024];
     snprintf(file, sizeof(file), "%s/generator.npz", scale_path);
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_map_string_to_array map;
     mlx_map_string_to_string meta;
     if (mlx_load_safetensors(&map, &meta, file, s) != 0) {
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1127,7 +1101,6 @@ int mlx_faciesgan_load_generator_state(MLXFaciesGAN *m, const char *scale_path,
             mlx_generator_free_parameters_list(plist);
         mlx_map_string_to_array_free(map);
         mlx_map_string_to_string_free(meta);
-        mlx_stream_free(s);
         return 0;
     }
 
@@ -1144,7 +1117,6 @@ int mlx_faciesgan_load_generator_state(MLXFaciesGAN *m, const char *scale_path,
     mlx_generator_free_parameters_list(plist);
     mlx_map_string_to_array_free(map);
     mlx_map_string_to_string_free(meta);
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -1156,11 +1128,10 @@ int mlx_faciesgan_load_discriminator_state(MLXFaciesGAN *m,
     char file[1024];
     snprintf(file, sizeof(file), "%s/discriminator.npz", scale_path);
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_map_string_to_array map;
     mlx_map_string_to_string meta;
     if (mlx_load_safetensors(&map, &meta, file, s) != 0) {
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1171,7 +1142,6 @@ int mlx_faciesgan_load_discriminator_state(MLXFaciesGAN *m,
             mlx_discriminator_free_parameters_list(plist);
         mlx_map_string_to_array_free(map);
         mlx_map_string_to_string_free(meta);
-        mlx_stream_free(s);
         return 0;
     }
 
@@ -1187,7 +1157,6 @@ int mlx_faciesgan_load_discriminator_state(MLXFaciesGAN *m,
     mlx_discriminator_free_parameters_list(plist);
     mlx_map_string_to_array_free(map);
     mlx_map_string_to_string_free(meta);
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -1225,11 +1194,10 @@ int mlx_faciesgan_load_shape(MLXFaciesGAN *m, const char *scale_path,
     char file[1024];
     snprintf(file, sizeof(file), "%s/shape.npz", scale_path);
 
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_map_string_to_array map;
     mlx_map_string_to_string meta;
     if (mlx_load_safetensors(&map, &meta, file, s) != 0) {
-        mlx_stream_free(s);
         return -1;
     }
 
@@ -1259,7 +1227,6 @@ int mlx_faciesgan_load_shape(MLXFaciesGAN *m, const char *scale_path,
             if (!newflat) {
                 mlx_map_string_to_array_free(map);
                 mlx_map_string_to_string_free(meta);
-                mlx_stream_free(s);
                 return -1;
             }
             m->shapes = newflat;
@@ -1272,7 +1239,6 @@ int mlx_faciesgan_load_shape(MLXFaciesGAN *m, const char *scale_path,
 
     mlx_map_string_to_array_free(map);
     mlx_map_string_to_string_free(meta);
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -1324,16 +1290,14 @@ int mlx_faciesgan_compute_recovery_loss(
     }
 
     /* Compute simple numeric MSE between rec_in and real, then scale by alpha. */
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     mlx_array diff = mlx_array_new();
     if (mlx_subtract(&diff, rec_in, real, s) != 0) {
-        mlx_stream_free(s);
         return -1;
     }
     mlx_array sq = mlx_array_new();
     if (mlx_square(&sq, diff, s) != 0) {
         mlx_array_free(diff);
-        mlx_stream_free(s);
         return -1;
     }
     int ndim = (int)mlx_array_ndim(diff);
@@ -1342,7 +1306,6 @@ int mlx_faciesgan_compute_recovery_loss(
         if (mlx_alloc_int_array(&axes, ndim) != 0) {
             mlx_array_free(diff);
             mlx_array_free(sq);
-            mlx_stream_free(s);
             return -1;
         }
         for (int a = 0; a < ndim; ++a)
@@ -1354,7 +1317,6 @@ int mlx_faciesgan_compute_recovery_loss(
         mlx_array_free(diff);
         mlx_array_free(sq);
         mlx_array_free(mean);
-        mlx_stream_free(s);
         return -1;
     }
     mlx_free_int_array(&axes, &ndim);
@@ -1367,13 +1329,11 @@ int mlx_faciesgan_compute_recovery_loss(
         mlx_array_free(mean);
         mlx_array_free(alpha_arr);
         mlx_array_free(outv);
-        mlx_stream_free(s);
         return -1;
     }
 
     if (mlx_alloc_pod((void **)out_loss, sizeof(mlx_array), 1) != 0) {
         mlx_array_free(outv);
-        mlx_stream_free(s);
         return -1;
     }
     **out_loss = outv;
@@ -1382,7 +1342,6 @@ int mlx_faciesgan_compute_recovery_loss(
     mlx_array_free(sq);
     mlx_array_free(mean);
     mlx_array_free(alpha_arr);
-    mlx_stream_free(s);
     return 0;
 }
 

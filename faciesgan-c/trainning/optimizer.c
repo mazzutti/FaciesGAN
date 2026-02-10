@@ -1,5 +1,6 @@
 #include "optimizer.h"
 #include "array_helpers.h"
+#include "scalar_pool.h"
 #include "scheduler.h"
 #include <math.h>
 #include <stdlib.h>
@@ -158,7 +159,7 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
 
     /* Lazy init per-parameter state on first call (or explicit init via wrapper)
      */
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     if (opt->param_n == 0) {
         mlx_stream tmp_s = s; /* pass stream into helper */
         mlx_optimizer_init_from_params(opt, params, n);
@@ -175,34 +176,21 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
     float effective_lr = opt->lr;
     opt->last_used_lr = effective_lr;
 
-    /* Pre-allocate scalar temporaries for reuse to reduce allocation churn */
-    mlx_array scal_b1 = mlx_array_new();
-    mlx_array scal_1mb1 = mlx_array_new();
-    mlx_array scal_b2 = mlx_array_new();
-    mlx_array scal_1mb2 = mlx_array_new();
-    mlx_array eps_arr = mlx_array_new();
-    mlx_array lr_arr = mlx_array_new();
-    mlx_array decay_scale_arr = mlx_array_new();
-    if (opt->beta1 != 0.0f) {
-        mlx_array_free(scal_b1);
-        scal_b1 = mlx_array_new_float(opt->beta1);
-        mlx_array_free(scal_1mb1);
-        scal_1mb1 = mlx_array_new_float(1.0f - opt->beta1);
-    }
-    if (opt->beta2 != 0.0f) {
-        mlx_array_free(scal_b2);
-        scal_b2 = mlx_array_new_float(opt->beta2);
-        mlx_array_free(scal_1mb2);
-        scal_1mb2 = mlx_array_new_float(1.0f - opt->beta2);
-    }
-    mlx_array_free(eps_arr);
-    eps_arr = mlx_array_new_float(opt->eps);
-    mlx_array_free(lr_arr);
-    lr_arr = mlx_array_new_float(effective_lr);
-    if (opt->weight_decay != 0.0f) {
-        mlx_array_free(decay_scale_arr);
-        decay_scale_arr = mlx_array_new_float(opt->lr * opt->weight_decay);
-    }
+    /* Pre-allocate scalar temporaries — created directly to avoid
+     * the alloc→free→realloc churn of the old pattern.  These are
+     * freed at the end of this function. */
+    mlx_array scal_b1 = (opt->beta1 != 0.0f)
+        ? mlx_array_new_float(opt->beta1) : mlx_array_new();
+    mlx_array scal_1mb1 = (opt->beta1 != 0.0f)
+        ? mlx_array_new_float(1.0f - opt->beta1) : mlx_array_new();
+    mlx_array scal_b2 = (opt->beta2 != 0.0f)
+        ? mlx_array_new_float(opt->beta2) : mlx_array_new();
+    mlx_array scal_1mb2 = (opt->beta2 != 0.0f)
+        ? mlx_array_new_float(1.0f - opt->beta2) : mlx_array_new();
+    mlx_array eps_arr = mlx_array_new_float(opt->eps);
+    mlx_array lr_arr = mlx_array_new_float(effective_lr);
+    mlx_array decay_scale_arr = (opt->weight_decay != 0.0f)
+        ? mlx_array_new_float(opt->lr * opt->weight_decay) : mlx_array_new();
 
     /* Gradients are left lazy — they will be transitively evaluated
      * when the caller batch-evals model params + optimizer state at the
@@ -433,7 +421,6 @@ int mlx_adam_step(MLXOptimizer *opt, mlx_array **params, mlx_array **grads,
     mlx_array_free(lr_arr);
     mlx_array_free(decay_scale_arr);
 
-    mlx_stream_free(s);
     return 0;
 }
 
@@ -503,24 +490,23 @@ void mlx_optimizer_init_from_params(MLXOptimizer *opt, mlx_array **params,
                                     int n) {
     if (!opt || !params || n <= 0)
         return;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     opt->param_n = n;
     if (mlx_alloc_mlx_array_ptrs(&opt->m, n) != 0) {
         opt->param_n = 0;
-        mlx_stream_free(s);
         return;
     }
     if (mlx_alloc_mlx_array_ptrs(&opt->v, n) != 0) {
         mlx_free_mlx_array_ptrs(&opt->m, n);
         opt->param_n = 0;
-        mlx_stream_free(s);
         return;
     }
     for (int i = 0; i < n; ++i) {
         opt->m[i] = NULL;
         opt->v[i] = NULL;
         mlx_array tmp = mlx_array_new();
-        mlx_array zero = mlx_array_new_float(0.0f);
+        /* Use pooled zero — do NOT free it (owned by scalar pool). */
+        mlx_array zero = mlx_scalar_zero();
         if (params[i]) {
             if (mlx_multiply(&tmp, *params[i], zero, s) == 0) {
                 opt->m[i] = NULL;
@@ -542,9 +528,7 @@ void mlx_optimizer_init_from_params(MLXOptimizer *opt, mlx_array **params,
         } else {
             mlx_array_free(tmp);
         }
-        mlx_array_free(zero);
     }
-    mlx_stream_free(s);
 }
 
 int mlx_optimizer_apply_flat(MLXOptimizer *opt, mlx_array **params,
@@ -894,7 +878,7 @@ int mlx_optimizer_save_to_npz(MLXOptimizer *opt, const char *npz_path) {
 int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
     if (!opt || !npz_path)
         return -1;
-    mlx_stream s = mlx_default_gpu_stream_new();
+    mlx_stream s = mlx_gpu_stream();
     /* per-parameter m/v: try m_0.npy/v_0.npy ... if present */
     for (int i = 0; i < opt->param_n; ++i) {
         char nm[64];
@@ -1016,6 +1000,5 @@ int mlx_optimizer_load_from_npz(MLXOptimizer *opt, const char *npz_path) {
         }
     }
 
-    mlx_stream_free(s);
     return 0;
 }

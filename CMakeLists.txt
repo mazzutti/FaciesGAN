@@ -102,6 +102,7 @@ target_sources(custom_layer PRIVATE
   # faciesgan-c/utils_extra.c (merged into utils.c)
   faciesgan-c/trainning/scheduler.c
   faciesgan-c/trainning/array_helpers.c
+  faciesgan-c/trainning/scalar_pool.c
   faciesgan-c/trainning/train_manager.c
   faciesgan-c/trainning/mlx_native_grad.c
   faciesgan-c/trainning/python_entry.c

@@ -3,6 +3,7 @@
 
 #include <mlx/c/mlx.h>
 #include "mem_debug.h"
+#include "array_helpers.h"
 
 /* Helper: detach from computation graph and free an mlx_array.
  * Uses mlx_stop_gradient to break gradient references before freeing,
@@ -12,13 +13,12 @@ static inline void detach_and_free(mlx_array arr) {
     if (arr.ctx) {
         /* Create a stopped version to break graph references */
         mlx_array stopped = mlx_array_new();
-        mlx_stream s = mlx_default_gpu_stream_new();
+        mlx_stream s = mlx_gpu_stream();
         if (mlx_stop_gradient(&stopped, arr, s) == 0) {
             /* Evaluate to materialize and release graph */
             mlx_array_eval(stopped);
             mlx_array_free(stopped);
         }
-        mlx_stream_free(s);
     }
     mlx_array_free(arr);
 }
