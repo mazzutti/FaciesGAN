@@ -1,6 +1,36 @@
 {
   "configurations": [
+   
     {
+      "name": "Linux",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "${workspaceFolder}/faciesgan-c/models",
+        "${workspaceFolder}/faciesgan-c/trainning",
+        "${workspaceFolder}/faciesgan-c",
+        "${workspaceFolder}/faciesgan-c/datasets",
+        "${workspaceFolder}/faciesgan-c/io",
+        "${workspaceFolder}/faciesgan-c/third_party",
+        "${workspaceFolder}/mlx-c",
+        "${workspaceFolder}/mlx-c/mlx",
+        "${workspaceFolder}/mlx-c/mlx/c"
+      ],
+      "defines": [],
+      "compilerPath": "/usr/bin/gcc",
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "linux-gcc-x64",
+      "browse": {
+        "path": [
+          "${workspaceFolder}/**",
+          "${workspaceFolder}/faciesgan-c/third_party",
+          "${workspaceFolder}/faciesgan-c/datasets",
+          "${workspaceFolder}/faciesgan-c/io"
+        ],
+        "limitSymbolsToIncludedHeaders": false
+      }
+    },
+     {
       "name": "Mac",
       "includePath": [
         "${workspaceFolder}/**",
@@ -23,6 +53,35 @@
       "cStandard": "c11",
       "cppStandard": "c++17",
       "intelliSenseMode": "macos-clang-arm64",
+      "browse": {
+        "path": [
+          "${workspaceFolder}/**",
+          "${workspaceFolder}/faciesgan-c/third_party",
+          "${workspaceFolder}/faciesgan-c/datasets",
+          "${workspaceFolder}/faciesgan-c/io"
+        ],
+        "limitSymbolsToIncludedHeaders": false
+      }
+    },
+    {
+      "name": "Windows",
+      "includePath": [
+        "${workspaceFolder}/**",
+        "${workspaceFolder}/faciesgan-c/models",
+        "${workspaceFolder}/faciesgan-c/trainning",
+        "${workspaceFolder}/faciesgan-c",
+        "${workspaceFolder}/faciesgan-c/datasets",
+        "${workspaceFolder}/faciesgan-c/io",
+        "${workspaceFolder}/faciesgan-c/third_party",
+        "${workspaceFolder}/mlx-c",
+        "${workspaceFolder}/mlx-c/mlx",
+        "${workspaceFolder}/mlx-c/mlx/c"
+      ],
+      "defines": ["_WIN32"],
+      "compilerPath": "cl.exe",
+      "cStandard": "c11",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "windows-msvc-x64",
       "browse": {
         "path": [
           "${workspaceFolder}/**",

@@ -71,10 +71,12 @@
     },
     {
       "name": "C: Launch FaciesGAN (lldb)",
-      "type": "lldb",
+      "type": "cppdbg",
       "request": "launch",
       "program": "${workspaceFolder}/build/faciesgan",
       "preLaunchTask": "Build FaciesGAN (Release+LTO)",
+      "miDebuggerPath": "/usr/bin/lldb",
+      "MIMode": "lldb",
       "args": [
         "--input-path",
         "data",
@@ -105,35 +107,97 @@
         "--no-tensorboard",
         "--use-wells",
         "--use-seismic",
-        "--use-mlx"
+        // "--use-mlx"
         // "--compile-backend"
       ],
       "cwd": "${workspaceFolder}",
-      "env": {
-        "OUTPUT_PATH": "${workspaceFolder}/results/",
-        "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
-        "PYTHONEXECUTABLE": "${workspaceFolder}/.venv/bin/python",
-        "VIRTUAL_ENV": "${workspaceFolder}/.venv",
-        "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}",
-        "FACIESGAN_COLLATE_VECTORIZE": "1",
-        "FACIESGAN_IPC_SHM": "1",
-        "FACIESGAN_HUGEPAGE": "1",
-        "FACIESGAN_PIN_WORKER": "1",
-        "FACIESGAN_RT_SCHED": "1",
-        "FACIESGAN_RT_PRIORITY": "10",
-        "FACIESGAN_BORROW_BATCHES": "1",
-        "FACIESGAN_ALLOW_DATALOADER_WORKERS": "1",
-        "FACIESGAN_ALLOW_PARALLEL_SCALES": "7",
-        "FACIESGAN_PROCESS_WORKERS": "1",
-        "FACIESGAN_PROC_SYNC_IO": "1",
-        "FACIESGAN_USE_WELLS": "1",
-        "FACIESGAN_USE_SEISMIC": "1"
-      },
-      "stopOnEntry": false,
-      "terminal": "integrated",
-      "initCommands": [
-        "settings set target.max-children-count 256",
-        "settings set target.max-string-summary-length 512"
+      "environment": [
+        {
+          "name": "OUTPUT_PATH",
+          "value": "${workspaceFolder}/results/"
+        },
+        {
+          "name": "PYTHONPATH",
+          "value": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python"
+        },
+        {
+          "name": "PYTHONEXECUTABLE",
+          "value": "${workspaceFolder}/.venv/bin/python"
+        },
+        {
+          "name": "VIRTUAL_ENV",
+          "value": "${workspaceFolder}/.venv"
+        },
+        {
+          "name": "PATH",
+          "value": "${workspaceFolder}/.venv/bin:${env:PATH}"
+        },
+        {
+          "name": "FACIESGAN_COLLATE_VECTORIZE",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_IPC_SHM",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_HUGEPAGE",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_PIN_WORKER",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_RT_SCHED",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_RT_PRIORITY",
+          "value": "10"
+        },
+        {
+          "name": "FACIESGAN_BORROW_BATCHES",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_ALLOW_DATALOADER_WORKERS",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_ALLOW_PARALLEL_SCALES",
+          "value": "7"
+        },
+        {
+          "name": "FACIESGAN_PROCESS_WORKERS",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_PROC_SYNC_IO",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_USE_WELLS",
+          "value": "1"
+        },
+        {
+          "name": "FACIESGAN_USE_SEISMIC",
+          "value": "1"
+        }
+      ],
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "setupCommands": [
+        {
+          "description": "Set max children count",
+          "text": "settings set target.max-children-count 256",
+          "ignoreFailures": true
+        },
+        {
+          "description": "Set max string summary length",
+          "text": "settings set target.max-string-summary-length 512",
+          "ignoreFailures": true
+        }
       ]
     }
   ],
