@@ -25,9 +25,9 @@
         "--output-path",
         "results/py/",
         "--num-train-pyramids",
-        "1",
+        "200",
         "--batch-size",
-        "1",
+        "10",
         "--num-workers",
         "0",
         "--num-iter",
@@ -49,7 +49,7 @@
         "--no-tensorboard",
         "--use-wells",
         "--use-seismic",
-        "--use-mlx",
+        // "--use-mlx",
         // "--compile-backend"
       ]
     },

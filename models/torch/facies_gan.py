@@ -410,9 +410,26 @@ class TorchFaciesGAN(
         if reinit:
             self.generator.gens[scale].apply(utils.weights_init)
         else:
-            self.generator.gens[scale].load_state_dict(
-                self.generator.gens[scale - 1].state_dict()
-            )
+            # Attempt to copy parameters from previous scale but only for
+            # matching parameter shapes. This handles cases where feature
+            # counts change between scales (e.g., parallel initialization)
+            src_state = self.generator.gens[scale - 1].state_dict()
+            tgt_state = self.generator.gens[scale].state_dict()
+
+            # Build filtered state with only keys present in both and with
+            # identical tensor shapes.
+            filtered: dict[str, torch.Tensor] = {}
+            for k, v in src_state.items():
+                if k in tgt_state and v.shape == tgt_state[k].shape:
+                    filtered[k] = v
+
+            if filtered:
+                # Load only the matching parameters; allow missing keys.
+                self.generator.gens[scale].load_state_dict(filtered, strict=False)
+            else:
+                # No compatible parameters to copy; fall back to weight init.
+                self.generator.gens[scale].apply(utils.weights_init)
+
         self.generator.gens[scale] = self.generator.gens[scale].to(self.device)
 
     def forward(

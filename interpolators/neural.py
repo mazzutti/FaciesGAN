@@ -138,7 +138,7 @@ class NeuralSmoother(BaseInterpolator):
             # with "_orig_mod.". Conversely, checkpoints saved from the
             # original model won't have that prefix. Detect the pattern
             # and rewrite keys to match `self.model`'s expected keys.
-            model_keys = set(self.model.state_dict().keys())
+            model_keys = set(self.model.state_dict().keys())  # type: ignore
             ck_keys = set(ms.keys())
 
             def any_prefixed(keys: set[str], prefix: str) -> bool:
@@ -148,17 +148,26 @@ class NeuralSmoother(BaseInterpolator):
             # If model expects prefixed keys but checkpoint doesn't, add prefix
             if any_prefixed(model_keys, prefix) and not any_prefixed(ck_keys, prefix):
                 ms = {f"{prefix}{k}": v for k, v in ms.items()}
-                logger.info("Adjusted checkpoint keys: added _orig_mod. prefix to match compiled model")
+                logger.info(
+                    "Adjusted checkpoint keys: added _orig_mod. prefix to match compiled model"
+                )
             # If checkpoint has prefix but model does not, strip it
             elif any_prefixed(ck_keys, prefix) and not any_prefixed(model_keys, prefix):
-                ms = { (k[len(prefix):] if k.startswith(prefix) else k): v for k, v in ms.items() }
-                logger.info("Adjusted checkpoint keys: removed _orig_mod. prefix to match model")
+                ms = {
+                    (k[len(prefix) :] if k.startswith(prefix) else k): v
+                    for k, v in ms.items()
+                }
+                logger.info(
+                    "Adjusted checkpoint keys: removed _orig_mod. prefix to match model"
+                )
 
             try:
                 self.model.load_state_dict(ms)  # pyright: ignore
             except RuntimeError as exc:
                 # Fall back to non-strict load to allow minor key mismatches
-                logger.warning("Strict load_state_dict failed: %s; retrying with strict=False", exc)
+                logger.warning(
+                    "Strict load_state_dict failed: %s; retrying with strict=False", exc
+                )
                 self.model.load_state_dict(ms, strict=False)  # pyright: ignore
             logger.info(
                 f"Loaded model checkpoint from {model_Path}; skipping training."
