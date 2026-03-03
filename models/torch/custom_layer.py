@@ -62,6 +62,52 @@ class TorchConvBlock(nn.Sequential):
         self.add_module("LeakyRelu", nn.LeakyReLU(0.2, inplace=True))
 
 
+class TorchDiscConvBlock(nn.Sequential):
+    """Discriminator conv block: Spectral-Norm Conv2D + LeakyReLU (no BN).
+
+    BatchNorm rescales activations and defeats the Lipschitz constraint
+    provided by spectral normalisation.  This block replaces
+    :class:`TorchConvBlock` inside the discriminator so that hinge /
+    relativistic losses remain stable without a gradient penalty.
+
+    Parameters
+    ----------
+    in_channels : int
+        Number of input channels.
+    out_channels : int
+        Number of output channels.
+    kernel_size : int
+        Size of the convolutional kernel.
+    padding : int
+        Amount of padding to add.
+    stride : int
+        Stride of the convolution.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        padding: int,
+        stride: int,
+    ) -> None:
+        super().__init__()
+        self.add_module(
+            "conv",
+            nn.utils.spectral_norm(
+                nn.Conv2d(
+                    in_channels,
+                    out_channels,
+                    kernel_size=kernel_size,
+                    stride=stride,
+                    padding=padding,
+                )
+            ),
+        )
+        self.add_module("LeakyRelu", nn.LeakyReLU(0.2, inplace=True))
+
+
 class TorchSPADE(nn.Module):
     """Spatially-Adaptive Denormalization (SPADE) layer.
 
@@ -363,13 +409,13 @@ class TorchSPADEDiscriminator(nn.Module):
 
         nn.Module.__init__(self)  # type: ignore
 
-        self.head = TorchConvBlock(
+        self.head = TorchDiscConvBlock(
             input_channels, num_features, kernel_size, padding_size, 1
         )
 
         self.body = nn.Sequential(
             *[
-                TorchConvBlock(
+                TorchDiscConvBlock(
                     max(num_features // (2**i), min_num_features),
                     max(num_features // (2 ** (i + 1)), min_num_features),
                     kernel_size,
@@ -381,12 +427,14 @@ class TorchSPADEDiscriminator(nn.Module):
         )
 
         output_channels = max(num_features // (2 ** (num_layer - 2)), min_num_features)
-        self.tail = nn.Conv2d(
-            output_channels,
-            1,
-            kernel_size=kernel_size,
-            stride=1,
-            padding=padding_size,
+        self.tail = nn.utils.spectral_norm(
+            nn.Conv2d(
+                output_channels,
+                1,
+                kernel_size=kernel_size,
+                stride=1,
+                padding=padding_size,
+            )
         )
 
     def forward(self, generated_facie: torch.Tensor) -> torch.Tensor:

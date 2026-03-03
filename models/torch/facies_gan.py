@@ -192,30 +192,21 @@ class TorchFaciesGAN(
             fake = self.generate_fake(noises, scale)
             d_fake = self.discriminator(scale, fake.detach())  # type: ignore
 
-            # WGAN losses: the discriminator maximises the gap between
-            # scores on real and fake samples.
-            real_loss = d_real.mean()
-            fake_loss = d_fake.mean()
+            # Relativistic average hinge terms. The discriminator loss is
+            # the sum of hinge losses comparing each real score to the
+            # average fake score and vice-versa.
+            real_minus = d_real - d_fake.mean()
+            fake_minus = d_fake - d_real.mean()
+            real_term = F.relu(1.0 - real_minus).mean()
+            fake_term = F.relu(1.0 + fake_minus).mean()
 
-        # Lazy gradient penalty (StyleGAN2-style): compute the expensive
-        # WGAN-GP penalty only every ``gp_interval`` discriminator steps
-        # and scale the weight by the interval to compensate.
-        self._disc_step_counter += 1
-        if self.gp_interval <= 1 or (self._disc_step_counter % self.gp_interval == 0):
-            gp = self.compute_gradient_penalty(scale, real, fake.detach())
-            # Scale weight to compensate for the reduced frequency.
-            if self.gp_interval > 1:
-                gp = gp * self.gp_interval
-        else:
-            gp = self._zero_scalar
-
-        total = -real_loss + fake_loss + gp
+        total = real_term + fake_term
         return (
             DiscriminatorMetrics(
                 total=total,
-                real=real_loss.detach(),
-                fake=fake_loss.detach(),
-                gp=gp.detach(),
+                real=d_real.mean().detach(),
+                fake=d_fake.mean().detach(),
+                gp=self._zero_scalar,
             ),
             None,
         )
@@ -294,32 +285,21 @@ class TorchFaciesGAN(
                         scale, facies_pyramid[scale].to(self.device)
                     )
                     d_fake = self.discriminator(scale, fake)
-                    real_loss = d_real.mean()
-                    fake_loss = d_fake.mean()
+                    real_minus = d_real - d_fake.mean()
+                    fake_minus = d_fake - d_real.mean()
+                    real_term = F.relu(1.0 - real_minus).mean()
+                    fake_term = F.relu(1.0 + fake_minus).mean()
 
-                # Lazy gradient penalty
-                self._disc_step_counter += 1
-                if self.gp_interval <= 1 or (
-                    self._disc_step_counter % self.gp_interval == 0
-                ):
-                    gp = self.compute_gradient_penalty(
-                        scale, facies_pyramid[scale], fake
-                    )
-                    if self.gp_interval > 1:
-                        gp = gp * self.gp_interval
-                else:
-                    gp = self._zero_scalar
-
-                total = -real_loss + fake_loss + gp
+                total = real_term + fake_term
 
                 self.update_discriminator_weights(scale, optimizers[scale], total, None)
 
                 step_metrics.append(
                     DiscriminatorMetrics(
                         total=total.detach(),
-                        real=real_loss.detach(),
-                        fake=fake_loss.detach(),
-                        gp=gp.detach(),
+                        real=d_real.mean().detach(),
+                        fake=d_fake.mean().detach(),
+                        gp=self._zero_scalar,
                     )
                 )
 
@@ -474,7 +454,23 @@ class TorchFaciesGAN(
             fake = fake_samples[0]
 
             # Delegate component computations to subclass hooks
-            adv = self.compute_adversarial_loss(scale, fake)
+            # Relativistic average hinge generator adversarial loss.
+            # Temporarily disable gradient tracking on discriminator
+            # parameters so backward() only updates generator params.
+            disc_module = self.discriminator.discs[scale]
+            # Turn off requires_grad for discriminator params
+            for p in disc_module.parameters():
+                p.requires_grad_(False)
+            d_fake = self.discriminator(scale, fake)
+            d_real = self.discriminator(scale, real.to(self.device)).detach()
+            # Restore discriminator param grads
+            for p in disc_module.parameters():
+                p.requires_grad_(True)
+
+            # Relativistic average hinge generator loss
+            g_real_term = F.relu(1.0 + (d_real - d_fake.mean())).mean()
+            g_fake_term = F.relu(1.0 - (d_fake - d_real.mean())).mean()
+            adv = g_real_term + g_fake_term
             mask = masks_pyramid.get(scale, None)
             well = wells_pyramid.get(scale, None)
             well = self.compute_masked_loss(

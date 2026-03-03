@@ -147,7 +147,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         # Lazy gradient penalty: compute GP every N discriminator steps
         # to amortise the cost of create_graph=True double backward.
         # The GP weight is multiplied by gp_interval to compensate.
-        self.gp_interval: int = getattr(options, "gp_interval", 1)
+        self.gp_interval: int = getattr(options, "gp_interval", 8)
         self._disc_step_counter: int = 0
 
     @abstractmethod

@@ -74,7 +74,7 @@ class TrainningOptions(argparse.Namespace):
         enable_tensorboard: bool = True,
         enable_plot_facies: bool = True,
         compile_backend: bool = False,
-        gp_interval: int = 1,
+        gp_interval: int = 8,
     ) -> None:
         """Create a TrainningOptions namespace with defaults for training.
 
