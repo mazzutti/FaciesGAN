@@ -521,6 +521,7 @@ class TorchTrainer(
                 lr=self.lr_d,
                 betas=(self.beta1, 0.999),
                 fused=use_fused,
+                foreach=not use_fused,  # foreach is implicit when fused=True
             )
             self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
                 self.discriminator_optimizers[scale],
@@ -533,6 +534,7 @@ class TorchTrainer(
                 lr=self.lr_g,
                 betas=(self.beta1, 0.999),
                 fused=use_fused,
+                foreach=not use_fused,  # foreach is implicit when fused=True
             )
 
             self.generator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(

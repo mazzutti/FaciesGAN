@@ -270,23 +270,29 @@ class TorchFaciesGAN(
                 prefaked[scale] = list(batched_fake.split(B, dim=0))  # type: ignore[arg-type]
 
         # ── D-step loop using pre-generated fakes ──
+        # Structure: forward+backward all scales → one coalesced
+        # all_reduce → step all optimizers.  This reduces NCCL
+        # collectives from S per D-step to 1.
         step_metrics: list[DiscriminatorMetrics[torch.Tensor]] = []
+        # Track the last GP value computed per scale across all D-steps
+        # so it can be reported even when the final step skips GP.
+        last_gp: dict[int, torch.Tensor] = {}
         for step_idx in range(D):
             step_metrics = []
             self._disc_step_counter += 1
             compute_gp = (self._disc_step_counter % self.gp_interval) == 0
 
+            # Phase 1: zero_grad + forward + backward for every scale.
+            for scale in sorted_scales:
+                optimizers[scale].zero_grad(set_to_none=True)
+
             for scale in sorted_scales:
                 fake = prefaked[scale][step_idx]
                 real = facies_pyramid[scale].to(self.device, non_blocking=True)
 
-                # Discriminator forward runs in fp32 (no autocast) —
-                # WGAN critic scores need full precision and the GP
-                # backward is incompatible with GradScaler.
                 d_real = self.discriminator(scale, real)
                 d_fake = self.discriminator(scale, fake)
 
-                # WGAN losses (matching MLX implementation).
                 real_loss = -d_real.mean()
                 fake_loss = d_fake.mean()
 
@@ -295,21 +301,33 @@ class TorchFaciesGAN(
                         self.compute_gradient_penalty(scale, real, fake.detach())
                         * self.gp_interval
                     )
+                    last_gp[scale] = gp.detach()
                 else:
                     gp = self._zero_scalar
 
                 total = real_loss + fake_loss + gp
-
-                self.update_discriminator_weights(scale, optimizers[scale], total, None)
+                total.backward()  # type: ignore[no-untyped-call]
 
                 step_metrics.append(
                     DiscriminatorMetrics(
                         total=total.detach(),
                         real=real_loss.detach(),
                         fake=fake_loss.detach(),
-                        gp=gp.detach(),
+                        # Report the most recent GP that was actually
+                        # computed for this scale, not the zero placeholder.
+                        gp=last_gp.get(scale, gp.detach()),
                     )
                 )
+
+            # Phase 2: one coalesced all_reduce across all disc modules.
+            if self.use_ddp:
+                self._allreduce_grads_coalesced(
+                    [self.discriminator.discs[s] for s in sorted_scales]
+                )
+
+            # Phase 3: step all disc optimizers.
+            for scale in sorted_scales:
+                optimizers[scale].step()
 
         return tuple(step_metrics)
 
@@ -357,11 +375,14 @@ class TorchFaciesGAN(
             for s in sorted_scales:
                 self.generator.gens[s].requires_grad_(False)
 
+            # Phase 1: forward + backward for each scale (sequential
+            # because each scale's forward depends on earlier frozen
+            # blocks in the progressive chain).
+            losses_by_scale: dict[int, torch.Tensor] = {}
             for scale in sorted_scales:
                 if scale >= len(facies_pyramid):
                     continue
 
-                # Ensure noise amplitudes have been initialized.
                 if len(self.noise_amps) < scale + 1:
                     raise RuntimeError(
                         f"noise_amp not initialized for scale {scale}. "
@@ -371,7 +392,7 @@ class TorchFaciesGAN(
                 # Unfreeze only the target scale's gen block.
                 self.generator.gens[scale].requires_grad_(True)
 
-                result, gradients = self.compute_generator_metrics(
+                result, _ = self.compute_generator_metrics(
                     indexes,
                     scale,
                     facies_pyramid[scale],
@@ -382,9 +403,11 @@ class TorchFaciesGAN(
                 )
                 metrics = cast(GeneratorMetrics[torch.Tensor], result)
 
-                self.update_generator_weights(
-                    scale, optimizers[scale], metrics.total, gradients
-                )
+                # zero_grad + scaled backward (no all-reduce yet).
+                optimizers[scale].zero_grad(set_to_none=True)
+                self._grad_scaler_g.scale(metrics.total).backward()  # type: ignore[no-untyped-call]
+
+                losses_by_scale[scale] = metrics.total
 
                 # Re-freeze so the next scale's backward skips this block.
                 self.generator.gens[scale].requires_grad_(False)
@@ -398,6 +421,20 @@ class TorchFaciesGAN(
                         div=metrics.div.detach(),
                     )
                 )
+
+            # Phase 2: one coalesced all_reduce for all gen modules.
+            if self.use_ddp:
+                self._allreduce_grads_coalesced(
+                    [self.generator.gens[s] for s in sorted_scales
+                     if s in losses_by_scale]
+                )
+
+            # Phase 3: unscale + step all gen optimizers.
+            for scale in sorted_scales:
+                if scale not in losses_by_scale:
+                    continue
+                self._grad_scaler_g.unscale_(optimizers[scale])
+                self._grad_scaler_g.step(optimizers[scale])
 
             # Restore requires_grad on all active blocks for next step.
             for s in sorted_scales:
@@ -1080,21 +1117,27 @@ class TorchFaciesGAN(
 
     @staticmethod
     def _allreduce_grads(module: nn.Module) -> None:
-        """Average gradients across all DDP ranks with a single all-reduce.
+        """Average gradients of a single module across DDP ranks."""
+        TorchFaciesGAN._allreduce_grads_coalesced([module])
 
-        Every trainable parameter is included in the flattened buffer even
-        if ``backward()`` left its ``.grad`` as ``None`` (which can happen
-        when a parameter was not part of the computation graph on a given
-        rank).  A zero tensor is substituted for missing gradients so that
-        **all ranks always call ``all_reduce`` on identically-sized
-        buffers**.  Without this, one rank could skip the collective while
-        another blocks — an immediate NCCL deadlock.
+    @staticmethod
+    def _allreduce_grads_coalesced(modules: list[nn.Module]) -> None:
+        """Average gradients across all DDP ranks with a **single** all-reduce.
+
+        Flattens trainable-parameter gradients from *all* provided modules
+        into one contiguous buffer, performs a single NCCL ``all_reduce``,
+        and scatters the averaged gradients back.
+
+        Every trainable parameter is included even if ``backward()`` left
+        its ``.grad`` as ``None`` (a zero tensor is substituted so the
+        flat buffer size is identical across ranks — avoiding NCCL
+        deadlocks from mismatched collective calls).
         """
-        params = [p for p in module.parameters() if p.requires_grad]
+        params: list[nn.Parameter] = []
+        for m in modules:
+            params.extend(p for p in m.parameters() if p.requires_grad)
         if not params:
             return
-        # Materialise missing grads as zeros so the flat buffer size is
-        # identical across ranks regardless of local backward() paths.
         for p in params:
             if p.grad is None:
                 p.grad = torch.zeros_like(p.data)
