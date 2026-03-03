@@ -18,7 +18,8 @@
         "VIRTUAL_ENV": "${workspaceFolder}/.venv",
         "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}",
         "FG_INSTRUMENT_LOKY": "1",
-        "PYTHONWARNINGS": "ignore::UserWarning"
+        "PYTHONWARNINGS": "ignore::UserWarning",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
       },
       "args": [
         "--nproc_per_node=2",
@@ -30,7 +31,7 @@
         "--num-train-pyramids",
         "200",
         "--batch-size",
-        "60",
+        "50",
         "--num-workers",
         "4",
         "--num-iter",

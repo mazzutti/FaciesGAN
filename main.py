@@ -138,10 +138,10 @@ def get_arguments() -> ArgumentParser:
     )
     parser.add_argument("--gamma", type=float, help="scheduler gamma", default=0.9)
     parser.add_argument(
-        "--lr-g", type=float, default=5e-5, help="learning rate, default=5e-5"
+        "--lr-g", type=float, default=5e-4, help="learning rate, default=5e-4"
     )
     parser.add_argument(
-        "--lr-d", type=float, default=5e-5, help="learning rate, default=5e-5"
+        "--lr-d", type=float, default=5e-4, help="learning rate, default=5e-4"
     )
     parser.add_argument(
         "--lr-decay", type=int, default=1000, help="number of epochs before lr decay"

@@ -446,7 +446,12 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             Dictionary of seismic-conditioning tensors for all scales.
         """
 
-        indexes = list(range(self.batch_size))
+        # Derive indexes from the actual batch size (the last DataLoader
+        # batch may be smaller than self.batch_size, so a hard-coded range
+        # would produce out-of-bounds indices on wells/seismic tensors).
+        first_scale = min(facies_pyramid)
+        actual_batch = facies_pyramid[first_scale].shape[0]  # type: ignore[union-attr]
+        indexes = list(range(actual_batch))
 
         # if self.fine_tuning:
         #     for scale in scales:
@@ -767,14 +772,29 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 )
                 lines.append("  ├" + "─" * 99 + "┤")
 
+                import torch as _t
+
                 for scale in scales:
                     g = scale_metrics.generator[scale]
                     d = scale_metrics.discriminator[scale]
+                    v: list[float] = _t.stack(
+                        [  # type: ignore[arg-type]
+                            g.total,
+                            g.fake,
+                            g.rec,
+                            g.well,
+                            g.div,
+                            d.total,
+                            d.real,
+                            d.fake,
+                            d.gp,
+                        ]
+                    ).tolist()
                     lines.append(
                         (
-                            f"  │ {scale:^5} │ {g.total.item():8.3f} │ {g.fake.item():7.3f} │ {g.rec.item():7.3f} │ "
-                            f"{g.well.item():7.3f} │ {g.div.item():7.3f} │ {d.total.item():8.3f} │ {d.real.item():7.3f} │ "
-                            f"{d.fake.item():7.3f} │ {d.gp.item():7.3f} │"
+                            f"  │ {scale:^5} │ {v[0]:8.3f} │ {v[1]:7.3f} │ {v[2]:7.3f} │ "
+                            f"{v[3]:7.3f} │ {v[4]:7.3f} │ {v[5]:8.3f} │ {v[6]:7.3f} │ "
+                            f"{v[7]:7.3f} │ {v[8]:7.3f} │"
                         )
                     )
 
@@ -1040,12 +1060,32 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         Notes
         -----
-        Metric dataclass fields are tensor scalars; this function converts
-        them to Python floats via `.item()` before writing to TensorBoard or
-        formatting for display.
+        Metric dataclass fields are tensor scalars; this function batch-converts
+        them to Python floats via ``torch.stack().tolist()`` (single GPU sync)
+        before writing to TensorBoard or formatting for display.
         """
         g = generator_metrics
         d = discriminator_metrics
+
+        # Batch all .item() calls into one GPU→CPU sync (single
+        # cudaMemcpy instead of 9 separate ones per scale per epoch).
+        import torch as _t
+
+        vals: list[float] = _t.stack(
+            [  # type: ignore[arg-type]
+                g.total,
+                g.fake,
+                g.rec,
+                g.well,
+                g.div,
+                d.total,
+                d.real,
+                d.fake,
+                d.gp,
+            ]
+        ).tolist()
+        g_total, g_fake, g_rec, g_well, g_div = vals[:5]
+        d_total, d_real, d_fake, d_gp = vals[5:]
 
         # Update progress bar description with more detailed info
         if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
@@ -1054,22 +1094,22 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     epoch + 1,
                     self.num_iter,
                     list(self.model.active_scales),
-                    g.total.item(),
-                    d.total.item(),
+                    g_total,
+                    d_total,
                 )
             )
 
         # Log to TensorBoard - discriminator losses
-        writer.add_scalar("Loss/train/discriminator/real", -d.real.item(), epoch)  # type: ignore
-        writer.add_scalar("Loss/train/discriminator/fake", d.fake.item(), epoch)  # type: ignore
+        writer.add_scalar("Loss/train/discriminator/real", -d_real, epoch)  # type: ignore
+        writer.add_scalar("Loss/train/discriminator/fake", d_fake, epoch)  # type: ignore
         writer.add_scalar(  # type: ignore
-            "Loss/train/discriminator/gradient_penalty", d.gp.item(), epoch
+            "Loss/train/discriminator/gradient_penalty", d_gp, epoch
         )
-        writer.add_scalar("Loss/train/discriminator", d.total.item(), epoch)  # type: ignore
+        writer.add_scalar("Loss/train/discriminator", d_total, epoch)  # type: ignore
 
         # Log to TensorBoard - generator losses
-        writer.add_scalar("Loss/train/generator/adversarial", g.fake.item(), epoch)  # type: ignore
-        writer.add_scalar("Loss/train/generator/reconstruction", g.rec.item(), epoch)  # type: ignore
-        writer.add_scalar("Loss/train/generator/well_constraint", g.well.item(), epoch)  # type: ignore
-        writer.add_scalar("Loss/train/generator/diversity", g.div.item(), epoch)  # type: ignore
-        writer.add_scalar("Loss/train/generator", g.total.item(), epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator/adversarial", g_fake, epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator/reconstruction", g_rec, epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator/well_constraint", g_well, epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator/diversity", g_div, epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator", g_total, epoch)  # type: ignore

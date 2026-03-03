@@ -154,6 +154,10 @@ class TorchTrainer(
             pin_memory=self.device.type == "cuda",
             persistent_workers=has_workers,
             prefetch_factor=4 if has_workers else None,
+            # Drop the last incomplete batch to avoid shape mismatches
+            # when the per-rank sample count is not divisible by
+            # batch_size (the training loop assumes full batches).
+            drop_last=True,
             # Prevent a hung DataLoader worker from silently blocking the
             # training loop.  Under DDP a stalled rank causes every other
             # rank to block in the next NCCL collective.
@@ -240,11 +244,12 @@ class TorchTrainer(
         if len(self.model.rec_noise) >= scale + 1:
             return
 
+        actual_batch = real.shape[0]
         if scale == 0:
             z_rec = torch_utils.generate_noise(
                 (self.noise_channels, *real.shape[2:]),
                 device=self.device,
-                num_samp=self.batch_size,
+                num_samp=actual_batch,
             )
             z_rec = F.pad(z_rec, [self.zero_padding] * 4, value=0)
             self.model.rec_noise.append(z_rec)
@@ -279,7 +284,7 @@ class TorchTrainer(
                 *real.shape[2:],
             ),
             device=self.device,
-            num_samp=self.batch_size,
+            num_samp=actual_batch,
         )
 
         to_concat = [z_rec]
@@ -465,7 +470,8 @@ class TorchTrainer(
             Dictionary of seismic-conditioning tensors per scale.
         """
         if self.enable_plot_facies:
-            indexes = torch.randint(self.batch_size, (self.num_real_facies,))
+            actual_batch = real_facies.shape[0]
+            indexes = torch.randint(actual_batch, (self.num_real_facies,))
 
             # Repeat each index num_generated_per_real times
             tiled_indexes: list[int] = cast(

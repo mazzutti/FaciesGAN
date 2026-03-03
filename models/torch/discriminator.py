@@ -76,7 +76,9 @@ class TorchDiscriminator(Discriminator[torch.Tensor, nn.Module], nn.Module):
         )
         nn.Module.__init__(self)  # type: ignore
 
-        self.discs: list[nn.Module] = list()
+        # Use nn.ModuleList so that .train()/.eval(), .to(device),
+        # and .state_dict() propagate to all per-scale disc blocks.
+        self.discs = nn.ModuleList()  # type: ignore[assignment]
 
     def __call__(self, scale: int, input_tensor: torch.Tensor) -> torch.Tensor:
         return super().__call__(scale, input_tensor)

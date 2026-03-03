@@ -221,10 +221,11 @@ class MLXTrainer(
         if len(self.model.rec_noise) > scale:
             return
 
+        actual_batch = real.shape[0]
         if scale == 0:
             z_rec = mlx_utils.generate_noise(
                 (*real.shape[1:3], self.noise_channels),
-                num_samp=self.batch_size,
+                num_samp=actual_batch,
             )
 
             p = self.model.zero_padding
@@ -252,7 +253,7 @@ class MLXTrainer(
         if seismic_pyramid.get(scale, None) is not None:
             shape = (shape[0], shape[1], shape[2] - self.num_img_channels)
 
-        z_rec = mlx_utils.generate_noise(shape, num_samp=self.batch_size)
+        z_rec = mlx_utils.generate_noise(shape, num_samp=actual_batch)
 
         to_concat = [z_rec]
         if wells_pyramid.get(scale, None) is not None:
@@ -627,9 +628,10 @@ class MLXTrainer(
         seismic_pyramid : dict[int, mx.array], optional
             Dictionary of seismic-conditioning tensors for all scales.
         """
+        actual_batch = real_facies.shape[0]
         indexes = mx.random.randint(  # type: ignore
             0,
-            self.batch_size,
+            actual_batch,
             shape=(self.num_real_facies,),
             dtype=mx.int32,
         )

@@ -57,7 +57,7 @@ class MLXDiscriminator(Discriminator[mx.array, nn.Module], nn.Module):
         nn.Module.__init__(self)
 
         self.dtype = dtype
-        self.discs: list[nn.Module] = list()
+        self.discs = list()  # type: ignore[assignment]
         self.set_dtype(self.dtype)
 
     def __call__(self, scale: int, input_tensor: mx.array) -> mx.array:

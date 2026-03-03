@@ -67,7 +67,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             num_layer, kernel_size, padding_size, input_channels, output_channels
         )
         nn.Module.__init__(self)
-        self.gens: list[nn.Module] = list()
+        self.gens = list()  # type: ignore[assignment]
         self.color_quantizer = MLXColorQuantization(
             temperature=0.1,
         )
@@ -207,6 +207,14 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             out_mod = self.gens[index]
             out_tmp = cast(mx.array, out_mod(z_mod))
             out_facie = out_tmp + out_facie
+
+            # Clamp to [-1, 1] after each scale so the progressive
+            # residuals stay within the tanh / color-palette range.
+            # Without this, values accumulate across scales (up to
+            # ±num_scales) and the final color quantizer maps pixels
+            # to wrong pure colors at scales >= 2.
+            out_facie = mx.clip(out_facie, -1.0, 1.0)
+
         # Apply color quantization to enforce pure colors.
         out_facie = self.color_quantizer(out_facie)
         return out_facie

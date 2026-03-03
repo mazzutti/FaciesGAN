@@ -15,10 +15,10 @@ import torch.nn.functional as F
 
 
 class TorchConvBlock(nn.Sequential):
-    """Convolutional block with Conv2D, BatchNorm, and LeakyReLU.
+    """Convolutional block with Conv2D, InstanceNorm, and LeakyReLU.
 
     A standard building block for both generator and discriminator networks,
-    combining convolution, batch normalization, and activation.
+    combining convolution, instance normalization, and activation.
 
     Parameters
     ----------
@@ -58,17 +58,16 @@ class TorchConvBlock(nn.Sequential):
                 padding=padding,
             ),
         )
-        self.add_module("norm", nn.BatchNorm2d(out_channels))
+        self.add_module("norm", nn.InstanceNorm2d(out_channels, affine=True))
         self.add_module("LeakyRelu", nn.LeakyReLU(0.2, inplace=True))
 
 
 class TorchDiscConvBlock(nn.Sequential):
-    """Discriminator conv block: Spectral-Norm Conv2D + LeakyReLU (no BN).
+    """Discriminator conv block: Conv2D + InstanceNorm + LeakyReLU.
 
-    BatchNorm rescales activations and defeats the Lipschitz constraint
-    provided by spectral normalisation.  This block replaces
-    :class:`TorchConvBlock` inside the discriminator so that hinge /
-    relativistic losses remain stable without a gradient penalty.
+    Uses InstanceNorm (matching the MLX discriminator) instead of
+    SpectralNorm.  The WGAN-GP gradient penalty enforces the Lipschitz
+    constraint externally.
 
     Parameters
     ----------
@@ -95,16 +94,15 @@ class TorchDiscConvBlock(nn.Sequential):
         super().__init__()
         self.add_module(
             "conv",
-            nn.utils.spectral_norm(
-                nn.Conv2d(
-                    in_channels,
-                    out_channels,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    padding=padding,
-                )
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
             ),
         )
+        self.add_module("norm", nn.InstanceNorm2d(out_channels, affine=True))
         self.add_module("LeakyRelu", nn.LeakyReLU(0.2, inplace=True))
 
 
@@ -146,7 +144,7 @@ class TorchSPADE(nn.Module):
         """
         super().__init__()  # type: ignore
 
-        self.norm = nn.InstanceNorm2d(norm_nc, affine=False)
+        self.norm = nn.InstanceNorm2d(norm_nc, affine=True)
 
         padding = kernel_size // 2
 
@@ -427,14 +425,12 @@ class TorchSPADEDiscriminator(nn.Module):
         )
 
         output_channels = max(num_features // (2 ** (num_layer - 2)), min_num_features)
-        self.tail = nn.utils.spectral_norm(
-            nn.Conv2d(
-                output_channels,
-                1,
-                kernel_size=kernel_size,
-                stride=1,
-                padding=padding_size,
-            )
+        self.tail = nn.Conv2d(
+            output_channels,
+            1,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding_size,
         )
 
     def forward(self, generated_facie: torch.Tensor) -> torch.Tensor:

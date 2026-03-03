@@ -7,6 +7,7 @@ store numeric configuration and then implement the abstract methods.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import MutableSequence
 from typing import Generic
 
 from typedefs import TModule, TTensor
@@ -20,7 +21,7 @@ class Discriminator(ABC, Generic[TTensor, TModule]):
     by calling the base constructor and implement `forward` and `__call__`.
     """
 
-    discs: list[TModule]
+    discs: MutableSequence[TModule]
 
     def __init__(
         self,

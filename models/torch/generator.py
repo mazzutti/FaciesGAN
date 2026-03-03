@@ -93,8 +93,9 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
         )
         super(nn.Module, self).__init__()
 
-        # Replace the generic gens container with PyTorch ModuleList
-        self.gens: list[nn.Module] = list()
+        # Use nn.ModuleList so that .train()/.eval(), .to(device),
+        # and .state_dict() propagate to all per-scale gen blocks.
+        self.gens = nn.ModuleList()  # type: ignore[assignment]
 
         # Color quantization layer (framework-specific)
         self.color_quantizer = TorchColorQuantization(temperature=0.1)
@@ -203,6 +204,13 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
                 )
 
             out_facie = self.gens[index](z_in) + out_facie
+
+            # Clamp to [-1, 1] after each scale so the progressive
+            # residuals stay within the tanh / color-palette range.
+            # Without this, values accumulate across scales (up to
+            # ±num_scales) and the final color quantizer maps pixels
+            # to wrong pure colors at scales >= 2.
+            out_facie = out_facie.clamp(-1, 1)
 
         # Apply color quantization to enforce pure colors
         out_facie = self.color_quantizer(out_facie)

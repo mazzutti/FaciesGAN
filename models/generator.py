@@ -11,6 +11,7 @@ from __future__ import annotations
 import math
 
 from abc import ABC, abstractmethod
+from collections.abc import MutableSequence
 from typing import Generic
 
 
@@ -29,7 +30,7 @@ class Generator(ABC, Generic[TTensor, TModule]):
     generators without importing framework-specific modules.
     """
 
-    gens: list[TModule]
+    gens: MutableSequence[TModule]
 
     def __init__(
         self,

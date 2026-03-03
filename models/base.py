@@ -961,23 +961,6 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             if hasattr(self, "noise_amps") and len(self.noise_amps) > 0
             else [1.0] * (scale + 1)
         )
-        """Return noise amplitude for a given scale.
-
-        Parameters
-        ----------
-        scale : int
-            Pyramid scale index for which to get noise amplitude.
-
-        Returns
-        -------
-        list[float]
-            List of noise amplitudes up to the requested scale.
-        """
-        return (
-            self.noise_amps[: scale + 1]
-            if len(self.noise_amps) >= scale + 1
-            else [1.0] * (scale + 1)
-        )
 
     def get_num_features(self, scale: int) -> tuple[int, int]:
         """Calculate feature counts for networks at a given scale.
