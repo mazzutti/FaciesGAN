@@ -777,7 +777,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 for scale in scales:
                     g = scale_metrics.generator[scale]
                     d = scale_metrics.discriminator[scale]
-                    v: list[float] = _t.stack(
+                    v: list[float] = _t.stack(  # type: ignore[arg-type]
                         [  # type: ignore[arg-type]
                             g.total,
                             g.fake,
@@ -1071,7 +1071,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         # cudaMemcpy instead of 9 separate ones per scale per epoch).
         import torch as _t
 
-        vals: list[float] = _t.stack(
+        vals: list[float] = _t.stack(  # type: ignore[arg-type]
             [  # type: ignore[arg-type]
                 g.total,
                 g.fake,

@@ -1126,7 +1126,7 @@ class TorchFaciesGAN(
         wrapped with DDP (see :meth:`finalize_discriminator_scale`).
         """
         optimizer.zero_grad(set_to_none=True)
-        loss.backward()
+        loss.backward()  # type: ignore[no-untyped-call]
         if self.use_ddp:
             self._allreduce_grads(self.discriminator.discs[scale])
         optimizer.step()
