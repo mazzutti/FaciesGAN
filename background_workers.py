@@ -66,6 +66,7 @@ def _save_plot_task(
     index: int,
     out_dir: str,
     masks_arr: TTensor | None = None,
+    batch_id: int | None = None,
 ) -> bool:
     """
     Internal task to save a plot in a background process.
@@ -85,7 +86,14 @@ def _save_plot_task(
     # The plotting helper will accept the tensors and perform any
     # conversions internally as needed.
     plot_generated_facies(
-        fake_list, real_arr, stage, index, masks_arr, out_dir, save=True
+        fake_list,
+        real_arr,
+        stage,
+        index,
+        masks_arr,
+        out_dir,
+        save=True,
+        batch_id=batch_id,
     )
     return True
 
@@ -114,6 +122,7 @@ def _save_plot_task_from_npy(
     index: int,
     out_dir: str,
     masks_path: str | None = None,
+    batch_id: int | None = None,
 ) -> bool:
     """
     Internal task to load .npy files and save a plot in a background process.
@@ -132,7 +141,14 @@ def _save_plot_task_from_npy(
     masks_arr = np.load(masks_path) if masks_path else None
 
     plot_generated_facies(
-        fake_arr, real_arr, stage, index, masks_arr, out_dir, save=True
+        fake_arr,
+        real_arr,
+        stage,
+        index,
+        masks_arr,
+        out_dir,
+        save=True,
+        batch_id=batch_id,
     )
     return True
 
@@ -227,6 +243,7 @@ class BackgroundWorker:
         masks: TTensor | None = None,
         wait_if_full: bool = True,
         timeout: float | None = None,
+        batch_id: int | None = None,
     ) -> Future[bool]:
         """
         Submit a plot job to the process pool (non-blocking by default).
@@ -280,6 +297,7 @@ class BackgroundWorker:
                 int(index),
                 str(out_dir),
                 masks,
+                int(batch_id) if batch_id is not None else None,
             )
             # Track and attach callback
             self._pending.add(fut)
@@ -379,6 +397,7 @@ def submit_plot_generated_facies(
     index: int,
     out_dir: str,
     masks: TTensor | None = None,
+    batch_id: int | None = None,
 ) -> Future[bool]:
     """
     Submit a plot job using the module-level BackgroundWorker.
@@ -390,8 +409,22 @@ def submit_plot_generated_facies(
 
     This wrapper provides backward compatibility for callers that expect a
     module-level function rather than instantiating the singleton class.
+
+    A 30-second timeout is enforced so that a full worker queue cannot
+    block the main training loop indefinitely.  Under DDP this prevents
+    rank 0 from stalling while other ranks proceed to the next NCCL
+    collective — a common source of silent deadlocks.
     """
     # BackgroundWorker is a singleton — calling the constructor returns the
     # shared instance. Use it to submit the job.
     worker = BackgroundWorker()
-    return worker.submit_plot_generated_facies(fake, real, stage, index, out_dir, masks)
+    return worker.submit_plot_generated_facies(
+        fake,
+        real,
+        stage,
+        index,
+        out_dir,
+        masks,
+        batch_id=batch_id,
+        timeout=30.0,
+    )

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import math
 
-import mlx.nn as nn  # type: ignore
 from abc import ABC, abstractmethod
 from typing import Generic
 

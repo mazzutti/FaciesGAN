@@ -144,6 +144,12 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         # active scales set
         self.active_scales: set[int] = set()
 
+        # Lazy gradient penalty: compute GP every N discriminator steps
+        # to amortise the cost of create_graph=True double backward.
+        # The GP weight is multiplied by gp_interval to compensate.
+        self.gp_interval: int = getattr(options, "gp_interval", 1)
+        self._disc_step_counter: int = 0
+
     @abstractmethod
     def __call__(
         self, *args: Any, **kwds: Any
@@ -220,6 +226,50 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             If the subclass does not override this method.
         """
         raise NotImplementedError("Subclasses must implement concatenate_tensors")
+
+    @abstractmethod
+    def split_tensor(self, tensor: TTensor, chunks: int) -> list[TTensor]:
+        """Split a tensor into ``chunks`` equal parts along the batch dimension.
+
+        Parameters
+        ----------
+        tensor : TTensor
+            Tensor to split (batch dimension is dim 0).
+        chunks : int
+            Number of equal-sized chunks.
+
+        Returns
+        -------
+        list[TTensor]
+            List of ``chunks`` tensors.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
+        """
+        raise NotImplementedError("Subclasses must implement split_tensor")
+
+    @abstractmethod
+    def cat_batch(self, tensors: list[TTensor]) -> TTensor:
+        """Concatenate tensors along the batch (first) dimension.
+
+        Parameters
+        ----------
+        tensors : list[TTensor]
+            List of tensors to concatenate along dim 0.
+
+        Returns
+        -------
+        TTensor
+            Concatenated tensor.
+
+        Raises
+        ------
+        NotImplementedError
+            If the subclass does not override this method.
+        """
+        raise NotImplementedError("Subclasses must implement cat_batch")
 
     @abstractmethod
     def compute_diversity_loss(self, fake_samples: list[TTensor]) -> TTensor:
@@ -802,9 +852,10 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
     ) -> list[TTensor]:
         """Generate multiple candidate outputs for `scale` using current generator.
 
-        This centralizes the pattern of sampling multiple noise realizations
-        and forwarding them through `self.generator` so concrete subclasses
-        can reuse the logic without duplicating code.
+        All diversity samples are generated in a **single batched forward
+        pass** (batch dimension is tiled by ``num_diversity_samples``) to
+        maximise GPU utilisation.  The output is then split back into
+        individual samples for the downstream diversity loss.
 
         Parameters
         ----------
@@ -822,14 +873,29 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         list[TTensor]
             List of generated tensors from multiple noise realizations.
         """
-        samples: list[TTensor] = []
-        for _ in range(self.num_diversity_samples):
+        N = self.num_diversity_samples
+        if N <= 1:
             noises = self.get_pyramid_noise(
                 scale, indexes, wells_pyramid, seismic_pyramid
             )
             amps = self.get_noise_aplitude(scale)
-            samples.append(self.generator(noises, amps, stop_scale=scale))
-        return samples
+            return [self.generator(noises, amps, stop_scale=scale)]
+
+        # Build N independent noise pyramids and concatenate along batch dim
+        # so the generator runs a single forward with batch size B*N.
+        noise_sets: list[list[TTensor]] = [
+            self.get_pyramid_noise(scale, indexes, wells_pyramid, seismic_pyramid)
+            for _ in range(N)
+        ]
+        batched_noises: list[TTensor] = [
+            self.cat_batch([noise_sets[k][lvl] for k in range(N)])
+            for lvl in range(scale + 1)
+        ]
+        amps = self.get_noise_aplitude(scale)
+        batched_out = self.generator(batched_noises, amps, stop_scale=scale)
+
+        # Split back into N individual samples along batch dim (dim 0).
+        return self.split_tensor(batched_out, N)
 
     def get_pyramid_noise(
         self,
@@ -1077,6 +1143,10 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         the abstract methods `init_scale_generator` and
         `init_scale_discriminator` which concrete subclasses must implement.
 
+        The active_scales set is replaced with exactly the scales being
+        trained so that optimize_discriminator / optimize_generator only
+        iterate the current group (previous groups' scales are frozen).
+
         Parameters
         ----------
         start_scale : int
@@ -1084,10 +1154,84 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         num_scales : int
             Number of consecutive scales to initialize.
         """
+        new_scales: set[int] = set()
         for scale in range(start_scale, start_scale + num_scales):
             self.init_generator_for_scale(scale)
             self.init_discriminator_for_scale(scale)
-            self.active_scales.add(scale)
+            new_scales.add(scale)
+        self.active_scales = new_scales
+
+    def freeze_generator_scales(self, active_scales: tuple[int, ...]) -> None:
+        """Freeze generator blocks outside the active training set.
+
+        Sets ``requires_grad_(False)`` on generator blocks for scales that
+        are **not** in ``active_scales``.  This prevents ``backward()``
+        from allocating gradient tensors on frozen parameters during the
+        progressive forward pass, saving significant GPU memory.
+
+        Active scales are unfrozen (``requires_grad_(True)``) to ensure
+        they can be trained normally.
+
+        Subclasses may override to add framework-specific cleanup.
+
+        Parameters
+        ----------
+        active_scales : tuple[int, ...]
+            Scales currently being trained.
+        """
+        active_set = set(active_scales)
+        for i, gen in enumerate(self.generator.gens):
+            if hasattr(gen, "requires_grad_"):
+                gen.requires_grad_(i in active_set)  # type: ignore[union-attr]
+
+    def trim_rec_noise(self, keep_up_to: int) -> None:
+        """Move reconstruction noise tensors outside the active range to CPU.
+
+        The progressive generator forward indexes noise by scale position,
+        so we cannot remove entries.  Instead we move tensors for
+        previously-trained scales to CPU, freeing CUDA memory while
+        keeping them available if ever needed again.
+
+        Parameters
+        ----------
+        keep_up_to : int
+            Index of the first scale to *keep* on device.  Entries
+            ``rec_noise[0 .. keep_up_to-1]`` are moved to CPU.
+        """
+        try:
+            import torch
+
+            for i in range(min(keep_up_to, len(self.rec_noise))):
+                t = self.rec_noise[i]
+                if isinstance(t, torch.Tensor) and t.is_cuda:
+                    self.rec_noise[i] = t.cpu()
+        except ImportError:
+            pass
+
+    def clear_stale_generator_grads(self, active_scales: tuple[int, ...]) -> None:
+        """Free ``.grad`` tensors on generator parameters outside active scales.
+
+        ``backward()`` computes gradients for every ``requires_grad``
+        parameter in the computation graph, but only the current
+        scale's optimizer zeroes them.  Leftover gradient tensors on
+        other active scales waste GPU memory.  This method sets them to
+        ``None`` to allow the CUDA allocator to reclaim the blocks.
+
+        Parameters
+        ----------
+        active_scales : tuple[int, ...]
+            Scales that were just trained (whose optimizers already
+            called ``zero_grad``).
+        """
+        # After the last scale in the optimization loop, ALL active
+        # scales' parameters may carry stale .grad tensors from the
+        # backward passes of subsequent scales.
+        for _idx, gen in enumerate(self.generator.gens):
+            if not hasattr(gen, "parameters"):
+                continue
+            for p in gen.parameters():  # type: ignore[union-attr]
+                if p.grad is not None:  # type: ignore[union-attr]
+                    p.grad = None  # type: ignore[union-attr]
 
     def is_spade_scale(self, scale: int) -> bool:
         """Return True if `scale` uses SPADE (or other scale-specific flag).
@@ -1227,13 +1371,18 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         """
         step_metrics: list[DiscriminatorMetrics[TTensor]] = []
 
+        # Sort active scales so that every DDP rank iterates in the same
+        # order.  ``active_scales`` is a set whose iteration order is an
+        # implementation detail of CPython; sorting removes any ambiguity
+        # and guarantees that per-scale all-reduce calls are matched
+        # across ranks (NCCL matches collectives by call order).
+        sorted_scales = sorted(self.active_scales)
+
         for _ in range(self.discriminator_steps):
 
             # Compute metrics for this discriminator step only
-            step_metrics: list[DiscriminatorMetrics[TTensor]] = []
-            step_gradients: list[dict[str, TTensor]] = []
-            losses: list[TTensor] = []
-            for scale in self.active_scales:
+            step_metrics = []
+            for scale in sorted_scales:
 
                 metrics, gradients = self.compute_discriminator_metrics(
                     indexes,
@@ -1246,17 +1395,24 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
                 metrics = cast(DiscriminatorMetrics[TTensor], metrics)
 
                 # Delegate the optimization step to subclass
-                updates = self.update_discriminator_weights(
+                self.update_discriminator_weights(
                     scale,
                     optimizers[scale],
                     metrics.total,
                     gradients,
                 )
-                if updates:
-                    step_gradients.append(updates)
 
-                step_metrics.append(metrics)
-                losses.extend(metrics.as_tuple())
+                # Detach immediately after backward to release the
+                # autograd graph node cycle rooted at metrics.total.
+                if hasattr(metrics.total, "detach"):
+                    metrics = DiscriminatorMetrics(  # type: ignore[misc]
+                        total=metrics.total.detach(),  # type: ignore[union-attr]
+                        real=metrics.real.detach(),  # type: ignore[union-attr]
+                        fake=metrics.fake.detach(),  # type: ignore[union-attr]
+                        gp=metrics.gp.detach(),  # type: ignore[union-attr]
+                    )
+
+                step_metrics.append(metrics)  # type: ignore[arg-type]
 
         return tuple(step_metrics)
 
@@ -1303,13 +1459,13 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
 
         step_metrics: list[GeneratorMetrics[TTensor]] = []
 
+        sorted_scales = sorted(self.active_scales)
+
         for _ in range(self.generator_steps):
 
             # Compute per-scale metrics using subclass hook
-            step_gradients: list[dict[str, TTensor]] = []
-            losses: list[Any] = []
             step_metrics = []
-            for scale in self.active_scales:
+            for scale in sorted_scales:
                 if scale >= len(facies_pyramid):
                     continue
 
@@ -1337,17 +1493,44 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
                 metrics = cast(GeneratorMetrics[TTensor], metrics)
 
                 # Delegate the optimization step to subclass
-                updates = self.update_generator_weights(
+                self.update_generator_weights(
                     scale,
                     optimizers[scale],
                     metrics.total,
                     gradients,
                 )
-                if updates:
-                    step_gradients.append(updates)
 
-                step_metrics.append(metrics)
-                losses.extend(metrics.as_tuple())
+                # After backward the computation graph buffers are
+                # freed, but the autograd Node objects still form a
+                # reference cycle via metrics.total.grad_fn.  Detach
+                # immediately so those nodes can be collected.
+                if hasattr(metrics.total, "detach"):
+                    metrics = GeneratorMetrics(  # type: ignore[misc]
+                        total=metrics.total.detach(),  # type: ignore[union-attr]
+                        fake=metrics.fake.detach(),  # type: ignore[union-attr]
+                        rec=metrics.rec.detach(),  # type: ignore[union-attr]
+                        well=metrics.well.detach(),  # type: ignore[union-attr]
+                        div=metrics.div.detach(),  # type: ignore[union-attr]
+                    )
+
+                step_metrics.append(metrics)  # type: ignore[arg-type]
+
+                # Free stale .grad on gen blocks that are NOT the
+                # current scale.  backward() fans out gradients to
+                # every requires_grad parameter in the graph (which
+                # includes all active gen blocks for multi-scale
+                # forward), but only the current scale's optimizer
+                # zeroes its own.  Clearing immediately avoids keeping
+                # those gradient tensors alive until the next scale's
+                # zero_grad or end-of-epoch cleanup.
+                for idx, gen in enumerate(self.generator.gens):
+                    if idx == scale:
+                        continue
+                    if not hasattr(gen, "parameters"):
+                        continue
+                    for p in gen.parameters():  # type: ignore[union-attr]
+                        if p.grad is not None:  # type: ignore[union-attr]
+                            p.grad = None  # type: ignore[union-attr]
 
         return tuple(step_metrics)
 

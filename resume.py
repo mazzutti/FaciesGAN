@@ -19,6 +19,7 @@ import random
 from types import SimpleNamespace
 
 import torch
+import torch.distributed as dist
 
 from config import G_FILE, OPT_FILE, RESULT_FACIES_PATH
 from log import init_output_logging
@@ -79,11 +80,22 @@ if __name__ == "__main__":
         if torch.cuda.is_available()
         else f"mps:{options.gpu_device}" if torch.backends.mps.is_available() else "cpu"
     )
+
+    # ── Detect distributed (torchrun) ────────────────────────────────
+    local_rank = int(os.environ.get("LOCAL_RANK", -1))
+    distributed = local_rank >= 0
+
+    if distributed:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f"cuda:{local_rank}")
+
     trainer = TorchTrainer(
         options,
         arguments.fine_tuning,
         arguments.checkpoint_path,
         device,
+        distributed=distributed,
     )
 
     if arguments.fine_tuning:

@@ -596,6 +596,7 @@ class MLXTrainer(
         self,
         scale: int,
         epoch: int,
+        batch_id: int,
         results_path: str,
         real_facies: mx.array,
         wells_pyramid: dict[int, mx.array] = {},
@@ -667,11 +668,15 @@ class MLXTrainer(
         import os
 
         gen_denorm = utils.mlx2np(generated_facies, denormalize=True)
-        npy_path = os.path.join(results_path, f"scale_{scale}_epoch_{epoch}_fake.npy")
+        npy_path = os.path.join(
+            results_path,
+            f"scale_{scale}_batch_{batch_id}_epoch_{epoch}_fake.npy",
+        )
         np.save(npy_path, gen_denorm)
         real_denorm = utils.mlx2np(real_facies_tensor, denormalize=True)
         real_npy_path = os.path.join(
-            results_path, f"scale_{scale}_epoch_{epoch}_real.npy"
+            results_path,
+            f"scale_{scale}_batch_{batch_id}_epoch_{epoch}_real.npy",
         )
         np.save(real_npy_path, real_denorm)
 
@@ -683,6 +688,7 @@ class MLXTrainer(
                 epoch,
                 results_path,
                 utils.mlx2np(masks_tensor) if masks_tensor is not None else None,
+                batch_id=batch_id,
             )
 
     def save_optimizers(

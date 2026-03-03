@@ -7,6 +7,8 @@ images. Docstrings in this module follow NumPy-style conventions and describe
 input/output shapes where helpful.
 """
 
+from __future__ import annotations
+
 import hashlib
 import random
 import os
@@ -64,7 +66,17 @@ else:
         import torch
 from PIL import Image, ImageDraw, ImageFont
 
-import mlx.core as mx
+import platform as _platform
+
+if TYPE_CHECKING:
+    import mlx.core as mx
+elif _platform.system() == "Darwin":
+    try:
+        import mlx.core as mx
+    except ImportError:
+        mx = None  # type: ignore[assignment]
+else:
+    mx = None  # type: ignore[assignment]
 
 from config import RESULTS_DIR
 
@@ -934,6 +946,7 @@ def plot_generated_facies(
     save: bool = False,
     cell_size: int = 256,
     device: torch.device = torch.device("cpu"),
+    batch_id: int | None = None,
 ) -> None:
     """Plot and optionally save generated facies using PIL (50-100x faster than matplotlib).
 
@@ -1275,7 +1288,10 @@ def plot_generated_facies(
             output_img.paste(gen_img, (x_offset, y_offset + title_height))
 
     # Save directly
-    output_img.save(f"{out_dir}/gen_{stage}_{index}.png", optimize=True)
+    if batch_id is not None:
+        output_img.save(f"{out_dir}/gen_{stage}_{batch_id}_{index}.png", optimize=True)
+    else:
+        output_img.save(f"{out_dir}/gen_{stage}_{index}.png", optimize=True)
 
 
 def load_facies_for_plot(

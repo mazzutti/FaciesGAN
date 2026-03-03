@@ -382,7 +382,11 @@ class TorchSPADEDiscriminator(nn.Module):
 
         output_channels = max(num_features // (2 ** (num_layer - 2)), min_num_features)
         self.tail = nn.Conv2d(
-            output_channels, 1, kernel_size=kernel_size, stride=1, padding=padding_size
+            output_channels,
+            1,
+            kernel_size=kernel_size,
+            stride=1,
+            padding=padding_size,
         )
 
     def forward(self, generated_facie: torch.Tensor) -> torch.Tensor:
@@ -403,7 +407,6 @@ class TorchSPADEDiscriminator(nn.Module):
         scores = self.head(generated_facie)
         scores = self.body(scores)
         scores = self.tail(scores)
-
         return scores
 
 
@@ -459,6 +462,10 @@ class TorchColorQuantization(nn.Module):
         torch.Tensor
             Quantized tensor with same shape.
         """
+        # Ensure pure_colors lives on the same device as the input tensor
+        # (needed for multi-GPU setups where scales run on different devices).
+        pure_colors = self.pure_colors.to(x.device)
+
         if not self.training:
             # Hard quantization during inference
             b, c, h, w = x.shape
@@ -469,12 +476,12 @@ class TorchColorQuantization(nn.Module):
             # Avoid cdist which can create complex views
             # ||x - c||^2 = ||x||^2 + ||c||^2 - 2*x*c
             x_norm = (x_flat**2).sum(dim=1, keepdim=True)
-            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)
-            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, self.pure_colors.t())
+            c_norm = (pure_colors**2).sum(dim=1, keepdim=True)
+            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, pure_colors.t())
 
             # Get nearest color
             indices = torch.argmin(distances, dim=1)
-            quantized = self.pure_colors[indices]
+            quantized = pure_colors[indices]
 
             return quantized.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
         else:
@@ -485,13 +492,13 @@ class TorchColorQuantization(nn.Module):
 
             # Calculate distances using explicit operations (avoid cdist)
             x_norm = (x_flat**2).sum(dim=1, keepdim=True)
-            c_norm = (self.pure_colors**2).sum(dim=1, keepdim=True)
-            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, self.pure_colors.t())
+            c_norm = (pure_colors**2).sum(dim=1, keepdim=True)
+            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, pure_colors.t())
 
             # Soft assignment using softmax
             weights = F.softmax(-distances / self.temperature, dim=1)
 
             # Weighted sum of pure colors
-            quantized = torch.mm(weights, self.pure_colors)
+            quantized = torch.mm(weights, pure_colors)
 
             return quantized.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()

@@ -36,14 +36,15 @@ def calc_gradient_penalty(
     torch.Tensor
         Calculated gradient penalty scalar value.
     """
-    alpha = torch.rand(1, 1).expand(real_data.size()).to(device)
+    # Create alpha directly on device (avoids CPU→GPU transfer).
+    alpha = torch.rand(1, 1, device=device).expand_as(real_data)
     interpolates = (alpha * real_data + (1 - alpha) * fake_data).requires_grad_(True)
     disc_interpolates = discriminator(interpolates)
 
     gradients: torch.Tensor = torch.autograd.grad(
         outputs=disc_interpolates,
         inputs=interpolates,
-        grad_outputs=torch.ones(disc_interpolates.size()).to(device),
+        grad_outputs=torch.ones_like(disc_interpolates),
         create_graph=True,
         retain_graph=True,
         only_inputs=True,

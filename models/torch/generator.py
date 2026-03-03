@@ -184,32 +184,30 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
                 ),
             )
 
-            z_in = z[index].clone()
             if self.has_cond_channels:
-                z_in[:, : self.output_channels, :, :] = (
-                    amp[index] * z[index][:, : self.output_channels, :, :]
+                # Build z_in without clone: use out-of-place ops to avoid
+                # copying the full tensor and in-place version-counter bumps.
+                padded_facie = F.pad(
+                    out_facie, [self.zero_padding] * 4, value=0
+                ).repeat(1, self.cond_channels // self.output_channels, 1, 1)
+                z_in = torch.cat(
+                    [
+                        amp[index] * z[index][:, : self.output_channels, :, :],
+                        z[index][:, self.output_channels :, :, :] + padded_facie,
+                    ],
+                    dim=1,
                 )
             else:
-                z_in = amp[index] * z_in
-
-            padded_facie = F.pad(out_facie, [self.zero_padding] * 4, value=0)
-            if self.has_cond_channels:
-                num_repeats = self.cond_channels // self.output_channels
-                padded_facie = padded_facie.repeat(1, num_repeats, 1, 1)
-                # Add padded output facie to well conditioning channels
-                z_in[:, self.output_channels :, :, :] = (
-                    z_in[:, self.output_channels :, :, :] + padded_facie
+                z_in = amp[index] * z[index] + F.pad(
+                    out_facie, [self.zero_padding] * 4, value=0
                 )
-            else:
-                z_in = z_in + padded_facie
 
-            # SPADE generator takes full conditioning and outputs directly
             out_facie = self.gens[index](z_in) + out_facie
 
         # Apply color quantization to enforce pure colors
         out_facie = self.color_quantizer(out_facie)
 
-        return out_facie
+        return out_facie  # type: ignore[return-value]
 
     def create_scale(
         self, scale: int, num_features: int, min_num_features: int

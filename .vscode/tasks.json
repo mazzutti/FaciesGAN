@@ -90,6 +90,36 @@
 			],
 			"isBackground": false,
 			"problemMatcher": []
+		},
+		{
+			"label": "Train FaciesGAN (DDP 2 GPUs)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"PYTHONPATH=${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python VIRTUAL_ENV=${workspaceFolder}/.venv PATH=${workspaceFolder}/.venv/bin:${env:PATH} torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path results/py/ --num-train-pyramids 200 --batch-size 40 --num-workers 1 --num-iter 100 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --no-tensorboard --use-wells --use-seismic"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated"
+			}
+		},
+		{
+			"label": "kill-torchrun-orphans",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-c",
+				"pkill -9 -f 'torchrun|torch.distributed.run.*main.py' 2>/dev/null; echo 'Cleaned up torchrun processes'"
+			],
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "silent",
+				"panel": "shared",
+				"close": true
+			}
 		}
 	]
 }

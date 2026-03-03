@@ -476,7 +476,7 @@ MLXTrainer *MLXTrainer_new(const TrainningOptions *opts, int fine_tuning,
             int w = trainer->scales[si * 4 + 2];
             int c = trainer->scales[si * 4 + 3];
             /* print as Batch, Channels, Height, Width (NCHW display) */
-            printf("║ %8d ║ %8d ║ %8d ║ %8d ║\n", b, h, w, c);
+            printf("║ %8d ║ %8d ║ %8d ║ %8d ║\n", b, c, h, w);
         }
         printf("╚══════════╩══════════╩══════════╩══════════╝\n");
     }

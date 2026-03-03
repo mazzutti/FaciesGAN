@@ -10,6 +10,7 @@ fields and exposes abstract methods concrete trainers must implement.
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 import time
@@ -82,6 +83,11 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self.fine_tuning: bool = fine_tuning
         self.checkpoint_path: str = checkpoint_path
 
+        # Distributed training flag — only rank-0 should perform I/O.
+        # Subclasses (e.g. TorchTrainer) may set this before calling super().
+        if not hasattr(self, "_is_main_process"):
+            self._is_main_process: bool = True
+
         # Common training parameters (conservative subset)
         self.start_scale: int = options.start_scale
         self.stop_scale: int = options.stop_scale
@@ -142,7 +148,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self.scales: tuple[tuple[int, ...], ...] = scales
         self.data_loader: IDataLoader = self.create_dataloader()
 
-        print(f"DataLoader num_workers: {self.data_loader.num_workers}")
+        if self._is_main_process:
+            print(f"DataLoader num_workers: {self.data_loader.num_workers}")
 
         self.model = self.create_model()
         self.model.shapes = list(self.scales)
@@ -174,26 +181,28 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         # discriminator schedulers
         self.discriminator_schedulers: dict[int, TScheduler] = {}
 
-        print("Generated facie shapes:")
-        print("╔══════════╦══════════╦══════════╦══════════╗")
-        print(
-            "║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format(
-                "Batch", "Channels", "Height", "Width"
-            )
-        )
-        print("╠══════════╬══════════╬══════════╬══════════╣")
-        for shape in self.scales:
-            print(
+        if self._is_main_process:
+            lines = ["Generated facie shapes:"]
+            lines.append("╔══════════╦══════════╦══════════╦══════════╗")
+            lines.append(
                 "║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format(
-                    shape[0], shape[1], shape[2], shape[3]
+                    "Batch", "Channels", "Height", "Width"
                 )
             )
-        print("╚══════════╩══════════╩══════════╩══════════╝")
+            lines.append("╠══════════╬══════════╬══════════╬══════════╣")
+            for shape in self.scales:
+                lines.append(
+                    "║ {:^8} ║ {:^8} ║ {:^8} ║ {:^8} ║".format(
+                        shape[0], self.noise_channels, shape[2], shape[3]
+                    )
+                )
+            lines.append("╚══════════╩══════════╩══════════╩══════════╝")
+            print("\n".join(lines), flush=True)
 
         # Initialize TensorBoard visualizer if enabled
         self.enable_tensorboard = options.enable_tensorboard
         self.enable_plot_facies = options.enable_plot_facies
-        if self.enable_tensorboard:
+        if self.enable_tensorboard and self._is_main_process:
             viz_path = os.path.join(self.output_path, "training_visualizations")
             log_dir = os.path.join(self.output_path, "tensorboard_logs")
             dataset_info = f"{len(self.dataset)} pyramids, {self.batch_size} batch size"
@@ -212,7 +221,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             print("   Then open: http://localhost:6006")
         else:
             self.visualizer = None  # type: ignore
-            print("📊 TensorBoard logging disabled")
+            if self._is_main_process:
+                print("📊 TensorBoard logging disabled")
 
     @abstractmethod
     def create_model(self) -> FaciesGAN[TTensor, TModule, TOptimizer, TScheduler]:
@@ -451,10 +461,13 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         stop_scale = min(max(scales), self.stop_scale) + 1
         rec_in_pyramid: dict[int, TTensor] = {}
+        active = set(self.model.active_scales)
         for scale in range(stop_scale):
-            rec_in_pyramid[scale] = self.compute_rec_input(
-                scale, indexes, facies_pyramid
-            )
+            # Only compute rec_in for active scales (needed by generator)
+            if scale in active:
+                rec_in_pyramid[scale] = self.compute_rec_input(
+                    scale, indexes, facies_pyramid
+                )
             self.init_rec_noise_and_amp(
                 scale,
                 indexes,
@@ -501,6 +514,10 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 masks_pyramid=masks_pyramid,
                 seismic_pyramid=seismic_pyramid,
             )
+
+            # Release GPU tensors that are no longer needed
+            del scale_metrics
+            generated_samples = ()
 
         # for scale in scales:
         #     self.save_optimizers(
@@ -642,6 +659,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self,
         scale: int,
         epoch: int,
+        batch_id: int,
         results_path: str,
         real_facies: TTensor,
         wells_pyramid: dict[int, TTensor] = {},
@@ -660,6 +678,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             Scale index to save generated facies for.
         epoch : int
             Current epoch index.
+        batch_id : int
+            Current batch index.
         results_path : str
             Path to the results directory for the current scale.
         real_facies : TTensor
@@ -723,66 +743,67 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         """
         samples_processed = self.batch_size * epoch
 
-        # Visualizer update
-        if self.enable_tensorboard and self.visualizer:
-            self.visualizer.update(
-                epoch, scale_metrics, generated_samples, samples_processed
-            )
-
-        # Print formatted metrics table occasionally
-        if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
-            # Build the entire metrics box as a single string and write it
-            # with one `progress.write` call to avoid interleaving with other
-            # prints from other threads/processes.
-            lines: list[str] = []
-            lines.append(
-                f"\n  Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch + 1:4d}/{self.num_iter}]"
-            )
-            lines.append("  ┌" + "─" * 99 + "┐")
-            lines.append(
-                (
-                    f"  │ {'Scale':^5} │ {'G_total':>8} │ {'G_adv':>7} │ {'G_rec':>7} │ "
-                    f"{'G_well':>7} │ {'G_div':>7} │ {'D_total':>8} │ {'D_real':>7} │ "
-                    f"{'D_fake':>7} │ {'D_gp':>7} │"
+        # ── Rank-0U-only I/O ─────────────────────────────────────────
+        if self._is_main_process:
+            # Visualizer update
+            if self.enable_tensorboard and self.visualizer:
+                self.visualizer.update(
+                    epoch, scale_metrics, generated_samples, samples_processed
                 )
-            )
-            lines.append("  ├" + "─" * 99 + "┤")
 
+            # Print formatted metrics table occasionally
+            if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
+                lines: list[str] = []
+                lines.append(
+                    f"\n  Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch + 1:4d}/{self.num_iter}]"
+                )
+                lines.append("  ┌" + "─" * 99 + "┐")
+                lines.append(
+                    (
+                        f"  │ {'Scale':^5} │ {'G_total':>8} │ {'G_adv':>7} │ {'G_rec':>7} │ "
+                        f"{'G_well':>7} │ {'G_div':>7} │ {'D_total':>8} │ {'D_real':>7} │ "
+                        f"{'D_fake':>7} │ {'D_gp':>7} │"
+                    )
+                )
+                lines.append("  ├" + "─" * 99 + "┤")
+
+                for scale in scales:
+                    g = scale_metrics.generator[scale]
+                    d = scale_metrics.discriminator[scale]
+                    lines.append(
+                        (
+                            f"  │ {scale:^5} │ {g.total.item():8.3f} │ {g.fake.item():7.3f} │ {g.rec.item():7.3f} │ "
+                            f"{g.well.item():7.3f} │ {g.div.item():7.3f} │ {d.total.item():8.3f} │ {d.real.item():7.3f} │ "
+                            f"{d.fake.item():7.3f} │ {d.gp.item():7.3f} │"
+                        )
+                    )
+
+                lines.append("  └" + "─" * 99 + "┘")
+                progress.write("\n".join(lines))  # type: ignore
+
+            # Save to TensorBoard and log per-scale
             for scale in scales:
                 g = scale_metrics.generator[scale]
                 d = scale_metrics.discriminator[scale]
-                lines.append(
-                    (
-                        f"  │ {scale:^5} │ {g.total.item():8.3f} │ {g.fake.item():7.3f} │ {g.rec.item():7.3f} │ "
-                        f"{g.well.item():7.3f} │ {g.div.item():7.3f} │ {d.total.item():8.3f} │ {d.real.item():7.3f} │ "
-                        f"{d.fake.item():7.3f} │ {d.gp.item():7.3f} │"
+                self.log_epoch(progress, writers[scale], epoch, g, d)  # type: ignore
+
+            # Save generated facies at intervals
+            if (epoch % self.save_interval == 0 or epoch == self.num_iter - 1) and (
+                epoch != 0 or self.num_iter == 1
+            ):
+                for scale in scales:
+                    self.save_generated_facies(
+                        scale,
+                        epoch,
+                        self._current_batch_id,
+                        results_paths[scale],
+                        facies_pyramid[scale],
+                        wells_pyramid,
+                        masks_pyramid,
+                        seismic_pyramid,
                     )
-                )
 
-            lines.append("  └" + "─" * 99 + "┘")
-            progress.write("\n".join(lines))  # type: ignore
-
-        # Save to TensorBoard and log per-scale
-        for scale in scales:
-            g = scale_metrics.generator[scale]
-            d = scale_metrics.discriminator[scale]
-            self.log_epoch(progress, writers[scale], epoch, g, d)  # type: ignore
-
-        # Save generated facies at intervals
-        if (epoch % self.save_interval == 0 or epoch == self.num_iter - 1) and (
-            epoch != 0 or self.num_iter == 1
-        ):
-            for scale in scales:
-                self.save_generated_facies(
-                    scale,
-                    epoch,
-                    results_paths[scale],
-                    facies_pyramid[scale],
-                    wells_pyramid,
-                    masks_pyramid,
-                    seismic_pyramid,
-                )
-
+        # ── All ranks ─────────────────────────────────────────────────
         # Step schedulers
         self.schedulers_step(scales)
         progress.update(1)  # type: ignore
@@ -806,11 +827,42 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             self.generator_schedulers[scale].step()
             self.discriminator_schedulers[scale].step()
 
+    def _release_accelerator_memory(self) -> None:
+        """Release unused accelerator (GPU) memory back to the OS.
+
+        Synchronises CUDA first so that asynchronously-freed tensors are
+        actually returned to the allocator, then runs Python garbage
+        collection and asks the caching allocator to release unused blocks.
+        """
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+        except ImportError:
+            pass
+        gc.collect()
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                # MPS doesn't have empty_cache but we can still trigger GC
+                pass
+        except ImportError:
+            pass
+
     def train(self) -> None:
         """Train the FaciesGAN model with parallel scale training.
 
         Trains multiple pyramid scales simultaneously in groups. Processes
         scales in batches of num_parallel_scales at a time.
+
+        When running under DDP only the main process (``_is_main_process``)
+        performs I/O (directory creation, model saving, TensorBoard logging,
+        progress bar updates).  All ranks participate in model init,
+        optimizer setup and training iterations.
         """
         start_train_time = time.time()
 
@@ -823,16 +875,41 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             )
 
             scales_to_train = tuple(range(scale, scale + num_scales_in_group))
-            print(f"\n{'='*60}")
-            print(f"Training scales {scales_to_train} in parallel")
-            print(f"{'='*60}\n")
+            if self._is_main_process:
+                print(f"\n{'='*60}")
+                print(f"Training scales {scales_to_train} in parallel")
+                print(f"{'='*60}\n")
 
             group_start_time = time.time()
 
-            # Initialize all scales in the group
+            # Initialize all scales in the group (all ranks)
             self.model.init_scales(scale, num_scales_in_group)
 
-            # Setup optimizers for active scales
+            # Freeze generator blocks from previous groups so backward()
+            # does not allocate gradient tensors on them.  The forward
+            # pass still runs through these scales (progressive
+            # synthesis), but without requires_grad the autograd engine
+            # skips gradient storage, saving significant CUDA memory.
+            self.model.freeze_generator_scales(scales_to_train)
+
+            # Discard rec_noise for scales outside the current group to
+            # free CUDA memory.  Only noise for the active scales (and
+            # the scales needed by the progressive forward pass) is
+            # kept — the rest is regenerated if needed later.
+            self.model.trim_rec_noise(min(scales_to_train))
+
+            # Prune optimizers/schedulers from previous groups to free
+            # Adam state buffers and avoid training frozen scales.
+            for s in list(self.generator_optimizers):
+                if s not in scales_to_train:
+                    del self.generator_optimizers[s]
+                    del self.generator_schedulers[s]
+            for s in list(self.discriminator_optimizers):
+                if s not in scales_to_train:
+                    del self.discriminator_optimizers[s]
+                    del self.discriminator_schedulers[s]
+
+            # Setup optimizers for active scales (all ranks)
             self.setup_optimizers(scales_to_train)
 
             # Create directories for all scales (use dict to map scale -> path)
@@ -843,12 +920,16 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 s: os.path.join(scale_paths[s], RESULT_FACIES_PATH)
                 for s in scales_to_train
             }
-            writers: dict[int, SummaryWriter] = {
-                s: SummaryWriter(log_dir=scale_paths[s]) for s in scales_to_train
-            }
-            for s in scales_to_train:
-                utils.create_dirs(scale_paths[s])
-                utils.create_dirs(results_paths[s])
+
+            # Only main process creates directories, writers
+            writers: dict[int, SummaryWriter] = {}
+            if self._is_main_process:
+                writers = {
+                    s: SummaryWriter(log_dir=scale_paths[s]) for s in scales_to_train
+                }
+                for s in scales_to_train:
+                    utils.create_dirs(scale_paths[s])
+                    utils.create_dirs(results_paths[s])
 
             if self.fine_tuning:
                 for s in scales_to_train:
@@ -857,7 +938,11 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             # Iterate over DataLoader batches for this group and train on each
             # Single progress bar for all batches and epochs in this group
             total_batches = len(self.data_loader)
-            progress = tqdm(total=self.num_iter * total_batches, position=0)  # type: ignore
+            progress = tqdm(  # type: ignore
+                total=self.num_iter * total_batches,
+                position=0,
+                disable=not self._is_main_process,
+            )
 
             # Use create_batch_iterator to allow subclasses to inject prefetching logic
             # Need to load all scales from 0 to max(scales_to_train) for noise initialization
@@ -896,30 +981,37 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
             progress.close()  # type: ignore
 
-            # After processing all batches for this group, save models
-            for s in scales_to_train:
-                self.model.save_scale(s, scale_paths[s])
+            # After processing all batches for this group, save models (rank 0 only)
+            if self._is_main_process:
+                for s in scales_to_train:
+                    self.model.save_scale(s, scale_paths[s])
 
-            # Close writers
+            # Close writers (rank 0 only)
             for writer in writers.values():
                 writer.close()
 
+            # Release GPU memory cached by the allocator between groups
+            self._release_accelerator_memory()
+
             group_end_time = time.time()
             elapsed = log.format_time(int(group_end_time - group_start_time))
-            print(f"\nScales {scales_to_train} training time: {elapsed}")
+            if self._is_main_process:
+                print(f"\nScales {scales_to_train} training time: {elapsed}")
 
             scale += num_scales_in_group
 
         end_train_time = time.time()
-        print(
-            "\nTotal training time:",
-            log.format_time(int(end_train_time - start_train_time)),
-        )
+        if self._is_main_process:
+            print(
+                "\nTotal training time:",
+                log.format_time(int(end_train_time - start_train_time)),
+            )
 
         # Close TensorBoard writer
         if self.enable_tensorboard and self.visualizer:
             self.visualizer.close()
-        print("\n✅ Training complete!")
+        if self._is_main_process:
+            print("\n✅ Training complete!")
         if self.enable_tensorboard:
             print("📊 View results in TensorBoard (if still running)")
 

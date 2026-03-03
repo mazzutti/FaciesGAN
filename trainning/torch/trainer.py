@@ -23,10 +23,12 @@ from collections.abc import Iterator, Mapping
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import LRScheduler
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 import background_workers as bw
 from datasets.data_prefetcher import PyramidsBatch
@@ -36,6 +38,7 @@ from datasets import PyramidsDataset
 from datasets.torch.dataset import TorchPyramidsDataset
 from models import FaciesGAN, TorchFaciesGAN
 from models.torch import utils as torch_utils
+from models.torch.facies_gan import unwrap_ddp
 from options import TrainningOptions
 from trainning.base import Trainer
 from typedefs import Batch
@@ -74,7 +77,7 @@ class TorchTrainer(
     ----------
     device : torch.device
         Training device.
-    model : FaciesGAN
+    model : TorchFaciesGAN
         The multi-scale model instance managed by the trainer.
 
     Notes
@@ -85,12 +88,15 @@ class TorchTrainer(
       prepared and returned by :meth:`TorchDataPrefetcher`.
     """
 
+    model: TorchFaciesGAN  # type: ignore[assignment]
+
     def __init__(
         self,
         options: TrainningOptions,
         fine_tuning: bool = False,
         checkpoint_path: str = ".checkpoints",
         device: torch.device = torch.device("cpu"),
+        distributed: bool = False,
     ) -> None:
         """Create a Trainer instance and prepare datasets, model and logging.
 
@@ -104,21 +110,54 @@ class TorchTrainer(
             Whether to attempt to load existing checkpoints, by default False.
         checkpoint_path : str, optional
             Base path for checkpoint files, by default ".checkpoints/".
+        distributed : bool, optional
+            Whether running under ``DistributedDataParallel`` with
+            ``torchrun``.  When ``True`` the batch size is divided by
+            ``world_size`` and a ``DistributedSampler`` is used.
         """
         self.device: torch.device = device
+        self.distributed: bool = distributed
+        # Must be set *before* super().__init__() so that prints inside
+        # the base __init__ are correctly guarded on non-main ranks.
+        if distributed:
+            self._is_main_process = dist.get_rank() == 0
         super().__init__(options, fine_tuning, checkpoint_path)
 
     def create_dataloader(self) -> DataLoader[Batch[torch.Tensor]]:
         """Create and return a :class:`torch.utils.data.DataLoader` for the
         trainer's dataset using configured batch size and worker settings.
+
+        When running under DDP a :class:`DistributedSampler` is used so
+        each rank gets a non-overlapping subset of the data.  The per-rank
+        batch size is also halved here (rather than later) so the DataLoader
+        is constructed with the correct value.
         """
+        sampler: DistributedSampler[Batch[torch.Tensor]] | None = None
+        shuffle = False
+        if self.distributed:
+            # Halve per-GPU batch size so the effective batch is unchanged.
+            world_size = dist.get_world_size()
+            self.batch_size = max(1, self.batch_size // world_size)
+            sampler = DistributedSampler(
+                self.dataset,
+                num_replicas=dist.get_world_size(),
+                rank=dist.get_rank(),
+                shuffle=True,
+            )
+        has_workers = self.options.num_workers > 0
         return DataLoader(
             self.dataset,
             batch_size=self.batch_size,
-            shuffle=False,
+            shuffle=shuffle,
+            sampler=sampler,
             num_workers=self.options.num_workers,
-            pin_memory=True if self.device.type == "cuda" else False,
-            persistent_workers=(self.options.num_workers > 0),
+            pin_memory=self.device.type == "cuda",
+            persistent_workers=has_workers,
+            prefetch_factor=4 if has_workers else None,
+            # Prevent a hung DataLoader worker from silently blocking the
+            # training loop.  Under DDP a stalled rank causes every other
+            # rank to block in the next NCCL collective.
+            timeout=120 if has_workers else 0,
         )
 
     def create_model(
@@ -133,6 +172,7 @@ class TorchTrainer(
             self.options,
             self.device,
             noise_channels=self.noise_channels,
+            use_ddp=self.distributed,
         )
 
     def generate_visualization_samples(
@@ -182,7 +222,7 @@ class TorchTrainer(
     ) -> torch.Tensor:
         real = facies_pyramid[scale]
         if scale == 0:
-            return torch.zeros_like(real)
+            return torch.zeros_like(real).to(self.device)
 
         return torch_utils.interpolate(
             facies_pyramid[scale - 1][indexes],
@@ -216,7 +256,7 @@ class TorchTrainer(
                     stop_scale=scale,
                 )
 
-            rmse = torch.sqrt(F.mse_loss(fake, real))
+            rmse = torch.sqrt(F.mse_loss(fake, real.to(fake.device)))
             amp = self.scale0_noise_amp * rmse.item()
             if len(self.model.noise_amps) <= scale:
                 self.model.noise_amps.append(amp)
@@ -244,9 +284,9 @@ class TorchTrainer(
 
         to_concat = [z_rec]
         if len(wells_pyramid) > 0:
-            to_concat.append(wells_pyramid[scale])
+            to_concat.append(wells_pyramid[scale].to(self.device))
         if len(seismic_pyramid) > 0:
-            to_concat.append(seismic_pyramid[scale])
+            to_concat.append(seismic_pyramid[scale].to(self.device))
 
         if len(to_concat) > 1:
             z_rec = torch.cat(to_concat, dim=1)
@@ -266,7 +306,7 @@ class TorchTrainer(
                 stop_scale=scale,
             )
 
-        rmse = torch.sqrt(F.mse_loss(fake, real))
+        rmse = torch.sqrt(F.mse_loss(fake, real.to(fake.device)))
         amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
 
         if scale < len(self.model.noise_amps):
@@ -313,10 +353,12 @@ class TorchTrainer(
                 str(self.checkpoint_path), str(scale), D_FILE
             )
 
-            self.model.generator.gens[scale].load_state_dict(
+            gen = unwrap_ddp(self.model.generator.gens[scale])
+            gen.load_state_dict(
                 torch_utils.load(generator_path, self.device, as_type=Mapping[str, Any])
             )
-            self.model.discriminator.discs[scale].load_state_dict(
+            disc = unwrap_ddp(self.model.discriminator.discs[scale])
+            disc.load_state_dict(
                 torch_utils.load(
                     discriminator_path, self.device, as_type=Mapping[str, Any]
                 )
@@ -391,6 +433,7 @@ class TorchTrainer(
         self,
         scale: int,
         epoch: int,
+        batch_id: int,
         results_path: str,
         real_facies: torch.Tensor,
         wells_pyramid: dict[int, torch.Tensor] = {},
@@ -461,14 +504,17 @@ class TorchTrainer(
                     if len(masks_pyramid) > 0
                     else None
                 ),
+                batch_id=batch_id,
             )
 
     def setup_optimizers(self, scales: tuple[int, ...]) -> None:
+        use_fused = self.device.type == "cuda"
         for scale in scales:
             self.discriminator_optimizers[scale] = torch.optim.Adam(
                 self.model.discriminator.discs[scale].parameters(),
                 lr=self.lr_d,
                 betas=(self.beta1, 0.999),
+                fused=use_fused,
             )
             self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
                 self.discriminator_optimizers[scale],
@@ -480,6 +526,7 @@ class TorchTrainer(
                 self.model.generator.gens[scale].parameters(),
                 lr=self.lr_g,
                 betas=(self.beta1, 0.999),
+                fused=use_fused,
             )
 
             self.generator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(

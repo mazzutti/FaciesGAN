@@ -32,13 +32,14 @@ class TrainningOptions(argparse.Namespace):
         gamma: float = 0.9,
         generator_steps: int = 3,
         gpu_device: int = 0,
+        gpu_devices: list[int] | None = None,
         img_color_range: tuple[int, int] = (0, 255),
         input_path: str = DATA_DIR,
         kernel_size: int = 3,
         lambda_grad: float = 0.1,
-        lr_d: float = 5e-05,
+        lr_d: float = 5e-04,
         lr_decay: int = 1000,
-        lr_g: float = 5e-05,
+        lr_g: float = 5e-04,
         manual_seed: int | None = None,
         max_size: int = 1024,
         min_num_feature: int = 32,
@@ -73,6 +74,7 @@ class TrainningOptions(argparse.Namespace):
         enable_tensorboard: bool = True,
         enable_plot_facies: bool = True,
         compile_backend: bool = False,
+        gp_interval: int = 1,
     ) -> None:
         """Create a TrainningOptions namespace with defaults for training.
 
@@ -192,6 +194,7 @@ class TrainningOptions(argparse.Namespace):
         self.gamma = gamma
         self.generator_steps = generator_steps
         self.gpu_device = gpu_device
+        self.gpu_devices = gpu_devices
         self.img_color_range = img_color_range
         self.input_path = input_path
         self.kernel_size = kernel_size
@@ -233,6 +236,7 @@ class TrainningOptions(argparse.Namespace):
         self.enable_tensorboard = enable_tensorboard
         self.enable_plot_facies = enable_plot_facies
         self.compile_backend = compile_backend
+        self.gp_interval = gp_interval
 
 
 class ResumeOptions(argparse.Namespace):

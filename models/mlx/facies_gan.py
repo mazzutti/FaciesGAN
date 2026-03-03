@@ -554,6 +554,27 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         concat_tensor = mx.concat(tensors, axis=-1)  # type: ignore
         return concat_tensor
 
+    def split_tensor(self, tensor: mx.array, chunks: int) -> list[mx.array]:
+        """Split a tensor into ``chunks`` equal parts along the batch dimension.
+
+        Parameters
+        ----------
+        tensor : mx.array
+            Tensor to split (batch dimension is dim 0).
+        chunks : int
+            Number of equal-sized chunks.
+
+        Returns
+        -------
+        list[mx.array]
+            List of ``chunks`` arrays.
+        """
+        return list(mx.split(tensor, chunks, axis=0))  # type: ignore
+
+    def cat_batch(self, tensors: list[mx.array]) -> mx.array:
+        """Concatenate tensors along the batch (first) dimension."""
+        return mx.concat(tensors, axis=0)  # type: ignore
+
     def compute_diversity_loss(self, fake_samples: list[mx.array]) -> mx.array:
         """Compute diversity loss across multiple generated `fake_samples`.
 
