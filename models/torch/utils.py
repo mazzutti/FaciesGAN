@@ -3,6 +3,7 @@ from typing import cast
 import torch
 import torch.nn as nn
 
+from apex_utils import FusedLayerNorm
 from typedefs import T
 
 
@@ -135,7 +136,7 @@ def weights_init(m: nn.Module) -> None:
     """
     if isinstance(m, nn.Conv2d):
         m.weight.data.normal_(0.0, 0.02)
-    elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.InstanceNorm2d):
+    elif isinstance(m, (nn.BatchNorm2d, nn.InstanceNorm2d, FusedLayerNorm)):
         # Only initialize if affine parameters exist
         if getattr(m, "weight", None) is not None:
             m.weight.data.normal_(1.0, 0.02)

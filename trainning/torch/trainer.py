@@ -31,6 +31,7 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 import background_workers as bw
+from apex_utils import FusedAdam
 from datasets.data_prefetcher import PyramidsBatch
 from datasets.torch.data_prefetcher import TorchDataPrefetcher
 from config import D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, SCH_D_FILE, SCH_G_FILE
@@ -535,14 +536,12 @@ class TorchTrainer(
             )
 
     def setup_optimizers(self, scales: tuple[int, ...]) -> None:
-        use_fused = self.device.type == "cuda"
         for scale in scales:
-            self.discriminator_optimizers[scale] = torch.optim.Adam(
+            self.discriminator_optimizers[scale] = FusedAdam(
                 self.model.discriminator.discs[scale].parameters(),
                 lr=self.lr_d,
                 betas=(self.beta1, 0.999),
-                fused=use_fused,
-                foreach=not use_fused,  # foreach is implicit when fused=True
+                set_grad_none=False,
             )
             self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
                 self.discriminator_optimizers[scale],
@@ -550,12 +549,11 @@ class TorchTrainer(
                 gamma=self.gamma,
             )
 
-            self.generator_optimizers[scale] = torch.optim.Adam(
+            self.generator_optimizers[scale] = FusedAdam(
                 self.model.generator.gens[scale].parameters(),
                 lr=self.lr_g,
                 betas=(self.beta1, 0.999),
-                fused=use_fused,
-                foreach=not use_fused,  # foreach is implicit when fused=True
+                set_grad_none=False,
             )
 
             self.generator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(

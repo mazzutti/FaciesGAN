@@ -320,9 +320,7 @@ class TorchFaciesGAN(
             # Sanity check: all ranks must agree on whether to compute GP,
             # otherwise the allreduce mixes GP vs non-GP gradients.
             if self.use_ddp and dist.is_initialized():
-                flag = torch.tensor(
-                    [float(compute_gp)], device=self.device
-                )
+                flag = torch.tensor([float(compute_gp)], device=self.device)
                 dist.all_reduce(flag, op=dist.ReduceOp.MAX)  # type: ignore[arg-type]
                 assert flag.item() == float(compute_gp), (
                     f"Rank {dist.get_rank()}: _disc_step_counter desync — "
@@ -331,7 +329,7 @@ class TorchFaciesGAN(
 
             # Phase 1: zero_grad + forward + backward for every scale.
             for scale in sorted_scales:
-                optimizers[scale].zero_grad(set_to_none=True)
+                optimizers[scale].zero_grad()
 
             # Store per-scale raw losses so metrics can be built after
             # the cross-rank scale-factor sync that follows.
@@ -497,7 +495,7 @@ class TorchFaciesGAN(
                 metrics = cast(GeneratorMetrics[torch.Tensor], result)
 
                 # zero_grad + scaled backward (no all-reduce yet).
-                optimizers[scale].zero_grad(set_to_none=True)
+                optimizers[scale].zero_grad()
                 self._grad_scaler_g.scale(metrics.total).backward()  # type: ignore[no-untyped-call]
 
                 losses_by_scale[scale] = metrics.total
@@ -514,6 +512,13 @@ class TorchFaciesGAN(
                         div=metrics.div.detach(),
                     )
                 )
+
+            # Restore requires_grad BEFORE the all-reduce so that
+            # _allreduce_grads_coalesced's ``if p.requires_grad`` filter
+            # includes the parameters whose .grad was filled by backward.
+            for s in sorted_scales:
+                if s in losses_by_scale:
+                    self.generator.gens[s].requires_grad_(True)
 
             # Phase 2: one coalesced all_reduce for all gen modules.
             # No barrier needed — NCCL all_reduce is already a
@@ -534,7 +539,7 @@ class TorchFaciesGAN(
                 self._grad_scaler_g.unscale_(optimizers[scale])
                 self._grad_scaler_g.step(optimizers[scale])
 
-            # Restore requires_grad on all active blocks for next step.
+            # Restore requires_grad on remaining blocks for next step.
             for s in sorted_scales:
                 self.generator.gens[s].requires_grad_(True)
 
@@ -995,24 +1000,14 @@ class TorchFaciesGAN(
         # non_blocking=False avoids a race where the H2D copy hasn't
         # finished before the first kernel reads the tensor.
         dev = self.device
-        facies_pyramid = {
-            k: v.to(dev) for k, v in facies_pyramid.items()
-        }
-        rec_in_pyramid = {
-            k: v.to(dev) for k, v in rec_in_pyramid.items()
-        }
+        facies_pyramid = {k: v.to(dev) for k, v in facies_pyramid.items()}
+        rec_in_pyramid = {k: v.to(dev) for k, v in rec_in_pyramid.items()}
         if wells_pyramid:
-            wells_pyramid = {
-                k: v.to(dev) for k, v in wells_pyramid.items()
-            }
+            wells_pyramid = {k: v.to(dev) for k, v in wells_pyramid.items()}
         if masks_pyramid:
-            masks_pyramid = {
-                k: v.to(dev) for k, v in masks_pyramid.items()
-            }
+            masks_pyramid = {k: v.to(dev) for k, v in masks_pyramid.items()}
         if seismic_pyramid:
-            seismic_pyramid = {
-                k: v.to(dev) for k, v in seismic_pyramid.items()
-            }
+            seismic_pyramid = {k: v.to(dev) for k, v in seismic_pyramid.items()}
 
         disc_metrics_tuple = self.optimize_discriminator(
             indexes,
@@ -1284,27 +1279,7 @@ class TorchFaciesGAN(
         grads = [p.grad for p in params]
         flat = torch._utils._flatten_dense_tensors(grads)  # type: ignore[attr-defined]
 
-        try:
-            dist.all_reduce(flat, op=dist.ReduceOp.AVG)  # type: ignore[arg-type]
-        except RuntimeError as e:
-            # Log the error with rank information for debugging
-            rank = dist.get_rank() if dist.is_initialized() else -1
-            import logging
-
-            logger = logging.getLogger(__name__)
-            logger.error(f"[Rank {rank}] NCCL all_reduce failed: {e}")
-            logger.error(
-                f"[Rank {rank}] Params count: {len(params)}, Flat size: {flat.numel()}"  # type: ignore[attr-defined]
-            )
-            # Synchronize error state across ranks to prevent desync
-            if dist.is_initialized():
-                # Create an error indicator tensor
-                error_tensor = torch.tensor([1.0], device=flat.device)  # type: ignore
-                try:
-                    dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)  # type: ignore[attr-defined]
-                except:
-                    pass  # If this fails, we're already in deep trouble
-            raise
+        dist.all_reduce(flat, op=dist.ReduceOp.AVG)  # type: ignore[arg-type]
 
         for g, synced in zip(  # type: ignore[assignment]
             grads, torch._utils._unflatten_dense_tensors(flat, grads)  # type: ignore[attr-defined]
@@ -1330,7 +1305,7 @@ class TorchFaciesGAN(
         all-reduced across ranks because the discriminator is not
         wrapped with DDP (see :meth:`finalize_discriminator_scale`).
         """
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad()
         loss.backward()  # type: ignore[no-untyped-call]
         if self.use_ddp:
             self._allreduce_grads(self.discriminator.discs[scale])
@@ -1349,7 +1324,7 @@ class TorchFaciesGAN(
         all-reduced across ranks because the generator is not wrapped
         with DDP (see :meth:`finalize_generator_scale`).
         """
-        optimizer.zero_grad(set_to_none=True)
+        optimizer.zero_grad()
         self._grad_scaler_g.scale(loss).backward()  # type: ignore[no-untyped-call]
         if self.use_ddp:
             self._allreduce_grads(self.generator.gens[scale])

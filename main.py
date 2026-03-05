@@ -14,7 +14,8 @@ from argparse import ArgumentParser
 from datetime import datetime
 
 # Suppress torch.compile symbolic-shape C++ warnings (pow_by_natural etc.)
-# Must be set before importing torch.
+# Must be set before importing torch.  Apex AMP (O1) is compatible with
+# torch.compile; Apex issues its own diagnostics separately.
 os.environ.setdefault("TORCH_LOGS", "-dynamo")
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
 

@@ -17,3 +17,4 @@ scipy
 mlx
 lovely_tensors
 tqdm
+nvidia-apex
