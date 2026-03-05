@@ -204,7 +204,7 @@ class TorchTrainer(
         tuple[torch.Tensor, ...]
             A tuple of generated facies tensors for visualization, one per scale.
         """
-        with torch.no_grad():
+        with torch.inference_mode():
             return tuple(
                 self.model.generate_fake(
                     self.model.get_pyramid_noise(
@@ -427,11 +427,32 @@ class TorchTrainer(
 
         Overrides the base implementation to use :class:`TorchDataPrefetcher`,
         which moves tensors to the GPU asynchronously.
+
+        Under DDP, adds synchronization barriers after each batch to ensure
+        all ranks stay in sync and don't desynchronize on NCCL collectives.
         """
         prefetcher = TorchDataPrefetcher(loader, scales, self.device)
         batch = prefetcher.next()
+        batch_count = 0
         while batch is not None:
             yield batch
+            batch_count += 1
+
+            # Synchronize ranks after each batch in DDP to prevent desync
+            if self.distributed and batch_count % 10 == 0:
+                try:
+                    dist.barrier()  # type: ignore
+                except RuntimeError as e:
+                    import logging
+
+                    logger = logging.getLogger(__name__)
+                    rank = dist.get_rank() if dist.is_initialized() else -1
+                    logger.error(
+                        f"[Rank {rank}] DDP barrier failed after batch {batch_count}: {e}"
+                    )
+                    logger.error(f"[Rank {rank}] This rank may be desynced from others")
+                    raise
+
             batch = prefetcher.next()
 
     def save_generated_facies(
@@ -484,7 +505,7 @@ class TorchTrainer(
                 seismic_pyramid,
             )
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 generated_facies = self.model.generator(
                     noises,
                     self.model.noise_amps[: scale + 1],

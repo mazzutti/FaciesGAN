@@ -65,6 +65,10 @@ class Generator(ABC, Generic[TTensor, TModule]):
         super().__init__()
         self.spade_scales: set[int] = set()
 
+        # Gradient (activation) checkpointing — set by the model class
+        # when the user passes ``--gradient-checkpoint``.
+        self.use_gradient_checkpointing: bool = False
+
         # stored configuration fields used in the generator
         self.num_layer = num_layer
 

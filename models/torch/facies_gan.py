@@ -11,11 +11,18 @@ import os
 from typing import Any, cast
 
 import torch
+import torch._dynamo
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp.autocast_mode import autocast
 from torch.amp.grad_scaler import GradScaler
+
+# Raise the per-code-object recompile cache so that modules called with
+# varying shapes (different scales, batch sizes, inference_mode vs normal)
+# can each keep a specialised compiled graph instead of hitting the
+# default limit of 8 and falling back to eager or erroring out.
+torch._dynamo.config.cache_size_limit = 64  # type: ignore[attr-defined]
 
 from config import AMP_FILE, D_FILE, G_FILE, M_FILE, SHAPE_FILE
 from models.base import FaciesGAN, IterableMetrics
@@ -111,8 +118,40 @@ class TorchFaciesGAN(
         self._zero_scalar = torch.tensor(0.0, device=device)
         self._zero_one = torch.zeros(1, device=device)
 
+        # Gradient (activation) checkpointing trades compute for memory.
+        self._use_gradient_checkpointing = getattr(
+            options, "gradient_checkpointing", False
+        )
+
+        # Mapping from scale → original (uncompiled) disc module used
+        # exclusively for gradient-penalty computation that requires
+        # ``create_graph=True`` (incompatible with compiled graphs).
+        self._uncompiled_discs: dict[int, nn.Module] = {}
+
         # Create framework objects via the base class helper (calls build_* hooks)
         self.setup_framework()
+
+        # Propagate the checkpointing flag to the generator after it is
+        # constructed (setup_framework calls build_generator).
+        if self._use_gradient_checkpointing:
+            self.generator.use_gradient_checkpointing = True
+
+        # Compile the color quantizer — it runs on every gen forward
+        # (~49 times per iteration) and has a simple compute graph
+        # (einsum + softmax) that benefits from operator fusion.
+        # Uses dynamic=False so each (H,W) gets an optimally-specialised
+        # graph.  The cache_size_limit above is raised to accommodate
+        # all scale×batch-size variants without hitting the recompile cap.
+        # CUDA graphs are disabled because the quantizer is called with
+        # different spatial shapes across scales.
+        if self._use_compile:
+            gen = cast(TorchGenerator, self.generator)
+            gen.color_quantizer = torch.compile(  # type: ignore[assignment]
+                gen.color_quantizer,
+                fullgraph=True,
+                dynamic=False,
+                mode="max-autotune-no-cudagraphs",
+            )
 
     def __call__(self, *args: Any, **kwds: Any) -> ScaleMetrics[torch.Tensor]:
         return nn.Module.__call__(self, *args, **kwds)
@@ -226,10 +265,6 @@ class TorchFaciesGAN(
         forward (batch = D × B) before the D-step loop begins.  This is
         safe because generator weights are frozen during D optimisation.
 
-        ``torch.compile(dynamic=True)`` on the gen blocks prevents
-        recompilation when the batch dimension changes between the D and
-        G phases.
-
         Lazy gradient penalty (``gp_interval``) amortises the expensive
         ``create_graph=True`` double backward.
 
@@ -251,7 +286,7 @@ class TorchFaciesGAN(
         # is cheaper than D separate forwards with batch = B (fewer
         # kernel launches).
         prefaked: dict[int, list[torch.Tensor]] = {}
-        with torch.no_grad():
+        with torch.inference_mode():
             for scale in sorted_scales:
                 noise_sets = [
                     self.get_pyramid_noise(
@@ -282,16 +317,38 @@ class TorchFaciesGAN(
             self._disc_step_counter += 1
             compute_gp = (self._disc_step_counter % self.gp_interval) == 0
 
+            # Sanity check: all ranks must agree on whether to compute GP,
+            # otherwise the allreduce mixes GP vs non-GP gradients.
+            if self.use_ddp and dist.is_initialized():
+                flag = torch.tensor(
+                    [float(compute_gp)], device=self.device
+                )
+                dist.all_reduce(flag, op=dist.ReduceOp.MAX)  # type: ignore[arg-type]
+                assert flag.item() == float(compute_gp), (
+                    f"Rank {dist.get_rank()}: _disc_step_counter desync — "
+                    f"local compute_gp={compute_gp}, but another rank disagrees"
+                )
+
             # Phase 1: zero_grad + forward + backward for every scale.
             for scale in sorted_scales:
                 optimizers[scale].zero_grad(set_to_none=True)
 
+            # Store per-scale raw losses so metrics can be built after
+            # the cross-rank scale-factor sync that follows.
+            raw_losses: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
             for scale in sorted_scales:
                 fake = prefaked[scale][step_idx]
-                real = facies_pyramid[scale].to(self.device, non_blocking=True)
+                real = facies_pyramid[scale]
 
-                d_real = self.discriminator(scale, real)
-                d_fake = self.discriminator(scale, fake)
+                # Discriminator forward runs in fp32 (no autocast) —
+                # WGAN critic scores need full precision and the GP
+                # backward is incompatible with GradScaler.
+
+                # Batch real+fake into a single disc forward to halve
+                # kernel launches and improve GPU utilization (especially
+                # for small batch sizes where each launch is under-utilized).
+                d_both = self.discriminator.discs[scale](torch.cat([real, fake], dim=0))
+                d_real, d_fake = d_both[:B], d_both[B:]
 
                 real_loss = -d_real.mean()
                 fake_loss = d_fake.mean()
@@ -305,27 +362,56 @@ class TorchFaciesGAN(
                 else:
                     gp = self._zero_scalar
 
-                total = real_loss + fake_loss + gp
+                # Per-scale loss normalization: divide by EMA of discriminator
+                # output magnitude so coarse scales don't dominate training.
+                sf = self.get_loss_scale_factor(scale)
+                total = (real_loss + fake_loss + gp) / sf
                 total.backward()  # type: ignore[no-untyped-call]
 
+                # Update the EMA scale factor AFTER backward (no side effects
+                # during autograd, and computed from raw un-normalized losses).
+                d_mag = (real_loss.abs() + fake_loss.abs()).detach().item()
+                self.update_loss_scale_factor(scale, d_mag)
+                raw_losses[scale] = (
+                    real_loss.detach(),
+                    fake_loss.detach(),
+                )
+
+            # Synchronize loss_scale_factors across DDP ranks so all ranks
+            # divide by the same value — prevents gradient magnitude drift
+            # from rank-local EMA updates on different data subsets.
+            if self.use_ddp and dist.is_initialized():
+                for scale in sorted_scales:
+                    sf_tensor = torch.tensor(
+                        [self.loss_scale_factors.get(scale, 1.0)],
+                        device=self.device,
+                    )
+                    dist.all_reduce(sf_tensor, op=dist.ReduceOp.AVG)  # type: ignore[arg-type]
+                    self.loss_scale_factors[scale] = sf_tensor.item()
+
+            # Build per-scale metrics using the now-synced scale factors.
+            for scale in sorted_scales:
+                sf = self.get_loss_scale_factor(scale)
+                rl, fl = raw_losses[scale]
+                gp_val = last_gp.get(scale, self._zero_scalar)
                 step_metrics.append(
                     DiscriminatorMetrics(
-                        total=total.detach(),
-                        real=real_loss.detach(),
-                        fake=fake_loss.detach(),
-                        # Report the most recent GP that was actually
-                        # computed for this scale, not the zero placeholder.
-                        gp=last_gp.get(scale, gp.detach()),
+                        total=(rl + fl + gp_val) / sf,
+                        real=rl / sf,
+                        fake=fl / sf,
+                        gp=gp_val / sf,
                     )
                 )
 
             # Phase 2: one coalesced all_reduce across all disc modules.
+            # No barrier needed — NCCL all_reduce is already a
+            # synchronizing collective that blocks until all ranks enter.
             if self.use_ddp:
                 self._allreduce_grads_coalesced(
                     [self.discriminator.discs[s] for s in sorted_scales]
                 )
 
-            # Phase 3: step all disc optimizers.
+            # Phase 3: step all disc optimizers (plain fp32).
             for scale in sorted_scales:
                 optimizers[scale].step()
 
@@ -366,6 +452,13 @@ class TorchFaciesGAN(
             return ()
 
         step_metrics: list[GeneratorMetrics[torch.Tensor]] = []
+
+        # Freeze discriminator for the entire G-phase — its weights are
+        # never updated here and keeping requires_grad=False avoids
+        # saving per-parameter activation buffers in the autograd graph
+        # during the adversarial-loss forward through the disc.
+        for s in sorted_scales:
+            self.discriminator.discs[s].requires_grad_(False)
 
         for _ in range(G):
             step_metrics = []
@@ -423,10 +516,15 @@ class TorchFaciesGAN(
                 )
 
             # Phase 2: one coalesced all_reduce for all gen modules.
+            # No barrier needed — NCCL all_reduce is already a
+            # synchronizing collective that blocks until all ranks enter.
             if self.use_ddp:
                 self._allreduce_grads_coalesced(
-                    [self.generator.gens[s] for s in sorted_scales
-                     if s in losses_by_scale]
+                    [
+                        self.generator.gens[s]
+                        for s in sorted_scales
+                        if s in losses_by_scale
+                    ]
                 )
 
             # Phase 3: unscale + step all gen optimizers.
@@ -444,6 +542,10 @@ class TorchFaciesGAN(
             # on the same optimizers.  One update per G-step (G calls)
             # instead of per-scale (G×S calls).
             self._grad_scaler_g.update()
+
+        # Unfreeze discriminator so the next D-phase can compute grad.
+        for s in sorted_scales:
+            self.discriminator.discs[s].requires_grad_(True)
 
         return tuple(step_metrics)
 
@@ -503,12 +605,14 @@ class TorchFaciesGAN(
             fake = fake_samples[0]
 
             # WGAN generator adversarial loss: -E[D(fake)].
-            # Temporarily disable gradient tracking on discriminator
-            # parameters so backward() only updates generator params.
-            disc_module = self.discriminator.discs[scale]
-            disc_module.requires_grad_(False)
+            # Discriminator params are frozen for the entire G-phase
+            # (see optimize_generator) so no per-scale toggle is needed.
             adv = self.compute_adversarial_loss(scale, fake)
-            disc_module.requires_grad_(True)
+
+            # Per-scale loss normalization (consistent with discriminator).
+            # D runs first and populates scale factors; G reads them.
+            adv = adv / self.get_loss_scale_factor(scale)
+
             mask = masks_pyramid.get(scale, None)
             well = wells_pyramid.get(scale, None)
             well = self.compute_masked_loss(
@@ -528,26 +632,18 @@ class TorchFaciesGAN(
                 seismic_pyramid,
             )
 
-            well_d = well.to(adv.device)
-            rec_d = rec_loss.to(adv.device)
-            div_d = div.to(adv.device)
-            total = adv + well_d + rec_d + div_d
+            total = adv + well + rec_loss + div
 
         del fake_samples  # free diversity candidates early
 
         # Detach component losses — backward() will be called on total;
         # the individual components are only needed as scalar logs.
-        adv = adv.detach()
-        rec_d = rec_d.detach()
-        well_d = well_d.detach()
-        div_d = div_d.detach()
-
         metrics = GeneratorMetrics(
             total=total,
-            fake=adv,
-            rec=rec_d,
-            well=well_d,
-            div=div_d,
+            fake=adv.detach(),
+            rec=rec_loss.detach(),
+            well=well.detach(),
+            div=div.detach(),
         )
 
         return metrics, None
@@ -605,7 +701,7 @@ class TorchFaciesGAN(
         torch.Tensor
             Negative mean discriminator score.
         """
-        return -self.discriminator.discs[scale](fake.to(self.device)).mean()
+        return -self.discriminator.discs[scale](fake).mean()
 
     def compute_diversity_loss(self, fake_samples: list[torch.Tensor]) -> torch.Tensor:
         """Compute diversity loss across multiple generated `fake_samples`.
@@ -665,7 +761,9 @@ class TorchFaciesGAN(
         Returns:
             torch.Tensor: Scalar gradient penalty term.
         """
-        disc = unwrap_ddp(self.discriminator.discs[scale])
+        disc = unwrap_ddp(
+            self._uncompiled_discs.get(scale, self.discriminator.discs[scale])
+        )
         with autocast("cuda", enabled=False):
             return utils.calc_gradient_penalty(
                 disc,
@@ -701,10 +799,7 @@ class TorchFaciesGAN(
         """
         if well is None or mask is None:
             return self._zero_one
-        mask_d = mask.to(fake.device, non_blocking=True)
-        return self.well_loss_penalty * F.mse_loss(
-            fake * mask_d, real.to(fake.device, non_blocking=True) * mask_d
-        )
+        return self.well_loss_penalty * F.mse_loss(fake * mask, real * mask)
 
     def compute_recovery_loss(
         self,
@@ -749,11 +844,11 @@ class TorchFaciesGAN(
         rec = self.generator(
             rec_noise,
             self.noise_amps[: scale + 1],
-            in_noise=rec_in.to(self.device, non_blocking=True),
+            in_noise=rec_in,
             start_scale=scale,
             stop_scale=scale,
         )
-        rec_loss = self.alpha * F.mse_loss(rec, real.to(rec.device, non_blocking=True))
+        rec_loss = self.alpha * F.mse_loss(rec, real)
         return rec_loss
 
     def finalize_discriminator_scale(self, scale: int) -> None:
@@ -784,11 +879,20 @@ class TorchFaciesGAN(
             # this automatically for wrapped modules; we replicate it here).
             for p in self.discriminator.discs[scale].parameters():
                 dist.broadcast(p.data, src=0)
-        # Discriminator is intentionally NOT compiled even when
-        # ``_use_compile`` is True.  The R1 gradient penalty uses
-        # ``autograd.grad(create_graph=True)`` (double backward) which
-        # is incompatible with torch.compile.  The disc is small anyway
-        # so the throughput impact is negligible.
+
+        # Keep an uncompiled reference for gradient-penalty computation
+        # (``create_graph=True`` is incompatible with compiled graphs).
+        # Then compile the disc block for all regular forward passes.
+        # The two share the same underlying parameters so gradient
+        # updates through either are visible to both.
+        self._uncompiled_discs[scale] = self.discriminator.discs[scale]
+        if self._use_compile:
+            self.discriminator.discs[scale] = torch.compile(  # type: ignore[assignment]
+                self.discriminator.discs[scale],
+                fullgraph=True,
+                dynamic=False,
+                mode="max-autotune-no-cudagraphs",
+            )
 
     def finalize_generator_scale(self, scale: int, reinit: bool) -> None:
         """Finalize generator block after creation.
@@ -848,6 +952,9 @@ class TorchFaciesGAN(
         ):
             self.generator.gens[scale] = torch.compile(  # type: ignore[assignment]
                 self.generator.gens[scale],
+                fullgraph=True,
+                dynamic=False,
+                mode="max-autotune-no-cudagraphs",
             )
 
     def forward(
@@ -882,6 +989,31 @@ class TorchFaciesGAN(
         ScaleMetrics[torch.Tensor]:
             Container with discriminator and generator metrics for the scale.
         """
+        # ── Ensure all pyramid tensors reside on the compute device ──
+        # The data prefetcher already moves tensors to GPU on a side
+        # stream, so these calls are usually no-ops.  Using
+        # non_blocking=False avoids a race where the H2D copy hasn't
+        # finished before the first kernel reads the tensor.
+        dev = self.device
+        facies_pyramid = {
+            k: v.to(dev) for k, v in facies_pyramid.items()
+        }
+        rec_in_pyramid = {
+            k: v.to(dev) for k, v in rec_in_pyramid.items()
+        }
+        if wells_pyramid:
+            wells_pyramid = {
+                k: v.to(dev) for k, v in wells_pyramid.items()
+            }
+        if masks_pyramid:
+            masks_pyramid = {
+                k: v.to(dev) for k, v in masks_pyramid.items()
+            }
+        if seismic_pyramid:
+            seismic_pyramid = {
+                k: v.to(dev) for k, v in seismic_pyramid.items()
+            }
+
         disc_metrics_tuple = self.optimize_discriminator(
             indexes,
             discriminator_optimizers,
@@ -975,11 +1107,19 @@ class TorchFaciesGAN(
         s: torch.Tensor | None = None
 
         if well is not None:
-            w = well[indexes].to(self.device)
+            # .to() is a no-op when already on the correct device.
+            # Only fancy-index when the caller selected a strict subset
+            # of the batch (indexes == list(range(B)) is the common
+            # hot path — skip the copy).
+            w = well.to(self.device, non_blocking=True)
+            if w.shape[0] != batch:
+                w = w[indexes]
             noise_channels -= w.shape[1]
 
         if seismic is not None:
-            s = seismic[indexes].to(self.device)
+            s = seismic.to(self.device, non_blocking=True)
+            if s.shape[0] != batch:
+                s = s[indexes]
             noise_channels -= s.shape[1]
 
         z = utils.generate_noise(
@@ -1143,7 +1283,29 @@ class TorchFaciesGAN(
                 p.grad = torch.zeros_like(p.data)
         grads = [p.grad for p in params]
         flat = torch._utils._flatten_dense_tensors(grads)  # type: ignore[attr-defined]
-        dist.all_reduce(flat, op=dist.ReduceOp.AVG)  # type: ignore[arg-type]
+
+        try:
+            dist.all_reduce(flat, op=dist.ReduceOp.AVG)  # type: ignore[arg-type]
+        except RuntimeError as e:
+            # Log the error with rank information for debugging
+            rank = dist.get_rank() if dist.is_initialized() else -1
+            import logging
+
+            logger = logging.getLogger(__name__)
+            logger.error(f"[Rank {rank}] NCCL all_reduce failed: {e}")
+            logger.error(
+                f"[Rank {rank}] Params count: {len(params)}, Flat size: {flat.numel()}"  # type: ignore[attr-defined]
+            )
+            # Synchronize error state across ranks to prevent desync
+            if dist.is_initialized():
+                # Create an error indicator tensor
+                error_tensor = torch.tensor([1.0], device=flat.device)  # type: ignore
+                try:
+                    dist.all_reduce(error_tensor, op=dist.ReduceOp.MAX)  # type: ignore[attr-defined]
+                except:
+                    pass  # If this fails, we're already in deep trouble
+            raise
+
         for g, synced in zip(  # type: ignore[assignment]
             grads, torch._utils._unflatten_dense_tensors(flat, grads)  # type: ignore[attr-defined]
         ):

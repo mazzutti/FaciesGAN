@@ -10,6 +10,7 @@ from typing import Any, Self, cast
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint as ckpt_utils
 
 from models.generator import Generator
 from models.torch import utils
@@ -97,6 +98,12 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
         # and .state_dict() propagate to all per-scale gen blocks.
         self.gens = nn.ModuleList()  # type: ignore[assignment]
 
+        # Gradient (activation) checkpointing flag.  When True the
+        # per-scale gen blocks' activations are recomputed during
+        # backward instead of stored, trading ~30% more compute for
+        # significantly lower peak GPU memory.
+        self.use_gradient_checkpointing: bool = False
+
         # Color quantization layer (framework-specific)
         self.color_quantizer = TorchColorQuantization(temperature=0.1)
 
@@ -167,10 +174,15 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
             height, width = tuple(
                 dim - self.full_zero_padding for dim in z[start_scale].shape[2:]
             )
-            out_facie = torch.zeros(
+            device = z[start_scale].device
+            # Allocate in channels_last on CUDA to match conv weight layout
+            # and avoid implicit format conversions during forward.
+            out_facie: torch.Tensor = torch.zeros(
                 (batch_size, channels, height, width),
-                device=z[start_scale].device,
+                device=device,
             )
+            if device.type == "cuda":
+                out_facie = out_facie.to(memory_format=torch.channels_last)
         else:
             out_facie = in_noise
 
@@ -203,7 +215,19 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
                     out_facie, [self.zero_padding] * 4, value=0
                 )
 
-            out_facie = self.gens[index](z_in) + out_facie
+            if (
+                self.use_gradient_checkpointing
+                and self.training
+                and z_in.requires_grad
+            ):
+                # Recompute this block's activations during backward.
+                # use_reentrant=False is the recommended mode (no
+                # nesting caveats, compatible with compiled models).
+                out_facie = cast(torch.Tensor, ckpt_utils.checkpoint(  # type: ignore[misc]
+                    self.gens[index], z_in, use_reentrant=False
+                )) + out_facie
+            else:
+                out_facie = self.gens[index](z_in) + out_facie
 
             # Clamp to [-1, 1] after each scale so the progressive
             # residuals stay within the tanh / color-palette range.

@@ -62,6 +62,10 @@ def generate_noise(
 ) -> torch.Tensor:
     """Generate a random noise tensor with specified dimensions.
 
+    On CUDA the tensor is created in ``channels_last`` memory format so
+    downstream convolutions (which use ``channels_last`` weights) avoid an
+    implicit layout conversion on every forward call.
+
     Parameters
     ----------
     size : tuple[int, ...]
@@ -80,9 +84,14 @@ def generate_noise(
         Random tensor sampled from standard normal distribution with shape
         (num_samp, channels, height/scale, width/scale).
     """
-    noise = torch.randn(
-        num_samp, size[0], *[round(s / scale) for s in size[1:]], device=device
-    )
+    shape = (num_samp, size[0], *[round(s / scale) for s in size[1:]])
+    if device.type == "cuda" and len(shape) == 4:
+        # Allocate directly in channels_last layout — avoids a copy
+        # compared to randn(...).to(memory_format=channels_last).
+        noise = torch.empty(shape, device=device, memory_format=torch.channels_last)
+        noise.normal_()
+    else:
+        noise = torch.randn(*shape, device=device)
     if scale != 1:
         noise = interpolate(noise, size[1:])
     return noise

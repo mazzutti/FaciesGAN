@@ -150,6 +150,45 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         self.gp_interval: int = getattr(options, "gp_interval", 8)
         self._disc_step_counter: int = 0
 
+        # Per-scale loss normalization factors: track discriminator output
+        # magnitude to normalize losses across scales. Without normalization,
+        # coarse scales (e.g., scale 0) produce much larger D outputs and
+        # dominate training. Uses exponential moving average for stability.
+        self.loss_scale_factors: dict[int, float] = {}
+
+        # EMA decay for loss scale factor updates (0.99 = slow update)
+        self.loss_scale_ema_decay: float = getattr(
+            options, "loss_scale_ema_decay", 0.99
+        )
+
+    def update_loss_scale_factor(self, scale: int, d_mag: float) -> None:
+        """Update the EMA loss scale factor for a given scale.
+
+        Called after discriminator forward (outside autodiff) to track
+        discriminator output magnitude per scale.
+
+        Parameters
+        ----------
+        scale : int
+            Pyramid scale index.
+        d_mag : float
+            Discriminator output magnitude (|real_loss| + |fake_loss|).
+        """
+        if scale not in self.loss_scale_factors:
+            self.loss_scale_factors[scale] = d_mag if d_mag > 0 else 1.0
+        else:
+            decay = self.loss_scale_ema_decay
+            self.loss_scale_factors[scale] = (
+                decay * self.loss_scale_factors[scale] + (1 - decay) * d_mag
+            )
+
+    def get_loss_scale_factor(self, scale: int) -> float:
+        """Return the current loss normalization factor for a scale.
+
+        Returns 1.0 if no factor has been recorded yet (first iteration).
+        """
+        return max(self.loss_scale_factors.get(scale, 1.0), 1e-4)
+
     @abstractmethod
     def __call__(
         self, *args: Any, **kwds: Any

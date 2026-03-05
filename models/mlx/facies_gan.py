@@ -234,6 +234,17 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
         params = cast(dict[str, Any], self.discriminator.discs[scale].parameters())
         metrics.total, gradients = mx.value_and_grad(compute_metrics)(params)  # type: ignore
 
+        # Update scale factor AFTER autodiff (no side effects during gradient computation).
+        d_mag = float((metrics.real.abs() + metrics.fake.abs()).astype(mx.float32))
+        self.update_loss_scale_factor(scale, d_mag)
+        sf = self.get_loss_scale_factor(scale)
+
+        # Normalize logged metrics (gradients already computed from raw losses)
+        metrics.real = metrics.real / sf
+        metrics.fake = metrics.fake / sf
+        metrics.gp = metrics.gp / sf
+        metrics.total = metrics.total / sf
+
         # Return gradients so they can be passed to update_discriminator_weights
         return metrics, cast(dict[str, Any], gradients)
 
@@ -313,6 +324,12 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Mo
 
         params = cast(dict[str, Any], self.generator.gens[scale].parameters())
         metrics.total, gradients = mx.value_and_grad(compute_metrics)(params)  # type: ignore
+
+        # Per-scale loss normalization (consistent with discriminator).
+        # D runs first and populates scale factors; G reads them.
+        sf = self.get_loss_scale_factor(scale)
+        metrics.fake = metrics.fake / sf
+        metrics.total = metrics.total / sf
 
         return metrics, cast(dict[str, Any], gradients)
 

@@ -84,9 +84,11 @@ class TorchDataPrefetcher(DataPrefetcher[torch.Tensor]):
                 scale: utils.to_device(wells[scale], self.device, channels_last=True)
                 for scale in self.scales
             }
-            # Masks are computed from the device-resident well tensors
+            # Masks are computed from the device-resident well tensors.
+            # Use float (not int) so downstream multiplications with
+            # float feature maps avoid an implicit dtype promotion cast.
             masks_pyramid: dict[int, torch.Tensor] = {
-                scale: (w.abs().sum(dim=1, keepdim=True) > 0).int()
+                scale: (w.abs().sum(dim=1, keepdim=True) > 0).float()
                 for scale, w in wells_pyramid.items()
             }
         else:

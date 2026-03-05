@@ -18,6 +18,39 @@ from datetime import datetime
 os.environ.setdefault("TORCH_LOGS", "-dynamo")
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
 
+
+# ---------------------------------------------------------------------------
+# Silence harmless resource_tracker KeyError tracebacks at exit.
+#
+# loky (used by joblib.Memory for pyramid caching) creates POSIX shared-
+# memory segments and cleans them up on its own.  Python 3.12's
+# multiprocessing.resource_tracker daemon still has them registered and
+# prints noisy KeyError tracebacks when it later tries to double-clean.
+#
+# The tracker is a separate process so we cannot monkey-patch it.  Instead,
+# we register an atexit handler that terminates the tracker daemon before
+# it enters the cleanup-and-warn code path.  Because loky already unlinked
+# every segment it created, nothing actually leaks.
+# ---------------------------------------------------------------------------
+def _silence_resource_tracker() -> None:
+    try:
+        from multiprocessing.resource_tracker import (
+            _resource_tracker,  # type: ignore[attr-defined]cd
+        )
+
+        if _resource_tracker._pid is not None:  # type: ignore[union-attr]
+            os.kill(_resource_tracker._pid, signal.SIGKILL)  # type: ignore[arg-type]
+            os.waitpid(_resource_tracker._pid, 0)  # type: ignore[arg-type]
+            _resource_tracker._pid = None  # type: ignore[assignment]
+        if _resource_tracker._fd is not None:  # type: ignore[union-attr]
+            os.close(_resource_tracker._fd)  # type: ignore[arg-type]
+            _resource_tracker._fd = None  # type: ignore[assignment]
+    except Exception:
+        pass
+
+
+atexit.register(_silence_resource_tracker)
+
 import torch
 import torch.distributed as dist
 from dateutil import tz
@@ -264,6 +297,16 @@ def get_arguments() -> ArgumentParser:
         action="store_true",
         help="Hand off orchestration to compiled C library via ctypes (thin wrapper)",
     )
+    parser.add_argument(
+        "--gradient-checkpoint",
+        action="store_true",
+        help=(
+            "Enable activation checkpointing on generator blocks.  Trades "
+            "~30%% extra compute for significantly lower peak GPU memory, "
+            "allowing larger batch sizes.  Incompatible with torch.compile "
+            "(compile is automatically disabled when this flag is set)."
+        ),
+    )
 
     return parser
 
@@ -321,6 +364,17 @@ def main() -> None:
         # Default to True for CUDA when --no-compile is not set
         if torch.cuda.is_available():
             options.compile_backend = True
+
+    # Handle --gradient-checkpoint (incompatible with torch.compile)
+    if hasattr(options, "gradient_checkpoint") and options.gradient_checkpoint:
+        options.gradient_checkpointing = True
+        # torch.compile reorders saved tensors in a way that breaks
+        # checkpoint recomputation metadata — disable it when
+        # checkpointing is active.
+        options.compile_backend = False
+    else:
+        if not hasattr(options, "gradient_checkpointing"):
+            options.gradient_checkpointing = False
 
     if options.manual_seed is not None:
         random.seed(options.manual_seed)

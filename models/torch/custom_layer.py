@@ -56,6 +56,7 @@ class TorchConvBlock(nn.Sequential):
                 kernel_size=kernel_size,
                 stride=stride,
                 padding=padding,
+                bias=False,  # InstanceNorm2d(affine=True) has its own bias
             ),
         )
         self.add_module("norm", nn.InstanceNorm2d(out_channels, affine=True))
@@ -100,6 +101,7 @@ class TorchDiscConvBlock(nn.Sequential):
                 kernel_size=kernel_size,
                 stride=stride,
                 padding=padding,
+                bias=False,  # InstanceNorm2d(affine=True) has its own bias
             ),
         )
         self.add_module("norm", nn.InstanceNorm2d(out_channels, affine=True))
@@ -493,8 +495,39 @@ class TorchColorQuantization(nn.Module):
         )
         self.pure_colors: torch.Tensor
 
+    def _sq_distances_nchw(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute squared distances from each pixel to each palette color.
+
+        Operates entirely in NCHW layout using ``einsum`` to avoid the
+        two expensive ``permute().contiguous()`` round-trips that the
+        previous implementation required.
+
+        Parameters
+        ----------
+        x : torch.Tensor
+            Input tensor of shape ``(B, 3, H, W)``.
+
+        Returns
+        -------
+        torch.Tensor
+            Squared-distance tensor of shape ``(B, K, H, W)`` where *K*
+            is the palette size.
+        """
+        colors = self.pure_colors  # (K, 3)
+        # ||x||^2 per-pixel: (B, 1, H, W)
+        x_sq = (x * x).sum(dim=1, keepdim=True)
+        # ||c||^2 per-color: (K,) → (1, K, 1, 1) for broadcasting
+        c_sq = (colors * colors).sum(dim=1).reshape(1, -1, 1, 1)
+        # x·c per color: (B, K, H, W)
+        dot = torch.einsum("bchw,kc->bkhw", x, colors)
+        return x_sq + c_sq - 2 * dot
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Quantize RGB output to pure colors.
+
+        All computation stays in NCHW layout via ``einsum``, eliminating
+        the two ``permute().contiguous()`` copies per forward pass that
+        the original implementation paid.
 
         Parameters
         ----------
@@ -506,43 +539,15 @@ class TorchColorQuantization(nn.Module):
         torch.Tensor
             Quantized tensor with same shape.
         """
-        # Ensure pure_colors lives on the same device as the input tensor
-        # (needed for multi-GPU setups where scales run on different devices).
-        pure_colors = self.pure_colors.to(x.device)
+        colors = self.pure_colors  # (K, 3)
+        distances = self._sq_distances_nchw(x)  # (B, K, H, W)
 
         if not self.training:
-            # Hard quantization during inference
-            b, c, h, w = x.shape
-            # Use contiguous to avoid view issues
-            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)
+            # Hard quantization — one-hot argmin then einsum back to (B,3,H,W)
+            indices = distances.argmin(dim=1, keepdim=True)  # (B, 1, H, W)
+            one_hot = torch.zeros_like(distances).scatter_(1, indices, 1.0)
+            return torch.einsum("bkhw,kc->bchw", one_hot, colors)
 
-            # Calculate distances to pure colors using explicit operations
-            # Avoid cdist which can create complex views
-            # ||x - c||^2 = ||x||^2 + ||c||^2 - 2*x*c
-            x_norm = (x_flat**2).sum(dim=1, keepdim=True)
-            c_norm = (pure_colors**2).sum(dim=1, keepdim=True)
-            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, pure_colors.t())
-
-            # Get nearest color
-            indices = torch.argmin(distances, dim=1)
-            quantized = pure_colors[indices]
-
-            return quantized.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
-        else:
-            # Soft quantization during training (differentiable)
-            b, c, h, w = x.shape
-            # Use contiguous to avoid view issues
-            x_flat = x.permute(0, 2, 3, 1).contiguous().view(-1, 3)
-
-            # Calculate distances using explicit operations (avoid cdist)
-            x_norm = (x_flat**2).sum(dim=1, keepdim=True)
-            c_norm = (pure_colors**2).sum(dim=1, keepdim=True)
-            distances = x_norm + c_norm.t() - 2 * torch.mm(x_flat, pure_colors.t())
-
-            # Soft assignment using softmax
-            weights = F.softmax(-distances / self.temperature, dim=1)
-
-            # Weighted sum of pure colors
-            quantized = torch.mm(weights, pure_colors)
-
-            return quantized.view(b, h, w, c).permute(0, 3, 1, 2).contiguous()
+        # Soft (differentiable) quantization during training
+        weights = F.softmax(-distances / self.temperature, dim=1)  # (B, K, H, W)
+        return torch.einsum("bkhw,kc->bchw", weights, colors)

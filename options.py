@@ -75,6 +75,7 @@ class TrainningOptions(argparse.Namespace):
         enable_plot_facies: bool = True,
         compile_backend: bool = False,
         gp_interval: int = 8,
+        gradient_checkpointing: bool = False,
     ) -> None:
         """Create a TrainningOptions namespace with defaults for training.
 
@@ -237,6 +238,7 @@ class TrainningOptions(argparse.Namespace):
         self.enable_plot_facies = enable_plot_facies
         self.compile_backend = compile_backend
         self.gp_interval = gp_interval
+        self.gradient_checkpointing = gradient_checkpointing
 
 
 class ResumeOptions(argparse.Namespace):

@@ -498,13 +498,14 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 seismic_pyramid,
             )
 
-            if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
-                generated_samples = self.generate_visualization_samples(
-                    scales,
-                    indexes,
-                    wells_pyramid,
-                    seismic_pyramid,
-                )
+            if (epoch + 1) % 200 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
+                if self._is_main_process:
+                    generated_samples = self.generate_visualization_samples(
+                        scales,
+                        indexes,
+                        wells_pyramid,
+                        seismic_pyramid,
+                    )
 
             self.handle_epoch_end(  # type: ignore
                 scales=scales,
@@ -801,11 +802,14 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 lines.append("  └" + "─" * 99 + "┘")
                 progress.write("\n".join(lines))  # type: ignore
 
-            # Save to TensorBoard and log per-scale
-            for scale in scales:
-                g = scale_metrics.generator[scale]
-                d = scale_metrics.discriminator[scale]
-                self.log_epoch(progress, writers[scale], epoch, g, d)  # type: ignore
+            # Save to TensorBoard and log per-scale (only when TB is
+            # enabled — each call does a GPU→CPU sync via torch.stack().tolist();
+            # skipping it avoids 14 000 syncs / 126 000 TB writes per batch).
+            if self.enable_tensorboard:
+                for scale in scales:
+                    g = scale_metrics.generator[scale]
+                    d = scale_metrics.discriminator[scale]
+                    self.log_epoch(progress, writers[scale], epoch, g, d)  # type: ignore
 
             # Save generated facies at intervals
             if (epoch % self.save_interval == 0 or epoch == self.num_iter - 1) and (
@@ -944,9 +948,11 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             # Only main process creates directories, writers
             writers: dict[int, SummaryWriter] = {}
             if self._is_main_process:
-                writers = {
-                    s: SummaryWriter(log_dir=scale_paths[s]) for s in scales_to_train
-                }
+                if self.enable_tensorboard:
+                    writers = {
+                        s: SummaryWriter(log_dir=scale_paths[s])
+                        for s in scales_to_train
+                    }
                 for s in scales_to_train:
                     utils.create_dirs(scale_paths[s])
                     utils.create_dirs(results_paths[s])

@@ -36,8 +36,6 @@
     "scripts/": true
   },
   "python.analysis.exclude": [
-    "**/.venv/**",
-    "**/.venv/**/site-packages/**",
     "**/__pycache__",
     "**/.pytest_cache",
     "results/",
@@ -48,7 +46,10 @@
     "build-asan/",
     "tools/",
     "scripts/",
-    "data/"
+    "data/", 
+    "**/node_modules", 
+    "**/.*", 
+    ".venv"
   ],
   "editor.defaultFormatter": "ms-python.black-formatter",
   "python.analysis.enableTroubleshootMissingImports": true,
@@ -63,6 +64,12 @@
   "python.analysis.useLibraryCodeForTypes": true,
   "python.analysis.indexing": false,
   "python.analysis.autoSearchPaths": true,
+  "python.analysis.extraPaths": [
+    "../tools/pytorch"
+  ],
+  "python.autoComplete.extraPaths": [
+    "../tools/pytorch"
+  ],
   "editor.codeActionsOnSave": {
     "source.organizeImports": "always"
   },
