@@ -30,7 +30,7 @@ from models.torch import utils
 from models.torch.discriminator import TorchDiscriminator
 from models.torch.generator import TorchGenerator
 from options import TrainningOptions
-from trainning.metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
+from metrics import DiscriminatorMetrics, GeneratorMetrics, ScaleMetrics
 
 
 def unwrap_ddp(module: nn.Module) -> nn.Module:
@@ -116,7 +116,6 @@ class TorchFaciesGAN(
         # Pre-allocate constant zero scalars on device so the hot path
         # avoids repeated small CUDA allocations.
         self._zero_scalar = torch.tensor(0.0, device=device)
-        self._zero_one = torch.zeros(1, device=device)
 
         # Gradient (activation) checkpointing trades compute for memory.
         self._use_gradient_checkpointing = getattr(
@@ -142,15 +141,17 @@ class TorchFaciesGAN(
         # Uses dynamic=False so each (H,W) gets an optimally-specialised
         # graph.  The cache_size_limit above is raised to accommodate
         # all scale×batch-size variants without hitting the recompile cap.
-        # CUDA graphs are disabled because the quantizer is called with
-        # different spatial shapes across scales.
+        # The quantizer output flows into non-compiled discriminator
+        # and loss code, so CUDA graphs would overwrite its output
+        # buffer before consumers read it.  Use "default" mode (Inductor
+        # fusion only, no CUDA graphs) to avoid the stale-tensor error.
         if self._use_compile:
             gen = cast(TorchGenerator, self.generator)
             gen.color_quantizer = torch.compile(  # type: ignore[assignment]
                 gen.color_quantizer,
                 fullgraph=True,
                 dynamic=False,
-                mode="max-autotune-no-cudagraphs",
+                mode="default",
             )
 
     def __call__(self, *args: Any, **kwds: Any) -> ScaleMetrics[torch.Tensor]:
@@ -538,6 +539,10 @@ class TorchFaciesGAN(
                     continue
                 self._grad_scaler_g.unscale_(optimizers[scale])
                 self._grad_scaler_g.step(optimizers[scale])
+                # GradScaler may skip optimizer.step() when inf/nan
+                # gradients are detected, leaving _opt_called unset
+                # and causing a spurious LRScheduler warning.
+                optimizers[scale]._opt_called = True  # type: ignore[attr-defined]
 
             # Restore requires_grad on remaining blocks for next step.
             for s in sorted_scales:
@@ -803,7 +808,7 @@ class TorchFaciesGAN(
                 `self.well_loss_penalty`, or zero if no wells are used.
         """
         if well is None or mask is None:
-            return self._zero_one
+            return self._zero_scalar
         return self.well_loss_penalty * F.mse_loss(fake * mask, real * mask)
 
     def compute_recovery_loss(
@@ -837,7 +842,7 @@ class TorchFaciesGAN(
                 or zero when recovery is disabled.
         """
         if self.alpha == 0:
-            return self._zero_one
+            return self._zero_scalar
         rec_noise = self.get_pyramid_noise(
             scale,
             indexes,
@@ -896,7 +901,6 @@ class TorchFaciesGAN(
                 self.discriminator.discs[scale],
                 fullgraph=True,
                 dynamic=False,
-                mode="max-autotune-no-cudagraphs",
             )
 
     def finalize_generator_scale(self, scale: int, reinit: bool) -> None:
@@ -959,7 +963,6 @@ class TorchFaciesGAN(
                 self.generator.gens[scale],
                 fullgraph=True,
                 dynamic=False,
-                mode="max-autotune-no-cudagraphs",
             )
 
     def forward(
@@ -1183,7 +1186,8 @@ class TorchFaciesGAN(
         """Load discriminator state dict for `scale` from `scale_path` if present.
 
         Handles DDP-wrapped modules by loading into the inner
-        ``.module`` when applicable.
+        ``.module`` when applicable.  Also normalises ``_orig_mod.``
+        prefix from ``torch.compile``.
 
         Args:
             scale_path (str): Directory path for the given scale.
@@ -1191,15 +1195,31 @@ class TorchFaciesGAN(
         """
         disc_path = os.path.join(scale_path, D_FILE)
         if os.path.exists(disc_path):
-            unwrap_ddp(self.discriminator.discs[scale]).load_state_dict(
-                torch.load(disc_path, map_location=self.device)
-            )
+            state = torch.load(disc_path, map_location=self.device)
+            target = unwrap_ddp(self.discriminator.discs[scale])
+            model_keys = set(target.state_dict().keys())
+            ck_keys = set(state.keys())
+            prefix = "_orig_mod."
+            if any(k.startswith(prefix) for k in ck_keys) and not any(
+                k.startswith(prefix) for k in model_keys
+            ):
+                state = {
+                    (k[len(prefix) :] if k.startswith(prefix) else k): v
+                    for k, v in state.items()
+                }
+            elif any(k.startswith(prefix) for k in model_keys) and not any(
+                k.startswith(prefix) for k in ck_keys
+            ):
+                state = {f"{prefix}{k}": v for k, v in state.items()}
+            target.load_state_dict(state)
 
     def load_generator_state(self, scale_path: str, scale: int) -> None:
         """Load generator state dict for the latest generator in the scale.
 
         Handles DDP-wrapped modules by loading into the inner
-        ``.module`` when applicable.
+        ``.module`` when applicable.  Also strips the ``_orig_mod.``
+        prefix added by ``torch.compile`` when the current model is
+        uncompiled (and vice-versa).
 
         Args:
             scale_path (str): Directory path for the given scale.
@@ -1207,9 +1227,25 @@ class TorchFaciesGAN(
         """
         gen_path = os.path.join(scale_path, G_FILE)
         if os.path.exists(gen_path):
-            unwrap_ddp(self.generator.gens[scale]).load_state_dict(
-                torch.load(gen_path, map_location=self.device)
-            )
+            state = torch.load(gen_path, map_location=self.device)
+            target = unwrap_ddp(self.generator.gens[scale])
+            model_keys = set(target.state_dict().keys())
+            ck_keys = set(state.keys())
+            prefix = "_orig_mod."
+            # Checkpoint has prefix but model does not → strip it
+            if any(k.startswith(prefix) for k in ck_keys) and not any(
+                k.startswith(prefix) for k in model_keys
+            ):
+                state = {
+                    (k[len(prefix) :] if k.startswith(prefix) else k): v
+                    for k, v in state.items()
+                }
+            # Model has prefix but checkpoint does not → add it
+            elif any(k.startswith(prefix) for k in model_keys) and not any(
+                k.startswith(prefix) for k in ck_keys
+            ):
+                state = {f"{prefix}{k}": v for k, v in state.items()}
+            target.load_state_dict(state)
 
     def load_shape(self, scale_path: str) -> None:
         """Load saved shape tensor for a scale and append to `self.shapes`.
@@ -1330,6 +1366,9 @@ class TorchFaciesGAN(
             self._allreduce_grads(self.generator.gens[scale])
         self._grad_scaler_g.unscale_(optimizer)
         self._grad_scaler_g.step(optimizer)
+        # GradScaler may skip optimizer.step() on inf/nan, leaving
+        # _opt_called unset → spurious LRScheduler warning.
+        optimizer._opt_called = True  # type: ignore[attr-defined]
         # NOTE: scaler.update() is called once per G iteration in
         # optimize_generator, not here — calling it per-scale would
         # adjust the scale factor 7× too often.

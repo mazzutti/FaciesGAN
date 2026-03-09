@@ -6,13 +6,11 @@ facies, and provide simple MDS visualizations. It is primarily a
 convenience script used offline after training.
 """
 
-import copy
 import json
 import os
 import random
 import time
 from argparse import ArgumentParser
-from types import SimpleNamespace
 
 import numpy as np
 import tifffile as tif
@@ -30,11 +28,19 @@ from config import OPT_FILE
 from datasets.torch.dataset import TorchPyramidsDataset
 from log import format_time
 from models.torch.facies_gan import TorchFaciesGAN
+from options import TrainningOptions
 import utils
 
 
 def generate_facies(
-    model: TorchFaciesGAN, how_many: int, model_path: str, options: SimpleNamespace
+    model: TorchFaciesGAN,
+    how_many: int,
+    model_path: str,
+    options: TrainningOptions,
+    dataset: TorchPyramidsDataset | None = None,
+    *,
+    wells_pyramid: dict[int, torch.Tensor] | None = None,
+    seismic_pyramid: dict[int, torch.Tensor] | None = None,
 ) -> tuple[list[NDArray[np.float32]], list[int]]:
     """Generate facies realizations using trained FaciesGAN model.
 
@@ -43,14 +49,22 @@ def generate_facies(
 
     Parameters
     ----------
-    model : FaciesGAN
+    model : TorchFaciesGAN
         FaciesGAN model instance.
     how_many : int
         Number of facies realizations to generate.
     model_path : str
         Path to directory containing trained model checkpoints.
-    options : SimpleNamespace
+    options : TrainningOptions
         Generation options including wells, rec flag, etc.
+    dataset : TorchPyramidsDataset | None
+        Dataset providing wells/seismic conditioning pyramids.  Can be
+        omitted when *wells_pyramid* and *seismic_pyramid* are supplied
+        directly (avoids the expensive facies-pyramid construction).
+    wells_pyramid : dict[int, torch.Tensor] | None
+        Pre-built wells conditioning dict keyed by scale index.
+    seismic_pyramid : dict[int, torch.Tensor] | None
+        Pre-built seismic conditioning dict keyed by scale index.
 
     Returns
     -------
@@ -60,25 +74,51 @@ def generate_facies(
         indices used.
     """
     model.load(model_path, load_discriminator=False, load_wells=False)
-    # model.generator.eval()
 
     mask_indexes = list(random.choice(options.wells) for _ in range(how_many))
 
     # Get the highest scale (finest resolution)
     max_scale = len(model.noise_amps) - 1
 
+    # Build conditioning pyramids from dataset (if not supplied directly)
+    if wells_pyramid is None or seismic_pyramid is None:
+        assert (
+            dataset is not None
+        ), "Either dataset or both wells_pyramid/seismic_pyramid must be provided"
+        wells_pyramid, seismic_pyramid = _build_conditioning_pyramids(
+            dataset, max_scale, options
+        )
+
     # Generate noise for the maximum scale
-    if options.rec:
-        noises = model.get_pyramid_noise(max_scale, mask_indexes, rec=True)
-    else:
-        noises = model.get_pyramid_noise(max_scale, mask_indexes, rec=False)
+    noises = model.get_pyramid_noise(
+        max_scale, mask_indexes, wells_pyramid, seismic_pyramid, rec=options.rec
+    )
 
     with torch.no_grad():
         generated_facies: list[NDArray[np.float32]] = [
             utils.torch2np(gen_facie.unsqueeze(0), denormalize=True)
-            for gen_facie in model.generator(noises, model.noise_amps)
+            for gen_facie in model.generator(
+                noises, model.get_noise_aplitude(max_scale)
+            )
         ]
     return generated_facies, mask_indexes
+
+
+def _build_conditioning_pyramids(
+    dataset: TorchPyramidsDataset,
+    max_scale: int,
+    options: TrainningOptions,
+) -> tuple[dict[int, torch.Tensor], dict[int, torch.Tensor]]:
+    """Build wells and seismic conditioning pyramid dicts from dataset."""
+    wells_pyramid: dict[int, torch.Tensor] = {}
+    seismic_pyramid: dict[int, torch.Tensor] = {}
+    for s in range(max_scale + 1):
+        _, wells_s, seismic_s = dataset.get_scale_data(s)
+        if options.use_wells and wells_s.numel() > 0:
+            wells_pyramid[s] = wells_s
+        if options.use_seismic and seismic_s.numel() > 0:
+            seismic_pyramid[s] = seismic_s
+    return wells_pyramid, seismic_pyramid
 
 
 def generate_comparison_plots(
@@ -86,6 +126,7 @@ def generate_comparison_plots(
     dataset: TorchPyramidsDataset,
     model_path: str,
     out_path: str,
+    options: TrainningOptions,
     num_generated: int = 3,
     num_real: int = 5,
     scale: int | None = None,
@@ -97,14 +138,16 @@ def generate_comparison_plots(
 
     Parameters
     ----------
-    model : FaciesGAN
+    model : TorchFaciesGAN
         Trained FaciesGAN model instance.
-    dataset : PyramidsDataset
+    dataset : TorchPyramidsDataset
         Dataset containing facies and wells pyramids.
     model_path : str
         Path to directory containing trained model checkpoints.
     out_path : str
         Directory to save the comparison plots.
+    options : TrainningOptions
+        Training options (needed for use_wells / use_seismic flags).
     num_generated : int, optional
         Number of generated variants per real facies. Defaults to 3.
     num_real : int, optional
@@ -113,11 +156,15 @@ def generate_comparison_plots(
         Pyramid scale to use. If None, uses the finest scale. Defaults to None.
     """
     model.load(model_path, load_discriminator=False, load_wells=False)
-    # model.generator.eval()
 
     # Use finest scale if not specified
     if scale is None:
         scale = len(model.noise_amps) - 1
+
+    # Build conditioning pyramids from dataset
+    wells_pyramid, seismic_pyramid = _build_conditioning_pyramids(
+        dataset, scale, options
+    )
 
     facies_scale, wells_scale, _ = dataset.get_scale_data(scale)
     num_images = facies_scale.shape[0]
@@ -134,7 +181,7 @@ def generate_comparison_plots(
         real = facies_scale[start:end]
 
         # Build masks from wells
-        if len(wells_scale) > 0:
+        if wells_scale.numel() > 0:
             wells = wells_scale[start:end]
             masks = (wells.abs().sum(dim=1, keepdim=True) > 0).float()
         else:
@@ -143,10 +190,14 @@ def generate_comparison_plots(
         # Generate fake samples using the trained model
         fake_list: list[torch.Tensor] = []
         for i_idx in range(start, end):
-            noises = model.get_pyramid_noise(scale, [i_idx] * num_generated, rec=False)
+            noises = model.get_pyramid_noise(
+                scale, [i_idx] * num_generated, wells_pyramid, seismic_pyramid
+            )
             with torch.no_grad():
                 fake = model.generator(
-                    noises, model.noise_amps[: scale + 1], stop_scale=scale
+                    noises,
+                    model.get_noise_aplitude(scale),
+                    stop_scale=scale,
                 )
                 fake_list.append(fake.detach().cpu())
 
@@ -162,7 +213,9 @@ def generate_comparison_plots(
 def plot_mds(
     fake_facies: list[NDArray[np.float32]],
     mask_indexes: list[int],
-    options: SimpleNamespace,
+    options: TrainningOptions,
+    dataset: TorchPyramidsDataset,
+    save_path: str | None = None,
 ) -> None:
     """Plot MDS embedding comparing real and generated facies.
 
@@ -173,13 +226,20 @@ def plot_mds(
     mask_indexes : list[int]
         Indices used for well-based conditioning corresponding to the generated
         facies.
-    options : SimpleNamespace
-        Options namespace containing dataset indices and other generation flags.
+    options : TrainningOptions
+        Options containing dataset indices and other generation flags.
+    dataset : TorchPyramidsDataset
+        Dataset providing real facies data for comparison.
+    save_path : str | None, optional
+        If provided, save the plot to this file path instead of showing
+        it interactively.
     """
     # fake_facies parameter is a list of numpy arrays. Do not rebind the parameter
     # to an ndarray (which would violate the annotated type). Use a new local
     # variable for the stacked ndarray representation.
-    fake_facies_arr = np.stack(fake_facies, 0).squeeze(-1)
+    fake_facies_arr = np.stack(fake_facies, 0)
+    if fake_facies_arr.shape[-1] == 1:
+        fake_facies_arr = fake_facies_arr.squeeze(-1)
     real_facies, _, _ = dataset.get_scale_data(-1)
     real_facies = np.reshape(
         utils.torch2np(real_facies, denormalize=True),
@@ -194,7 +254,9 @@ def plot_mds(
         max_iter=3000,
         eps=1e-9,
         random_state=np.random.RandomState(seed=3),
-        dissimilarity="precomputed",
+        metric="precomputed",
+        n_init=4,
+        init="random",  # type: ignore
         n_jobs=1,
         normalized_stress="auto",
     )
@@ -211,7 +273,11 @@ def plot_mds(
     plt.xlabel("MDS Dimension 1")  # type: ignore
     plt.ylabel("MDS Dimension 2")  # type: ignore
     plt.legend(("Real Facies", "Fake Facies"), loc="upper right")  # type: ignore
-    plt.show()  # type: ignore
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")  # type: ignore
+        plt.close()  # type: ignore
+    else:
+        plt.show()  # type: ignore
 
 
 if __name__ == "__main__":
@@ -273,8 +339,9 @@ if __name__ == "__main__":
     if arguments.out_path is None:
         arguments.out_path = arguments.model_path
 
-    if not os.path.exists(arguments.out_path):
-        os.makedirs(arguments.out_path)
+    # Place generated images in a dedicated subdirectory
+    gen_output = os.path.join(arguments.out_path, "generated")
+    os.makedirs(gen_output, exist_ok=True)
 
     if torch.cuda.is_available():
         device = torch.device(f"cuda:{arguments.gpu_device}")
@@ -284,57 +351,67 @@ if __name__ == "__main__":
         device = torch.device(f"cpu:{arguments.gpu_device}")
 
     with open(os.path.join(arguments.model_path, OPT_FILE), "r") as f:
-        args = json.load(f, object_hook=lambda x: SimpleNamespace(**x))
-        args.use_gpu = arguments.use_gpu
-        args.rec = arguments.rec
-        args.wells = arguments.wells
-        args.device = device
-        args.data_dir = "data"
+        json_data = json.load(f)
+
+    # Build a proper TrainningOptions from the saved JSON and CLI overrides,
+    # filtering out keys not accepted by TrainningOptions (e.g. output_fullpath).
+    import inspect
+
+    _valid_keys = set(inspect.signature(TrainningOptions.__init__).parameters) - {
+        "self"
+    }
+    args = TrainningOptions(**{k: v for k, v in json_data.items() if k in _valid_keys})
+    args.rec = arguments.rec
+    args.wells = arguments.wells
+    args.device = device
+    args.compile_backend = False  # no need to compile for one-shot generation
 
     start_time = time.time()
 
     print("Generating facies...")
 
-    options = copy.copy(args)
-
-    dataset: TorchPyramidsDataset = TorchPyramidsDataset(options)
+    dataset: TorchPyramidsDataset = TorchPyramidsDataset(args)
     masked_facies: list[torch.Tensor] = []
 
     for i in range(len(dataset)):
-        masked_facies.append(
-            torch.stack(
-                [
-                    mask * facie
-                    for mask, facie in zip(
-                        dataset.get_scale_data(i), dataset.get_scale_data(i)
-                    )
-                ],
-                dim=0,
-            )
-        )
-    faciesGAN = TorchFaciesGAN(options=args, device=args.device)
+        facies_s, wells_s, _ = dataset.get_scale_data(i)
+        if wells_s.numel() > 0:
+            masks_s = (wells_s.abs().sum(dim=1, keepdim=True) > 0).float()
+            masked_facies.append(facies_s * masks_s)
+        else:
+            masked_facies.append(facies_s)
+
+    noise_ch = (
+        args.noise_channels
+        + (args.num_img_channels if args.use_wells else 0)
+        + (args.num_img_channels if args.use_seismic else 0)
+    )
+    faciesGAN = TorchFaciesGAN(options=args, device=device, noise_channels=noise_ch)
 
     if arguments.comparison_plots:
         # Generate comparison plots instead of individual facies
+        comparison_out = os.path.join(gen_output, "comparison_plots")
+        os.makedirs(comparison_out, exist_ok=True)
         generate_comparison_plots(
             faciesGAN,
             dataset,
             arguments.model_path,
-            arguments.out_path,
+            comparison_out,
+            options=args,
             num_generated=arguments.num_generated,
             num_real=arguments.num_real,
             scale=arguments.plot_scale,
         )
-        print(f"Comparison plots saved to '{arguments.out_path}'.")
+        print(f"Comparison plots saved to '{comparison_out}'.")
         print(f"Total time: {format_time(int(time.time() - start_time))}")
         exit(0)
 
     facies, mi = generate_facies(
-        faciesGAN, arguments.how_many, arguments.model_path, args
+        faciesGAN, arguments.how_many, arguments.model_path, args, dataset
     )
 
     if arguments.plot_mds:
-        plot_mds(facies, mi, args)
+        plot_mds(facies, mi, args, dataset)
     if arguments.plot_well_mask:
         for i, (facie, masked_facie) in enumerate(
             zip(facies, [masked_facies[-1][i] for i in mi]), 1
@@ -363,17 +440,13 @@ if __name__ == "__main__":
             axes.set_yticks([])  # type: ignore
             axes.axis("off")  # type: ignore
 
-            out_file = os.path.join(arguments.out_path, f"generated_facie_{i}.tif")
+            out_file = os.path.join(gen_output, f"generated_facie_{i}.tif")
             fig.savefig(out_file)  # type: ignore
             plt.close(fig)
     else:
         for i, facie in enumerate(facies, 1):
-            tif.imwrite(
-                os.path.join(arguments.out_path, f"generated_facie_{i}.tif"), facie
-            )
+            tif.imwrite(os.path.join(gen_output, f"generated_facie_{i}.tif"), facie)
 
-    generated_pattern = os.path.join(
-        arguments.out_path, "generated_facie_[1, 2, ...].tif"
-    )
+    generated_pattern = os.path.join(gen_output, "generated_facie_[1, 2, ...].tif")
     print(f"Facies generated at '{generated_pattern}'.")
     print(f"Total time: {format_time(int(time.time() - start_time))}")

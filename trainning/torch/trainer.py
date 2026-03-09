@@ -124,6 +124,11 @@ class TorchTrainer(
             self._is_main_process = dist.get_rank() == 0
         super().__init__(options, fine_tuning, checkpoint_path)
 
+    def _ddp_barrier(self) -> None:
+        """Synchronize DDP ranks via NCCL barrier."""
+        if self.distributed and dist.is_initialized():
+            dist.barrier()  # type: ignore
+
     def create_dataloader(self) -> DataLoader[Batch[torch.Tensor]]:
         """Create and return a :class:`torch.utils.data.DataLoader` for the
         trainer's dataset using configured batch size and worker settings.

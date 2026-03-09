@@ -57,6 +57,7 @@ def _empty_pyramid_tensor(scale: tuple[int, ...], channels_last: bool) -> torch.
 
 
 @memory.cache  # type: ignore
+@memory.cache  # type: ignore
 def to_facies_pyramids(
     scale_list: tuple[tuple[int, ...], ...],
     channels_last: bool = False,

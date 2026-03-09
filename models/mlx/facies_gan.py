@@ -15,7 +15,7 @@ from models.mlx.discriminator import MLXDiscriminator
 from models.mlx.generator import MLXGenerator
 from options import TrainningOptions
 import models.mlx.utils as utils
-from trainning.metrics import (
+from metrics import (
     DiscriminatorMetrics,
     GeneratorMetrics,
     IterableMetrics,

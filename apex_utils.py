@@ -11,5 +11,5 @@ exported here: ``FusedAdam`` (optimizer) and ``FusedLayerNorm``
 were removed from Apex; PyTorch's native ``torch.amp`` is used instead.
 """
 
-from apex.optimizers import FusedAdam  # noqa: F401 – re-exported
-from apex.normalization import FusedLayerNorm  # noqa: F401 – re-exported
+from apex.optimizers import FusedAdam  # type: ignore[import]  # noqa: F401 – re-exported
+from apex.normalization import FusedLayerNorm  # type: ignore[import]  # noqa: F401 – re-exported

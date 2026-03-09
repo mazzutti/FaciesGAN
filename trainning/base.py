@@ -40,7 +40,7 @@ import utils
 from config import RESULT_FACIES_PATH
 from datasets import PyramidsDataset
 import log
-from trainning.metrics import (
+from metrics import (
     DiscriminatorMetrics,
     GeneratorMetrics,
     ScaleMetrics,
@@ -265,6 +265,13 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             If the subclass does not implement this method.
         """
         raise NotImplementedError("Subclasses must implement init_dataset")
+
+    def _ddp_barrier(self) -> None:
+        """Synchronize DDP ranks.  No-op for non-distributed training.
+
+        Overridden by framework-specific trainers (e.g.
+        :class:`TorchTrainer`) to call ``dist.barrier()``.
+        """
 
     @abstractmethod
     def generate_visualization_samples(
@@ -499,13 +506,15 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             )
 
             if (epoch + 1) % 200 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
-                if self._is_main_process:
-                    generated_samples = self.generate_visualization_samples(
-                        scales,
-                        indexes,
-                        wells_pyramid,
-                        seismic_pyramid,
-                    )
+                # Run on ALL ranks so torch.compile trace caches warm
+                # up identically.  Only rank-0 uses the output for
+                # I/O; non-main ranks discard the tensors.
+                generated_samples = self.generate_visualization_samples(
+                    scales,
+                    indexes,
+                    wells_pyramid,
+                    seismic_pyramid,
+                )
 
             self.handle_epoch_end(  # type: ignore
                 scales=scales,
@@ -520,6 +529,13 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 masks_pyramid=masks_pyramid,
                 seismic_pyramid=seismic_pyramid,
             )
+
+            # Synchronize DDP ranks after rank-0-only I/O
+            # (TensorBoard logging, facies saving) that may trigger
+            # torch.compile autotuning for new input shapes.  Without
+            # this barrier the next epoch's NCCL collectives can timeout
+            # while rank-0 is still compiling kernels.
+            self._ddp_barrier()
 
             # Release GPU tensors that are no longer needed
             del scale_metrics
@@ -753,7 +769,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         if self._is_main_process:
             # Visualizer update
             if self.enable_tensorboard and self.visualizer:
-                self.visualizer.update(
+                self.visualizer.update(  # type: ignore
                     epoch, scale_metrics, generated_samples, samples_processed
                 )
 
@@ -812,8 +828,10 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     self.log_epoch(progress, writers[scale], epoch, g, d)  # type: ignore
 
             # Save generated facies at intervals
-            if (epoch % self.save_interval == 0 or epoch == self.num_iter - 1) and (
-                epoch != 0 or self.num_iter == 1
+            if (
+                (epoch % self.save_interval == 0 or epoch == self.num_iter - 1)
+                and (epoch != 0 or self.num_iter == 1)
+                and (self._current_batch_id == self._total_batches - 1)
             ):
                 for scale in scales:
                     self.save_generated_facies(
@@ -1012,6 +1030,11 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 for s in scales_to_train:
                     self.model.save_scale(s, scale_paths[s])
 
+            # Synchronise so non-zero ranks wait for rank 0 to finish
+            # saving before proceeding to the next scale group (or to
+            # DDP teardown at the end of training).
+            self._ddp_barrier()
+
             # Close writers (rank 0 only)
             for writer in writers.values():
                 writer.close()
@@ -1040,6 +1063,11 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             print("\n✅ Training complete!")
         if self.enable_tensorboard:
             print("📊 View results in TensorBoard (if still running)")
+
+        # Final DDP barrier: ensure all ranks have finished training
+        # before returning so the caller can safely tear down the
+        # process group without one rank still doing I/O.
+        self._ddp_barrier()
 
     def log_epoch(
         self,

@@ -316,11 +316,17 @@ def _kill_child_processes() -> None:
     """Kill all descendant processes of the current PID.
 
     Walks ``/proc`` to find every process whose parent (ppid) matches our
-    pid, then sends ``SIGKILL``.  This is more reliable than
-    ``os.killpg`` when processes are spawned by debugpy or torchrun into
-    separate process groups.
+    pid, then sends ``SIGTERM`` first (giving children a chance to drain
+    in-flight GPU / NCCL operations) and falls back to ``SIGKILL`` if
+    they are still alive after a short grace period.  Killing a process
+    with SIGKILL while CUDA kernels or NCCL collectives are in-flight
+    can leave the GPU driver in a bad state ("GPU has fallen off the
+    bus").
     """
+    import time
+
     my_pid = os.getpid()
+    children: list[int] = []
     try:
         for entry in os.listdir("/proc"):
             if not entry.isdigit():
@@ -328,15 +334,32 @@ def _kill_child_processes() -> None:
             try:
                 with open(f"/proc/{entry}/stat") as f:
                     parts = f.read().split()
-                # Field 3 (0-indexed) is ppid
                 ppid = int(parts[3])
                 child_pid = int(entry)
                 if ppid == my_pid and child_pid != my_pid:
-                    os.kill(child_pid, signal.SIGKILL)
+                    children.append(child_pid)
             except (OSError, IndexError, ValueError):
                 continue
     except OSError:
         pass
+
+    # Phase 1: SIGTERM — let children flush GPU work
+    for pid in children:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            pass
+
+    # Brief grace period for GPU kernels to drain
+    if children:
+        time.sleep(0.5)
+
+    # Phase 2: SIGKILL any survivors
+    for pid in children:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
 
 
 def main() -> None:
@@ -413,11 +436,12 @@ def main() -> None:
         dist.init_process_group(
             backend=backend,
             device_id=device_id,
-            timeout=timedelta(minutes=5),
+            timeout=timedelta(minutes=15),
         )
         rank = dist.get_rank()
         if torch.cuda.is_available():
             torch.cuda.set_device(local_rank)
+            torch.cuda.set_per_process_memory_fraction(0.90)  # type: ignore
             device = torch.device(f"cuda:{local_rank}")
         else:
             device = torch.device("cpu")
@@ -443,8 +467,11 @@ def main() -> None:
 
     is_main = rank == 0
 
-    timestamp = datetime.now(tz.tzlocal()).strftime("%Y_%m_%d_%H_%M_%S")
-    options.output_path = os.path.join(options.output_path, timestamp)
+    if getattr(options, "output_fullpath", None):
+        options.output_path = options.output_fullpath
+    else:
+        timestamp = datetime.now(tz.tzlocal()).strftime("%Y_%m_%d_%H_%M_%S")
+        options.output_path = os.path.join(options.output_path, timestamp)
     options.start_scale = 0
 
     if is_main:
@@ -650,23 +677,64 @@ def main() -> None:
 
         # Under DDP, a crash on one rank leaves the other hanging in NCCL
         # collectives.  dist.destroy_process_group() itself can block when
-        # the peer is already dead.  Force-exit so no orphan survives.
+        # the peer is already dead.  Drain pending GPU work before hard-
+        # exiting so the driver is not left in a dirty state ("GPU has
+        # fallen off the bus").
         if distributed:
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                except Exception as sync_err:
+                    print(
+                        f"Warning: CUDA sync before exit failed: {sync_err}",
+                        file=sys.stderr,
+                    )
             os._exit(1)
 
         raise exc
     finally:
+        import sys
+
         try:
             from background_workers import BackgroundWorker
 
-            BackgroundWorker().shutdown(wait=True)
-        except Exception:
-            pass
+            bw = BackgroundWorker()
+            # Wait for pending plot jobs with a bounded timeout so we
+            # don't block DDP teardown indefinitely.  Then shut down the
+            # pool without waiting (workers are killed on process exit).
+            bw.wait_pending(timeout=120.0)
+            bw.shutdown(wait=False)
+        except Exception as e:
+            print(f"Warning: BackgroundWorker shutdown failed: {e}", file=sys.stderr)
         if distributed:
+            # Drain all pending GPU kernels before tearing down NCCL.
+            # Destroying the process group while CUDA ops are in-flight
+            # can corrupt driver state ("GPU has fallen off the bus").
+            if torch.cuda.is_available():
+                try:
+                    torch.cuda.synchronize()
+                except Exception as sync_err:
+                    print(
+                        f"Warning: CUDA sync before destroy_process_group "
+                        f"failed: {sync_err}",
+                        file=sys.stderr,
+                    )
+            # Barrier so both ranks reach destroy_process_group together.
+            # Without this, one rank may be stuck in BackgroundWorker
+            # shutdown while the other already entered destroy_process_group
+            # (a collective), causing a hang.
             try:
-                dist.destroy_process_group()
+                if dist.is_initialized():
+                    dist.barrier()  # type: ignore[arg-type]
             except Exception:
                 pass
+            try:
+                dist.destroy_process_group()
+            except Exception as e:
+                print(
+                    f"Warning: destroy_process_group failed: {e}",
+                    file=sys.stderr,
+                )
 
     if is_main:
         print("\n" + "=" * 60)

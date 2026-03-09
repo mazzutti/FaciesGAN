@@ -29,13 +29,13 @@
         "--output-path",
         "results/py/",
         "--num-train-pyramids",
-        "200",
+        "10",
         "--batch-size",
-        "50",
+        "1",
         "--num-workers",
-        "4",
+        "2",
         "--num-iter",
-        "100",
+        "1000",
         "--num-parallel-scales",
         "7",
         "--discriminator-steps",
@@ -203,6 +203,74 @@
           "ignoreFailures": true
         }
       ]
+    },
+    {
+      "name": "Python: Generate Facies",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/gen_facies.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
+        "VIRTUAL_ENV": "${workspaceFolder}/.venv",
+        "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
+      },
+      "args": [
+        "--how_many",
+        "${input:howMany}",
+        "--model_path",
+        "${workspaceFolder}/results/py/2026_03_07_22_16_43",
+        "--out_path",
+        "${workspaceFolder}/results/py/generated",
+        "--use_gpu",
+        "--plot_well_mask"
+      ]
+    },
+    {
+      "name": "Python: Experiments (Ablation)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/experiments.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
+        "VIRTUAL_ENV": "${workspaceFolder}/.venv",
+        "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}",
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+      },
+      "args": [
+        "--input-path",
+        "data",
+        "--output-path",
+        "results/experiments",
+        "--num-iter",
+        "2000",
+        "--num-train-pyramids",
+        "200",
+        "--batch-size",
+        "40",
+        "--num-workers",
+        "8",
+        "--num-parallel-scales",
+        "7",
+        "--nproc-per-node",
+        "2",
+        "--how-many",
+        "1000",
+        "--no-tensorboard",
+      ]
+    }
+  ],
+  "inputs": [
+    {
+      "id": "howMany",
+      "type": "promptString",
+      "description": "How many facies to generate?",
+      "default": "10"
     }
   ],
   "compounds": [
