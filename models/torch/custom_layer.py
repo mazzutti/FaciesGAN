@@ -468,13 +468,16 @@ class TorchColorQuantization(nn.Module):
     the ``[-1, 1]`` range (tanh output).
     """
 
-    def __init__(self, temperature: float = 0.1) -> None:
+    def __init__(self, temperature: float = 0.5) -> None:
         """Create a ColorQuantization module.
 
         Parameters
         ----------
         temperature : float, optional
             Softmax temperature used during training for soft assignments.
+            Higher values produce softer (more differentiable) assignments
+            enabling better gradient flow; lower values produce sharper
+            (more discrete) outputs. Default is 0.5.
         """
         super().__init__()  # type: ignore
         self.temperature = temperature

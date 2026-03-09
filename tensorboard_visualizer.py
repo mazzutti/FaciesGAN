@@ -16,7 +16,7 @@ from tensorboardX import SummaryWriter  # pyright: ignore
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from trainning.metrics import ScaleMetrics
+    from metrics import ScaleMetrics
     from typedefs import TTensor  # type: ignore
 else:
     # Use string-based/type-agnostic annotations at runtime to avoid importing

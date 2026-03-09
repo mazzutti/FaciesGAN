@@ -117,9 +117,13 @@ def get_arguments() -> ArgumentParser:
     parser.add_argument("--discriminator-steps", type=int, default=3)
     parser.add_argument("--generator-steps", type=int, default=3)
     parser.add_argument("--alpha", type=float, default=10)
+    parser.add_argument("--lr-g", type=float, default=5e-4)
+    parser.add_argument("--lr-d", type=float, default=5e-4)
+    parser.add_argument("--lr-decay", type=int, default=1000)
     parser.add_argument("--scale0-noise-amp", type=float, default=1.5)
     parser.add_argument("--min-noise-amp", type=float, default=0.3)
     parser.add_argument("--lambda-diversity", type=float, default=1.0)
+    parser.add_argument("--well-loss-penalty", type=float, default=10.0)
     parser.add_argument("--manual-seed", type=int, default=None)
     parser.add_argument("--gpu-device", type=int, default=0)
     parser.add_argument(
@@ -172,12 +176,20 @@ def _build_training_args(
         str(getattr(args, "generator_steps")),
         "--alpha",
         str(getattr(args, "alpha")),
+        "--lr-g",
+        str(getattr(args, "lr_g")),
+        "--lr-d",
+        str(getattr(args, "lr_d")),
+        "--lr-decay",
+        str(getattr(args, "lr_decay")),
         "--scale0-noise-amp",
         str(getattr(args, "scale0_noise_amp")),
         "--min-noise-amp",
         str(getattr(args, "min_noise_amp")),
         "--lambda-diversity",
         str(getattr(args, "lambda_diversity")),
+        "--well-loss-penalty",
+        str(getattr(args, "well_loss_penalty")),
         "--compile-backend",
     ]
 

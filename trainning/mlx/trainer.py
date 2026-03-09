@@ -22,7 +22,7 @@ from models.mlx.facies_gan import MLXFaciesGAN
 from options import TrainningOptions
 
 from trainning.base import Trainer
-from trainning.metrics import (
+from metrics import (
     DiscriminatorMetrics,
     GeneratorMetrics,
     IterableMetrics,

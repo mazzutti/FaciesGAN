@@ -69,7 +69,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
         nn.Module.__init__(self)
         self.gens = list()  # type: ignore[assignment]
         self.color_quantizer = MLXColorQuantization(
-            temperature=0.1,
+            temperature=0.5,
         )
 
     def __call__(

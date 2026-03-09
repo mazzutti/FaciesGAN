@@ -105,7 +105,7 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
         self.use_gradient_checkpointing: bool = False
 
         # Color quantization layer (framework-specific)
-        self.color_quantizer = TorchColorQuantization(temperature=0.1)
+        self.color_quantizer = TorchColorQuantization(temperature=0.5)
 
     def __call__(
         self,

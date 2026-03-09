@@ -40,7 +40,7 @@ TrainningOptions *mlx_options_new_trainning_defaults(void) {
     o->noise_amp = 0.1;
     o->min_noise_amp = 0.1;
     o->scale0_noise_amp = 1.0;
-    o->well_loss_penalty = 10.0;
+    o->well_loss_penalty = 1000.0;
     o->lambda_diversity = 1.0;
     o->num_diversity_samples = 3;
     o->num_feature = 32;

@@ -564,7 +564,7 @@ class MLXColorQuantization(nn.Module):
 
     def __init__(
         self,
-        temperature: float = 0.1,
+        temperature: float = 0.5,
     ) -> None:
         super().__init__()
         self.temperature = temperature
