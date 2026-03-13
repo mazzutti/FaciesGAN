@@ -1,33 +1,30 @@
-#!/usr/bin/env zsh
+#!/usr/bin/env bash
 
 # Launch TensorBoard to view training progress
-# Usage: ./launch_tensorboard.sh [optional_port]
+# Usage: ./launch_tensorboard.sh [logdir] [port]
 
-PORT=${1:-6006}
-
-LATEST_DIR=$(ls -d results/*_results 2>/dev/null | sort -r | head -1)
-
-if [[ -z "$LATEST_DIR" ]]; then
-    echo "❌ No results directory found in results/"
-    exit 1
-fi
-
-echo "📁 Found latest results: $LATEST_DIR"
-
-LOGDIR="$LATEST_DIR/tensorboard_logs"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LOGDIR="${1:-$SCRIPT_DIR/results/experiments}"
+PORT="${2:-6006}"
 
 if [[ ! -d "$LOGDIR" ]]; then
-    echo "❌ TensorBoard logs not found at: $LOGDIR"
-    exit 1
+    mkdir -p "$LOGDIR"
+    echo "📁 Created log directory: $LOGDIR"
 fi
 
-echo "🚀 Launching TensorBoard..."
+# Kill any existing tensorboard (exclude this script's own process tree)
+pgrep -f bin/tensorboard | while read pid; do
+    [ "$pid" != "$$" ] && kill "$pid" 2>/dev/null
+done
+sleep 0.5
+
+echo "TensorBoard launching..."
 echo "   Log directory: $LOGDIR"
 echo "   Port: $PORT"
-echo ""
-echo "Open in browser: http://localhost:$PORT"
-echo ""
-echo "Press Ctrl+C to stop TensorBoard"
-echo ""
+echo "   URL: http://localhost:$PORT"
 
-tensorboard --logdir=$LOGDIR --port=$PORT --bind_all
+exec "$SCRIPT_DIR/.venv/bin/tensorboard" \
+    --logdir="$LOGDIR" \
+    --port="$PORT" \
+    --bind_all \
+    --load_fast=false

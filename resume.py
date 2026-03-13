@@ -44,6 +44,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--start-scale", type=int, default=0, help="start scale for fine-tuning"
     )
+    parser.add_argument(
+        "--start-epoch",
+        type=int,
+        default=0,
+        help="epoch to resume training from within the current scale group",
+    )
 
     # Number of parallel scales to process at once when resuming
     parser.add_argument(
@@ -64,6 +70,9 @@ if __name__ == "__main__":
         options = json.load(f, object_hook=lambda x: SimpleNamespace(**x))
 
     options.out_path = arguments.checkpoint_path
+
+    # Forward resume-specific options into the loaded options namespace
+    options.start_epoch = getattr(arguments, "start_epoch", 0)
 
     init_output_logging(os.path.join(options.out_path, "log.txt"))
 

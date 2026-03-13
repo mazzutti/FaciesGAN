@@ -34,7 +34,15 @@ import background_workers as bw
 from apex_utils import FusedAdam
 from datasets.data_prefetcher import PyramidsBatch
 from datasets.torch.data_prefetcher import TorchDataPrefetcher
-from config import D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, SCH_D_FILE, SCH_G_FILE
+from config import (
+    D_FILE,
+    EPOCH_CKPT_FILE,
+    G_FILE,
+    OPT_D_FILE,
+    OPT_G_FILE,
+    SCH_D_FILE,
+    SCH_G_FILE,
+)
 from datasets import PyramidsDataset
 from datasets.torch.dataset import TorchPyramidsDataset
 from models import FaciesGAN, TorchFaciesGAN
@@ -548,9 +556,9 @@ class TorchTrainer(
                 betas=(self.beta1, 0.999),
                 set_grad_none=False,
             )
-            self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
+            self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.StepLR(
                 self.discriminator_optimizers[scale],
-                milestones=[self.lr_decay],
+                step_size=self.lr_decay,
                 gamma=self.gamma,
             )
 
@@ -561,9 +569,30 @@ class TorchTrainer(
                 set_grad_none=False,
             )
 
-            self.generator_schedulers[scale] = torch.optim.lr_scheduler.MultiStepLR(
+            self.generator_schedulers[scale] = torch.optim.lr_scheduler.StepLR(
                 self.generator_optimizers[scale],
-                milestones=[self.lr_decay],
+                step_size=self.lr_decay,
+                gamma=self.gamma,
+            )
+
+    def reset_schedulers(self, scales: tuple[int, ...]) -> None:
+        for scale in scales:
+            # Reset optimizer param group LRs to initial values before
+            # creating new schedulers, otherwise StepLR picks up the
+            # already-decayed LR as its base.
+            for pg in self.generator_optimizers[scale].param_groups:
+                pg["lr"] = self.lr_g
+            for pg in self.discriminator_optimizers[scale].param_groups:
+                pg["lr"] = self.lr_d
+
+            self.generator_schedulers[scale] = torch.optim.lr_scheduler.StepLR(
+                self.generator_optimizers[scale],
+                step_size=self.lr_decay,
+                gamma=self.gamma,
+            )
+            self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.StepLR(
+                self.discriminator_optimizers[scale],
+                step_size=self.lr_decay,
                 gamma=self.gamma,
             )
 
@@ -591,3 +620,158 @@ class TorchTrainer(
         torch.save(
             discriminator_scheduler.state_dict(), os.path.join(scale_path, SCH_D_FILE)
         )
+
+    def save_epoch_checkpoint(
+        self,
+        scales: tuple[int, ...],
+        scale_paths: dict[int, str],
+        epoch: int,
+        batch_id: int,
+    ) -> None:
+        checkpoint: dict[str, object] = {
+            "epoch": epoch,
+            "batch_id": batch_id,
+            "noise_amps": list(self.model.noise_amps),
+        }
+        per_scale: dict[int, dict[str, object]] = {}
+        for s in scales:
+            gen = unwrap_ddp(self.model.generator.gens[s])
+            disc = unwrap_ddp(self.model.discriminator.discs[s])
+            per_scale[s] = {
+                "generator": gen.state_dict(),
+                "discriminator": disc.state_dict(),
+                "opt_g": self.generator_optimizers[s].state_dict(),
+                "opt_d": self.discriminator_optimizers[s].state_dict(),
+                "sch_g": self.generator_schedulers[s].state_dict(),
+                "sch_d": self.discriminator_schedulers[s].state_dict(),
+            }
+        checkpoint["scales"] = per_scale
+
+        # Save into the first scale's directory (arbitrary but deterministic)
+        ckpt_path = os.path.join(scale_paths[min(scales)], EPOCH_CKPT_FILE)
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+        torch.save(checkpoint, ckpt_path)
+        print(f"  Epoch checkpoint saved at epoch {epoch} (batch {batch_id})")
+
+    def load_epoch_checkpoint(
+        self,
+        scales: tuple[int, ...],
+        scale_paths: dict[int, str],
+    ) -> tuple[int, int]:
+        ckpt_path = os.path.join(scale_paths[min(scales)], EPOCH_CKPT_FILE)
+
+        # ── Fast path: a full epoch checkpoint exists ──────────────
+        if os.path.isfile(ckpt_path):
+            checkpoint = torch.load(
+                ckpt_path, map_location=self.device, weights_only=False
+            )
+            epoch: int = checkpoint["epoch"]
+            batch_id: int = checkpoint["batch_id"]
+
+            self.model.noise_amps = checkpoint["noise_amps"]
+
+            per_scale: dict[int, dict[str, object]] = checkpoint["scales"]
+            for s, state in per_scale.items():
+                gen = unwrap_ddp(self.model.generator.gens[s])
+                gen.load_state_dict(state["generator"])  # type: ignore[arg-type]
+                disc = unwrap_ddp(self.model.discriminator.discs[s])
+                disc.load_state_dict(state["discriminator"])  # type: ignore[arg-type]
+                self.generator_optimizers[s].load_state_dict(state["opt_g"])  # type: ignore[arg-type]
+                self.discriminator_optimizers[s].load_state_dict(state["opt_d"])  # type: ignore[arg-type]
+                self.generator_schedulers[s].load_state_dict(state["sch_g"])  # type: ignore[arg-type]
+                self.discriminator_schedulers[s].load_state_dict(state["sch_d"])  # type: ignore[arg-type]
+
+            return epoch, batch_id
+
+        # ── Fallback: load from scale-level checkpoints ────────────
+        # When no epoch checkpoint exists but the user passed
+        # --start-epoch, reconstruct the training state from the
+        # per-scale generator/discriminator files that the normal
+        # training loop writes at the end of each scale group.
+        #
+        # If a completed_epoch.txt metadata file exists, use it to
+        # determine the actual last-completed epoch instead of relying
+        # on the CLI --start-epoch value (which may be stale).
+        from config import COMPLETED_EPOCH_FILE
+
+        effective_start = self.start_epoch
+        meta_path = os.path.join(scale_paths[min(scales)], COMPLETED_EPOCH_FILE)
+        if os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                completed = int(f.read().strip())
+            if completed >= self.num_iter:
+                # Training already finished for this scale group;
+                # nothing to resume.
+                print(
+                    f"  Scale group already completed {completed} epochs "
+                    f"(num_iter={self.num_iter}); nothing to resume."
+                )
+                return self.num_iter, 0
+            effective_start = max(effective_start, completed)
+
+        if effective_start <= 0:
+            return 0, 0
+
+        loaded_any = False
+        for s in scales:
+            gen_path = os.path.join(scale_paths[s], G_FILE)
+            disc_path = os.path.join(scale_paths[s], D_FILE)
+            if os.path.isfile(gen_path):
+                gen = unwrap_ddp(self.model.generator.gens[s])
+                gen.load_state_dict(
+                    torch_utils.load(gen_path, self.device, as_type=Mapping[str, Any])
+                )
+                loaded_any = True
+            if os.path.isfile(disc_path):
+                disc = unwrap_ddp(self.model.discriminator.discs[s])
+                disc.load_state_dict(
+                    torch_utils.load(disc_path, self.device, as_type=Mapping[str, Any])
+                )
+
+        if not loaded_any:
+            return 0, 0
+
+        # Load noise amplitudes from scale-level files
+        from config import AMP_FILE
+
+        for s in sorted(scales):
+            amp_path = os.path.join(scale_paths[s], AMP_FILE)
+            if os.path.isfile(amp_path):
+                with open(amp_path) as f:
+                    amp_val = float(f.read().strip())
+                while len(self.model.noise_amps) <= s:
+                    self.model.noise_amps.append(0.0)
+                self.model.noise_amps[s] = amp_val
+
+        # Try to restore optimizer/scheduler states from scale-level files.
+        # If they exist the LR schedulers are fully restored; otherwise
+        # we fast-forward them to approximate the right learning rate.
+        opts_loaded = False
+        for s in scales:
+            try:
+                self.load_optimizers(
+                    s,
+                    scale_paths[s],
+                    self.generator_optimizers[s],
+                    self.discriminator_optimizers[s],
+                    self.generator_schedulers[s],
+                    self.discriminator_schedulers[s],
+                )
+                opts_loaded = True
+            except Exception:
+                pass
+
+        if not opts_loaded:
+            # Fast-forward the LR schedulers to match the requested epoch
+            for _ in range(effective_start):
+                for s in scales:
+                    self.generator_schedulers[s].step()
+                    self.discriminator_schedulers[s].step()
+
+        if self._is_main_process:
+            print(
+                f"  Loaded scale-level checkpoints"
+                f" (optimizers {'restored' if opts_loaded else 'reset, schedulers fast-forwarded'})"
+                f" at epoch {effective_start}"
+            )
+        return effective_start, 0

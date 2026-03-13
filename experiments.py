@@ -36,10 +36,13 @@ import torch
 
 from config import OPT_FILE
 from datasets.torch.dataset import TorchPyramidsDataset
-from gen_facies import plot_mds
 from log import format_time
 from models.torch.facies_gan import TorchFaciesGAN
 from options import TrainningOptions
+
+# Type alias for shared embeddings: method -> (real_reduced, {variant: fake_reduced})
+_SharedEmbeddings = dict[str, tuple[np.ndarray, dict[str, np.ndarray]]]
+
 
 # ---------------------------------------------------------------------------
 # Experiment variant descriptors
@@ -132,6 +135,12 @@ def get_arguments() -> ArgumentParser:
         default=2,
         help="Number of GPUs for DDP training (default: 2).",
     )
+    parser.add_argument(
+        "--start-epoch",
+        type=int,
+        default=0,
+        help="Resume training from this epoch (default: 0).",
+    )
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument(
         "--no-plot-facies",
@@ -147,10 +156,33 @@ def get_arguments() -> ArgumentParser:
 # ---------------------------------------------------------------------------
 
 
+def _find_last_completed_scale(variant_output: str) -> int:
+    """Return the index of the last fully-completed scale, or -1 if none."""
+    scale = 0
+    while os.path.isfile(os.path.join(variant_output, str(scale), "generator.pth")):
+        scale += 1
+    return scale - 1
+
+
+def _read_completed_epochs(variant_output: str, stop_scale: int) -> int:
+    """Read the completed epoch count from the first scale's metadata.
+
+    Returns 0 if no metadata file exists.
+    """
+    from config import COMPLETED_EPOCH_FILE
+
+    meta_path = os.path.join(variant_output, "0", COMPLETED_EPOCH_FILE)
+    if os.path.isfile(meta_path):
+        with open(meta_path) as f:
+            return int(f.read().strip())
+    return 0
+
+
 def _build_training_args(
     args: object,
     variant: dict[str, bool],
     variant_output: str,
+    start_scale: int = 0,
 ) -> list[str]:
     """Build CLI argument list for ``main.py`` for one experiment variant."""
     cmd_args: list[str] = [
@@ -158,6 +190,8 @@ def _build_training_args(
         str(getattr(args, "input_path")),
         "--output-fullpath",
         variant_output,
+        "--start-scale",
+        str(start_scale),
         "--num-iter",
         str(getattr(args, "num_iter")),
         "--num-train-pyramids",
@@ -192,6 +226,10 @@ def _build_training_args(
         str(getattr(args, "well_loss_penalty")),
         "--compile-backend",
     ]
+
+    start_epoch = getattr(args, "start_epoch", 0)
+    if start_epoch > 0:
+        cmd_args.extend(["--start-epoch", str(start_epoch)])
 
     seed = getattr(args, "manual_seed", None)
     if seed is not None:
@@ -413,65 +451,263 @@ def _generate_variant(
 
     print(f"  Generated {len(facies)} facies -> {gen_output}")
 
-    # MDS comparison plot (requires full dataset for real facies)
-    dataset = TorchPyramidsDataset(opts)
-    mds_path = os.path.join(gen_output, "mds_comparison.png")
-    plot_mds(facies, mask_indexes, opts, dataset, save_path=mds_path)
-    print(f"  MDS plot -> {mds_path}")
-
     return facies, mask_indexes
 
 
-def _plot_combined_mds(
+_EMBEDDINGS_FILE = "shared_embeddings.npz"
+_FACIES_FILE = "generated_facies.npz"
+
+
+def _save_shared_embeddings(
+    shared: _SharedEmbeddings,
     all_facies: dict[str, list[np.ndarray]],
-    all_mask_indexes: dict[str, list[int]],
-    model_paths: dict[str, str],
     base_output: str,
+    num_iter: int,
 ) -> None:
-    """Create a 2×2 combined MDS plot comparing all variants against real facies."""
-    from matplotlib import pyplot as plt
-    from sklearn.manifold import MDS
-    from sklearn.metrics import euclidean_distances
+    """Persist shared embeddings and generated facies to disk."""
+    data: dict[str, np.ndarray] = {"_num_iter": np.array(num_iter)}
+    for method, (real_r, per_variant) in shared.items():
+        data[f"{method}_real"] = real_r
+        for vname, fake_r in per_variant.items():
+            data[f"{method}_{vname}"] = fake_r
+    np.savez(os.path.join(base_output, _EMBEDDINGS_FILE), **data)  # type: ignore
+
+    facies_data: dict[str, np.ndarray] = {}
+    for vname, flist in all_facies.items():
+        facies_data[vname] = np.stack(flist, 0)
+    np.savez(os.path.join(base_output, _FACIES_FILE), **facies_data)  # type: ignore
+    print(f"  Saved embeddings checkpoint -> {base_output}/{_EMBEDDINGS_FILE}")
+
+
+def _load_shared_embeddings(
+    base_output: str,
+    num_iter: int,
+) -> tuple[_SharedEmbeddings, dict[str, list[np.ndarray]]] | None:
+    """Load previously saved shared embeddings if they match *num_iter*."""
+    emb_path = os.path.join(base_output, _EMBEDDINGS_FILE)
+    fac_path = os.path.join(base_output, _FACIES_FILE)
+    if not (os.path.isfile(emb_path) and os.path.isfile(fac_path)):
+        return None
+    emb_data = np.load(emb_path)
+    saved_iter = int(emb_data["_num_iter"])
+    if saved_iter != num_iter:
+        return None
+
+    methods = {k.split("_")[0] for k in emb_data.files if k != "_num_iter"}
+    shared: _SharedEmbeddings = {}
+    for method in methods:
+        real_key = f"{method}_real"
+        if real_key not in emb_data:
+            continue
+        real_r = emb_data[real_key]
+        per_variant: dict[str, np.ndarray] = {}
+        for vname in VARIANT_NAMES:
+            vkey = f"{method}_{vname}"
+            if vkey in emb_data:
+                per_variant[vname] = emb_data[vkey]
+        shared[method] = (real_r, per_variant)
+
+    fac_data = np.load(fac_path)
+    all_facies: dict[str, list[np.ndarray]] = {}
+    for vname in VARIANT_NAMES:
+        if vname in fac_data:
+            all_facies[vname] = list(fac_data[vname])
+    return shared, all_facies
+
+
+def _compute_shared_embeddings(
+    all_facies: dict[str, list[np.ndarray]],
+    dataset: TorchPyramidsDataset,
+) -> _SharedEmbeddings:
+    """Compute UMAP, Isomap, t-SNE, and MDS in a single shared space.
+
+    Fits each reducer on the concatenation of real data and **all**
+    variants' generated data so that the real-data coordinates are
+    identical across subplots in both per-variant and combined plots.
+
+    Returns
+    -------
+    _SharedEmbeddings
+        Mapping *method* -> ``(real_reduced, {variant: fake_reduced})``.
+    """
+    import warnings
+
+    import scipy.sparse as sparse  # type: ignore
+    from sklearn.manifold import MDS, TSNE, Isomap  # type: ignore
+    from sklearn.metrics import euclidean_distances  # type: ignore
+    from umap import UMAP  # type: ignore
 
     import utils
-    from datasets.torch.dataset import TorchPyramidsDataset
 
-    # Load real facies once (use the first available variant's options)
-    first_name = next(iter(model_paths))
-    first_path = model_paths[first_name]
-
-    import inspect
-
-    with open(os.path.join(first_path, OPT_FILE), "r") as f:
-        json_data = json.load(f)
-    _valid_keys = set(inspect.signature(TrainningOptions.__init__).parameters) - {
-        "self"
-    }
-    ref_opts = TrainningOptions(
-        **{k: v for k, v in json_data.items() if k in _valid_keys}
+    real_tensor, _, _ = dataset.get_scale_data(-1)
+    real_flat = np.reshape(
+        utils.torch2np(real_tensor, denormalize=True),
+        [real_tensor.shape[0], -1],
     )
-    ref_opts.compile_backend = False
+    n_real = real_flat.shape[0]
 
-    dataset = TorchPyramidsDataset(ref_opts)
-    real_facies_tensor, _, _ = dataset.get_scale_data(-1)
-    real_facies_flat = np.reshape(
-        utils.torch2np(real_facies_tensor, denormalize=True),
-        [real_facies_tensor.shape[0], -1],
-    )
-    real_sim = euclidean_distances(real_facies_flat)
+    ordered = [n for n in VARIANT_NAMES if n in all_facies]
+    fake_flats: list[np.ndarray] = []
+    sizes: dict[str, int] = {}
+    for name in ordered:
+        arr = np.stack(all_facies[name], 0)
+        if arr.shape[-1] == 1:
+            arr = arr.squeeze(-1)
+        flat = np.reshape(arr, [len(all_facies[name]), -1])
+        fake_flats.append(flat)
+        sizes[name] = flat.shape[0]
 
-    mds = MDS(
-        n_components=2,
-        max_iter=3000,
-        eps=1e-9,
-        random_state=np.random.RandomState(seed=3),
-        metric="precomputed",
-        n_init=4,
-        init="random",  # type: ignore
-        n_jobs=1,
-        normalized_stress="auto",
+    combined = np.concatenate([real_flat] + fake_flats, axis=0).astype(np.float32)
+
+    def _split(emb: np.ndarray) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+        real_r = emb[:n_real]
+        off = n_real
+        per_variant: dict[str, np.ndarray] = {}
+        for nm in ordered:
+            n = sizes[nm]
+            per_variant[nm] = emb[off : off + n]
+            off += n
+        return real_r, per_variant
+
+    results: _SharedEmbeddings = {}
+
+    n_samples = combined.shape[0]
+    print(
+        f"  Total samples: {n_samples} ({n_real} real + {n_samples - n_real} fake)",
+        flush=True,
     )
-    real_reduced = mds.fit((real_sim + real_sim.T) / 2).embedding_
+
+    # Pre-compute the MDS distance matrix on the main thread (shared
+    # read-only memory avoids a copy in the thread pool).
+    distances = euclidean_distances(combined)
+    distances = (distances + distances.T) / 2
+
+    # ── Helper closures (one per method) ──────────────────────────
+    def _fit_umap() -> tuple[str, np.ndarray]:
+        print("  Computing shared UMAP embedding ...", flush=True)
+        reducer = UMAP(  # type: ignore
+            n_components=2,
+            n_neighbors=min(15, n_samples - 1),
+            min_dist=0.1,
+            metric="euclidean",
+            random_state=42,
+            n_epochs=200,
+            init="spectral",
+        )
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=sparse.SparseEfficiencyWarning)
+            warnings.filterwarnings("ignore", category=UserWarning, module="umap")
+            emb: np.ndarray = reducer.fit_transform(combined)  # type: ignore
+        print("    UMAP done.", flush=True)
+        return "umap", emb
+
+    def _fit_isomap() -> tuple[str, np.ndarray]:
+        print("  Computing shared Isomap embedding ...", flush=True)
+        iso = Isomap(n_components=2, n_neighbors=min(10, n_samples - 1))
+        emb: np.ndarray = iso.fit_transform(combined)  # type: ignore
+        print("    Isomap done.", flush=True)
+        return "isomap", emb
+
+    def _fit_tsne() -> tuple[str, np.ndarray]:
+        print("  Computing shared t-SNE embedding ...", flush=True)
+        tsne = TSNE(
+            n_components=2,
+            perplexity=min(30.0, (n_samples - 1) / 3.0),
+            random_state=42,
+        )
+        emb: np.ndarray = tsne.fit_transform(combined)  # type: ignore
+        print("    t-SNE done.", flush=True)
+        return "tsne", emb
+
+    def _fit_mds() -> tuple[str, np.ndarray]:
+        print("  Computing shared MDS embedding ...", flush=True)
+        # Use PCA on the distance matrix for a good initialisation so
+        # that a single SMACOF run converges fast.
+        from sklearn.decomposition import PCA  # type: ignore
+
+        pca_init = PCA(n_components=2, random_state=3).fit_transform(distances)
+        mds = MDS(
+            n_components=2,
+            max_iter=300,
+            eps=1e-6,
+            random_state=np.random.RandomState(seed=3),
+            metric="precomputed",  # type: ignore
+            n_init=1,
+            init="random",  # type: ignore  # overridden by fit_transform(init=)
+            normalized_stress="auto",
+        )
+        emb: np.ndarray = mds.fit_transform(distances, init=pca_init)  # type: ignore
+        print("    MDS done.", flush=True)
+        return "mds", emb
+
+    # ── Run all four in parallel ──────────────────────────────────
+    # The underlying C/Cython/numba code releases the GIL, so threads
+    # provide true parallelism without serialization overhead.
+    from concurrent.futures import ThreadPoolExecutor
+
+    print("  Running UMAP, Isomap, t-SNE, MDS in parallel ...", flush=True)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [
+            pool.submit(_fit_umap),
+            pool.submit(_fit_isomap),
+            pool.submit(_fit_tsne),
+            pool.submit(_fit_mds),
+        ]
+        for fut in futures:
+            method_name, emb = fut.result()
+            results[method_name] = _split(emb)
+
+    return results
+
+
+def _plot_per_variant_embedding(
+    method: str,
+    real_reduced: np.ndarray,
+    fake_reduced: np.ndarray,
+    save_path: str,
+) -> None:
+    """Save a single per-variant embedding plot using pre-computed coordinates."""
+    from matplotlib import pyplot as plt
+
+    label = "t-SNE" if method == "tsne" else method.upper()
+    plt.figure()  # type: ignore
+    plt.scatter(real_reduced[:, 0], real_reduced[:, 1], alpha=0.6)  # type: ignore
+    plt.scatter(fake_reduced[:, 0], fake_reduced[:, 1], alpha=0.6)  # type: ignore
+    plt.title(f"{label} Visualization of FaciesGAN generated facies")  # type: ignore
+    plt.xlabel(f"{label} Dimension 1")  # type: ignore
+    plt.ylabel(f"{label} Dimension 2")  # type: ignore
+    plt.legend(("Real Facies", "Fake Facies"), loc="upper right")  # type: ignore
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")  # type: ignore
+    plt.close()  # type: ignore
+
+
+def _plot_combined_embeddings(
+    method: str,
+    shared_embedding: tuple[np.ndarray, dict[str, np.ndarray]],
+    base_output: str,
+    num_iter: int = 0,
+) -> None:
+    """Create a 2x2 combined embedding plot.
+
+    Uses a single real-data projection paired with per-variant fake
+    projections, so the real dots are identical across all four subplots.
+
+    Parameters
+    ----------
+    method : str
+        Embedding method name (``"mds"``, ``"umap"``, ``"isomap"``, or
+        ``"tsne"``).
+    shared_embedding : tuple[np.ndarray, dict[str, np.ndarray]]
+        ``(real_reduced, {variant: fake_reduced})`` computed in a single
+        shared embedding space.
+    base_output : str
+        Directory where the combined PNG will be saved.
+    num_iter : int, optional
+        Epoch number appended to the filename when > 0.
+    """
+    from matplotlib import pyplot as plt
+
+    label = "t-SNE" if method == "tsne" else method.upper()
 
     variant_labels = {
         "wells_seismic": "Wells + Seismic",
@@ -481,38 +717,31 @@ def _plot_combined_mds(
     }
 
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))  # type: ignore
-    fig.suptitle("MDS Comparison: Real vs Generated Facies", fontsize=14)  # type: ignore
+    fig.suptitle(f"{label} Comparison: Real vs Generated Facies", fontsize=14)  # type: ignore
 
     for ax, name in zip(axes.flat, VARIANT_NAMES):
-        if name not in all_facies:
+        if name not in shared_embedding[1]:
             ax.set_title(f"{variant_labels.get(name, name)} (no data)")
             ax.axis("off")
             continue
+        real_reduced = shared_embedding[0]
+        fake_reduced = shared_embedding[1][name]
 
-        fake_arr = np.stack(all_facies[name], 0)
-        if fake_arr.shape[-1] == 1:
-            fake_arr = fake_arr.squeeze(-1)
-        fake_flat = np.reshape(fake_arr, [fake_arr.shape[0], -1])
-        fake_sim = euclidean_distances(fake_flat)
-        fake_reduced = mds.fit((fake_sim + fake_sim.T) / 2).embedding_
-
-        mi = all_mask_indexes[name]
-        real_subset = (
-            real_reduced[mi] if len(mi) <= real_reduced.shape[0] else real_reduced
-        )
-
-        ax.scatter(real_subset[:, 0], real_subset[:, 1], alpha=0.6, label="Real")
+        ax.scatter(real_reduced[:, 0], real_reduced[:, 1], alpha=0.6, label="Real")
         ax.scatter(fake_reduced[:, 0], fake_reduced[:, 1], alpha=0.6, label="Generated")
         ax.set_title(variant_labels.get(name, name))
-        ax.set_xlabel("MDS Dimension 1")
-        ax.set_ylabel("MDS Dimension 2")
+        ax.set_xlabel(f"{label} Dimension 1")
+        ax.set_ylabel(f"{label} Dimension 2")
         ax.legend(loc="upper right", fontsize=8)
 
     plt.tight_layout()
-    combined_path = os.path.join(base_output, "mds_comparison_all_variants.png")
+    epoch_tag = f"_epoch{num_iter}" if num_iter > 0 else ""
+    combined_path = os.path.join(
+        base_output, f"{method}_comparison_all_variants{epoch_tag}.png"
+    )
     plt.savefig(combined_path, dpi=150, bbox_inches="tight")  # type: ignore
     plt.close(fig)
-    print(f"\nCombined MDS plot -> {combined_path}")
+    print(f"\nCombined {label} plot -> {combined_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -530,6 +759,7 @@ def main() -> None:
 
     # Map variant name -> model path (either from training or --model-paths)
     model_paths: dict[str, str] = {}
+    any_retrained = False
 
     total_start = time.time()
 
@@ -561,47 +791,155 @@ def main() -> None:
             wells_flag = "ON" if variant["use_wells"] else "OFF"
             seismic_flag = "ON" if variant["use_seismic"] else "OFF"
 
+            # Check for existing checkpoint
+            last_done = _find_last_completed_scale(variant_output)
+            start_epoch = getattr(args, "start_epoch", 0)
+
+            # Auto-detect start_epoch from completed_epoch.txt when
+            # resuming (--start-epoch > 0) or when all scales exist.
+            completed_epochs = _read_completed_epochs(variant_output, args.stop_scale)
+
+            # If the user specified --start-epoch, use the max of that
+            # and what was actually completed.
+            if start_epoch > 0:
+                effective_start = max(start_epoch, completed_epochs)
+            else:
+                effective_start = completed_epochs
+
+            # Skip if all scales are trained AND the model has already
+            # reached (or exceeded) the requested num_iter.
+            if last_done >= args.stop_scale and effective_start >= args.num_iter:
+                model_paths[name] = variant_output
+                print(f"\n{'─' * 60}")
+                print(
+                    f"Skipping variant: {name} "
+                    f"(fully trained — {completed_epochs}/{args.num_iter} epochs)"
+                )
+                print(f"  {variant_output}")
+                print(f"{'─' * 60}")
+                continue
+
+            # When resuming from a specific epoch, re-enter all scale
+            # groups so the trainer can load existing checkpoints and
+            # continue from that epoch.
+            if effective_start > 0:
+                resume_scale = 0
+            else:
+                resume_scale = last_done + 1 if last_done >= 0 else 0
+
             print(f"\n{'─' * 60}")
             print(f"Training variant: {name}")
             print(f"  wells={wells_flag}  seismic={seismic_flag}")
+            if effective_start > 0:
+                print(
+                    f"  Resuming from epoch {effective_start} (all scales will be re-entered)"
+                )
+            elif resume_scale > 0:
+                print(
+                    f"  Resuming from scale {resume_scale} (scales 0-{last_done} already done)"
+                )
             print(f"  DDP: {nproc} GPUs  compile_backend: ON")
             print(f"{'─' * 60}")
 
-            variant_args = _build_training_args(args, variant, variant_output)
+            variant_args = _build_training_args(
+                args, variant, variant_output, start_scale=resume_scale
+            )
+            # Override --start-epoch with effective_start so the
+            # subprocess always receives the actual resume point.
+            # Remove any existing --start-epoch first.
+            try:
+                idx = variant_args.index("--start-epoch")
+                variant_args[idx + 1] = str(effective_start)
+            except ValueError:
+                if effective_start > 0:
+                    variant_args.extend(["--start-epoch", str(effective_start)])
             variant_start = time.time()
             _train_variant(variant_args, nproc)
+            any_retrained = True
             elapsed = format_time(int(time.time() - variant_start))
 
             # --output-fullpath places artifacts directly in variant_output
             model_paths[name] = variant_output
             print(f"  Training complete ({elapsed}) -> {variant_output}")
 
-    # ── Generate facies from all trained models ──
-    print(f"\n{'=' * 70}")
-    print("GENERATING FACIES FROM TRAINED MODELS")
-    print(f"{'=' * 70}\n")
+    # ── Try to load cached embeddings ──
+    # Reuse only when no variant was retrained (all skipped); if any model
+    # was retrained the old embeddings are stale and must be recomputed.
+    cached = (
+        _load_shared_embeddings(base_output, args.num_iter)
+        if not any_retrained
+        else None
+    )
+    if cached is not None:
+        shared, all_facies = cached
+        print(f"Loaded cached embeddings for epoch {args.num_iter}")
+    else:
+        # ── Generate facies from all trained models ──
+        print(f"\n{'=' * 70}")
+        print("GENERATING FACIES FROM TRAINED MODELS")
+        print(f"{'=' * 70}\n")
 
-    all_facies: dict[str, list[np.ndarray]] = {}
-    all_mask_indexes: dict[str, list[int]] = {}
+        all_facies: dict[str, list[np.ndarray]] = {}
+        all_mask_indexes: dict[str, list[int]] = {}
 
-    for name in VARIANT_NAMES:
-        model_path = model_paths[name]
-        gen_output = os.path.join(base_output, name, "generated")
+        for name in VARIANT_NAMES:
+            model_path = model_paths[name]
+            gen_output = os.path.join(base_output, name, "generated")
 
-        print(f"Generating from variant: {name}")
-        print(f"  model: {model_path}")
+            print(f"Generating from variant: {name}")
+            print(f"  model: {model_path}")
 
-        variant_facies, variant_mi = _generate_variant(
-            model_path=model_path,
-            gen_output=gen_output,
-            how_many=args.how_many,
-            device=device,
+            variant_facies, variant_mi = _generate_variant(
+                model_path=model_path,
+                gen_output=gen_output,
+                how_many=args.how_many,
+                device=device,
+            )
+            all_facies[name] = variant_facies
+            all_mask_indexes[name] = variant_mi
+
+        # ── Shared embeddings for all plots ──
+        # Fit UMAP, Isomap, t-SNE, and MDS once on real + ALL variants'
+        # fakes so the real dots are identical across all plots.
+        import inspect
+
+        first_model = model_paths[VARIANT_NAMES[0]]
+        with open(os.path.join(first_model, OPT_FILE), "r") as f:
+            _json = json.load(f)
+        _valid = set(inspect.signature(TrainningOptions.__init__).parameters) - {"self"}
+        _base_opts = TrainningOptions(**{k: v for k, v in _json.items() if k in _valid})
+        _base_opts.wells = list(range(200))
+        _base_opts.rec = False
+        _base_opts.compile_backend = False
+        _dataset = TorchPyramidsDataset(_base_opts)
+
+        print("\nComputing shared embeddings for all plots...", flush=True)
+        shared = _compute_shared_embeddings(all_facies, _dataset)
+
+        # Persist for future resume
+        _save_shared_embeddings(shared, all_facies, base_output, args.num_iter)
+
+    # ── Per-variant plots (consistent real coordinates) ──
+    for method in ("mds", "umap", "isomap", "tsne"):
+        real_reduced, per_variant_fakes = shared[method]
+        for name in VARIANT_NAMES:
+            if name not in per_variant_fakes:
+                continue
+            gen_output = os.path.join(base_output, name, "generated")
+            plot_path = os.path.join(gen_output, f"{method}_comparison.png")
+            _plot_per_variant_embedding(
+                method, real_reduced, per_variant_fakes[name], plot_path
+            )
+            print(f"  {method.upper()} plot -> {plot_path}")
+
+    # ── Combined comparison plots (2x2 grid) ──
+    for method in ("mds", "umap", "isomap", "tsne"):
+        _plot_combined_embeddings(
+            method,
+            shared[method],
+            base_output,
+            args.num_iter,
         )
-        all_facies[name] = variant_facies
-        all_mask_indexes[name] = variant_mi
-
-    # ── Combined MDS comparison plot across all variants ──
-    _plot_combined_mds(all_facies, all_mask_indexes, model_paths, base_output)
 
     total_elapsed = format_time(int(time.time() - total_start))
     print(f"\n{'=' * 70}")

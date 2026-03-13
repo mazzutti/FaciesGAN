@@ -89,6 +89,18 @@ def get_arguments() -> ArgumentParser:
     )
     parser.add_argument("--stop-scale", type=int, help="stop scale", default=6)
     parser.add_argument(
+        "--start-scale",
+        type=int,
+        help="scale to start/resume training from (default: 0)",
+        default=0,
+    )
+    parser.add_argument(
+        "--start-epoch",
+        type=int,
+        help="epoch to resume training from within the current scale group (default: 0)",
+        default=0,
+    )
+    parser.add_argument(
         "--num-img-channels", type=int, help="facie number of channels", default=3
     )
     parser.add_argument(
@@ -472,7 +484,11 @@ def main() -> None:
     else:
         timestamp = datetime.now(tz.tzlocal()).strftime("%Y_%m_%d_%H_%M_%S")
         options.output_path = os.path.join(options.output_path, timestamp)
-    options.start_scale = 0
+    options.start_scale = (
+        options.start_scale
+        if hasattr(options, "start_scale") and options.start_scale
+        else 0
+    )
 
     if is_main:
         os.makedirs(options.output_path, exist_ok=True)
@@ -566,6 +582,12 @@ def main() -> None:
         trainer = TorchTrainer(options, device=device, distributed=distributed)
         if is_main:
             print("Using Torch backend for training.")
+
+    # Resume from checkpoint when starting from a non-zero scale
+    if options.start_scale > 0:
+        trainer.load(options.output_path, until_scale=options.start_scale - 1)
+        if is_main:
+            print(f"Resumed from checkpoint: loaded scales 0-{options.start_scale - 1}")
 
     # Register cleanup so child processes are killed on any exit path
     # (unhandled exception, KeyboardInterrupt, normal exit, etc.)

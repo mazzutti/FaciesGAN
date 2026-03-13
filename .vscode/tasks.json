@@ -107,6 +107,28 @@
 			}
 		},
 		{
+			"label": "start-tensorboard",
+			"type": "shell",
+			"command": "${workspaceFolder}/launch_tensorboard.sh",
+			"isBackground": true,
+			"problemMatcher": {
+				"pattern": {
+					"regexp": "^$",
+					"file": 1
+				},
+				"background": {
+					"activeOnStart": true,
+					"beginsPattern": ".",
+					"endsPattern": "TensorBoard"
+				}
+			},
+			"presentation": {
+				"reveal": "silent",
+				"panel": "dedicated",
+				"close": false
+			}
+		},
+		{
 			"label": "kill-torchrun-orphans",
 			"type": "shell",
 			"command": "bash",

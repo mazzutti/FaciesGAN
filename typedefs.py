@@ -26,12 +26,13 @@ import torch
 from torch.utils.data import DataLoader
 
 if TYPE_CHECKING:
-    from trainning.mlx.schedulers import MultiStepLR
+    from trainning.mlx.schedulers import MultiStepLR, StepLR
 else:
     # Avoid importing training internals at module import time to prevent
     # circular imports when other modules (e.g., `trainning.base`) import
     # `typedefs`. Use a permissive fallback for runtime typing.
     MultiStepLR = object  # type: ignore
+    StepLR = object  # type: ignore
 
 # Generic type variables for type hinting
 T = TypeVar("T")
@@ -87,6 +88,7 @@ TScheduler = TypeVar(
     "TScheduler",
     torch.optim.lr_scheduler.LRScheduler,
     MultiStepLR,
+    StepLR,
 )
 
 

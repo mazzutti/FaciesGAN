@@ -20,10 +20,10 @@ from metrics import (
     GeneratorMetrics,
     IterableMetrics,
 )
-from trainning.mlx.schedulers import MultiStepLR
+from trainning.mlx.schedulers import StepLR
 
 
-class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, MultiStepLR], nn.Module):
+class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, StepLR], nn.Module):
     """MLX adapter for the FaciesGAN architecture.
 
     This class implements the abstract FaciesGAN base for the Apple MLX framework.

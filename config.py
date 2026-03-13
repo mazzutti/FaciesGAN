@@ -28,6 +28,14 @@ SCH_G_FILE = "sch_G.pth"
 SCH_D_FILE = "sch_D.pth"
 RESULT_FACIES_PATH = "real_x_generated_facies"
 
+# Epoch-level checkpoint (saved inside each scale directory)
+EPOCH_CKPT_FILE = "epoch_checkpoint.pth"
+
+# Small metadata file recording the last completed epoch for a scale
+# group.  Written when the group finishes so that resume can detect the
+# actual training progress even after the epoch checkpoint is removed.
+COMPLETED_EPOCH_FILE = "completed_epoch.txt"
+
 # Model and auxiliary filenames used by the facies GAN implementation
 G_FILE = "generator.pth"
 D_FILE = "discriminator.pth"

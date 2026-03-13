@@ -90,6 +90,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         # Common training parameters (conservative subset)
         self.start_scale: int = options.start_scale
+        self.start_epoch: int = getattr(options, "start_epoch", 0)
         self.stop_scale: int = options.stop_scale
         self.output_path: str = options.output_path
         self.num_iter: int = options.num_iter
@@ -209,16 +210,18 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             if len(options.wells_mask_columns) > 0:
                 dataset_info += f", wells: {options.wells_mask_columns}"
 
+            _purge = self.start_epoch if self.start_epoch > 0 else None
             self.visualizer = TensorBoardVisualizer(
                 num_scales=self.stop_scale - self.start_scale + 1,
                 output_dir=viz_path,
                 log_dir=log_dir,
                 update_interval=1,
                 dataset_info=dataset_info,
+                purge_step=_purge,
             )
-            print("📊 TensorBoard logging enabled!")
-            print(f"   View training progress: tensorboard --logdir={log_dir}")
-            print("   Then open: http://localhost:6006")
+            print(f"📊 TensorBoard logging enabled")
+            print(f"   logdir: {log_dir}")
+            print(f"   URL: http://localhost:6006")
         else:
             self.visualizer = None  # type: ignore
             if self._is_main_process:
@@ -412,6 +415,15 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         """
         raise NotImplementedError("Subclasses must implement setup_optimizers")
 
+    @abstractmethod
+    def reset_schedulers(self, scales: tuple[int, ...]) -> None:
+        """Reset LR schedulers to their initial state for a new batch.
+
+        Called at the start of each DataLoader batch so that every batch
+        trains with the same LR schedule (e.g. decay at epoch 500, 1000).
+        """
+        raise NotImplementedError("Subclasses must implement reset_schedulers")
+
     def train_scales(
         self,
         scales: tuple[int, ...],
@@ -424,6 +436,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         wells_pyramid: dict[int, TTensor] = {},
         masks_pyramid: dict[int, TTensor] = {},
         seismic_pyramid: dict[int, TTensor] = {},
+        start_epoch: int = 0,
     ) -> None:
         """Train multiple pyramid scales simultaneously.
 
@@ -489,7 +502,11 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             )
 
         # Training loop - iterate epochs (0-based)
-        for epoch in range(self.num_iter):
+        if start_epoch > 0 and self._is_main_process:
+            print(
+                f"  Resuming from epoch {start_epoch} (skipping epochs 0-{start_epoch - 1})"
+            )
+        for epoch in range(start_epoch, self.num_iter):
             progress.set_description(  # type: ignore
                 f"Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch+1:4d}/{self.num_iter}]"
             )
@@ -536,6 +553,22 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             # this barrier the next epoch's NCCL collectives can timeout
             # while rank-0 is still compiling kernels.
             self._ddp_barrier()
+
+            # Save an epoch checkpoint at save_interval boundaries so
+            # training can be resumed from that point.  Skip the very
+            # last epoch — the full scale checkpoint saved in train()
+            # after the batch loop is sufficient for that case.
+            if (
+                (epoch + 1) % self.save_interval == 0
+                and epoch < self.num_iter - 1
+                and self._is_main_process
+            ):
+                self.save_epoch_checkpoint(
+                    scales,
+                    scale_paths,
+                    epoch + 1,
+                    batch_id,
+                )
 
             # Release GPU tensors that are no longer needed
             del scale_metrics
@@ -611,6 +644,59 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         discriminator_scheduler: TScheduler,
     ) -> None:
         raise NotImplementedError("Subclasses must implement save_optimizers")
+
+    @abstractmethod
+    def save_epoch_checkpoint(
+        self,
+        scales: tuple[int, ...],
+        scale_paths: dict[int, str],
+        epoch: int,
+        batch_id: int,
+    ) -> None:
+        """Save a mid-training checkpoint so training can resume from *epoch*.
+
+        The checkpoint must capture model weights, optimizer/scheduler
+        states and the noise amplitudes / reconstruction noise for the
+        scales currently being trained.
+
+        Parameters
+        ----------
+        scales : tuple[int, ...]
+            Scale indices being trained in the current group.
+        scale_paths : dict[int, str]
+            Per-scale output directory paths.
+        epoch : int
+            The *next* epoch to run (i.e. training completed up to
+            ``epoch - 1``).
+        batch_id : int
+            Current batch index within the DataLoader iteration.
+        """
+        raise NotImplementedError("Subclasses must implement save_epoch_checkpoint")
+
+    @abstractmethod
+    def load_epoch_checkpoint(
+        self,
+        scales: tuple[int, ...],
+        scale_paths: dict[int, str],
+    ) -> tuple[int, int]:
+        """Restore a previously saved epoch checkpoint.
+
+        Parameters
+        ----------
+        scales : tuple[int, ...]
+            Scale indices being trained in the current group.
+        scale_paths : dict[int, str]
+            Per-scale output directory paths (used to locate the checkpoint
+            file).
+
+        Returns
+        -------
+        tuple[int, int]
+            ``(start_epoch, resume_batch_id)`` — the epoch and batch id
+            to resume from.  Returns ``(0, 0)`` when no checkpoint is
+            found.
+        """
+        raise NotImplementedError("Subclasses must implement load_epoch_checkpoint")
 
     def load(self, path: str, until_scale: int | None = None) -> None:
         """Load saved models and set the starting scale for training.
@@ -763,14 +849,17 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         seismic_pyramid : dict[int, TTensor]
             Dictionary of seismic-conditioning tensors for all scales.
         """
-        samples_processed = self.batch_size * epoch
+        # Use a globally unique step so that different DataLoader
+        # batches do not overwrite each other's TensorBoard entries.
+        global_step = self._current_batch_id * self.num_iter + epoch
+        samples_processed = self.batch_size * global_step
 
         # ── Rank-0U-only I/O ─────────────────────────────────────────
         if self._is_main_process:
             # Visualizer update
             if self.enable_tensorboard and self.visualizer:
                 self.visualizer.update(  # type: ignore
-                    epoch, scale_metrics, generated_samples, samples_processed
+                    global_step, scale_metrics, generated_samples, samples_processed
                 )
 
             # Print formatted metrics table occasionally
@@ -825,7 +914,28 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 for scale in scales:
                     g = scale_metrics.generator[scale]
                     d = scale_metrics.discriminator[scale]
-                    self.log_epoch(progress, writers[scale], epoch, g, d)  # type: ignore
+                    self.log_epoch(progress, writers[scale], epoch, g, d, global_step)  # type: ignore
+                    # Log learning rates per scale
+                    lr_g = self.generator_schedulers[scale].get_last_lr()[0]  # type: ignore[union-attr]
+                    lr_d = self.discriminator_schedulers[scale].get_last_lr()[0]  # type: ignore[union-attr]
+                    writers[scale].add_scalar("LearningRate/generator", lr_g, global_step)  # type: ignore
+                    writers[scale].add_scalar("LearningRate/discriminator", lr_d, global_step)  # type: ignore
+
+            # Log when learning rate decays (at every lr_decay interval,
+            # before schedulers_step advances the count).
+            if (
+                self.lr_decay > 0
+                and epoch > 0
+                and epoch % self.lr_decay == 0
+            ):
+                lr_g_before = self.generator_schedulers[scales[0]].get_last_lr()[0]  # type: ignore[union-attr]
+                lr_g_after = lr_g_before * self.gamma  # type: ignore[operator]
+                progress.write(  # type: ignore
+                    f"\n  ⚡ LR decay at epoch {epoch}: "
+                    f"lr_g {lr_g_before:.2e} → {lr_g_after:.2e}, "
+                    f"lr_d {lr_g_before:.2e} → {lr_g_after:.2e} "
+                    f"(gamma={self.gamma})"
+                )
 
             # Save generated facies at intervals
             if (
@@ -846,7 +956,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     )
 
         # ── All ranks ─────────────────────────────────────────────────
-        # Step schedulers
+        # Step schedulers (LR decay happens here when epoch reaches
+        # the milestone — the console message above fires just before).
         self.schedulers_step(scales)
         progress.update(1)  # type: ignore
 
@@ -966,11 +1077,6 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             # Only main process creates directories, writers
             writers: dict[int, SummaryWriter] = {}
             if self._is_main_process:
-                if self.enable_tensorboard:
-                    writers = {
-                        s: SummaryWriter(log_dir=scale_paths[s])
-                        for s in scales_to_train
-                    }
                 for s in scales_to_train:
                     utils.create_dirs(scale_paths[s])
                     utils.create_dirs(results_paths[s])
@@ -979,11 +1085,81 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 for s in scales_to_train:
                     self.load_model(s)
 
+            # ── Epoch-level resume ──────────────────────────────────
+            # When start_epoch > 0 for the *first* scale group, load the
+            # epoch checkpoint (model weights + optimiser/scheduler states)
+            # and figure out which batch to resume from.
+            resume_epoch: int = 0
+            resume_batch_id: int = 0
+            # base_epoch: the epoch that unprocessed batches should start
+            # from.  When resuming mid-batch, batches after the resumed
+            # one already completed up to the previous full run's epoch
+            # count (recorded in completed_epoch.txt).  Without this,
+            # they would incorrectly restart from epoch 0.
+            base_epoch: int = 0
+            if self.start_epoch > 0:
+                resume_epoch, resume_batch_id = self.load_epoch_checkpoint(
+                    scales_to_train,
+                    scale_paths,
+                )
+                if resume_epoch > 0 and self._is_main_process:
+                    print(
+                        f"Epoch checkpoint loaded: resuming from batch {resume_batch_id}, "
+                        f"epoch {resume_epoch}"
+                    )
+                if resume_batch_id > 0:
+                    # Determine base_epoch: the epoch that all batches
+                    # before resume_batch_id already completed.
+                    # 1) Check completed_epoch.txt (written when a full
+                    #    scale group finishes).
+                    # 2) Fall back to self.start_epoch (the CLI value
+                    #    that triggered checkpoint loading — this is the
+                    #    epoch the scale-level models were trained to in
+                    #    the previous run).
+                    from config import COMPLETED_EPOCH_FILE
+
+                    meta_path = os.path.join(
+                        scale_paths[min(scales_to_train)], COMPLETED_EPOCH_FILE
+                    )
+                    if os.path.isfile(meta_path):
+                        with open(meta_path) as f:
+                            base_epoch = int(f.read().strip())
+                    else:
+                        base_epoch = self.start_epoch
+
+            # Create per-scale TensorBoard writers AFTER resume logic so
+            # purge_step can use the correct global_step value.  The
+            # first stale step is resume_batch_id * num_iter + resume_epoch.
+            if self._is_main_process and self.enable_tensorboard:
+                if resume_epoch > 0:
+                    _purge: int | None = resume_batch_id * self.num_iter + resume_epoch
+                else:
+                    _purge = None
+                writers = {
+                    s: SummaryWriter(log_dir=scale_paths[s], purge_step=_purge)
+                    for s in scales_to_train
+                }
+
             # Iterate over DataLoader batches for this group and train on each
             # Single progress bar for all batches and epochs in this group
             total_batches = len(self.data_loader)
+            if resume_epoch > 0:
+                if resume_batch_id == 0:
+                    # All batches completed through resume_epoch (scale-level
+                    # checkpoint); every batch runs the remaining epochs.
+                    progress_total = (self.num_iter - resume_epoch) * total_batches
+                else:
+                    # Mid-batch resume: the resumed batch runs fewer epochs;
+                    # later ones start from base_epoch (the last fully-completed
+                    # epoch count from the previous training run).
+                    batches_after_resume = max(0, total_batches - resume_batch_id - 1)
+                    progress_total = (
+                        self.num_iter - resume_epoch
+                    ) + batches_after_resume * (self.num_iter - base_epoch)
+            else:
+                progress_total = self.num_iter * total_batches
             progress = tqdm(  # type: ignore
-                total=self.num_iter * total_batches,
+                total=progress_total,
                 position=0,
                 disable=not self._is_main_process,
             )
@@ -995,6 +1171,28 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             batch_iterator = self.create_batch_iterator(self.data_loader, all_scales)
 
             for batch_id, batch in enumerate(batch_iterator):
+
+                # Skip batches already processed before the resume point
+                if resume_epoch > 0 and batch_id < resume_batch_id:
+                    continue
+
+                # Determine the epoch to start from for this batch.
+                # When resume_batch_id == 0, all batches completed through
+                # resume_epoch (scale-level checkpoint), so every batch
+                # starts from resume_epoch.  When resume_batch_id > 0
+                # (mid-batch epoch checkpoint), only the interrupted batch
+                # resumes from resume_epoch; later ones start from
+                # base_epoch (the last fully-completed epoch count).
+                batch_start_epoch = (
+                    resume_epoch
+                    if resume_epoch > 0
+                    and (resume_batch_id == 0 or batch_id == resume_batch_id)
+                    else base_epoch
+                )
+
+                # Reset LR schedulers so each batch trains with the
+                # same schedule (decay at epoch lr_decay, 2*lr_decay, ...).
+                self.reset_schedulers(scales_to_train)
 
                 # Expose batch info to train_scales so it can show epoch progress
                 self._total_batches = total_batches
@@ -1021,6 +1219,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     wells_pyramid=wells_pyramid,
                     masks_pyramid=masks_pyramid,
                     seismic_pyramid=seismic_pyramid,
+                    start_epoch=batch_start_epoch,
                 )
 
             progress.close()  # type: ignore
@@ -1029,6 +1228,37 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             if self._is_main_process:
                 for s in scales_to_train:
                     self.model.save_scale(s, scale_paths[s])
+                    self.save_optimizers(
+                        scale_paths[s],
+                        self.generator_optimizers[s],
+                        self.discriminator_optimizers[s],
+                        self.generator_schedulers[s],
+                        self.discriminator_schedulers[s],
+                    )
+
+                # Record the actual last epoch trained so that resume
+                # can detect the real training progress.  We write the
+                # last epoch index (0-based), i.e. self.num_iter - 1 is
+                # the last completed epoch when training ran to the end.
+                # NOTE: we deliberately write num_iter (the count of
+                # completed epochs) rather than num_iter-1 so that the
+                # value can be compared directly with start_epoch.
+                from config import COMPLETED_EPOCH_FILE
+
+                for s in scales_to_train:
+                    meta_path = os.path.join(scale_paths[s], COMPLETED_EPOCH_FILE)
+                    with open(meta_path, "w") as f:
+                        f.write(str(self.num_iter))
+
+                # Save a final epoch checkpoint so that the next resume
+                # can use the fast-path load instead of falling back to
+                # piece-meal scale-level file loading.
+                self.save_epoch_checkpoint(
+                    scales_to_train,
+                    scale_paths,
+                    self.num_iter,
+                    0,
+                )
 
             # Synchronise so non-zero ranks wait for rank 0 to finish
             # saving before proceeding to the next scale group (or to
@@ -1076,6 +1306,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         epoch: int,
         generator_metrics: GeneratorMetrics[TTensor],
         discriminator_metrics: DiscriminatorMetrics[TTensor],
+        global_step: int | None = None,
     ) -> None:
         """Log training metrics for the current epoch to TensorBoard and console.
 
@@ -1121,6 +1352,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         g_total, g_fake, g_rec, g_well, g_div = vals[:5]
         d_total, d_real, d_fake, d_gp = vals[5:]
 
+        step = global_step if global_step is not None else epoch
+
         # Update progress bar description with more detailed info
         if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
             epochs.set_description(  # type: ignore
@@ -1134,16 +1367,16 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             )
 
         # Log to TensorBoard - discriminator losses
-        writer.add_scalar("Loss/train/discriminator/real", -d_real, epoch)  # type: ignore
-        writer.add_scalar("Loss/train/discriminator/fake", d_fake, epoch)  # type: ignore
+        writer.add_scalar("Loss/train/discriminator/real", -d_real, step)  # type: ignore
+        writer.add_scalar("Loss/train/discriminator/fake", d_fake, step)  # type: ignore
         writer.add_scalar(  # type: ignore
-            "Loss/train/discriminator/gradient_penalty", d_gp, epoch
+            "Loss/train/discriminator/gradient_penalty", d_gp, step
         )
-        writer.add_scalar("Loss/train/discriminator", d_total, epoch)  # type: ignore
+        writer.add_scalar("Loss/train/discriminator", d_total, step)  # type: ignore
 
         # Log to TensorBoard - generator losses
-        writer.add_scalar("Loss/train/generator/adversarial", g_fake, epoch)  # type: ignore
-        writer.add_scalar("Loss/train/generator/reconstruction", g_rec, epoch)  # type: ignore
-        writer.add_scalar("Loss/train/generator/well_constraint", g_well, epoch)  # type: ignore
-        writer.add_scalar("Loss/train/generator/diversity", g_div, epoch)  # type: ignore
-        writer.add_scalar("Loss/train/generator", g_total, epoch)  # type: ignore
+        writer.add_scalar("Loss/train/generator/adversarial", g_fake, step)  # type: ignore
+        writer.add_scalar("Loss/train/generator/reconstruction", g_rec, step)  # type: ignore
+        writer.add_scalar("Loss/train/generator/well_constraint", g_well, step)  # type: ignore
+        writer.add_scalar("Loss/train/generator/diversity", g_div, step)  # type: ignore
+        writer.add_scalar("Loss/train/generator", g_total, step)  # type: ignore

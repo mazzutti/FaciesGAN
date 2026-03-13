@@ -2,7 +2,7 @@
 
 This module contains helpers to generate samples from a trained
 FaciesGAN model, create comparison plots between real and generated
-facies, and provide simple MDS visualizations. It is primarily a
+facies, and provide MDS, UMAP, Isomap, and t-SNE visualizations. It is primarily a
 convenience script used offline after training.
 """
 
@@ -10,9 +10,11 @@ import json
 import os
 import random
 import time
+import warnings
 from argparse import ArgumentParser
 
 import numpy as np
+import scipy.sparse as sparse  # type: ignore
 import tifffile as tif
 import torch
 from matplotlib import pyplot as plt
@@ -20,8 +22,9 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.markers import MarkerStyle
 from numpy.typing import NDArray
-from sklearn.manifold import MDS
+from sklearn.manifold import TSNE, Isomap, MDS
 from sklearn.metrics import euclidean_distances
+from umap import UMAP  # type: ignore
 
 from background_workers import submit_plot_generated_facies
 from config import OPT_FILE
@@ -216,7 +219,7 @@ def plot_mds(
     options: TrainningOptions,
     dataset: TorchPyramidsDataset,
     save_path: str | None = None,
-) -> None:
+) -> tuple[NDArray[np.float32], NDArray[np.float32]]:
     """Plot MDS embedding comparing real and generated facies.
 
     Parameters
@@ -233,6 +236,12 @@ def plot_mds(
     save_path : str | None, optional
         If provided, save the plot to this file path instead of showing
         it interactively.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(real_reduced, fake_reduced)`` — full (un-subsetted) real MDS
+        embedding and fake MDS embedding, so callers can reuse them.
     """
     # fake_facies parameter is a list of numpy arrays. Do not rebind the parameter
     # to an ndarray (which would violate the annotated type). Use a new local
@@ -263,11 +272,10 @@ def plot_mds(
     real_facies_reduced = mds.fit(
         (real_facies_similarities + real_facies_similarities.T) / 2
     ).embedding_
-    real_facies_reduced = real_facies_reduced[options.wells]
     fake_facies_reduced = mds.fit(
         (fake_facies_similarities + fake_facies_similarities.T) / 2
     ).embedding_
-    plt.scatter(real_facies_reduced[:, 0], real_facies_reduced[:, 1])  # type: ignore
+    plt.scatter(real_facies_reduced[options.wells, 0], real_facies_reduced[options.wells, 1])  # type: ignore
     plt.scatter(fake_facies_reduced[:, 0], fake_facies_reduced[:, 1])  # type: ignore
     plt.title("MDS Visualization of FaciesGAN generated facies")  # type: ignore
     plt.xlabel("MDS Dimension 1")  # type: ignore
@@ -278,6 +286,216 @@ def plot_mds(
         plt.close()  # type: ignore
     else:
         plt.show()  # type: ignore
+    return real_facies_reduced, fake_facies_reduced
+
+
+def plot_umap(
+    fake_facies: list[NDArray[np.float32]],
+    mask_indexes: list[int],
+    options: TrainningOptions,
+    dataset: TorchPyramidsDataset,
+    save_path: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Plot UMAP embedding comparing real and generated facies.
+
+    Parameters
+    ----------
+    fake_facies : list[np.ndarray]
+        List of generated facies arrays (flattenable) to include in the plot.
+    mask_indexes : list[int]
+        Indices used for well-based conditioning corresponding to the generated
+        facies.
+    options : TrainningOptions
+        Options containing dataset indices and other generation flags.
+    dataset : TorchPyramidsDataset
+        Dataset providing real facies data for comparison.
+    save_path : str | None, optional
+        If provided, save the plot to this file path instead of showing
+        it interactively.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(real_reduced, fake_reduced)`` — full (un-subsetted) real UMAP
+        embedding and fake UMAP embedding, so callers can reuse them.
+    """
+    fake_facies_arr = np.stack(fake_facies, 0)
+    if fake_facies_arr.shape[-1] == 1:
+        fake_facies_arr = fake_facies_arr.squeeze(-1)
+    real_facies, _, _ = dataset.get_scale_data(-1)
+    real_facies_flat = np.reshape(
+        utils.torch2np(real_facies, denormalize=True),
+        [real_facies.shape[0], -1],
+    )
+    fake_facies_flat = np.reshape(fake_facies_arr, [len(mask_indexes), -1])
+
+    # Fit UMAP on the combined real + fake data so both share the same space
+    combined = np.concatenate([real_facies_flat, fake_facies_flat], axis=0).astype(
+        np.float32
+    )
+    reducer = UMAP(  # type: ignore
+        n_components=2,
+        n_neighbors=min(15, combined.shape[0] - 1),
+        min_dist=0.1,
+        metric="euclidean",
+        random_state=42,
+    )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=sparse.SparseEfficiencyWarning)
+        warnings.filterwarnings("ignore", category=UserWarning, module="umap")
+        embedding: np.ndarray = reducer.fit_transform(combined)  # type: ignore
+
+    n_real = real_facies_flat.shape[0]
+    real_reduced: np.ndarray = embedding[:n_real]
+    fake_reduced: np.ndarray = embedding[n_real:]
+
+    plt.scatter(real_reduced[options.wells, 0], real_reduced[options.wells, 1])  # type: ignore
+    plt.scatter(fake_reduced[:, 0], fake_reduced[:, 1])  # type: ignore
+    plt.title("UMAP Visualization of FaciesGAN generated facies")  # type: ignore
+    plt.xlabel("UMAP Dimension 1")  # type: ignore
+    plt.ylabel("UMAP Dimension 2")  # type: ignore
+    plt.legend(("Real Facies", "Fake Facies"), loc="upper right")  # type: ignore
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")  # type: ignore
+        plt.close()  # type: ignore
+    else:
+        plt.show()  # type: ignore
+    return real_reduced, fake_reduced
+
+
+def plot_isomap(
+    fake_facies: list[NDArray[np.float32]],
+    mask_indexes: list[int],
+    options: TrainningOptions,
+    dataset: TorchPyramidsDataset,
+    save_path: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Plot Isomap embedding comparing real and generated facies.
+
+    Parameters
+    ----------
+    fake_facies : list[np.ndarray]
+        List of generated facies arrays (flattenable) to include in the plot.
+    mask_indexes : list[int]
+        Indices used for well-based conditioning corresponding to the generated
+        facies.
+    options : TrainningOptions
+        Options containing dataset indices and other generation flags.
+    dataset : TorchPyramidsDataset
+        Dataset providing real facies data for comparison.
+    save_path : str | None, optional
+        If provided, save the plot to this file path instead of showing
+        it interactively.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(real_reduced, fake_reduced)`` — full (un-subsetted) real Isomap
+        embedding and fake Isomap embedding, so callers can reuse them.
+    """
+    fake_facies_arr = np.stack(fake_facies, 0)
+    if fake_facies_arr.shape[-1] == 1:
+        fake_facies_arr = fake_facies_arr.squeeze(-1)
+    real_facies, _, _ = dataset.get_scale_data(-1)
+    real_facies_flat = np.reshape(
+        utils.torch2np(real_facies, denormalize=True),
+        [real_facies.shape[0], -1],
+    )
+    fake_facies_flat = np.reshape(fake_facies_arr, [len(mask_indexes), -1])
+
+    # Fit Isomap on the combined real + fake data so both share the same space
+    combined = np.concatenate([real_facies_flat, fake_facies_flat], axis=0).astype(
+        np.float32
+    )
+    n_neighbors = min(5, combined.shape[0] - 1)
+    iso = Isomap(n_components=2, n_neighbors=n_neighbors)
+    embedding: np.ndarray = iso.fit_transform(combined)  # type: ignore[assignment]
+
+    n_real = real_facies_flat.shape[0]
+    real_reduced: np.ndarray = embedding[:n_real]
+    fake_reduced: np.ndarray = embedding[n_real:]
+
+    plt.scatter(real_reduced[options.wells, 0], real_reduced[options.wells, 1])  # type: ignore
+    plt.scatter(fake_reduced[:, 0], fake_reduced[:, 1])  # type: ignore
+    plt.title("Isomap Visualization of FaciesGAN generated facies")  # type: ignore
+    plt.xlabel("Isomap Dimension 1")  # type: ignore
+    plt.ylabel("Isomap Dimension 2")  # type: ignore
+    plt.legend(("Real Facies", "Fake Facies"), loc="upper right")  # type: ignore
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")  # type: ignore
+        plt.close()  # type: ignore
+    else:
+        plt.show()  # type: ignore
+    return real_reduced, fake_reduced
+
+
+def plot_tsne(
+    fake_facies: list[NDArray[np.float32]],
+    mask_indexes: list[int],
+    options: TrainningOptions,
+    dataset: TorchPyramidsDataset,
+    save_path: str | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Plot t-SNE embedding comparing real and generated facies.
+
+    Parameters
+    ----------
+    fake_facies : list[np.ndarray]
+        List of generated facies arrays (flattenable) to include in the plot.
+    mask_indexes : list[int]
+        Indices used for well-based conditioning corresponding to the generated
+        facies.
+    options : TrainningOptions
+        Options containing dataset indices and other generation flags.
+    dataset : TorchPyramidsDataset
+        Dataset providing real facies data for comparison.
+    save_path : str | None, optional
+        If provided, save the plot to this file path instead of showing
+        it interactively.
+
+    Returns
+    -------
+    tuple[np.ndarray, np.ndarray]
+        ``(real_reduced, fake_reduced)`` \u2014 full (un-subsetted) real t-SNE
+        embedding and fake t-SNE embedding, so callers can reuse them.
+    """
+    fake_facies_arr = np.stack(fake_facies, 0)
+    if fake_facies_arr.shape[-1] == 1:
+        fake_facies_arr = fake_facies_arr.squeeze(-1)
+    real_facies, _, _ = dataset.get_scale_data(-1)
+    real_facies_flat = np.reshape(
+        utils.torch2np(real_facies, denormalize=True),
+        [real_facies.shape[0], -1],
+    )
+    fake_facies_flat = np.reshape(fake_facies_arr, [len(mask_indexes), -1])
+
+    # Fit t-SNE on the combined real + fake data so both share the same space
+    combined = np.concatenate([real_facies_flat, fake_facies_flat], axis=0).astype(
+        np.float32
+    )
+    tsne = TSNE(
+        n_components=2,
+        perplexity=min(30.0, (combined.shape[0] - 1) / 3.0),
+        random_state=42,
+    )
+    embedding: np.ndarray = tsne.fit_transform(combined)  # type: ignore[assignment]
+
+    n_real = real_facies_flat.shape[0]
+    real_reduced: np.ndarray = embedding[:n_real]
+    fake_reduced: np.ndarray = embedding[n_real:]
+
+    plt.scatter(real_reduced[options.wells, 0], real_reduced[options.wells, 1])  # type: ignore
+    plt.scatter(fake_reduced[:, 0], fake_reduced[:, 1])  # type: ignore
+    plt.title("t-SNE Visualization of FaciesGAN generated facies")  # type: ignore
+    plt.xlabel("t-SNE Dimension 1")  # type: ignore
+    plt.ylabel("t-SNE Dimension 2")  # type: ignore
+    plt.legend(("Real Facies", "Fake Facies"), loc="upper right")  # type: ignore
+    if save_path:
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")  # type: ignore
+        plt.close()  # type: ignore
+    else:
+        plt.show()  # type: ignore
+    return real_reduced, fake_reduced
 
 
 if __name__ == "__main__":
@@ -288,6 +506,15 @@ if __name__ == "__main__":
     parser.add_argument("--use_gpu", help="use available GPU", action="store_true")
     parser.add_argument(
         "--plot_mds", help="plot the multi dimensional scaling", action="store_true"
+    )
+    parser.add_argument(
+        "--plot_umap", help="plot the UMAP embedding", action="store_true"
+    )
+    parser.add_argument(
+        "--plot_isomap", help="plot the Isomap embedding", action="store_true"
+    )
+    parser.add_argument(
+        "--plot_tsne", help="plot the t-SNE embedding", action="store_true"
     )
     parser.add_argument(
         "--wells",
@@ -412,6 +639,12 @@ if __name__ == "__main__":
 
     if arguments.plot_mds:
         plot_mds(facies, mi, args, dataset)
+    if arguments.plot_umap:
+        plot_umap(facies, mi, args, dataset)
+    if arguments.plot_isomap:
+        plot_isomap(facies, mi, args, dataset)
+    if arguments.plot_tsne:
+        plot_tsne(facies, mi, args, dataset)
     if arguments.plot_well_mask:
         for i, (facie, masked_facie) in enumerate(
             zip(facies, [masked_facies[-1][i] for i in mi]), 1

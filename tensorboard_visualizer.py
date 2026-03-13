@@ -56,6 +56,7 @@ class TensorBoardVisualizer:
         log_dir: str | None = None,
         update_interval: int = 1,
         dataset_info: str | None = None,
+        purge_step: int | None = None,
     ):
         """Initialize the TensorBoard visualizer.
 
@@ -86,8 +87,10 @@ class TensorBoardVisualizer:
             os.makedirs(log_dir, exist_ok=True)
         os.makedirs(output_dir or ".", exist_ok=True)
 
-        # Create TensorBoard writer
-        self.writer = SummaryWriter(log_dir=log_dir)
+        # Create TensorBoard writer.  When resuming, purge_step tells
+        # tensorboardX to invalidate stale events from a previous run so
+        # the curves stay clean.
+        self.writer = SummaryWriter(log_dir=log_dir, purge_step=purge_step)
 
         # Training timing
         self.start_time = time.time()
@@ -99,8 +102,8 @@ class TensorBoardVisualizer:
             "Training/Scales", f"Training {num_scales} scales in parallel", 0
         )
 
-        print(f"✅ TensorBoard initialized. View at: tensorboard --logdir={log_dir}")
-        print(f"   Or run: tensorboard --logdir={log_dir} --port=6006")
+        print(f"✅ TensorBoard initialized.")
+        print(f"   tensorboard --logdir={log_dir} --port=6006 --bind_all")
 
     def update(
         self,
@@ -138,17 +141,18 @@ class TensorBoardVisualizer:
         if epoch % self.update_interval != 0 and epoch != 1:
             return
 
-        # At runtime `ScaleMetrics` is an alias to `object` to avoid imports,
-        # so `isinstance(..., ScaleMetrics)` will be true for any object
-        # (including plain dicts). Use attribute detection instead to
-        # determine whether we have a typed ScaleMetrics instance.
-        if hasattr(scale_metrics, "as_tuple_of_dicts"):
+        # Use attribute detection to determine whether we have a typed
+        # ScaleMetrics instance (isinstance checks won't work due to generics).
+        if not isinstance(scale_metrics, dict):
             flat_metrics: dict[int, dict[str, float]] = {
-                i: metrics
-                for i, metrics in enumerate(scale_metrics.as_tuple_of_dicts())  # type: ignore
+                s: {
+                    **scale_metrics.generator[s].as_dict(),
+                    **scale_metrics.discriminator[s].as_dict(),
+                }
+                for s in sorted(scale_metrics.generator)
             }
         else:
-            flat_metrics: dict[int, dict[str, float]] = scale_metrics  # type: ignore
+            flat_metrics = scale_metrics
 
         # Calculate timing info
         current_time = time.time()
@@ -164,10 +168,16 @@ class TensorBoardVisualizer:
             # Generator losses
             self.writer.add_scalar(f"Scale_{scale}/G_Total", metrics["g_total"], epoch)
             self.writer.add_scalar(
-                f"Scale_{scale}/G_Adversarial", metrics["g_adv"], epoch
+                f"Scale_{scale}/G_Adversarial", metrics["g_fake"], epoch
             )
             self.writer.add_scalar(
                 f"Scale_{scale}/G_Reconstruction", metrics["g_rec"], epoch
+            )
+            self.writer.add_scalar(
+                f"Scale_{scale}/G_Well_Constraint", metrics["g_well"], epoch
+            )
+            self.writer.add_scalar(
+                f"Scale_{scale}/G_Diversity", metrics["g_div"], epoch
             )
 
         # Compute and log mean losses across all scales
@@ -185,12 +195,16 @@ class TensorBoardVisualizer:
 
             # Mean generator losses
             mean_g_total = np.mean([flat_metrics[s]["g_total"] for s in scales])
-            mean_g_adv = np.mean([flat_metrics[s]["g_adv"] for s in scales])
+            mean_g_adv = np.mean([flat_metrics[s]["g_fake"] for s in scales])
             mean_g_rec = np.mean([flat_metrics[s]["g_rec"] for s in scales])
+            mean_g_well = np.mean([flat_metrics[s]["g_well"] for s in scales])
+            mean_g_div = np.mean([flat_metrics[s]["g_div"] for s in scales])
 
             self.writer.add_scalar("Mean/G_Total", mean_g_total, epoch)
             self.writer.add_scalar("Mean/G_Adversarial", mean_g_adv, epoch)
             self.writer.add_scalar("Mean/G_Reconstruction", mean_g_rec, epoch)
+            self.writer.add_scalar("Mean/G_Well_Constraint", mean_g_well, epoch)
+            self.writer.add_scalar("Mean/G_Diversity", mean_g_div, epoch)
 
         # Log training progress
         self.writer.add_scalar("Training/Samples_Processed", samples_processed, epoch)
@@ -237,22 +251,16 @@ class TensorBoardVisualizer:
                 # Convert to CHW format for TensorBoard (expects C, H, W)
                 img_chw = np.transpose(img, (2, 0, 1))
                 self.writer.add_image(f"Samples/Scale_{scale}", img_chw, epoch)
-                print(
-                    f"      Scale {scale}: shape {img_chw.shape}, range [{img_chw.min():.3f}, {img_chw.max():.3f}]"
-                )
 
         self.last_update_time = current_time
 
         # Flush to ensure data is written
         self.writer.flush()
 
-        print(f"📊 TensorBoard updated: epoch {epoch}, elapsed {elapsed/60:.1f}m")
-
     def close(self):
         """Close the TensorBoard writer."""
         if hasattr(self, "writer"):
             self.writer.close()
-            print("✅ TensorBoard writer closed")
 
     def __del__(self):
         """Cleanup when object is destroyed."""

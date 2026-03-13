@@ -143,3 +143,79 @@ class MultiStepLR:
         # If an optimizer is attached, sync its learning rate to scheduler
         if self.optimizer is not None and len(self._last_lr) > 0:
             self.optimizer.learning_rate = mx.array(self._last_lr[0])
+
+
+class StepLR:
+    """Step learning rate scheduler for MLX.
+
+    Decays the learning rate by ``gamma`` every ``step_size`` epochs.
+    Mirrors ``torch.optim.lr_scheduler.StepLR``.
+
+    Args:
+        init_lr: Initial learning rate.
+        step_size: Period of learning rate decay.
+        gamma: Multiplicative factor of learning rate decay.
+        last_step: The index of last step. Default: -1 (before first step).
+        optimizer: Optional MLX optimizer to update on each step.
+    """
+
+    def __init__(
+        self,
+        init_lr: float,
+        step_size: int,
+        gamma: float = 0.1,
+        last_step: int = -1,
+        optimizer: MLXOptimizer | None = None,
+    ) -> None:
+        self.base_lrs: list[float] = [float(init_lr)]
+        self.step_size = int(step_size)
+        self.gamma = float(gamma)
+        self.last_step = int(last_step)
+        self.optimizer = optimizer
+
+        if self.optimizer is not None:
+            if isinstance(self.optimizer.learning_rate, mx.array):  # type: ignore
+                lr_val = self.optimizer.learning_rate.item()
+            else:
+                lr_val = self.optimizer.learning_rate  # type: ignore
+            self.base_lrs = [lr_val]
+
+        self._last_lr: list[float] = self._compute_lrs()
+
+    def _compute_lrs(self, step: int | None = None) -> list[float]:
+        if step is None:
+            step = self.last_step
+        if step < 0 or self.step_size <= 0:
+            return list(self.base_lrs)
+        count = step // self.step_size
+        mul = self.gamma ** count
+        return [base_lr * mul for base_lr in self.base_lrs]
+
+    def step(self, step: int | None = None) -> list[float]:
+        if step is None:
+            self.last_step += 1
+        else:
+            self.last_step = int(step)
+
+        self._last_lr = self._compute_lrs(self.last_step)
+
+        if self.optimizer is not None:
+            self.optimizer.learning_rate = mx.array(self._last_lr[0])
+
+        return list(self._last_lr)
+
+    def get_lr(self) -> list[float]:
+        return list(self._last_lr)
+
+    def get_last_lr(self) -> list[float]:
+        return list(self._last_lr)
+
+    def state_dict(self) -> dict[str, object]:
+        return {k: v for k, v in self.__dict__.items() if k != "optimizer"}
+
+    def load_state_dict(self, state: dict[str, object]) -> None:
+        self.__dict__.update(state)
+        self.base_lrs = [float(x) for x in self.base_lrs]
+        self._last_lr = list(self._last_lr)
+        if self.optimizer is not None and len(self._last_lr) > 0:
+            self.optimizer.learning_rate = mx.array(self._last_lr[0])

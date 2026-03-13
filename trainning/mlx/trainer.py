@@ -12,7 +12,15 @@ import utils
 
 
 import background_workers as bw
-from config import D_FILE, G_FILE, OPT_D_FILE, OPT_G_FILE, SCH_D_FILE, SCH_G_FILE
+from config import (
+    D_FILE,
+    EPOCH_CKPT_FILE,
+    G_FILE,
+    OPT_D_FILE,
+    OPT_G_FILE,
+    SCH_D_FILE,
+    SCH_G_FILE,
+)
 from datasets import PyramidsDataset
 from datasets.data_prefetcher import PyramidsBatch
 from datasets.mlx.data_prefetcher import MLXDataPrefetcher
@@ -29,7 +37,7 @@ from metrics import (
     ScaleMetrics,
 )
 from trainning.mlx.collate import collate
-from trainning.mlx.schedulers import MultiStepLR
+from trainning.mlx.schedulers import StepLR
 from typedefs import Batch
 from models.mlx import utils as mlx_utils
 
@@ -51,7 +59,7 @@ class MLXTrainer(
         mx.array,
         nn.Module,
         optim.Optimizer,
-        MultiStepLR,
+        StepLR,
         DataLoader[Batch[mx.array]],
     ]
 ):
@@ -126,7 +134,7 @@ class MLXTrainer(
 
     def create_model(
         self,
-    ) -> FaciesGAN[mx.array, nn.Module, optim.Optimizer, MultiStepLR]:
+    ) -> FaciesGAN[mx.array, nn.Module, optim.Optimizer, StepLR]:
         """Instantiate and return the :class:`TorchFaciesGAN` configured
         with the trainer options and device.
 
@@ -344,8 +352,8 @@ class MLXTrainer(
         scale_path: str,
         generator_optimizer: optim.Optimizer,
         discriminator_optimizer: optim.Optimizer,
-        generator_scheduler: MultiStepLR,
-        discriminator_scheduler: MultiStepLR,
+        generator_scheduler: StepLR,
+        discriminator_scheduler: StepLR,
     ) -> None:
         """Load optimizer and scheduler state dictionaries from checkpoint.
 
@@ -557,9 +565,9 @@ class MLXTrainer(
                 generators[scale].parameters()
             )
 
-            self.generator_schedulers[scale] = MultiStepLR(
+            self.generator_schedulers[scale] = StepLR(
                 init_lr=self.lr_g,
-                milestones=[self.lr_decay],
+                step_size=self.lr_decay,
                 gamma=self.gamma,
                 optimizer=self.generator_optimizers[scale],
             )
@@ -571,9 +579,9 @@ class MLXTrainer(
             self.discriminator_optimizers[scale].init(  # type: ignore
                 discriminators[scale].parameters()
             )
-            self.discriminator_schedulers[scale] = MultiStepLR(
+            self.discriminator_schedulers[scale] = StepLR(
                 init_lr=self.lr_d,
-                milestones=[self.lr_decay],
+                step_size=self.lr_decay,
                 gamma=self.gamma,
                 optimizer=self.discriminator_optimizers[scale],
             )
@@ -693,13 +701,28 @@ class MLXTrainer(
                 batch_id=batch_id,
             )
 
+    def reset_schedulers(self, scales: tuple[int, ...]) -> None:
+        for scale in scales:
+            self.generator_schedulers[scale] = StepLR(
+                init_lr=self.lr_g,
+                step_size=self.lr_decay,
+                gamma=self.gamma,
+                optimizer=self.generator_optimizers[scale],
+            )
+            self.discriminator_schedulers[scale] = StepLR(
+                init_lr=self.lr_d,
+                step_size=self.lr_decay,
+                gamma=self.gamma,
+                optimizer=self.discriminator_optimizers[scale],
+            )
+
     def save_optimizers(
         self,
         scale_path: str,
         generator_optimizer: optim.Optimizer,
         discriminator_optimizer: optim.Optimizer,
-        generator_scheduler: MultiStepLR,
-        discriminator_scheduler: MultiStepLR,
+        generator_scheduler: StepLR,
+        discriminator_scheduler: StepLR,
     ) -> None:
         """Save optimizer and scheduler state dicts to disk using project
         filename constants from :mod:`config`.
@@ -788,3 +811,122 @@ class MLXTrainer(
             )
         except Exception as e:
             print(f"Failed to save discriminator scheduler state: {e}")
+
+    def save_epoch_checkpoint(
+        self,
+        scales: tuple[int, ...],
+        scale_paths: dict[int, str],
+        epoch: int,
+        batch_id: int,
+    ) -> None:
+        checkpoint: dict[str, object] = {
+            "epoch": np.array(epoch),
+            "batch_id": np.array(batch_id),
+            "noise_amps": np.array(self.model.noise_amps, dtype=np.float32),
+        }
+        for s in scales:
+            gen_weights = self.model.generator.gens[s].parameters()  # type: ignore[var-annotated]
+            disc_weights = self.model.discriminator.discs[s].parameters()  # type: ignore[var-annotated]
+            # Flatten model weights into the dict with a scale prefix
+            for key, val in nn.utils.tree_flatten(gen_weights):  # type: ignore
+                checkpoint[f"s{s}.gen.{key}"] = np.array(val)  # type: ignore[arg-type]
+            for key, val in nn.utils.tree_flatten(disc_weights):  # type: ignore
+                checkpoint[f"s{s}.disc.{key}"] = np.array(val)  # type: ignore[arg-type]
+
+        ckpt_path = os.path.join(
+            scale_paths[min(scales)],
+            EPOCH_CKPT_FILE.replace(".pth", ".npz"),
+        )
+        os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+        np.savez(ckpt_path, **checkpoint)  # type: ignore
+        print(f"  Epoch checkpoint saved at epoch {epoch} (batch {batch_id})")
+
+    def load_epoch_checkpoint(
+        self,
+        scales: tuple[int, ...],
+        scale_paths: dict[int, str],
+    ) -> tuple[int, int]:
+        ckpt_path = os.path.join(
+            scale_paths[min(scales)],
+            EPOCH_CKPT_FILE.replace(".pth", ".npz"),
+        )
+        # ── Fast path: a full epoch checkpoint exists ──────────────
+        if os.path.isfile(ckpt_path):
+            data = np.load(ckpt_path, allow_pickle=False)
+            epoch = int(data["epoch"])
+            batch_id = int(data["batch_id"])
+
+            self.model.noise_amps = data["noise_amps"].tolist()
+
+            for s in scales:
+                gen_items = {
+                    k[len(f"s{s}.gen.") :]: mx.array(data[k])
+                    for k in data
+                    if k.startswith(f"s{s}.gen.")
+                }
+                disc_items = {
+                    k[len(f"s{s}.disc.") :]: mx.array(data[k])
+                    for k in data
+                    if k.startswith(f"s{s}.disc.")
+                }
+                if gen_items:
+                    self.model.generator.gens[s].load_weights(list(gen_items.items()))  # type: ignore
+                if disc_items:
+                    self.model.discriminator.discs[s].load_weights(list(disc_items.items()))  # type: ignore
+
+            return epoch, batch_id
+
+        # ── Fallback: load from scale-level checkpoints ────────────
+        from config import COMPLETED_EPOCH_FILE
+
+        effective_start = self.start_epoch
+        meta_path = os.path.join(scale_paths[min(scales)], COMPLETED_EPOCH_FILE)
+        if os.path.isfile(meta_path):
+            with open(meta_path) as f:
+                completed = int(f.read().strip())
+            if completed >= self.num_iter:
+                print(
+                    f"  Scale group already completed {completed} epochs "
+                    f"(num_iter={self.num_iter}); nothing to resume."
+                )
+                return self.num_iter, 0
+            effective_start = max(effective_start, completed)
+
+        if effective_start <= 0:
+            return 0, 0
+
+        loaded_any = False
+        for s in scales:
+            gen_path = os.path.join(scale_paths[s], G_FILE)
+            if os.path.isfile(gen_path):
+                self.model.generator.gens[s].load_weights(gen_path)  # type: ignore
+                loaded_any = True
+            disc_path = os.path.join(scale_paths[s], D_FILE)
+            if os.path.isfile(disc_path):
+                self.model.discriminator.discs[s].load_weights(disc_path)  # type: ignore
+
+        if not loaded_any:
+            return 0, 0
+
+        from config import AMP_FILE
+
+        for s in sorted(scales):
+            amp_path = os.path.join(scale_paths[s], AMP_FILE)
+            if os.path.isfile(amp_path):
+                with open(amp_path) as f:
+                    amp_val = float(f.read().strip())
+                while len(self.model.noise_amps) <= s:
+                    self.model.noise_amps.append(0.0)
+                self.model.noise_amps[s] = amp_val
+
+        # Fast-forward schedulers
+        for _ in range(effective_start):
+            for s in scales:
+                self.generator_schedulers[s].step()
+                self.discriminator_schedulers[s].step()
+
+        print(
+            f"  No epoch checkpoint found — loaded scale-level model weights "
+            f"and fast-forwarded schedulers to epoch {effective_start}"
+        )
+        return effective_start, 0
