@@ -369,7 +369,7 @@ def _generate_variant(
         "self"
     }
     opts = TrainningOptions(**{k: v for k, v in json_data.items() if k in _valid_keys})
-    opts.wells = list(range(200))
+    opts.wells = list(range(0, 200, 4))
     opts.rec = False
     opts.compile_backend = False  # no need to compile for one-shot generation
 
@@ -908,7 +908,7 @@ def main() -> None:
             _json = json.load(f)
         _valid = set(inspect.signature(TrainningOptions.__init__).parameters) - {"self"}
         _base_opts = TrainningOptions(**{k: v for k, v in _json.items() if k in _valid})
-        _base_opts.wells = list(range(200))
+        _base_opts.wells = list(range(0, 200, 4))
         _base_opts.rec = False
         _base_opts.compile_backend = False
         _dataset = TorchPyramidsDataset(_base_opts)

@@ -29,7 +29,7 @@ class TrainningOptions(argparse.Namespace):
         crop_size: int = 256,
         discriminator_steps: int = 3,
         num_img_channels: int = 3,
-        gamma: float = 0.1,
+        gamma: float = 0.5,
         generator_steps: int = 3,
         gpu_device: int = 0,
         gpu_devices: list[int] | None = None,

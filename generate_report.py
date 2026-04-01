@@ -13,6 +13,7 @@ from matplotlib.image import imread
 
 
 RESULTS_DIR = Path("results/experiments")
+DATA_DIR = Path("data")
 VARIANTS = ["wells_seismic", "wells_only", "seismic_only", "unconditional"]
 VARIANT_LABELS = {
     "wells_seismic": "Wells + Seismic",
@@ -123,6 +124,47 @@ def _add_hyperparams_page(pdf: PdfPages, results_dir: Path) -> None:
             if i % 2 == 0:
                 table[i, j].set_facecolor("#D9E2F3")
 
+    pdf.savefig(fig)  # type: ignore
+    plt.close(fig)
+
+
+def _add_seismic_data_page(pdf: PdfPages, data_dir: Path) -> None:
+    """2x3 grid showing seismic data examples."""
+    seismic_dir = data_dir / "seismic"
+    seismic_files = sorted(seismic_dir.glob("xz_crossline_*.png"))
+    if not seismic_files:
+        return
+
+    images = []
+    titles = []
+    # Pick 6 evenly spaced images
+    indices = [int(i * (len(seismic_files) - 1) / 5) for i in range(6)]
+    for i in indices:
+        img_path = seismic_files[i]
+        images.append(imread(str(img_path)))  # type: ignore
+        titles.append(img_path.stem)  # type: ignore
+
+    if not images:
+        return
+
+    fig, axes = plt.subplots(2, 3, figsize=(11, 7.5))  # type: ignore
+    fig.suptitle(  # type: ignore
+        "Seismic Data Examples",
+        fontsize=16,
+        fontweight="bold",
+        y=0.98,
+    )
+
+    for i in range(2):
+        for j in range(3):
+            idx = i * 3 + j
+            ax = axes[i][j]
+            if idx < len(images):  # type: ignore
+                ax.imshow(images[idx], cmap="gray")
+                ax.set_title(titles[idx], fontsize=10)
+            ax.axis("off")
+
+    fig.tight_layout(rect=[0, 0, 1, 0.95])  # type: ignore
     pdf.savefig(fig)  # type: ignore
     plt.close(fig)
 
@@ -270,10 +312,18 @@ def _add_combined_embedding_grid(
     plt.close(fig)
 
 
-def generate_report(results_dir: Path | None = None, output: str | None = None) -> str:
+def generate_report(
+    results_dir: Path | None = None,
+    data_dir: Path | None = None,
+    output: str | None = None,
+) -> str:
     if results_dir is None:
         results_dir = RESULTS_DIR
     results_dir = Path(results_dir)
+
+    if data_dir is None:
+        data_dir = DATA_DIR
+    data_dir = Path(data_dir)
 
     if output is None:
         output = str(results_dir / "experiment_report.pdf")
@@ -283,6 +333,9 @@ def generate_report(results_dir: Path | None = None, output: str | None = None) 
     with PdfPages(output) as pdf:
         # --- Title page ---
         _add_title_page(pdf)
+
+        # --- Seismic data examples ---
+        _add_seismic_data_page(pdf, data_dir)
 
         # --- Hyperparameters ---
         _add_hyperparams_page(pdf, results_dir)
@@ -325,4 +378,4 @@ def generate_report(results_dir: Path | None = None, output: str | None = None) 
 
 
 if __name__ == "__main__":
-    generate_report()
+    generate_report(results_dir=RESULTS_DIR, data_dir=DATA_DIR)

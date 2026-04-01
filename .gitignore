@@ -17,6 +17,6 @@ tools/
 !tools/gen_mlx_cache.py
 !faciesgan-c/tools/facies_worker.c
 scripts/
-results/**
+results*/**
 **/events.out.tfevents*
 

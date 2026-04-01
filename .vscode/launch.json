@@ -30,9 +30,9 @@
         "--output-path",
         "results/py/",
         "--num-train-pyramids",
-        "10",
+        "200",
         "--batch-size",
-        "1",
+        "40",
         "--num-workers",
         "2",
         "--num-iter",
@@ -241,7 +241,9 @@
         "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
         "VIRTUAL_ENV": "${workspaceFolder}/.venv",
         "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}",
-        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"
+        "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        "FG_DEBUG_NAN": "1",
+        "CUDA_LAUNCH_BLOCKING": "1"
       },
       "args": [
         "--input-path",
@@ -249,11 +251,11 @@
         "--output-path",
         "results/experiments",
         "--num-iter",
-        "100",
+        "300",
         // "--start-epoch",
-        // "1500",
+        // "200",
         "--num-train-pyramids",
-        "200",
+        "50",
         "--batch-size",
         "1",
         "--num-workers",
@@ -266,7 +268,7 @@
         "1000",
         "--lr-g", "5e-4",
         "--lr-d",  "5e-4",
-        // "--lr-decay", "500",
+        // "--lr-decay", "100",
       ]
     }
   ],
