@@ -21,7 +21,7 @@ from interpolators.neural import NeuralSmoother
 from interpolators.well import WellInterpolator
 
 # Create a cache directory
-memory = Memory("./.cache", verbose=0)
+memory = Memory("./.cache", verbose=0) # type: ignore
 
 
 def _stack_and_format(

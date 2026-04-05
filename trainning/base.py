@@ -427,7 +427,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
     def train_scales(
         self,
         scales: tuple[int, ...],
-        writers: dict[int, SummaryWriter],
+        writers: dict[int, SummaryWriter], # type: ignore
         scale_paths: dict[int, str],
         results_paths: dict[int, str],
         batch_id: int,
@@ -811,7 +811,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         epoch: int,
         scale_metrics: ScaleMetrics[TTensor],
         generated_samples: tuple[TTensor, ...],
-        writers: dict[int, SummaryWriter],
+        writers: dict[int, SummaryWriter], # type: ignore
         results_paths: dict[int, str],
         progress: "tqdm[Any]",  # type: ignore
         facies_pyramid: dict[int, TTensor],
@@ -1075,7 +1075,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             }
 
             # Only main process creates directories, writers
-            writers: dict[int, SummaryWriter] = {}
+            writers: dict[int, SummaryWriter] = {} # type: ignore
             if self._is_main_process:
                 for s in scales_to_train:
                     utils.create_dirs(scale_paths[s])
@@ -1302,7 +1302,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
     def log_epoch(
         self,
         epochs: "tqdm[int]",  # type: ignore
-        writer: SummaryWriter,
+        writer: SummaryWriter, # type: ignore
         epoch: int,
         generator_metrics: GeneratorMetrics[TTensor],
         discriminator_metrics: DiscriminatorMetrics[TTensor],

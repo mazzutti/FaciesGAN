@@ -765,7 +765,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import lovely_tensors as lt  # type: ignore
+    import lovely_tensors as lt # type: ignore
 
     lt.monkey_patch()
 

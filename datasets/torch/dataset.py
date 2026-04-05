@@ -161,7 +161,7 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
 
     def clean_cache(self) -> None:
         """Clear any in-memory or on-disk cache used by the dataset."""
-        torch_utils.memory.clear(warn=False)
+        torch_utils.memory.clear(warn=False) # type: ignore
 
     def get_scale_data(self, scale: int | None = None) -> tuple[torch.Tensor, ...]:
         """Return facies, wells and seismic tensors for a given scale.

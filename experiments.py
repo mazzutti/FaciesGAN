@@ -599,7 +599,7 @@ def _compute_shared_embeddings(
             warnings.filterwarnings("ignore", category=UserWarning, module="umap")
             emb: np.ndarray = reducer.fit_transform(combined)  # type: ignore
         print("    UMAP done.", flush=True)
-        return "umap", emb
+        return "umap", emb # type: ignore
 
     def _fit_isomap() -> tuple[str, np.ndarray]:
         print("  Computing shared Isomap embedding ...", flush=True)
