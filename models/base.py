@@ -912,7 +912,11 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         list[TTensor]
             List of generated tensors from multiple noise realizations.
         """
-        N = self.num_diversity_samples
+        # During diversity warmup, use N=1 to avoid the expensive
+        # batched forward (N*B → B) while the generator is still random.
+        div_skip = getattr(self, "_div_skip_epochs", 0)
+        cur_epoch = getattr(self, "_current_epoch", 0)
+        N = 1 if cur_epoch < div_skip else self.num_diversity_samples
         if N <= 1:
             noises = self.get_pyramid_noise(
                 scale, indexes, wells_pyramid, seismic_pyramid

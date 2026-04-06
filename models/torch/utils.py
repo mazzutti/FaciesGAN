@@ -45,9 +45,10 @@ def calc_gradient_penalty(
     gradients: torch.Tensor = torch.autograd.grad(
         outputs=disc_interpolates,
         inputs=interpolates,
-        grad_outputs=torch.ones_like(disc_interpolates),
+        grad_outputs=torch.ones(
+            1, dtype=disc_interpolates.dtype, device=device
+        ).expand_as(disc_interpolates),
         create_graph=True,
-        retain_graph=True,
         only_inputs=True,
     )[0]
 

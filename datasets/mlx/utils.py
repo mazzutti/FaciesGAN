@@ -74,6 +74,19 @@ def to_seismic_pyramids(
         return tuple()
 
 
+def to_impedance_pyramids(
+    scale_list: tuple[tuple[int, ...], ...],
+    channels_last: bool = False,
+) -> tuple[mx.array, ...]:
+    """Generate multi-scale pyramids from acoustic impedance (delegates to torch)."""
+    torch_pyramids = torch_utils.to_impedance_pyramids(
+        scale_list, channels_last=channels_last
+    )
+    if len(torch_pyramids) > 0:
+        return tuple(mx.array(p.numpy()) for p in torch_pyramids)
+    return tuple()
+
+
 def to_wells_pyramids(
     scale_list: tuple[tuple[int, ...], ...],
     channels_last: bool = False,

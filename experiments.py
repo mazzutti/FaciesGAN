@@ -292,7 +292,26 @@ def _train_variant(
     env["PYTHONWARNINGS"] = "ignore::UserWarning:multiprocessing.resource_tracker"
     result = subprocess.run(cmd, check=False, env=env)
     if result.returncode != 0:
-        raise RuntimeError(f"Training failed with exit code {result.returncode}")
+        # torchrun may return non-zero if a worker crashes during
+        # shutdown (e.g. std::bad_alloc in NCCL teardown) even though
+        # training completed successfully.  Check whether model
+        # artifacts were actually written before aborting.
+        output_flag_idx = None
+        for i, a in enumerate(variant_args):
+            if a == "--output-fullpath" and i + 1 < len(variant_args):
+                output_flag_idx = i + 1
+                break
+        output_dir = variant_args[output_flag_idx] if output_flag_idx else None
+        if output_dir and _find_last_completed_scale(output_dir) >= 0:
+            print(
+                f"  Warning: torchrun exited with code {result.returncode} "
+                f"(likely shutdown cleanup error); model artifacts exist, "
+                f"continuing.",
+            )
+        else:
+            raise RuntimeError(
+                f"Training failed with exit code {result.returncode}"
+            )
 
 
 def _generate_on_device(

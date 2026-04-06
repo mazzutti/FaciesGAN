@@ -18,6 +18,7 @@ class DataFiles(Enum):
     FACIES = "facies"
     WELLS = "wells"
     SEISMIC = "seismic"
+    IMPEDANCE = "impedance"
 
     def __init__(self, value: str, data_dir: str = "./data") -> None:
         """Initialize a DataFiles enum member.

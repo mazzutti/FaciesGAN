@@ -18,6 +18,10 @@ from datetime import datetime
 # torch.compile; Apex issues its own diagnostics separately.
 os.environ.setdefault("TORCH_LOGS", "-dynamo")
 os.environ.setdefault("TORCHDYNAMO_VERBOSE", "0")
+os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF",
+    "expandable_segments:True,max_split_size_mb:128",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -280,6 +284,12 @@ def get_arguments() -> ArgumentParser:
         help="enable using seismic data during data loading",
     )
     parser.add_argument(
+        "--use-impedance",
+        action="store_true",
+        help="use acoustic impedance volume as primary facies source "
+        "(replaces the categorical facies images with continuous impedance crosslines)",
+    )
+    parser.add_argument(
         "--use-mlx",
         action="store_true",
         help="enable MLX backend/model implementations when available",
@@ -318,6 +328,16 @@ def get_arguments() -> ArgumentParser:
             "~30%% extra compute for significantly lower peak GPU memory, "
             "allowing larger batch sizes.  Incompatible with torch.compile "
             "(compile is automatically disabled when this flag is set)."
+        ),
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        type=str,
+        choices=["fp16", "bf16"],
+        default="bf16",
+        help=(
+            "AMP compute dtype for CUDA autocast. "
+            "Use bf16 on Ampere+ for improved stability/perf tradeoff."
         ),
     )
 
@@ -729,12 +749,41 @@ def main() -> None:
         except Exception as e:
             print(f"Warning: BackgroundWorker shutdown failed: {e}", file=sys.stderr)
         if distributed:
+            try:
+                if (
+                    os.environ.get("FG_PROFILE_ALLREDUCE", "0") == "1"
+                    and "trainer" in locals()
+                    and hasattr(trainer, "model")
+                    and hasattr(trainer.model, "report_allreduce_profile")
+                ):
+                    report_allreduce = getattr(trainer.model, "report_allreduce_profile")
+                    report_allreduce()
+            except Exception as profile_err:
+                print(
+                    f"Warning: allreduce profile reporting failed: {profile_err}",
+                    file=sys.stderr,
+                )
+
+            # Explicitly delete trainer/model BEFORE destroying the NCCL
+            # process group.  If these objects survive until Python's
+            # final GC sweep, their C++ destructors try to free
+            # NCCL-related buffers after the communicator is gone,
+            # causing std::bad_alloc.
+            if "trainer" in locals():
+                try:
+                    del trainer  # noqa: F821
+                except Exception:
+                    pass
+            import gc
+            gc.collect()
+
             # Drain all pending GPU kernels before tearing down NCCL.
             # Destroying the process group while CUDA ops are in-flight
             # can corrupt driver state ("GPU has fallen off the bus").
             if torch.cuda.is_available():
                 try:
                     torch.cuda.synchronize()
+                    torch.cuda.empty_cache()
                 except Exception as sync_err:
                     print(
                         f"Warning: CUDA sync before destroy_process_group "

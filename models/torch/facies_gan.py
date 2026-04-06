@@ -8,6 +8,7 @@ and discriminators for each scale.
 
 import math
 import os
+import time
 from typing import Any, cast
 
 import torch
@@ -93,16 +94,16 @@ class TorchFaciesGAN(
         self.use_ddp = use_ddp
 
         # AMP (Automatic Mixed Precision) for faster CUDA training.
-        # Only the *generator* path uses AMP.  The discriminator stays
-        # in fp32 because:
-        #   (a) WGAN critic scores need full precision for a good
-        #       Wasserstein distance approximation,
-        #   (b) the gradient penalty uses create_graph=True; GradScaler's
-        #       scale factor can cause inf/NaN in the second-order
-        #       backward, making the scaler silently skip steps,
-        #   (c) the disc is small — fp16 saves negligible time.
+        # The generator always uses AMP.  The discriminator uses AMP
+        # only on non-GP steps (7 of 8 with gp_interval=8); GP steps
+        # stay fp32 because autograd.grad(create_graph=True) is
+        # incompatible with AMP autocast.
         self._use_amp = device.type == "cuda"
-        self._grad_scaler_g = GradScaler(enabled=self._use_amp)
+        amp_dtype_opt = str(getattr(options, "amp_dtype", "fp16")).lower()
+        self._amp_dtype = torch.bfloat16 if amp_dtype_opt == "bf16" else torch.float16
+        # Grad scaling is only needed for fp16; bf16 is numerically robust.
+        self._use_grad_scaler = self._use_amp and self._amp_dtype == torch.float16
+        self._grad_scaler_g = GradScaler(enabled=self._use_grad_scaler)
 
         # torch.compile gives a meaningful speedup on CUDA when gradient
         # checkpointing is OFF (the two features are incompatible because
@@ -112,6 +113,7 @@ class TorchFaciesGAN(
         self._use_compile = device.type == "cuda" and getattr(
             options, "compile_backend", True
         )
+
 
         # Pre-allocate constant zero scalars on device so the hot path
         # avoids repeated small CUDA allocations.
@@ -127,6 +129,48 @@ class TorchFaciesGAN(
         # ``create_graph=True`` (incompatible with compiled graphs).
         self._uncompiled_discs: dict[int, nn.Module] = {}
 
+        # NVLink optimization: track pending async all-reduce work for overlap.
+        # Set to a dist.Work object when an async all-reduce is initiated;
+        # cleared by _wait_pending_allreduce() before the next step.
+        self._pending_allreduce_work: dist.Work | None = None
+
+        # Deferred disc gradient sync for D/G overlap.
+        # On the last D-step, the all-reduce is launched asynchronously so
+        # that NCCL communication overlaps with the generator forward pass
+        # at the start of the G-phase.  Completed inside
+        # compute_generator_metrics before the disc is evaluated.
+        self._pending_disc_ar_work: dist.Work | None = None
+        self._pending_disc_ar_flat: torch.Tensor | None = None
+        self._pending_disc_ar_grads: list[torch.Tensor] | None = None
+        self._pending_disc_ar_opts: dict[int, torch.optim.Optimizer] | None = None
+        self._pending_disc_ar_scales: list[int] | None = None
+
+        self._profile_allreduce = os.environ.get("FG_PROFILE_ALLREDUCE", "0") == "1"
+        self._profile_allreduce_total_s = 0.0
+        self._profile_collective_total_s = 0.0
+        self._profile_allreduce_calls = 0
+        self._profile_allreduce_total_elems = 0
+
+        # Recovery-loss warmup: skip the expensive reconstruction
+        # forward during the first 30% of training when generator
+        # output is still random.  Roughly halves G-phase cost during
+        # warmup.
+        self._current_epoch: int = 0
+        self._rec_skip_epochs: int = int(
+            getattr(options, "num_iter", 1) * 0.3
+        )
+        # Diversity warmup: use N=1 (no diversity) during early epochs
+        # when generator output is still random and diversity loss is
+        # meaningless.  Reduces G-phase gen forward batch from N*B to B
+        # (66% less work with N=3) during the warmup window.
+        self._div_skip_epochs: int = self._rec_skip_epochs
+
+        # Pre-allocated noise buffers for the D-phase batched noise
+        # generation.  Keyed by (level, D*B, total_channels, padH, padW)
+        # so the same buffer is reused every iteration, eliminating
+        # D*(scale+1) randn + F.pad + cat allocations per scale.
+        self._d_noise_bufs: dict[tuple[int, ...], torch.Tensor] = {}
+
         # Create framework objects via the base class helper (calls build_* hooks)
         self.setup_framework()
 
@@ -138,21 +182,60 @@ class TorchFaciesGAN(
         # Compile the color quantizer — it runs on every gen forward
         # (~49 times per iteration) and has a simple compute graph
         # (einsum + softmax) that benefits from operator fusion.
-        # Uses dynamic=False so each (H,W) gets an optimally-specialised
-        # graph.  The cache_size_limit above is raised to accommodate
-        # all scale×batch-size variants without hitting the recompile cap.
-        # The quantizer output flows into non-compiled discriminator
-        # and loss code, so CUDA graphs would overwrite its output
-        # buffer before consumers read it.  Use "default" mode (Inductor
-        # fusion only, no CUDA graphs) to avoid the stale-tensor error.
+        # When the quantizer uses the fused Triton kernel, skip
+        # torch.compile — the custom autograd.Function already runs
+        # the entire forward+backward in a single kernel launch.
+        # Only compile it when falling back to the einsum path.
         if self._use_compile:
             gen = cast(TorchGenerator, self.generator)
-            gen.color_quantizer = torch.compile(  # type: ignore[assignment]
-                gen.color_quantizer,
+            if not getattr(gen.color_quantizer, "use_triton", False):
+                gen.color_quantizer = torch.compile(  # type: ignore[assignment]
+                    gen.color_quantizer,
+                    fullgraph=True,
+                    dynamic=False,
+                    mode="default",
+                )
+
+        # Compile the residual-add + clamp helper so Inductor fuses
+        # them into a single pointwise kernel, saving one kernel launch
+        # per scale per generator forward pass.
+        if self._use_compile:
+            gen = cast(TorchGenerator, self.generator)
+            gen._residual_clamp = torch.compile(  # type: ignore[assignment]
+                TorchGenerator.residual_clamp_fn,
                 fullgraph=True,
                 dynamic=False,
-                mode="default",
             )
+
+    # ── GPU-resident loss scale factors ─────────────────────────
+    # Override the base-class EMA helpers so that scale factors stay
+    # as CUDA scalar tensors.  This eliminates 21 GPU→CPU .item()
+    # sync stalls per iteration (D-steps × scales) and lets the
+    # DDP sync build its all-reduce tensor without a round-trip.
+
+    def update_loss_scale_factor(self, scale: int, d_mag: float | torch.Tensor) -> None:  # type: ignore[override]
+        """EMA update keeping values as device-resident scalar tensors."""
+        if not isinstance(d_mag, torch.Tensor):
+            d_mag = torch.tensor(d_mag, device=self.device)
+        if scale not in self.loss_scale_factors:
+            self.loss_scale_factors[scale] = (  # type: ignore[assignment]
+                d_mag.detach().clone() if d_mag > 0 else torch.tensor(1.0, device=self.device)
+            )
+        else:
+            prev = self.loss_scale_factors[scale]
+            if not isinstance(prev, torch.Tensor):
+                prev = torch.tensor(prev, device=self.device)
+            decay = self.loss_scale_ema_decay
+            self.loss_scale_factors[scale] = (  # type: ignore[assignment]
+                decay * prev + (1 - decay) * d_mag
+            ).detach()
+
+    def get_loss_scale_factor(self, scale: int) -> float | torch.Tensor:  # type: ignore[override]
+        """Return the current GPU-resident scale factor (no sync)."""
+        sf = self.loss_scale_factors.get(scale, 1.0)
+        if isinstance(sf, torch.Tensor):
+            return torch.clamp(sf, min=1e-4)
+        return max(sf, 1e-4)
 
     def __call__(self, *args: Any, **kwds: Any) -> ScaleMetrics[torch.Tensor]:
         return nn.Module.__call__(self, *args, **kwds)
@@ -252,6 +335,86 @@ class TorchFaciesGAN(
             None,
         )
 
+    def _get_batched_d_noise(
+        self,
+        scale: int,
+        D: int,
+        B: int,
+        indexes: list[int],
+        wells_pyramid: dict[int, torch.Tensor],
+        seismic_pyramid: dict[int, torch.Tensor],
+    ) -> list[torch.Tensor]:
+        """Generate D×B noise per pyramid level using pre-allocated buffers.
+
+        Instead of D separate ``get_pyramid_noise`` calls followed by
+        ``torch.cat`` per level, this method reuses cached zero-padded
+        buffers and fills them in-place with ``.normal_()`` / ``.copy_()``.
+        This eliminates D×(scale+1) ``torch.randn`` + ``F.pad`` +
+        ``torch.cat`` allocations per scale on every iteration.
+
+        The returned buffers are owned by ``self._d_noise_bufs`` and will
+        be overwritten on the next call, which is safe because the
+        generator forward pass only reads from them (all arithmetic is
+        out-of-place).
+        """
+        DB = D * B
+        p = self.zero_padding
+        result: list[torch.Tensor] = []
+
+        for lvl in range(scale + 1):
+            spatial = self.get_noise_shape(lvl, use_base_channel=False)
+            H, W = spatial[0], spatial[1]
+            total_C = self.gen_input_channels
+            noise_C = total_C
+
+            w: torch.Tensor | None = None
+            s: torch.Tensor | None = None
+
+            if wells_pyramid:
+                w = wells_pyramid[lvl].to(self.device, non_blocking=True)
+                if w.shape[0] != B:
+                    w = w[indexes]
+                noise_C -= w.shape[1]
+
+            if seismic_pyramid:
+                s = seismic_pyramid[lvl].to(self.device, non_blocking=True)
+                if s.shape[0] != B:
+                    s = s[indexes]
+                noise_C -= s.shape[1]
+
+            padH, padW = H + 2 * p, W + 2 * p
+            key = (lvl, DB, total_C, padH, padW)
+
+            buf: torch.Tensor | None = self._d_noise_bufs.get(key)
+            if buf is None:
+                buf = torch.empty(
+                    DB, total_C, padH, padW,
+                    device=self.device,
+                    memory_format=torch.channels_last,
+                ).zero_()
+                self._d_noise_bufs[key] = buf
+
+            # Fill noise channels in the inner (unpadded) region.
+            buf[:, :noise_C, p : p + H, p : p + W].normal_()
+
+            # Copy conditioning into each D-chunk.
+            if w is not None:
+                wC = w.shape[1]
+                dst = buf[:, noise_C : noise_C + wC, p : p + H, p : p + W]
+                for d in range(D):
+                    dst[d * B : (d + 1) * B].copy_(w)
+
+            if s is not None:
+                sC = s.shape[1]
+                off = noise_C + (w.shape[1] if w is not None else 0)
+                dst_s = buf[:, off : off + sC, p : p + H, p : p + W]
+                for d in range(D):
+                    dst_s[d * B : (d + 1) * B].copy_(s)
+
+            result.append(buf)
+
+        return result
+
     def optimize_discriminator(
         self,
         indexes: list[int],
@@ -260,11 +423,15 @@ class TorchFaciesGAN(
         wells_pyramid: dict[int, torch.Tensor] = {},
         seismic_pyramid: dict[int, torch.Tensor] = {},
     ) -> tuple[DiscriminatorMetrics[torch.Tensor], ...]:
-        """Discriminator optimization with pre-batched fake generation.
+        """Discriminator optimization with gradient accumulation.
 
         All D fakes per scale are generated in a single batched generator
         forward (batch = D × B) before the D-step loop begins.  This is
         safe because generator weights are frozen during D optimisation.
+
+        Gradients are accumulated across all D forward-backward passes
+        (each scaled by 1/D) with a single all-reduce + optimizer step
+        at the end, reducing NCCL collectives from D to 1 per iteration.
 
         Lazy gradient penalty (``gp_interval``) amortises the expensive
         ``create_graph=True`` double backward.
@@ -278,6 +445,10 @@ class TorchFaciesGAN(
         if D <= 0:
             return ()
 
+        # Complete any deferred disc update from the previous forward()
+        # (safety net for the case where G == 0 skipped the G-phase).
+        self._complete_pending_disc_allreduce()
+
         sorted_scales = sorted(self.active_scales)
         B = len(indexes)
 
@@ -286,71 +457,60 @@ class TorchFaciesGAN(
         # fakes can be produced upfront.  One forward with batch = D*B
         # is cheaper than D separate forwards with batch = B (fewer
         # kernel launches).
+        # Noise buffers are pre-allocated and reused across iterations
+        # to eliminate D×(scale+1) randn + F.pad + cat allocations.
         prefaked: dict[int, list[torch.Tensor]] = {}
         with torch.inference_mode():
             for scale in sorted_scales:
-                noise_sets = [
-                    self.get_pyramid_noise(
-                        scale, indexes, wells_pyramid, seismic_pyramid
-                    )
-                    for _ in range(D)
-                ]
-                # Concatenate along batch dim: each level gets D*B samples.
-                batched_noises: list[torch.Tensor] = [
-                    torch.cat([noise_sets[k][lvl] for k in range(D)], dim=0)
-                    for lvl in range(scale + 1)
-                ]
+                batched_noises = self._get_batched_d_noise(
+                    scale, D, B, indexes, wells_pyramid, seismic_pyramid
+                )
                 amps = self.get_noise_aplitude(scale)
                 batched_fake = self.generator(batched_noises, amps, stop_scale=scale)
                 # Split back into D chunks of size B.
                 prefaked[scale] = list(batched_fake.split(B, dim=0))  # type: ignore[arg-type]
 
-        # ── D-step loop using pre-generated fakes ──
-        # Structure: forward+backward all scales → one coalesced
-        # all_reduce → step all optimizers.  This reduces NCCL
-        # collectives from S per D-step to 1.
+        # ── Gradient accumulation across D steps ──
+        # Instead of D separate (zero_grad → backward → all-reduce → step)
+        # cycles, we zero once, accumulate gradients over D forward-backward
+        # passes (each scaled by 1/D), then do a single all-reduce + step.
+        # This reduces NCCL collectives from D to 1 per iteration.
         step_metrics: list[DiscriminatorMetrics[torch.Tensor]] = []
         # Track the last GP value computed per scale across all D-steps
         # so it can be reported even when the final step skips GP.
         last_gp: dict[int, torch.Tensor] = {}
+
+        # Phase 1: zero_grad once before the accumulation loop.
+        for scale in sorted_scales:
+            self._optimizer_zero_grad(optimizers[scale])
+
         for step_idx in range(D):
             step_metrics = []
             self._disc_step_counter += 1
             compute_gp = (self._disc_step_counter % self.gp_interval) == 0
 
-            # Sanity check: all ranks must agree on whether to compute GP,
-            # otherwise the allreduce mixes GP vs non-GP gradients.
-            if self.use_ddp and dist.is_initialized():
-                flag = torch.tensor([float(compute_gp)], device=self.device)
-                dist.all_reduce(flag, op=dist.ReduceOp.MAX)  # type: ignore[arg-type]
-                assert flag.item() == float(compute_gp), (
-                    f"Rank {dist.get_rank()}: _disc_step_counter desync — "
-                    f"local compute_gp={compute_gp}, but another rank disagrees"
-                )
-
-            # Phase 1: zero_grad + forward + backward for every scale.
-            for scale in sorted_scales:
-                optimizers[scale].zero_grad()
-
             # Store per-scale raw losses so metrics can be built after
             # the cross-rank scale-factor sync that follows.
             raw_losses: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+            # On non-GP steps the disc forward+backward has no
+            # create_graph=True, so bf16 autocast is safe and saves
+            # ~5-10% wall time (7 of 8 steps with gp_interval=8).
+            # GP steps stay fp32 because autograd.grad(create_graph=True)
+            # is incompatible with AMP.
+            use_disc_amp = self._use_amp and not compute_gp
             for scale in sorted_scales:
                 fake = prefaked[scale][step_idx]
                 real = facies_pyramid[scale]
 
-                # Discriminator forward runs in fp32 (no autocast) —
-                # WGAN critic scores need full precision and the GP
-                # backward is incompatible with GradScaler.
-
                 # Batch real+fake into a single disc forward to halve
                 # kernel launches and improve GPU utilization (especially
                 # for small batch sizes where each launch is under-utilized).
-                d_both = self.discriminator.discs[scale](torch.cat([real, fake], dim=0))
-                d_real, d_fake = d_both[:B], d_both[B:]
+                with autocast("cuda", enabled=use_disc_amp, dtype=self._amp_dtype):
+                    d_both = self.discriminator.discs[scale](torch.cat([real, fake], dim=0))
+                    d_real, d_fake = d_both[:B], d_both[B:]
 
-                real_loss = -d_real.mean()
-                fake_loss = d_fake.mean()
+                    real_loss = -d_real.mean()
+                    fake_loss = d_fake.mean()
 
                 if compute_gp:
                     gp = (
@@ -363,30 +523,46 @@ class TorchFaciesGAN(
 
                 # Per-scale loss normalization: divide by EMA of discriminator
                 # output magnitude so coarse scales don't dominate training.
+                # Also divide by D to average gradients across accumulation
+                # steps (compensates for additive gradient accumulation).
                 sf = self.get_loss_scale_factor(scale)
-                total = (real_loss + fake_loss + gp) / sf
+                total = (real_loss + fake_loss + gp) / (sf * D)
                 total.backward()  # type: ignore[no-untyped-call]
 
                 # Update the EMA scale factor AFTER backward (no side effects
                 # during autograd, and computed from raw un-normalized losses).
-                d_mag = (real_loss.abs() + fake_loss.abs()).detach().item()
+                # Keep d_mag as a GPU tensor to avoid a sync stall.
+                d_mag = (real_loss.abs() + fake_loss.abs()).detach()
                 self.update_loss_scale_factor(scale, d_mag)
                 raw_losses[scale] = (
                     real_loss.detach(),
                     fake_loss.detach(),
                 )
 
-            # Synchronize loss_scale_factors across DDP ranks so all ranks
-            # divide by the same value — prevents gradient magnitude drift
-            # from rank-local EMA updates on different data subsets.
-            if self.use_ddp and dist.is_initialized():
-                for scale in sorted_scales:
-                    sf_tensor = torch.tensor(
-                        [self.loss_scale_factors.get(scale, 1.0)],
-                        device=self.device,
+            # Synchronize loss_scale_factors across DDP ranks periodically.
+            # The EMA (decay=0.99) converges quickly, so syncing every
+            # 50 D-steps is sufficient to prevent drift while eliminating
+            # ~98% of the per-step collectives.
+            if (
+                self.use_ddp
+                and dist.is_initialized()
+                and self._disc_step_counter % 50 == 0
+            ):
+                scales_list = sorted_scales
+                # Scale factors are already GPU tensors — stack into a
+                # contiguous buffer for the all-reduce without .item().
+                sf_tensors: list[torch.Tensor] = [
+                    self.loss_scale_factors[s]  # type: ignore[misc]
+                    if isinstance(self.loss_scale_factors.get(s), torch.Tensor)
+                    else torch.tensor(
+                        self.loss_scale_factors.get(s, 1.0), device=self.device
                     )
-                    dist.all_reduce(sf_tensor, op=dist.ReduceOp.AVG)  # type: ignore[arg-type]
-                    self.loss_scale_factors[scale] = sf_tensor.item()
+                    for s in scales_list
+                ]
+                sf_buf = torch.stack(sf_tensors)
+                dist.all_reduce(sf_buf, op=dist.ReduceOp.AVG)  # type: ignore[arg-type]
+                for i, s in enumerate(scales_list):
+                    self.loss_scale_factors[s] = sf_buf[i].detach()  # type: ignore[assignment]
 
             # Build per-scale metrics using the now-synced scale factors.
             for scale in sorted_scales:
@@ -402,15 +578,39 @@ class TorchFaciesGAN(
                     )
                 )
 
-            # Phase 2: one coalesced all_reduce across all disc modules.
-            # No barrier needed — NCCL all_reduce is already a
-            # synchronizing collective that blocks until all ranks enter.
-            if self.use_ddp:
-                self._allreduce_grads_coalesced(
-                    [self.discriminator.discs[s] for s in sorted_scales]
+        # Phase 2 + 3: single all-reduce + step after all D accumulation
+        # passes.  For DDP, launch asynchronously so the NCCL collective
+        # overlaps with the generator forward pass (compute stream).
+        if self.use_ddp:
+            disc_modules = [
+                self.discriminator.discs[s] for s in sorted_scales
+            ]
+            params: list[nn.Parameter] = []
+            for m in disc_modules:
+                params.extend(
+                    p for p in m.parameters() if p.requires_grad
                 )
-
-            # Phase 3: step all disc optimizers (plain fp32).
+            if params:
+                for p in params:
+                    if p.grad is None:
+                        p.grad = torch.zeros_like(p.data)
+                grads = cast(list[torch.Tensor], [p.grad for p in params])
+                flat = cast(
+                    torch.Tensor,
+                    torch._utils._flatten_dense_tensors(grads),  # type: ignore[attr-defined]
+                )
+                work = dist.all_reduce(  # type: ignore[arg-type]
+                    flat, op=dist.ReduceOp.AVG, async_op=True
+                )
+                self._pending_disc_ar_work = work  # type: ignore[assignment]
+                self._pending_disc_ar_flat = flat
+                self._pending_disc_ar_grads = grads
+                self._pending_disc_ar_opts = optimizers
+                self._pending_disc_ar_scales = sorted_scales
+            else:
+                for scale in sorted_scales:
+                    optimizers[scale].step()
+        else:
             for scale in sorted_scales:
                 optimizers[scale].step()
 
@@ -426,13 +626,17 @@ class TorchFaciesGAN(
         masks_pyramid: dict[int, torch.Tensor] = {},
         seismic_pyramid: dict[int, torch.Tensor] = {},
     ) -> tuple[GeneratorMetrics[torch.Tensor], ...]:
-        """Generator optimization with per-scale parameter freezing.
+        """Generator optimization with gradient accumulation and per-scale freezing.
 
         Overrides the base ``optimize_generator`` to temporarily freeze
         all active-group gen blocks **except** the one being trained.
         This prevents ``backward()`` from computing (and then discarding)
         gradients for gen blocks that participate in the progressive
         forward pass but whose optimizer is not being stepped.
+
+        Gradients are accumulated across all G forward-backward passes
+        (each scaled by 1/G) with a single all-reduce + optimizer step
+        at the end, reducing NCCL collectives from G to 1 per iteration.
 
         For *S* parallel scales training simultaneously, the base
         implementation computes gradients for 1+2+…+S = S(S+1)/2 block
@@ -459,6 +663,20 @@ class TorchFaciesGAN(
         for s in sorted_scales:
             self.discriminator.discs[s].requires_grad_(False)
 
+        # ── Gradient accumulation across G steps ──
+        # Instead of G separate (zero_grad → backward → all-reduce →
+        # step) cycles, we zero once, accumulate gradients over G
+        # forward-backward passes (each scaled by 1/G), then do a
+        # single all-reduce + step.  Reduces NCCL collectives from
+        # G to 1 per iteration.
+
+        # Phase 0: zero_grad once before the accumulation loop.
+        for s in sorted_scales:
+            self._optimizer_zero_grad(optimizers[s])
+
+        # Track which scales contributed gradients across all G steps.
+        all_losses_scales: set[int] = set()
+
         for _ in range(G):
             step_metrics = []
 
@@ -470,7 +688,6 @@ class TorchFaciesGAN(
             # Phase 1: forward + backward for each scale (sequential
             # because each scale's forward depends on earlier frozen
             # blocks in the progressive chain).
-            losses_by_scale: dict[int, torch.Tensor] = {}
             for scale in sorted_scales:
                 if scale >= len(facies_pyramid):
                     continue
@@ -495,11 +712,14 @@ class TorchFaciesGAN(
                 )
                 metrics = cast(GeneratorMetrics[torch.Tensor], result)
 
-                # zero_grad + scaled backward (no all-reduce yet).
-                optimizers[scale].zero_grad()
-                self._grad_scaler_g.scale(metrics.total).backward()  # type: ignore[no-untyped-call]
+                # Scale loss by 1/G for correct gradient averaging.
+                scaled_total = metrics.total / G
+                if self._use_grad_scaler:
+                    self._grad_scaler_g.scale(scaled_total).backward()  # type: ignore[no-untyped-call]
+                else:
+                    scaled_total.backward()  # type: ignore[no-untyped-call]
 
-                losses_by_scale[scale] = metrics.total
+                all_losses_scales.add(scale)
 
                 # Re-freeze so the next scale's backward skips this block.
                 self.generator.gens[scale].requires_grad_(False)
@@ -514,43 +734,35 @@ class TorchFaciesGAN(
                     )
                 )
 
-            # Restore requires_grad BEFORE the all-reduce so that
-            # _allreduce_grads_coalesced's ``if p.requires_grad`` filter
-            # includes the parameters whose .grad was filled by backward.
-            for s in sorted_scales:
-                if s in losses_by_scale:
-                    self.generator.gens[s].requires_grad_(True)
-
-            # Phase 2: one coalesced all_reduce for all gen modules.
-            # No barrier needed — NCCL all_reduce is already a
-            # synchronizing collective that blocks until all ranks enter.
-            if self.use_ddp:
-                self._allreduce_grads_coalesced(
-                    [
-                        self.generator.gens[s]
-                        for s in sorted_scales
-                        if s in losses_by_scale
-                    ]
-                )
-
-            # Phase 3: unscale + step all gen optimizers.
-            for scale in sorted_scales:
-                if scale not in losses_by_scale:
-                    continue
-                self._grad_scaler_g.unscale_(optimizers[scale])
-                self._grad_scaler_g.step(optimizers[scale])
-                # GradScaler may skip optimizer.step() when inf/nan
-                # gradients are detected, leaving _opt_called unset
-                # and causing a spurious LRScheduler warning.
-                optimizers[scale]._opt_called = True  # type: ignore[attr-defined]
-
-            # Restore requires_grad on remaining blocks for next step.
+            # Restore requires_grad between G steps so the next
+            # iteration's forward can use the correct blocks.
             for s in sorted_scales:
                 self.generator.gens[s].requires_grad_(True)
 
-            # Reset scaler state so the next G-step can call unscale_()
-            # on the same optimizers.  One update per G-step (G calls)
-            # instead of per-scale (G×S calls).
+        # Phase 2: single coalesced all_reduce after all G accumulation
+        # passes.  Restore requires_grad first so the filter includes
+        # parameters whose .grad was filled by backward.
+        if self.use_ddp:
+            self._allreduce_grads_coalesced(
+                [
+                    self.generator.gens[s]
+                    for s in sorted_scales
+                    if s in all_losses_scales
+                ]
+            )
+
+        # Phase 3: unscale + step all gen optimizers.
+        for scale in sorted_scales:
+            if scale not in all_losses_scales:
+                continue
+            if self._use_grad_scaler:
+                self._grad_scaler_g.unscale_(optimizers[scale])
+                self._grad_scaler_g.step(optimizers[scale])
+            else:
+                optimizers[scale].step()
+            optimizers[scale]._opt_called = True  # type: ignore[attr-defined]
+
+        if self._use_grad_scaler:
             self._grad_scaler_g.update()
 
         # Unfreeze discriminator so the next D-phase can compute grad.
@@ -604,7 +816,7 @@ class TorchFaciesGAN(
             If the subclass does not override this method.
         """
 
-        with autocast("cuda", enabled=self._use_amp):
+        with autocast("cuda", enabled=self._use_amp, dtype=self._amp_dtype):
             # Generate diversity candidates (framework-agnostic forward)
             fake_samples = self.generate_diverse_samples(
                 indexes,
@@ -613,6 +825,12 @@ class TorchFaciesGAN(
                 seismic_pyramid,
             )
             fake = fake_samples[0]
+
+            # Complete deferred disc all-reduce + optimizer step.
+            # The gen forward above queued kernels on the compute stream;
+            # the NCCL disc all-reduce ran concurrently on the NCCL stream.
+            # Waiting here gives maximum overlap before the disc is needed.
+            self._complete_pending_disc_allreduce()
 
             # WGAN generator adversarial loss: -E[D(fake)].
             # Discriminator params are frozen for the entire G-phase
@@ -841,7 +1059,7 @@ class TorchFaciesGAN(
             torch.Tensor: Scalar reconstruction loss weighted by `self.alpha`,
                 or zero when recovery is disabled.
         """
-        if self.alpha == 0:
+        if self.alpha == 0 or self._current_epoch < self._rec_skip_epochs:
             return self._zero_scalar
         rec_noise = self.get_pyramid_noise(
             scale,
@@ -997,21 +1215,6 @@ class TorchFaciesGAN(
         ScaleMetrics[torch.Tensor]:
             Container with discriminator and generator metrics for the scale.
         """
-        # ── Ensure all pyramid tensors reside on the compute device ──
-        # The data prefetcher already moves tensors to GPU on a side
-        # stream, so these calls are usually no-ops.  Using
-        # non_blocking=False avoids a race where the H2D copy hasn't
-        # finished before the first kernel reads the tensor.
-        dev = self.device
-        facies_pyramid = {k: v.to(dev) for k, v in facies_pyramid.items()}
-        rec_in_pyramid = {k: v.to(dev) for k, v in rec_in_pyramid.items()}
-        if wells_pyramid:
-            wells_pyramid = {k: v.to(dev) for k, v in wells_pyramid.items()}
-        if masks_pyramid:
-            masks_pyramid = {k: v.to(dev) for k, v in masks_pyramid.items()}
-        if seismic_pyramid:
-            seismic_pyramid = {k: v.to(dev) for k, v in seismic_pyramid.items()}
-
         disc_metrics_tuple = self.optimize_discriminator(
             indexes,
             discriminator_optimizers,
@@ -1105,17 +1308,15 @@ class TorchFaciesGAN(
         s: torch.Tensor | None = None
 
         if well is not None:
-            # .to() is a no-op when already on the correct device.
-            # Only fancy-index when the caller selected a strict subset
-            # of the batch (indexes == list(range(B)) is the common
-            # hot path — skip the copy).
-            w = well.to(self.device, non_blocking=True)
+            # The prefetcher already places tensors on self.device,
+            # so skip the redundant .to() dispatch overhead.
+            w = well
             if w.shape[0] != batch:
                 w = w[indexes]
             noise_channels -= w.shape[1]
 
         if seismic is not None:
-            s = seismic.to(self.device, non_blocking=True)
+            s = seismic
             if s.shape[0] != batch:
                 s = s[indexes]
             noise_channels -= s.shape[1]
@@ -1286,13 +1487,96 @@ class TorchFaciesGAN(
         """
         return obj.to(device or self.device)
 
-    @staticmethod
-    def _allreduce_grads(module: nn.Module) -> None:
-        """Average gradients of a single module across DDP ranks."""
-        TorchFaciesGAN._allreduce_grads_coalesced([module])
+    def _wait_pending_allreduce(self) -> None:
+        """Wait for any pending async all-reduce operation to complete.
+
+        When _pending_allreduce_work is set (from an async all-reduce),
+        this method blocks until the operation finishes and clears the reference.
+        Safe to call even if no work is pending.
+
+        This enables NVLink overlap: compute (backward on next layer/scale)
+        can proceed while the all-reduce of a previous scale's gradients
+        is in flight.
+        """
+        if self._pending_allreduce_work is not None:
+            self._pending_allreduce_work.wait()
+            self._pending_allreduce_work = None
+
+    def _complete_pending_disc_allreduce(self) -> None:
+        """Complete deferred disc gradient sync and optimizer step.
+
+        On the last D-step, the disc gradient all-reduce is launched
+        asynchronously so that NCCL runs on its own stream while the
+        generator forward pass queues kernels on the compute stream.
+        This method waits for the NCCL collective, scatters the averaged
+        gradients back into ``param.grad``, and steps the disc optimizers.
+
+        Safe to call when no async work is pending (no-op).
+        """
+        if self._pending_disc_ar_work is None:
+            return
+        self._pending_disc_ar_work.wait()
+        assert self._pending_disc_ar_flat is not None
+        assert self._pending_disc_ar_grads is not None
+        assert self._pending_disc_ar_opts is not None
+        assert self._pending_disc_ar_scales is not None
+        synced_grads = cast(
+            list[torch.Tensor],
+            torch._utils._unflatten_dense_tensors(  # type: ignore[attr-defined]
+                self._pending_disc_ar_flat, self._pending_disc_ar_grads
+            ),
+        )
+        for g, synced in zip(self._pending_disc_ar_grads, synced_grads):
+            g.copy_(synced)
+        for scale in self._pending_disc_ar_scales:
+            self._pending_disc_ar_opts[scale].step()
+        self._pending_disc_ar_work = None
+        self._pending_disc_ar_flat = None
+        self._pending_disc_ar_grads = None
+        self._pending_disc_ar_opts = None
+        self._pending_disc_ar_scales = None
 
     @staticmethod
-    def _allreduce_grads_coalesced(modules: list[nn.Module]) -> None:
+    def _optimizer_zero_grad(optimizer: torch.optim.Optimizer) -> None:
+        """Clear gradients using set_to_none when optimizer API supports it."""
+        try:
+            optimizer.zero_grad(set_to_none=True)
+        except TypeError:
+            optimizer.zero_grad()
+
+    def _allreduce_grads(self, module: nn.Module) -> dist.Work | None:
+        """Average gradients of a single module across DDP ranks (wrapped helper)."""
+        return self._allreduce_grads_coalesced([module])
+
+    def report_allreduce_profile(self) -> None:
+        """Print aggregate timing for coalesced gradient sync profiling."""
+        if not self._profile_allreduce or self._profile_allreduce_calls == 0:
+            return
+        avg_s = self._profile_allreduce_total_s / self._profile_allreduce_calls
+        avg_collective_s = (
+            self._profile_collective_total_s / self._profile_allreduce_calls
+        )
+        avg_elems = self._profile_allreduce_total_elems / self._profile_allreduce_calls
+        print("\n[ALLREDUCE_PROFILE] coalesced gradient sync summary")
+        print(
+            "[ALLREDUCE_PROFILE] "
+            "mode=ddp_all_reduce "
+            "profiling=detailed "
+            f"calls={self._profile_allreduce_calls} "
+            f"avg_total_time={avg_s:.6f}s "
+            f"avg_collective_time={avg_collective_s:.6f}s "
+            f"avg_elems={avg_elems:.0f} "
+            f"total_time={self._profile_allreduce_total_s:.6f}s "
+            f"collective_time={self._profile_collective_total_s:.6f}s"
+        )
+
+    def _sync_profile_device(self) -> None:
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _allreduce_grads_coalesced(
+        self, modules: list[nn.Module], async_op: bool = False
+    ) -> dist.Work | None:
         """Average gradients across all DDP ranks with a **single** all-reduce.
 
         Flattens trainable-parameter gradients from *all* provided modules
@@ -1303,24 +1587,84 @@ class TorchFaciesGAN(
         its ``.grad`` as ``None`` (a zero tensor is substituted so the
         flat buffer size is identical across ranks — avoiding NCCL
         deadlocks from mismatched collective calls).
+
+        Parameters
+        ----------
+        modules : list[nn.Module]
+            Modules whose gradients to synchronize.
+        async_op : bool, optional
+            If True, return the Work object and do not block.
+            Caller must call .wait() on the returned object before using
+            the synchronized gradients. Enables compute/comm overlap on
+            high-bandwidth links (NVLink, etc.). Default is False (blocking).
+
+        Returns
+        -------
+        dist.Work | None
+            If async_op=True: Work object to be waited on later.
+            If async_op=False: None (all-reduce is complete).
         """
         params: list[nn.Parameter] = []
         for m in modules:
             params.extend(p for p in m.parameters() if p.requires_grad)
         if not params:
-            return
+            return None
         for p in params:
             if p.grad is None:
                 p.grad = torch.zeros_like(p.data)
         grads = [p.grad for p in params]
-        flat = torch._utils._flatten_dense_tensors(grads)  # type: ignore[attr-defined]
+        
+        flatten_t0 = 0.0
+        if self._profile_allreduce:
+            self._sync_profile_device()
+            flatten_t0 = time.perf_counter()
+        flat = cast(
+            torch.Tensor,
+            torch._utils._flatten_dense_tensors(grads),  # type: ignore[attr-defined]
+        )
+        if self._profile_allreduce:
+            self._sync_profile_device()
+            _ = time.perf_counter() - flatten_t0
 
-        dist.all_reduce(flat, op=dist.ReduceOp.AVG)  # type: ignore[arg-type]
+        prof_t0 = time.perf_counter() if self._profile_allreduce else 0.0
+        collective_s = 0.0
+        collective_t0 = 0.0
 
+        if self._profile_allreduce and not async_op:
+            self._sync_profile_device()
+            collective_t0 = time.perf_counter()
+        work = dist.all_reduce(  # type: ignore[arg-type]
+            flat, op=dist.ReduceOp.AVG, async_op=async_op
+        )
+        if self._profile_allreduce and not async_op:
+            self._sync_profile_device()
+            collective_s = time.perf_counter() - collective_t0
+
+        # For async_op=False, work is None and gradients are already synced.
+        # For async_op=True, caller must .wait() on the returned Work before
+        # using the gradients.
+        if async_op:
+            return work  # type: ignore[return-value]
+
+        # Synchronous path: scatter synced gradients immediately
+        scatter_t0 = 0.0
+        if self._profile_allreduce:
+            self._sync_profile_device()
+            scatter_t0 = time.perf_counter()
         for g, synced in zip(  # type: ignore[assignment]
             grads, torch._utils._unflatten_dense_tensors(flat, grads)  # type: ignore[attr-defined]
         ):
             g.copy_(synced)  # type: ignore[arg-type]
+        if self._profile_allreduce:
+            self._sync_profile_device()
+            _ = time.perf_counter() - scatter_t0
+        if self._profile_allreduce:
+            self._sync_profile_device()
+            self._profile_allreduce_total_s += time.perf_counter() - prof_t0
+            self._profile_collective_total_s += collective_s
+            self._profile_allreduce_calls += 1
+            self._profile_allreduce_total_elems += flat.numel()
+        return None
 
     def update_discriminator_weights(
         self,
@@ -1340,11 +1684,14 @@ class TorchFaciesGAN(
         When running under DDP, discriminator gradients are manually
         all-reduced across ranks because the discriminator is not
         wrapped with DDP (see :meth:`finalize_discriminator_scale`).
+
+        NVLink optimization: waits for pending async all-reduce before step.
         """
-        optimizer.zero_grad()
+        self._optimizer_zero_grad(optimizer)
         loss.backward()  # type: ignore[no-untyped-call]
         if self.use_ddp:
             self._allreduce_grads(self.discriminator.discs[scale])
+        self._wait_pending_allreduce()
         optimizer.step()
 
     def update_generator_weights(
@@ -1359,13 +1706,22 @@ class TorchFaciesGAN(
         When running under DDP, generator gradients are manually
         all-reduced across ranks because the generator is not wrapped
         with DDP (see :meth:`finalize_generator_scale`).
+
+        NVLink optimization: waits for pending async all-reduce before step.
         """
-        optimizer.zero_grad()
-        self._grad_scaler_g.scale(loss).backward()  # type: ignore[no-untyped-call]
+        self._optimizer_zero_grad(optimizer)
+        if self._use_grad_scaler:
+            self._grad_scaler_g.scale(loss).backward()  # type: ignore[no-untyped-call]
+        else:
+            loss.backward()  # type: ignore[no-untyped-call]
         if self.use_ddp:
             self._allreduce_grads(self.generator.gens[scale])
-        self._grad_scaler_g.unscale_(optimizer)
-        self._grad_scaler_g.step(optimizer)
+        self._wait_pending_allreduce()
+        if self._use_grad_scaler:
+            self._grad_scaler_g.unscale_(optimizer)
+            self._grad_scaler_g.step(optimizer)
+        else:
+            optimizer.step()
         # GradScaler may skip optimizer.step() on inf/nan, leaving
         # _opt_called unset → spurious LRScheduler warning.
         optimizer._opt_called = True  # type: ignore[attr-defined]

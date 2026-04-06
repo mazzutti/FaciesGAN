@@ -19,6 +19,7 @@ Notes
 from __future__ import annotations
 
 import os
+import threading
 from collections.abc import Iterator, Mapping
 from typing import Any, cast
 
@@ -51,7 +52,7 @@ from models.torch.facies_gan import unwrap_ddp
 from options import TrainningOptions
 from trainning.base import Trainer
 from typedefs import Batch
-from utils import torch2np
+from utils import denorm, torch2np
 
 
 class TorchTrainer(
@@ -131,6 +132,7 @@ class TorchTrainer(
         if distributed:
             self._is_main_process = dist.get_rank() == 0
         super().__init__(options, fine_tuning, checkpoint_path)
+        self._ckpt_thread: threading.Thread | None = None
 
     def _ddp_barrier(self) -> None:
         """Synchronize DDP ranks via NCCL barrier."""
@@ -167,7 +169,7 @@ class TorchTrainer(
             num_workers=self.options.num_workers,
             pin_memory=self.device.type == "cuda",
             persistent_workers=has_workers,
-            prefetch_factor=4 if has_workers else None,
+            prefetch_factor=8 if has_workers else None,
             # Drop the last incomplete batch to avoid shape mismatches
             # when the per-rank sample count is not divisible by
             # batch_size (the training loop assumes full batches).
@@ -442,31 +444,14 @@ class TorchTrainer(
         Overrides the base implementation to use :class:`TorchDataPrefetcher`,
         which moves tensors to the GPU asynchronously.
 
-        Under DDP, adds synchronization barriers after each batch to ensure
-        all ranks stay in sync and don't desynchronize on NCCL collectives.
+        NVLink optimization: barriers are now sparse to maximize compute/comm
+        overlap. Critical barriers (epoch/checkpoint) remain; periodic sync
+        barriers have been removed to allow async all-reduce to proceed.
         """
         prefetcher = TorchDataPrefetcher(loader, scales, self.device)
         batch = prefetcher.next()
-        batch_count = 0
         while batch is not None:
             yield batch
-            batch_count += 1
-
-            # Synchronize ranks after each batch in DDP to prevent desync
-            if self.distributed and batch_count % 10 == 0:
-                try:
-                    dist.barrier()  # type: ignore
-                except RuntimeError as e:
-                    import logging
-
-                    logger = logging.getLogger(__name__)
-                    rank = dist.get_rank() if dist.is_initialized() else -1
-                    logger.error(
-                        f"[Rank {rank}] DDP barrier failed after batch {batch_count}: {e}"
-                    )
-                    logger.error(f"[Rank {rank}] This rank may be desynced from others")
-                    raise
-
             batch = prefetcher.next()
 
     def save_generated_facies(
@@ -506,7 +491,8 @@ class TorchTrainer(
         """
         if self.enable_plot_facies:
             actual_batch = real_facies.shape[0]
-            indexes = torch.randint(actual_batch, (self.num_real_facies,))
+            # Generate on CPU so .tolist() avoids a GPU→CPU sync.
+            indexes = torch.randint(actual_batch, (self.num_real_facies,), device="cpu")
 
             # Repeat each index num_generated_per_real times
             tiled_indexes: list[int] = cast(
@@ -534,17 +520,24 @@ class TorchTrainer(
 
             real_facies_tensor = real_facies[indexes]
 
+            # Batch GPU→CPU transfers with non_blocking=True so the
+            # three DMA copies overlap, then sync once before numpy
+            # conversion.  Denormalization runs on GPU to avoid a
+            # redundant per-element copy on CPU.
+            facies_cpu = denorm(facies_tensor.detach()).to("cpu", non_blocking=True)  # type: ignore[arg-type]
+            real_cpu = denorm(real_facies_tensor.detach()).to("cpu", non_blocking=True)  # type: ignore[arg-type]
+            masks_cpu: torch.Tensor | None = None
+            if len(masks_pyramid) > 0:
+                masks_cpu = masks_pyramid[scale][indexes].detach().to("cpu", non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+
             bw.submit_plot_generated_facies(
-                torch2np(facies_tensor.detach().cpu(), denormalize=True),
-                torch2np(real_facies_tensor.detach().cpu(), denormalize=True),
+                torch2np(facies_cpu),
+                torch2np(real_cpu),
                 scale,
                 epoch,
                 results_path,
-                (
-                    torch2np(masks_pyramid[scale][indexes].detach().cpu())
-                    if len(masks_pyramid) > 0
-                    else None
-                ),
+                torch2np(masks_cpu) if masks_cpu is not None else None,
                 batch_id=batch_id,
             )
 
@@ -554,7 +547,7 @@ class TorchTrainer(
                 self.model.discriminator.discs[scale].parameters(),
                 lr=self.lr_d,
                 betas=(self.beta1, 0.999),
-                set_grad_none=False,
+                set_grad_none=True,
             )
             self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.StepLR(
                 self.discriminator_optimizers[scale],
@@ -566,7 +559,7 @@ class TorchTrainer(
                 self.model.generator.gens[scale].parameters(),
                 lr=self.lr_g,
                 betas=(self.beta1, 0.999),
-                set_grad_none=False,
+                set_grad_none=True,
             )
 
             self.generator_schedulers[scale] = torch.optim.lr_scheduler.StepLR(
@@ -650,8 +643,17 @@ class TorchTrainer(
         # Save into the first scale's directory (arbitrary but deterministic)
         ckpt_path = os.path.join(scale_paths[min(scales)], EPOCH_CKPT_FILE)
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
-        torch.save(checkpoint, ckpt_path)
-        print(f"  Epoch checkpoint saved at epoch {epoch} (batch {batch_id})")
+        # Join any in-flight save before spawning a new one so we never
+        # have two concurrent writes to the same path.
+        if self._ckpt_thread is not None and self._ckpt_thread.is_alive():
+            self._ckpt_thread.join()
+        self._ckpt_thread = threading.Thread(
+            target=torch.save,
+            args=(checkpoint, ckpt_path),
+            daemon=True,
+        )
+        self._ckpt_thread.start()
+        print(f"  Epoch checkpoint save started at epoch {epoch} (batch {batch_id})")
 
     def load_epoch_checkpoint(
         self,

@@ -11,9 +11,7 @@
         "${workspaceFolder}/faciesgan-c/datasets",
         "${workspaceFolder}/faciesgan-c/io",
         "${workspaceFolder}/faciesgan-c/third_party",
-        "${workspaceFolder}/mlx-c",
-        "${workspaceFolder}/mlx-c/mlx",
-        "${workspaceFolder}/mlx-c/mlx/c"
+        "${workspaceFolder}/mlx-c"
       ],
       "defines": [],
       "compilerPath": "/usr/bin/gcc",
@@ -40,9 +38,7 @@
         "${workspaceFolder}/faciesgan-c/datasets",
         "${workspaceFolder}/faciesgan-c/io",
         "${workspaceFolder}/faciesgan-c/third_party",
-        "${workspaceFolder}/mlx-c",
-        "${workspaceFolder}/mlx-c/mlx",
-        "${workspaceFolder}/mlx-c/mlx/c"
+        "${workspaceFolder}/mlx-c"
       ],
       "defines": [],
       "macFrameworkPath": [
@@ -72,9 +68,7 @@
         "${workspaceFolder}/faciesgan-c/datasets",
         "${workspaceFolder}/faciesgan-c/io",
         "${workspaceFolder}/faciesgan-c/third_party",
-        "${workspaceFolder}/mlx-c",
-        "${workspaceFolder}/mlx-c/mlx",
-        "${workspaceFolder}/mlx-c/mlx/c"
+        "${workspaceFolder}/mlx-c"
       ],
       "defines": ["_WIN32"],
       "compilerPath": "cl.exe",

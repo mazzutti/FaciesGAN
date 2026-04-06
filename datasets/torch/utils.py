@@ -9,6 +9,9 @@ and return a list of PyTorch tensors, one tensor per scale, with shape
 ``(N, C, H, W)``.
 """
 
+import logging
+from pathlib import Path
+
 import torch
 from joblib import Memory  # type: ignore
 
@@ -16,6 +19,7 @@ import datasets.torch.utils as torch_utils
 import datasets.utils as data_utils
 from datasets.data_files import DataFiles
 from interpolators.config import InterpolatorConfig
+from interpolators.impedance import ImpedanceInterpolator, extract_crosslines, load_impedance_volume
 from interpolators.nearest import NearestInterpolator
 from interpolators.neural import NeuralSmoother
 from interpolators.well import WellInterpolator
@@ -97,6 +101,66 @@ def to_facies_pyramids(
         pyramid = neural_smoother.interpolate(facie_path, scale_list)
         for i in range(len(scale_list)):
             pyramids_list[i].append(torch_utils.norm(pyramid[i]))
+    pyramids = _stack_and_format(pyramids_list, channels_last)
+    return tuple(pyramids)
+
+
+logger = logging.getLogger(__name__)
+
+
+@memory.cache  # type: ignore
+def to_impedance_pyramids(
+    scale_list: tuple[tuple[int, ...], ...],
+    channels_last: bool = False,
+) -> tuple[torch.Tensor, ...]:
+    """Generate multi-scale pyramid tensors from acoustic impedance volume.
+
+    Reads the GSLIB ``.dat`` file in ``data/impedance/``, extracts 200 XZ
+    crossline slices, maps each to a 3-channel (grayscale→RGB) image in
+    [0, 1], and produces a multi-resolution pyramid identical in layout to
+    the facies pyramids.
+
+    Parameters
+    ----------
+    scale_list : tuple[tuple[int, ...], ...]
+        Tuple of scale descriptors ``(batch, channels, height, width)``.
+    channels_last : bool, optional
+        Whether the channel dimension is last, by default False.
+
+    Returns
+    -------
+    tuple[torch.Tensor, ...]
+        Per-scale tensors with shape ``(N, C, H, W)`` (or NHWC).
+    """
+    dat_dir = Path(DataFiles.IMPEDANCE.as_data_path())
+    dat_files = sorted(dat_dir.glob("*.dat"))
+    if not dat_files:
+        logger.warning("No .dat files found in %s; returning empty pyramids", dat_dir)
+        return tuple(
+            _empty_pyramid_tensor(scale, channels_last) for scale in scale_list
+        )
+
+    # Determine target image height from the InterpolatorConfig geometry
+    config = InterpolatorConfig(channels_last=channels_last)
+    target_height = config.geometry[1]  # 120
+
+    volume = load_impedance_volume(dat_files[0])
+    crosslines = extract_crosslines(volume, target_height=target_height)
+    logger.info(
+        "Loaded impedance volume from %s: %d crosslines, target height %d",
+        dat_files[0],
+        len(crosslines),
+        target_height,
+    )
+
+    interpolator = ImpedanceInterpolator(config)
+    pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
+
+    for crossline in crosslines:
+        pyramid = interpolator.interpolate_array(crossline, scale_list)
+        for i in range(len(scale_list)):
+            pyramids_list[i].append(torch_utils.norm(pyramid[i]))
+
     pyramids = _stack_and_format(pyramids_list, channels_last)
     return tuple(pyramids)
 

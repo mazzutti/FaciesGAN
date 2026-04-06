@@ -5,7 +5,7 @@ facies images from per-scale noise tensors, along with a simple
 ``ColorQuantization`` module used to snap outputs to a small palette.
 """
 
-from typing import Any, Self, cast
+from typing import Any, Callable, Self, cast
 
 import torch
 import torch.nn as nn
@@ -106,6 +106,20 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
 
         # Color quantization layer (framework-specific)
         self.color_quantizer = TorchColorQuantization(temperature=0.5)
+
+        # Residual add + clamp fused into a single callable so that
+        # torch.compile can merge them into one Inductor kernel,
+        # eliminating a separate clamp kernel launch per scale.
+        self._residual_clamp: Callable[
+            [torch.Tensor, torch.Tensor], torch.Tensor
+        ] = TorchGenerator.residual_clamp_fn
+
+    @staticmethod
+    def residual_clamp_fn(
+        gen_out: torch.Tensor, prev: torch.Tensor
+    ) -> torch.Tensor:
+        """Add residual and clamp to [-1, 1] in one pass."""
+        return (gen_out + prev).clamp(-1, 1)
 
     def __call__(
         self,
@@ -223,18 +237,16 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
                 # Recompute this block's activations during backward.
                 # use_reentrant=False is the recommended mode (no
                 # nesting caveats, compatible with compiled models).
-                out_facie = cast(torch.Tensor, ckpt_utils.checkpoint(  # type: ignore[misc]
+                gen_out = cast(torch.Tensor, ckpt_utils.checkpoint(  # type: ignore[misc]
                     self.gens[index], z_in, use_reentrant=False
-                )) + out_facie
+                ))
             else:
-                out_facie = self.gens[index](z_in) + out_facie
+                gen_out = self.gens[index](z_in)
 
-            # Clamp to [-1, 1] after each scale so the progressive
-            # residuals stay within the tanh / color-palette range.
-            # Without this, values accumulate across scales (up to
-            # ±num_scales) and the final color quantizer maps pixels
-            # to wrong pure colors at scales >= 2.
-            out_facie = out_facie.clamp(-1, 1)
+            # Fused residual add + clamp to [-1, 1].
+            # When compiled, Inductor merges the add and clamp into a
+            # single pointwise kernel, saving one kernel launch per scale.
+            out_facie = self._residual_clamp(gen_out, out_facie)
 
         # Apply color quantization to enforce pure colors
         out_facie = self.color_quantizer(out_facie)

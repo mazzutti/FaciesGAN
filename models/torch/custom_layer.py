@@ -13,6 +13,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Triton is optional — only available on CUDA builds.
+_has_triton = False
+try:
+    from models.torch.triton_color_quantize import triton_color_quantize
+
+    _has_triton = True
+except ImportError:
+    pass
+
 
 class TorchConvBlock(nn.Sequential):
     """Convolutional block with Conv2D, InstanceNorm, and LeakyReLU.
@@ -482,6 +491,9 @@ class TorchColorQuantization(nn.Module):
         super().__init__()  # type: ignore
         self.temperature = temperature
 
+        # Use Triton fused kernel on CUDA when available.
+        self.use_triton: bool = _has_triton
+
         # Define pure colors in [-1, 1] range (tanh output range)
         # Black, Red, Green, Blue
         self.register_buffer(
@@ -542,6 +554,11 @@ class TorchColorQuantization(nn.Module):
         torch.Tensor
             Quantized tensor with same shape.
         """
+        # Fast path: fused Triton kernel (single launch for the entire op).
+        if self.use_triton and x.is_cuda:
+            return triton_color_quantize(x, self.temperature, self.training) # type: ignore
+
+        # Fallback: einsum-based implementation (CPU or when Triton unavailable).
         colors = self.pure_colors  # (K, 3)
         distances = self._sq_distances_nchw(x)  # (B, K, H, W)
 

@@ -113,9 +113,16 @@ class MLXPyramidsDataset(PyramidsDataset[mx.array]):
         NotImplementedError
             If the subclass does not implement this method.
         """
-        facies_pyramids = mlx_utils.to_facies_pyramids(
-            self.scales, channels_last=channels_last
-        )
+        if getattr(self, "options", None) and getattr(
+            self.options, "use_impedance", False
+        ):
+            facies_pyramids = mlx_utils.to_impedance_pyramids(
+                self.scales, channels_last=channels_last
+            )
+        else:
+            facies_pyramids = mlx_utils.to_facies_pyramids(
+                self.scales, channels_last=channels_last
+            )
 
         # Respect training flags: avoid generating wells/seismic pyramids
         # if the options explicitly disable them.

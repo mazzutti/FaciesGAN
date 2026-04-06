@@ -113,9 +113,13 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
         NotImplementedError
             If the subclass does not implement this method.
         """
-        facies_pyramids: tuple[torch.Tensor, ...] = torch_utils.to_facies_pyramids(
-            self.scales
-        )
+        facies_pyramids: tuple[torch.Tensor, ...]
+        if getattr(self, "options", None) and getattr(
+            self.options, "use_impedance", False
+        ):
+            facies_pyramids = torch_utils.to_impedance_pyramids(self.scales)
+        else:
+            facies_pyramids = torch_utils.to_facies_pyramids(self.scales)
 
         # Respect training flags: avoid generating wells/seismic pyramids
         # if the options explicitly disable them.

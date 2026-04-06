@@ -97,13 +97,139 @@
 			"command": "bash",
 			"args": [
 				"-lc",
-				"OMP_NUM_THREADS=1 PYTHONPATH=${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python VIRTUAL_ENV=${workspaceFolder}/.venv PATH=${workspaceFolder}/.venv/bin:${env:PATH} torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path results/py/ --num-train-pyramids 200 --batch-size 40 --num-workers 1 --num-iter 100 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --no-tensorboard --use-wells --use-seismic"
+				"OMP_NUM_THREADS=1 PYTHONPATH=${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python VIRTUAL_ENV=${workspaceFolder}/.venv PATH=${workspaceFolder}/.venv/bin:${env:PATH} ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path results/py/ --num-train-pyramids 200 --batch-size 40 --num-workers 1 --num-iter 100 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --no-tensorboard --use-wells --use-seismic"
 			],
 			"isBackground": false,
 			"problemMatcher": [],
 			"presentation": {
 				"reveal": "always",
 				"panel": "dedicated"
+			}
+		},
+		{
+			"label": "Train DDP NVLink (Production)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export NCCL_DEBUG=WARN && export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/py/ddp_nvlink_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --num-train-pyramids 200 --batch-size 40 --num-workers 4 --num-iter 100 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated"
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
+			}
+		},
+		{
+			"label": "Train DDP NVLink (Debug)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export NCCL_DEBUG=INFO && export TORCH_DISTRIBUTED_DEBUG=DETAIL && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/py/ddp_nvlink_debug_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --num-train-pyramids 20 --batch-size 32 --num-workers 2 --num-iter 5 --num-parallel-scales 7 --discriminator-steps 2 --generator-steps 2 --use-wells 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated"
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
+			}
+		},
+		{
+			"label": "Train DDP NVLink (Quick Smoke Test)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export OMP_NUM_THREADS=2 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/py/ddp_nvlink_smoke_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --num-train-pyramids 5 --batch-size 16 --num-workers 1 --num-iter 1 --num-parallel-scales 3 --discriminator-steps 1 --generator-steps 1 --stop-scale 2 --no-plot-facies 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared"
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
+			}
+		},
+		{
+			"label": "Benchmark NVLink - 1 GPU (global bs=40)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -euo pipefail && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/bench/1gpu_bs40_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/python ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --manual-seed 0 --num-train-pyramids 200 --batch-size 40 --num-workers 4 --num-iter 50 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic --no-tensorboard --no-plot-facies 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated"
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
+			}
+		},
+		{
+			"label": "Benchmark NVLink - 2 GPU (global bs=40)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -euo pipefail && export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export NCCL_DEBUG=WARN && export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/bench/2gpu_bs40_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --manual-seed 0 --num-train-pyramids 200 --batch-size 40 --num-workers 4 --num-iter 50 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic --no-tensorboard --no-plot-facies 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated"
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
+			}
+		},
+		{
+			"label": "Benchmark NVLink - 2 GPU (global bs=80)",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -euo pipefail && export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export NCCL_DEBUG=WARN && export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/bench/2gpu_bs80_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --manual-seed 0 --num-train-pyramids 200 --batch-size 80 --num-workers 4 --num-iter 50 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic --no-tensorboard --no-plot-facies 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "dedicated"
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
+			}
+		},
+		{
+			"label": "Benchmark NVLink - summarize latest",
+			"type": "shell",
+			"command": "bash",
+			"args": [
+				"-lc",
+				"set -euo pipefail && ${workspaceFolder}/.venv/bin/python - <<'PY'\nimport glob\nimport os\nimport re\n\nroot = os.path.join('results', 'bench')\npatterns = {\n    '1gpu_bs40': os.path.join(root, '1gpu_bs40_*', 'log.txt'),\n    '2gpu_bs40': os.path.join(root, '2gpu_bs40_*', 'log.txt'),\n    '2gpu_bs80': os.path.join(root, '2gpu_bs80_*', 'log.txt'),\n}\n\nsec_re = re.compile(r'Total training time:\\s*(?:(\\d+)h)?\\s*(?:(\\d+)m)?\\s*(?:(\\d+)s)?')\n\ndef parse_seconds(text: str) -> float | None:\n    m = sec_re.search(text)\n    if not m:\n        return None\n    h = int(m.group(1) or 0)\n    mm = int(m.group(2) or 0)\n    s = int(m.group(3) or 0)\n    return float(h * 3600 + mm * 60 + s)\n\ndef latest(pattern: str) -> str | None:\n    files = glob.glob(pattern)\n    if not files:\n        return None\n    files.sort(key=os.path.getmtime)\n    return files[-1]\n\nrows = []\nfor name, pattern in patterns.items():\n    f = latest(pattern)\n    if not f:\n        rows.append((name, None, None, None))\n        continue\n    with open(f, 'r', encoding='utf-8', errors='ignore') as fh:\n        txt = fh.read()\n    sec = parse_seconds(txt)\n    # Effective sample count mirrors these benchmark tasks:\n    # num_train_pyramids=200, num_iter=50\n    samples = 200 * 50\n    sps = (samples / sec) if sec and sec > 0 else None\n    rows.append((name, f, sec, sps))\n\nprint('\\nNVLINK BENCH SUMMARY (latest runs)')\nprint('name          | total_seconds | samples_per_sec | log')\nprint('--------------+---------------+-----------------+-------------------------------')\nfor name, f, sec, sps in rows:\n    sec_s = f'{sec:.1f}' if sec is not None else 'n/a'\n    sps_s = f'{sps:.2f}' if sps is not None else 'n/a'\n    print(f'{name:<13} | {sec_s:>13} | {sps_s:>15} | {f or \"n/a\"}')\nPY"
+			],
+			"isBackground": false,
+			"problemMatcher": [],
+			"presentation": {
+				"reveal": "always",
+				"panel": "shared"
+			},
+			"options": {
+				"cwd": "${workspaceFolder}"
 			}
 		},
 		{

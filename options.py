@@ -71,12 +71,14 @@ class TrainningOptions(argparse.Namespace):
         use_mlx: bool = False,
         use_wells: bool = False,
         use_seismic: bool = False,
+        use_impedance: bool = False,
         wells_mask_columns: tuple[int, ...] = (),
         enable_tensorboard: bool = True,
         enable_plot_facies: bool = True,
         compile_backend: bool = False,
         gp_interval: int = 8,
         gradient_checkpointing: bool = False,
+        amp_dtype: str = "bf16",
     ) -> None:
         """Create a TrainningOptions namespace with defaults for training.
 
@@ -172,6 +174,9 @@ class TrainningOptions(argparse.Namespace):
             If True, enable loading/using well data (filter dataset by `wells`). Default is False.
         use_seismic : bool, optional
             If True, enable loading/using seismic data during training. Default is False.
+        use_impedance : bool, optional
+            If True, use acoustic impedance data as the primary facies source
+            instead of the categorical facies images. Default is False.
         wells : tuple of int, optional
             Optional list/tuple of well indices to filter dataset. Default is
             an empty tuple.
@@ -234,12 +239,14 @@ class TrainningOptions(argparse.Namespace):
         self.use_mlx = use_mlx
         self.use_wells = use_wells
         self.use_seismic = use_seismic
+        self.use_impedance = use_impedance
         self.wells_mask_columns = wells_mask_columns
         self.enable_tensorboard = enable_tensorboard
         self.enable_plot_facies = enable_plot_facies
         self.compile_backend = compile_backend
         self.gp_interval = gp_interval
         self.gradient_checkpointing = gradient_checkpointing
+        self.amp_dtype = amp_dtype
 
 
 class ResumeOptions(argparse.Namespace):

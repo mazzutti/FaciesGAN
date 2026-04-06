@@ -10,7 +10,6 @@ fields and exposes abstract methods concrete trainers must implement.
 
 from __future__ import annotations
 
-import gc
 import math
 import os
 import time
@@ -96,6 +95,11 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self.num_iter: int = options.num_iter
         self.save_interval: int = options.save_interval
         self.num_parallel_scales: int = options.num_parallel_scales
+
+        # How often to flush TensorBoard scalars (epochs).  Writing every
+        # epoch triggers a GPU→CPU sync per scale; batching to every N epochs
+        # reduces that overhead by ~N× with minimal loss of resolution.
+        self._tb_log_interval: int = 10
 
         self.batch_size: int = (
             options.batch_size
@@ -506,13 +510,25 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             print(
                 f"  Resuming from epoch {start_epoch} (skipping epochs 0-{start_epoch - 1})"
             )
+
+        profile_timing = os.environ.get("FG_PROFILE_TIMING", "0") == "1"
+        prof_opt_time = 0.0
+        prof_epoch_end_time = 0.0
+        prof_barrier_time = 0.0
+        prof_epochs = 0
+
         for epoch in range(start_epoch, self.num_iter):
             progress.set_description(  # type: ignore
                 f"Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch+1:4d}/{self.num_iter}]"
             )
 
+            # Let the model know the current epoch so it can skip
+            # recovery loss during the early-training warmup phase.
+            self.model._current_epoch = epoch  # type: ignore[attr-defined]
+
             generated_samples: tuple[TTensor, ...] = ()
 
+            opt_t0 = time.perf_counter() if profile_timing else 0.0
             scale_metrics = self.optimization_step(
                 indexes,
                 facies_pyramid,
@@ -521,6 +537,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 masks_pyramid,
                 seismic_pyramid,
             )
+            if profile_timing:
+                prof_opt_time += time.perf_counter() - opt_t0
 
             if (epoch + 1) % 200 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
                 # Run on ALL ranks so torch.compile trace caches warm
@@ -533,6 +551,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     seismic_pyramid,
                 )
 
+            ep_t0 = time.perf_counter() if profile_timing else 0.0
             self.handle_epoch_end(  # type: ignore
                 scales=scales,
                 epoch=epoch,
@@ -546,13 +565,26 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 masks_pyramid=masks_pyramid,
                 seismic_pyramid=seismic_pyramid,
             )
+            if profile_timing:
+                prof_epoch_end_time += time.perf_counter() - ep_t0
 
-            # Synchronize DDP ranks after rank-0-only I/O
-            # (TensorBoard logging, facies saving) that may trigger
-            # torch.compile autotuning for new input shapes.  Without
-            # this barrier the next epoch's NCCL collectives can timeout
-            # while rank-0 is still compiling kernels.
-            self._ddp_barrier()
+            # Synchronize DDP ranks only after epochs where rank-0 ran
+            # model inference (generate_visualization_samples or
+            # save_generated_facies), which may trigger torch.compile
+            # autotuning.  Skipping the barrier on plain training epochs
+            # eliminates the blocking collective on ~99% of iterations.
+            _needs_barrier = len(generated_samples) > 0 or (
+                self.enable_plot_facies
+                and (epoch % self.save_interval == 0 or epoch == self.num_iter - 1)
+                and (epoch != 0 or self.num_iter == 1)
+                and self._current_batch_id == self._total_batches - 1
+            )
+            br_t0 = time.perf_counter() if profile_timing else 0.0
+            if _needs_barrier:
+                self._ddp_barrier()
+            if profile_timing:
+                prof_barrier_time += time.perf_counter() - br_t0
+                prof_epochs += 1
 
             # Save an epoch checkpoint at save_interval boundaries so
             # training can be resumed from that point.  Skip the very
@@ -573,6 +605,20 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             # Release GPU tensors that are no longer needed
             del scale_metrics
             generated_samples = ()
+
+        if profile_timing and prof_epochs > 0 and self._is_main_process:
+            avg_opt = prof_opt_time / prof_epochs
+            avg_end = prof_epoch_end_time / prof_epochs
+            avg_bar = prof_barrier_time / prof_epochs
+            avg_total = avg_opt + avg_end + avg_bar
+            print("\n[TIMING] Per-epoch averages for current batch")
+            print(
+                "[TIMING] "
+                f"opt={avg_opt:.3f}s "
+                f"epoch_end={avg_end:.3f}s "
+                f"barrier={avg_bar:.3f}s "
+                f"tracked_total={avg_total:.3f}s"
+            )
 
         # for scale in scales:
         #     self.save_optimizers(
@@ -909,8 +955,13 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
             # Save to TensorBoard and log per-scale (only when TB is
             # enabled — each call does a GPU→CPU sync via torch.stack().tolist();
-            # skipping it avoids 14 000 syncs / 126 000 TB writes per batch).
-            if self.enable_tensorboard:
+            # throttled to every _tb_log_interval epochs to reduce host syncs).
+            _log_tb = (
+                (epoch + 1) % self._tb_log_interval == 0
+                or epoch == 0
+                or epoch == (self.num_iter - 1)
+            )
+            if self.enable_tensorboard and _log_tb:
                 for scale in scales:
                     g = scale_metrics.generator[scale]
                     d = scale_metrics.discriminator[scale]
@@ -983,18 +1034,12 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
     def _release_accelerator_memory(self) -> None:
         """Release unused accelerator (GPU) memory back to the OS.
 
-        Synchronises CUDA first so that asynchronously-freed tensors are
-        actually returned to the allocator, then runs Python garbage
-        collection and asks the caching allocator to release unused blocks.
+        Calls the caching allocator to release unused blocks.
+        ``empty_cache()`` already triggers an implicit device sync, so
+        an explicit ``synchronize()`` is unnecessary.  GC is skipped
+        because this is only called between scale groups and the
+        allocator handles freed tensors without a Python GC pass.
         """
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-        except ImportError:
-            pass
-        gc.collect()
         try:
             import torch
 
