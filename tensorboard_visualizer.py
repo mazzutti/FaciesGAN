@@ -179,6 +179,9 @@ class TensorBoardVisualizer:
             self.writer.add_scalar(
                 f"Scale_{scale}/G_Diversity", metrics["g_div"], epoch
             )
+            self.writer.add_scalar(
+                f"Scale_{scale}/G_Impedance", metrics["g_imp"], epoch
+            )
 
         # Compute and log mean losses across all scales
         if scale_metrics:
@@ -199,12 +202,14 @@ class TensorBoardVisualizer:
             mean_g_rec = np.mean([flat_metrics[s]["g_rec"] for s in scales])
             mean_g_well = np.mean([flat_metrics[s]["g_well"] for s in scales])
             mean_g_div = np.mean([flat_metrics[s]["g_div"] for s in scales])
+            mean_g_imp = np.mean([flat_metrics[s].get("g_imp", 0.0) for s in scales])
 
             self.writer.add_scalar("Mean/G_Total", mean_g_total, epoch)
             self.writer.add_scalar("Mean/G_Adversarial", mean_g_adv, epoch)
             self.writer.add_scalar("Mean/G_Reconstruction", mean_g_rec, epoch)
             self.writer.add_scalar("Mean/G_Well_Constraint", mean_g_well, epoch)
             self.writer.add_scalar("Mean/G_Diversity", mean_g_div, epoch)
+            self.writer.add_scalar("Mean/G_Impedance", mean_g_imp, epoch)
 
         # Log training progress
         self.writer.add_scalar("Training/Samples_Processed", samples_processed, epoch)
@@ -224,9 +229,19 @@ class TensorBoardVisualizer:
                 if img.ndim == 4:  # (B, C, H, W)
                     img = img[0]
 
-                # Handle tensor format: convert (C, H, W) to (H, W, C)
-                if img.ndim == 3 and img.shape[0] in [1, 3]:  # Channel first format
-                    img = np.transpose(img, (1, 2, 0))  # Convert to (H, W, C)
+                # Handle tensor format: convert (C, H, W) to (H, W, C).
+                # Use a general channel-first heuristic: first dim is smaller
+                # than both spatial dims (handles 1, 3, 6, … channels).
+                if (
+                    img.ndim == 3
+                    and img.shape[0] < img.shape[1]
+                    and img.shape[0] < img.shape[2]
+                ):
+                    img = np.transpose(img, (1, 2, 0))  # (C,H,W) → (H,W,C)
+
+                # 6-channel impedance: show only the facies RGB channels
+                if img.ndim == 3 and img.shape[2] == 6:
+                    img = img[:, :, :3]
 
                 # Check if already RGB (3 channels with values that look like RGB)
                 is_rgb = img.ndim == 3 and img.shape[2] == 3
@@ -248,8 +263,12 @@ class TensorBoardVisualizer:
                 # Ensure float32 and proper range
                 img = np.clip(img, 0, 1).astype(np.float32)
 
-                # Convert to CHW format for TensorBoard (expects C, H, W)
-                img_chw = np.transpose(img, (2, 0, 1))
+                # Convert to CHW format for TensorBoard (expects C, H, W).
+                # After the grayscale path img may be 2D (H, W).
+                if img.ndim == 2:
+                    img_chw = img[np.newaxis, :, :]  # (1, H, W)
+                else:
+                    img_chw = np.transpose(img, (2, 0, 1))  # (H,W,C) → (C,H,W)
                 self.writer.add_image(f"Samples/Scale_{scale}", img_chw, epoch)
 
         self.last_update_time = current_time

@@ -27,6 +27,7 @@ OPT_D_FILE = "opt_D.pth"
 SCH_G_FILE = "sch_G.pth"
 SCH_D_FILE = "sch_D.pth"
 RESULT_FACIES_PATH = "real_x_generated_facies"
+RESULT_IMPEDANCE_PATH = "real_x_generated_impedance"
 
 # Epoch-level checkpoint (saved inside each scale directory)
 EPOCH_CKPT_FILE = "epoch_checkpoint.pth"

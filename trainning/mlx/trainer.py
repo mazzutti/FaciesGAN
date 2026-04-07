@@ -601,7 +601,7 @@ class MLXTrainer(
             # Invalidate compiled step on optimizer change
             self._compiled_optimization_step = None
 
-    def save_generated_facies(
+    def save_generated_outputs(
         self,
         scale: int,
         epoch: int,
@@ -690,8 +690,8 @@ class MLXTrainer(
         )
         np.save(real_npy_path, real_denorm)
 
-        if self.enable_plot_facies:
-            bw.submit_plot_generated_facies(
+        if self.enable_plot_outputs:
+            bw.submit_plot_generated_outputs(
                 utils.mlx2np(facies_tensor, denormalize=True),
                 utils.mlx2np(real_facies_tensor, denormalize=True),
                 scale,

@@ -728,7 +728,7 @@ mlx_array_t mlx_generator_forward(MLXGenerator *m, const mlx_array *z_list,
         return in_noise;
 
     /* NOTE: Global lock removed — all training-path callers (value_and_grad
-     * closures, train_step, save_generated_facies) run single-threaded.
+     * closures, train_step, save_generated_outputs) run single-threaded.
      * Concurrent callers (prefetcher, dataloader) already hold the lock
      * before calling generator_forward.  Removing the lock avoids ~10+
      * recursive mutex lock/unlock pairs per epoch inside the hot path. */

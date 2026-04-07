@@ -25,6 +25,8 @@ and all intermediates stay in registers.
 
 from __future__ import annotations
 
+from typing import cast
+
 import triton  # type: ignore[import-untyped]
 import triton.language as tl  # type: ignore[import-untyped]
 import torch
@@ -45,23 +47,23 @@ C: int = 3  # channels
 
 
 # ── Forward kernel ───────────────────────────────────────────────────
-@triton.jit
+@triton.jit  # type: ignore[misc]
 def _color_quant_fwd_kernel(
-    X_ptr,          # (B, 3, H, W) input — contiguous or channels_last
-    OUT_ptr,        # (B, 3, H, W) output
-    WEIGHTS_ptr,    # (B, 4, H, W) saved softmax weights (for backward)
-    stride_b,       # stride along batch dimension
-    stride_c,       # stride along channel dimension
-    stride_h,       # stride along height dimension
-    stride_w,       # stride along width dimension
+    X_ptr: torch.Tensor,        # (B, 3, H, W) input — contiguous or channels_last
+    OUT_ptr: torch.Tensor,      # (B, 3, H, W) output
+    WEIGHTS_ptr: torch.Tensor,  # (B, 4, H, W) saved softmax weights (for backward)
+    stride_b: int,     # stride along batch dimension
+    stride_c: int,     # stride along channel dimension
+    stride_h: int,     # stride along height dimension
+    stride_w: int,     # stride along width dimension
     HW: tl.constexpr,        # H * W
     inv_temp: tl.constexpr,  # 1 / temperature
     BLOCK: tl.constexpr,     # tile size over the HW dimension
     TRAINING: tl.constexpr,  # 1 for soft quantization, 0 for hard
 ):
     """One program processes one (batch, hw_tile) rectangle."""
-    pid = tl.program_id(0)
-    num_hw_blocks = tl.cdiv(HW, BLOCK)
+    pid = tl.program_id(0)  # type: ignore[misc]
+    num_hw_blocks = tl.cdiv(HW, BLOCK)  # type: ignore[misc]
     b = pid // num_hw_blocks
     hw_block = pid % num_hw_blocks
     hw_offs = hw_block * BLOCK + tl.arange(0, BLOCK)
@@ -187,15 +189,15 @@ def _color_quant_fwd_kernel(
 
 
 # ── Backward kernel ─────────────────────────────────────────────────
-@triton.jit
+@triton.jit  # type: ignore[misc]
 def _color_quant_bwd_kernel(
-    GRAD_OUT_ptr,   # (B, 3, H, W) upstream gradient
-    WEIGHTS_ptr,    # (B, 4, H, W) saved softmax weights
-    GRAD_IN_ptr,    # (B, 3, H, W) gradient w.r.t. input x
-    stride_b,
-    stride_c,
-    stride_h,
-    stride_w,
+    GRAD_OUT_ptr: torch.Tensor,  # (B, 3, H, W) upstream gradient
+    WEIGHTS_ptr: torch.Tensor,   # (B, 4, H, W) saved softmax weights
+    GRAD_IN_ptr: torch.Tensor,   # (B, 3, H, W) gradient w.r.t. input x
+    stride_b: int,
+    stride_c: int,
+    stride_h: int,
+    stride_w: int,
     HW: tl.constexpr,
     inv_temp: tl.constexpr,
     BLOCK: tl.constexpr,
@@ -242,8 +244,8 @@ def _color_quant_bwd_kernel(
     So: dL/d(x_c) = sum_k [ W_k · (p_k - dot_wp) ] · 2(c_k[c] - x_c) / τ
     where dot_wp = sum_j W_j · p_j
     """
-    pid = tl.program_id(0)
-    num_hw_blocks = tl.cdiv(HW, BLOCK)
+    pid = tl.program_id(0)  # type: ignore[misc]
+    num_hw_blocks = tl.cdiv(HW, BLOCK)  # type: ignore[misc]
     b = pid // num_hw_blocks
     hw_block = pid % num_hw_blocks
     hw_offs = hw_block * BLOCK + tl.arange(0, BLOCK)
@@ -317,6 +319,16 @@ class _TritonColorQuantFn(torch.autograd.Function):
         temperature: float,
         training: bool,
     ) -> torch.Tensor:
+        # Ensure x is contiguous so that empty_like(x) creates an output buffer
+        # with matching strides.  Without this, a non-contiguous slice such as
+        # out_facie[:, :3, ...] of a 6-channel channels_last tensor (produced in
+        # impedance mode) has strides (864,1,72,6) while empty_like gives only
+        # 12960 elements with strides (432,1,36,3); the kernel then writes at
+        # offsets up to 25917, causing silent out-of-bounds GPU memory corruption
+        # that manifests as NaN gradients.
+        if not x.is_contiguous():
+            x = x.contiguous()
+
         B, _C, H, W = x.shape
         assert _C == 3, f"Expected 3 channels, got {_C}"
         HW = H * W
@@ -327,13 +339,13 @@ class _TritonColorQuantFn(torch.autograd.Function):
             (B, K, H, W), device=x.device, dtype=x.dtype
         ) if training else x.new_empty(0)
 
-        BLOCK = min(1024, triton.next_power_of_2(HW))
-        grid = (B * triton.cdiv(HW, BLOCK),)
+        BLOCK: int = min(1024, int(triton.next_power_of_2(HW)))  # type: ignore[arg-type]
+        grid: tuple[int, ...] = (B * int(triton.cdiv(HW, BLOCK)),)  # type: ignore[arg-type]
 
-        _color_quant_fwd_kernel[grid](
+        _color_quant_fwd_kernel[grid](  # type: ignore[index, arg-type]
             x, out, weights,
             x.stride(0), x.stride(1), x.stride(2), x.stride(3),
-            HW, inv_temp, BLOCK, int(training),
+            HW, inv_temp, BLOCK, int(training),  # type: ignore[arg-type]
         )
 
         if training:
@@ -351,29 +363,31 @@ class _TritonColorQuantFn(torch.autograd.Function):
         return out
 
     @staticmethod
-    def backward(
+    def backward(  # type: ignore[override]
         ctx: torch.autograd.function.FunctionCtx,
         grad_output: torch.Tensor,
     ) -> tuple[torch.Tensor | None, None, None]:
         (weights,) = ctx.saved_tensors  # type: ignore[attr-defined]
-        inv_temp: float = ctx.inv_temp  # type: ignore[attr-defined]
-        B, H, W, HW = ctx.shape_info  # type: ignore[attr-defined]
-        mem_format: int = ctx.mem_format  # type: ignore[attr-defined]
+        weights_tensor: torch.Tensor = cast(torch.Tensor, weights)
+        inv_temp: float = cast(float, ctx.inv_temp)  # type: ignore[attr-defined]
+        B, H, W, HW = cast(tuple[int, int, int, int], ctx.shape_info)  # type: ignore[attr-defined]
+        _ = H, W  # silence unused-variable error; shape_info stores (B, H, W, HW)
+        mem_format: torch.memory_format = cast(torch.memory_format, ctx.mem_format)  # type: ignore[attr-defined]
 
         # Ensure grad_output has real strides (autograd can pass expanded
         # tensors with stride-0, e.g. from sum().backward()).
-        grad_output = grad_output.contiguous(memory_format=mem_format)
+        grad_output = grad_output.contiguous(memory_format=mem_format)  # type: ignore[arg-type]
         stride_b, stride_c, stride_h, stride_w = grad_output.stride()
 
         grad_input = torch.empty_like(grad_output)
 
-        BLOCK = min(1024, triton.next_power_of_2(HW))
-        grid = (B * triton.cdiv(HW, BLOCK),)
+        BLOCK: int = min(1024, int(triton.next_power_of_2(HW)))  # type: ignore[arg-type]
+        grid: tuple[int, ...] = (B * int(triton.cdiv(HW, BLOCK)),)  # type: ignore[arg-type]
 
-        _color_quant_bwd_kernel[grid](
-            grad_output, weights, grad_input,
+        _color_quant_bwd_kernel[grid](  # type: ignore[index, arg-type]
+            grad_output, weights_tensor, grad_input,
             stride_b, stride_c, stride_h, stride_w,
-            HW, inv_temp, BLOCK,
+            HW, inv_temp, BLOCK,  # type: ignore[arg-type]
         )
 
         return grad_input, None, None

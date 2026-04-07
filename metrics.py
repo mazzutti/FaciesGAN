@@ -68,6 +68,7 @@ class GeneratorMetrics[TTensor]:
     rec: TTensor
     well: TTensor
     div: TTensor
+    imp: TTensor
 
     def as_dict(self) -> dict[str, float]:
         """Return the metric values as a dictionary.
@@ -83,6 +84,7 @@ class GeneratorMetrics[TTensor]:
             "g_rec": self.rec.item(),  # type: ignore
             "g_well": self.well.item(),  # type: ignore
             "g_div": self.div.item(),  # type: ignore
+            "g_imp": self.imp.item(),  # type: ignore
         }
 
     def as_tuple(self) -> tuple[TTensor, ...]:
@@ -94,7 +96,7 @@ class GeneratorMetrics[TTensor]:
             Tuple of metric values in the order:
             (total, fake, rec, well, div).
         """
-        return (self.total, self.fake, self.rec, self.well, self.div)
+        return (self.total, self.fake, self.rec, self.well, self.div, self.imp)
 
 
 @dataclass

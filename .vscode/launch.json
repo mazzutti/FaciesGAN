@@ -234,6 +234,29 @@
       ]
     },
     {
+      "name": "Python: Train Neural Smoothers",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/tools/train_neural_smoothers.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "justMyCode": false,
+      "env": {
+        "PYTHONPATH": "${workspaceFolder}/.venv/lib/python3.13/site-packages:${workspaceFolder}/build/_deps/mlx-src/python:${workspaceFolder}/mlx-c/python",
+        "VIRTUAL_ENV": "${workspaceFolder}/.venv",
+        "PATH": "${workspaceFolder}/.venv/bin:${env:PATH}"
+      },
+      "args": [
+        "--facies",
+        "--impedance",
+        "--epochs",
+        "2000",
+        "--lr",
+        "3e-4"
+        // "--force"
+      ]
+    },
+    {
       "name": "Python: Experiments (Ablation)",
       "type": "debugpy",
       "request": "launch",
@@ -281,6 +304,8 @@
         "--lr-g", "5e-4",
         "--lr-d",  "5e-4",
         // "--lr-decay", "100",
+        // "--use-impedance",
+        // "--impedance-loss-penalty", "1.0",
       ]
     }
   ],

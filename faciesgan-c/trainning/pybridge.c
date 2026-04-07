@@ -345,7 +345,7 @@ int pybridge_shutdown_background_worker(int wait) {
     return 1;
 }
 
-int pybridge_submit_plot_generated_facies(const char *fake_path,
+int pybridge_submit_plot_generated_outputs(const char *fake_path,
         const char *real_path, int stage,
         int index, const char *out_dir,
         const char *masks_path) {
@@ -353,10 +353,10 @@ int pybridge_submit_plot_generated_facies(const char *fake_path,
         return 0;
     }
     pybridge_acquire_gil();
-    /* Call submit_plot_generated_facies_from_npy on the background worker.
+    /* Call submit_plot_generated_outputs_from_npy on the background worker.
      * Signature: (fake_path, real_path, stage, index, out_dir, masks_path) */
     PyObject *res = PyObject_CallMethod(
-                        g_background_worker, "submit_plot_generated_facies_from_npy", "ssiiss",
+                        g_background_worker, "submit_plot_generated_outputs_from_npy", "ssiiss",
                         fake_path ? fake_path : "",
                         real_path ? real_path : "",
                         stage,

@@ -152,7 +152,7 @@ int MLXTrainer_setup_optimizers_impl(MLXTrainer *trainer, const int *scales,
                                      int n_scales);
 int MLXTrainer_load_model_impl(MLXTrainer *trainer, int scale,
                                const char *checkpoint_dir);
-int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
+int MLXTrainer_save_generated_outputs_impl(MLXTrainer *trainer, int scale,
         int epoch, const char *results_path, mlx_array real_facies,
         mlx_array masks,
         mlx_array **wells_pyramid, int n_wells,
@@ -290,16 +290,16 @@ int MLXTrainer_load_model(MLXTrainer *trainer, int scale,
         return trainer->ops->load_model(trainer, scale, checkpoint_dir);
     return MLXTrainer_load_model_impl(trainer, scale, checkpoint_dir);
 }
-int MLXTrainer_save_generated_facies(MLXTrainer *trainer, int scale, int epoch,
+int MLXTrainer_save_generated_outputs(MLXTrainer *trainer, int scale, int epoch,
                                      const char *results_path, mlx_array real_facies,
                                      mlx_array masks,
                                      mlx_array **wells_pyramid, int n_wells,
                                      mlx_array **seismic_pyramid, int n_seismic) {
-    if (trainer && trainer->ops && trainer->ops->save_generated_facies)
-        return trainer->ops->save_generated_facies(trainer, scale, epoch,
+    if (trainer && trainer->ops && trainer->ops->save_generated_outputs)
+        return trainer->ops->save_generated_outputs(trainer, scale, epoch,
                 results_path, real_facies, masks,
                 wells_pyramid, n_wells, seismic_pyramid, n_seismic);
-    return MLXTrainer_save_generated_facies_impl(trainer, scale, epoch,
+    return MLXTrainer_save_generated_outputs_impl(trainer, scale, epoch,
             results_path, real_facies, masks,
             wells_pyramid, n_wells, seismic_pyramid, n_seismic);
 }
@@ -338,7 +338,7 @@ MLXTrainerOps default_mlx_trainer_ops = {
     .close_visualizer = MLXTrainer_close_visualizer_impl,
     .setup_optimizers = MLXTrainer_setup_optimizers_impl,
     .load_model = MLXTrainer_load_model_impl,
-    .save_generated_facies = MLXTrainer_save_generated_facies_impl,
+    .save_generated_outputs = MLXTrainer_save_generated_outputs_impl,
     .get_model_ctx = MLXTrainer_get_model_ctx_impl,
     .get_shapes_flat = MLXTrainer_get_shapes_flat_impl,
     .set_shapes = MLXTrainer_set_shapes_impl,
@@ -1531,7 +1531,7 @@ int MLXTrainer_load_model_impl(MLXTrainer *trainer, int scale,
     return 0;
 }
 
-int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
+int MLXTrainer_save_generated_outputs_impl(MLXTrainer *trainer, int scale,
         int epoch, const char *results_path, mlx_array real_facies,
         mlx_array masks,
         mlx_array **wells_pyramid, int n_wells,
@@ -1581,7 +1581,7 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
         int real_idx = selected_indices[gen_idx / num_gen_per_real];
 
         /* Generate new random noises with conditioning (wells/seismic) when
-         * available.  This matches Python's save_generated_facies which calls
+         * available.  This matches Python's save_generated_outputs which calls
          * get_pyramid_noise(scale, repeated_indexes, wells_pyramid, seismic_pyramid). */
         mlx_array **noises = NULL;
         int n_noises = 0;
@@ -1816,7 +1816,7 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
             snprintf(masks_npy_path, PATH_MAX, "%s/scale_%d_epoch_%d_masks.npy", scale_results_path, scale, epoch);
 
             /* Save fake array for plotting: keep the 5D layout
-             * (num_real, num_gen_per_real, H, W, C) so `plot_generated_facies`
+             * (num_real, num_gen_per_real, H, W, C) so `plot_generated_outputs`
              * which expects a 5D grid receives the intended layout. Additionally
              * save a flattened 4D copy (N, H, W, C) for parity comparisons. */
             if (mlx_save(fake_npy_path, fake_5d) == 0) {
@@ -1976,7 +1976,7 @@ int MLXTrainer_save_generated_facies_impl(MLXTrainer *trainer, int scale,
                         /* Call pybridge to generate the plot with matplotlib fonts
                          * — only when facies plotting is enabled (--no-plot-facies skips). */
                         if (trainer->enable_plot_facies) {
-                            rc = pybridge_submit_plot_generated_facies(
+                            rc = pybridge_submit_plot_generated_outputs(
                                      fake_npy_path, real_npy_path, scale, epoch,
                                      scale_results_path, masks_path_arg) ? 0 : -1;
                         } else {
@@ -2760,7 +2760,7 @@ int MLXTrainer_train_impl(MLXTrainer *trainer) {
                                                ? *effective_mask_pyr[sc]
                                                : mlx_array_new();
                     /* Python uses 0-based epoch in filename (gen_{scale}_{epoch}.png) */
-                    int save_rc = MLXTrainer_save_generated_facies(
+                    int save_rc = MLXTrainer_save_generated_outputs(
                                       trainer, sc, epoch, spath, real_for_scale, mask_for_scale,
                                       well_pyr, well_pyr ? nsc : 0,
                                       seis_pyr, seis_pyr ? nsc : 0);

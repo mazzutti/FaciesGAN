@@ -117,7 +117,23 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
         if getattr(self, "options", None) and getattr(
             self.options, "use_impedance", False
         ):
-            facies_pyramids = torch_utils.to_impedance_pyramids(self.scales)
+            # When using impedance, concatenate facies (categorical RGB)
+            # with impedance channels so the model receives a single
+            # multi-channel "real" tensor per scale: [facies_RGB | imp_3ch].
+            facies_pyramids = torch_utils.to_facies_pyramids(self.scales)
+            impedance_pyramids = torch_utils.to_impedance_pyramids(self.scales)
+
+            combined: list[torch.Tensor] = []
+            for f, i in zip(facies_pyramids, impedance_pyramids):
+                # If impedance pyramid is empty, keep facies only
+                if i.numel() == 0:
+                    combined.append(f)
+                elif f.numel() == 0:
+                    combined.append(i)
+                else:
+                    # Concatenate along channel dim (N, C, H, W)
+                    combined.append(torch.cat([f, i], dim=1))
+            facies_pyramids = tuple(combined)
         else:
             facies_pyramids = torch_utils.to_facies_pyramids(self.scales)
 

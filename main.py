@@ -290,6 +290,12 @@ def get_arguments() -> ArgumentParser:
         "(replaces the categorical facies images with continuous impedance crosslines)",
     )
     parser.add_argument(
+        "--impedance-loss-penalty",
+        type=float,
+        default=1.0,
+        help="weight for the impedance MSE reconstruction loss (default: 1.0)",
+    )
+    parser.add_argument(
         "--use-mlx",
         action="store_true",
         help="enable MLX backend/model implementations when available",
@@ -300,9 +306,9 @@ def get_arguments() -> ArgumentParser:
         help="disable TensorBoard logging during training",
     )
     parser.add_argument(
-        "--no-plot-facies",
+        "--no-plot-outputs",
         action="store_true",
-        help="disable plot_generated_facies visualizations during training",
+        help="disable generated output visualizations (facies and impedance) during training",
     )
 
     parser.add_argument(
@@ -409,9 +415,9 @@ def main() -> None:
     if hasattr(options, "no_tensorboard") and options.no_tensorboard:
         options.enable_tensorboard = False
 
-    # Handle --no-plot-facies flag
-    if hasattr(options, "no_plot_facies") and options.no_plot_facies:
-        options.enable_plot_facies = False
+    # Handle --no-plot-outputs flag
+    if hasattr(options, "no_plot_outputs") and options.no_plot_outputs:
+        options.enable_plot_outputs = False
 
     # Handle --no-compile flag (torch.compile is on by default for CUDA)
     if hasattr(options, "no_compile") and options.no_compile:
@@ -806,6 +812,20 @@ def main() -> None:
                     f"Warning: destroy_process_group failed: {e}",
                     file=sys.stderr,
                 )
+
+            # Pre-empt the Inductor atexit handler that waits 300s for
+            # compile-worker subprocesses to exit — after NCCL teardown
+            # they can hang indefinitely.  Unregister it, then kill all
+            # remaining child processes (compile workers included).
+            try:
+                from torch._inductor.async_compile import (
+                    shutdown_compile_workers,
+                )
+
+                atexit.unregister(shutdown_compile_workers)
+            except Exception:
+                pass
+            _kill_child_processes()
 
     if is_main:
         print("\n" + "=" * 60)

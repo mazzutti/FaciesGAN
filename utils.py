@@ -221,7 +221,7 @@ class ExtractUniqueColors:
 
 
 # Note: module-level helper instances were removed. Instantiate helpers
-# at the call site (e.g., in `plot_generated_facies`) to allow explicit
+# at the call site (e.g., in `plot_generated_outputs`) to allow explicit
 # device and configuration control.
 
 
@@ -936,7 +936,7 @@ def draw_well_arrows(
     )
 
 
-def plot_generated_facies(
+def plot_generated_outputs(
     fake_facies: TTensor,
     real_facies: TTensor,
     stage: int,
@@ -947,6 +947,8 @@ def plot_generated_facies(
     cell_size: int = 256,
     device: torch.device = torch.device("cpu"),
     batch_id: int | None = None,
+    plot_title: str = "Facies",
+    quantize: bool = True,
 ) -> None:
     """Plot and optionally save generated facies using PIL (50-100x faster than matplotlib).
 
@@ -1074,7 +1076,7 @@ def plot_generated_facies(
         main_title_font = ImageFont.load_default()
 
     # Draw main title
-    main_title = f"Stage {stage} - Well Log, Real vs Generated Facies"
+    main_title = f"Stage {stage} - Well Log, Real vs Generated {plot_title}"
     # Get text bounding box for centering
     bbox = main_draw.textbbox((0, 0), main_title, font=main_title_font)
     text_width = bbox[2] - bbox[0]
@@ -1236,16 +1238,28 @@ def plot_generated_facies(
                 # Already RGB
                 gen_rgb = gen_arr_np
 
-            # Normalize if values are outside [0,1]
-            max_val = float(gen_rgb.max()) if gen_rgb.size > 0 else 1.0
-            if max_val > 1.0:
-                gen_rgb = gen_rgb / max_val
+            # Normalize generated image to [0,1]
+            if not quantize:
+                # For continuous data (e.g. impedance): min-max stretch per image
+                # so the full dynamic range is always visible even when the
+                # generator outputs values clustered near 0 early in training.
+                min_val = float(gen_rgb.min()) if gen_rgb.size > 0 else 0.0
+                max_val = float(gen_rgb.max()) if gen_rgb.size > 0 else 1.0
+                if max_val > min_val:
+                    gen_rgb = (gen_rgb - min_val) / (max_val - min_val)
+                else:
+                    gen_rgb = np.zeros_like(gen_rgb)
+            else:
+                max_val = float(gen_rgb.max()) if gen_rgb.size > 0 else 1.0
+                if max_val > 1.0:
+                    gen_rgb = gen_rgb / max_val
 
             # Quantize to pure colors extracted from real facies to remove noise
             # DO THIS BEFORE applying well mask to avoid corrupting well colors
             # Ensure pure_colors is a numpy ndarray of shape (N, 3) and dtype float
-            pure_colors_np = np.asarray(pure_colors, dtype=np.float32)
-            gen_rgb = quantizer(gen_rgb, pure_colors=pure_colors_np)
+            if quantize:
+                pure_colors_np = np.asarray(pure_colors, dtype=np.float32)
+                gen_rgb = quantizer(gen_rgb, pure_colors=pure_colors_np)
 
             # Now apply well mask using preprocessed mask and the already-processed real facies
             # Use real_arr_with_wells which already has white background in well columns

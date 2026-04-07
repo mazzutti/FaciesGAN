@@ -74,11 +74,12 @@ class TrainningOptions(argparse.Namespace):
         use_impedance: bool = False,
         wells_mask_columns: tuple[int, ...] = (),
         enable_tensorboard: bool = True,
-        enable_plot_facies: bool = True,
+        enable_plot_outputs: bool = True,
         compile_backend: bool = False,
         gp_interval: int = 8,
         gradient_checkpointing: bool = False,
         amp_dtype: str = "bf16",
+        impedance_loss_penalty: float = 1.0,
     ) -> None:
         """Create a TrainningOptions namespace with defaults for training.
 
@@ -182,8 +183,8 @@ class TrainningOptions(argparse.Namespace):
             an empty tuple.
         enable_tensorboard : bool, optional
             Enable TensorBoard logging during training. Default is True.
-        enable_plot_facies : bool, optional
-            Enable saving plot_generated_facies visualizations during training. Default is True.
+        enable_plot_outputs : bool, optional
+            Enable saving generated output visualizations (facies and impedance) during training. Default is True.
 
         Notes
         -----
@@ -242,11 +243,12 @@ class TrainningOptions(argparse.Namespace):
         self.use_impedance = use_impedance
         self.wells_mask_columns = wells_mask_columns
         self.enable_tensorboard = enable_tensorboard
-        self.enable_plot_facies = enable_plot_facies
+        self.enable_plot_outputs = enable_plot_outputs
         self.compile_backend = compile_backend
         self.gp_interval = gp_interval
         self.gradient_checkpointing = gradient_checkpointing
         self.amp_dtype = amp_dtype
+        self.impedance_loss_penalty = impedance_loss_penalty
 
 
 class ResumeOptions(argparse.Namespace):

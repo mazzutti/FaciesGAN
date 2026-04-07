@@ -117,7 +117,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         # Feature flags
         self.enable_tensorboard: bool = options.enable_tensorboard
-        self.enable_plot_facies: bool = options.enable_plot_facies
+        self.enable_plot_outputs: bool = options.enable_plot_outputs
 
         # Placeholder containers commonly used by concrete trainers
         self.visualizer: TensorBoardVisualizer | None = None
@@ -206,7 +206,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         # Initialize TensorBoard visualizer if enabled
         self.enable_tensorboard = options.enable_tensorboard
-        self.enable_plot_facies = options.enable_plot_facies
+        self.enable_plot_outputs = options.enable_plot_outputs
         if self.enable_tensorboard and self._is_main_process:
             viz_path = os.path.join(self.output_path, "training_visualizations")
             log_dir = os.path.join(self.output_path, "tensorboard_logs")
@@ -428,6 +428,23 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         """
         raise NotImplementedError("Subclasses must implement reset_schedulers")
 
+    def _warmup_compile_traces(
+        self,
+        scales: tuple[int, ...],
+        indexes: list[int],
+        facies_pyramid: dict[int, TTensor],
+        rec_in_pyramid: dict[int, TTensor],
+        wells_pyramid: dict[int, TTensor],
+        seismic_pyramid: dict[int, TTensor],
+    ) -> None:
+        """Hook for subclasses to warm up compiled code paths.
+
+        The default implementation is a no-op.  ``TorchTrainer`` overrides
+        this to run dummy forwards that force ``torch.compile`` to cache
+        specializations for recovery-loss and diversity-N>1 branches
+        before the training loop needs them.
+        """
+
     def train_scales(
         self,
         scales: tuple[int, ...],
@@ -505,6 +522,14 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 seismic_pyramid,
             )
 
+        # Pre-populate torch.compile trace caches for code paths that
+        # activate later (recovery loss, diversity N>1) so the first
+        # recompilation doesn't happen mid-training where it can crash.
+        self._warmup_compile_traces(
+            scales, indexes, facies_pyramid,
+            rec_in_pyramid, wells_pyramid, seismic_pyramid,
+        )
+
         # Training loop - iterate epochs (0-based)
         if start_epoch > 0 and self._is_main_process:
             print(
@@ -540,10 +565,18 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             if profile_timing:
                 prof_opt_time += time.perf_counter() - opt_t0
 
-            if (epoch + 1) % 200 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
-                # Run on ALL ranks so torch.compile trace caches warm
-                # up identically.  Only rank-0 uses the output for
-                # I/O; non-main ranks discard the tensors.
+            # Visualization epochs: 0, 199, 299, … (every 200 and last).
+            # Only rank-0 runs generate_visualization_samples; non-main
+            # ranks used to run it too to "warm up" compiled traces, but
+            # the training iterations already warm them up and the
+            # inference_mode specialisations are distinct, causing rank-1
+            # to lag minutes behind rank-0 at the barrier.
+            _is_viz_epoch = (
+                (epoch + 1) % 200 == 0
+                or epoch == 0
+                or epoch == (self.num_iter - 1)
+            )
+            if self._is_main_process and _is_viz_epoch:
                 generated_samples = self.generate_visualization_samples(
                     scales,
                     indexes,
@@ -567,14 +600,13 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             )
             if profile_timing:
                 prof_epoch_end_time += time.perf_counter() - ep_t0
-
-            # Synchronize DDP ranks only after epochs where rank-0 ran
-            # model inference (generate_visualization_samples or
-            # save_generated_facies), which may trigger torch.compile
-            # autotuning.  Skipping the barrier on plain training epochs
-            # eliminates the blocking collective on ~99% of iterations.
-            _needs_barrier = len(generated_samples) > 0 or (
-                self.enable_plot_facies
+            # Synchronize DDP ranks on visualization epochs and on
+            # save_generated_outputs epochs. Use _is_viz_epoch (symmetric
+            # pure-Python arithmetic) instead of len(generated_samples)
+            # so that rank-1 (which skips generate_visualization_samples)
+            # still reaches the barrier on the same epochs as rank-0.
+            _needs_barrier = _is_viz_epoch or (
+                self.enable_plot_outputs
                 and (epoch % self.save_interval == 0 or epoch == self.num_iter - 1)
                 and (epoch != 0 or self.num_iter == 1)
                 and self._current_batch_id == self._total_batches - 1
@@ -809,7 +841,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         """
         raise NotImplementedError("Subclasses must implement load_optimizers")
 
-    def save_generated_facies(
+    def save_generated_outputs(
         self,
         scale: int,
         epoch: int,
@@ -849,7 +881,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         NotImplementedError
             If the subclass does not implement this method.
         """
-        raise NotImplementedError("Subclasses must implement save_generated_facies")
+        raise NotImplementedError("Subclasses must implement save_generated_outputs")
 
     def handle_epoch_end(
         self,
@@ -914,15 +946,15 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 lines.append(
                     f"\n  Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch + 1:4d}/{self.num_iter}]"
                 )
-                lines.append("  ┌" + "─" * 99 + "┐")
+                lines.append("  ┌" + "─" * 110 + "┐")
                 lines.append(
                     (
                         f"  │ {'Scale':^5} │ {'G_total':>8} │ {'G_adv':>7} │ {'G_rec':>7} │ "
-                        f"{'G_well':>7} │ {'G_div':>7} │ {'D_total':>8} │ {'D_real':>7} │ "
+                        f"{'G_well':>7} │ {'G_div':>7} │ {'G_imp':>7} │ {'D_total':>8} │ {'D_real':>7} │ "
                         f"{'D_fake':>7} │ {'D_gp':>7} │"
                     )
                 )
-                lines.append("  ├" + "─" * 99 + "┤")
+                lines.append("  ├" + "─" * 110 + "┤")
 
                 import torch as _t
 
@@ -936,6 +968,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                             g.rec,
                             g.well,
                             g.div,
+                            g.imp,
                             d.total,
                             d.real,
                             d.fake,
@@ -945,12 +978,12 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     lines.append(
                         (
                             f"  │ {scale:^5} │ {v[0]:8.3f} │ {v[1]:7.3f} │ {v[2]:7.3f} │ "
-                            f"{v[3]:7.3f} │ {v[4]:7.3f} │ {v[5]:8.3f} │ {v[6]:7.3f} │ "
-                            f"{v[7]:7.3f} │ {v[8]:7.3f} │"
+                            f"{v[3]:7.3f} │ {v[4]:7.3f} │ {v[5]:7.3f} │ {v[6]:8.3f} │ {v[7]:7.3f} │ "
+                            f"{v[8]:7.3f} │ {v[9]:7.3f} │"
                         )
                     )
 
-                lines.append("  └" + "─" * 99 + "┘")
+                lines.append("  └" + "─" * 110 + "┘")
                 progress.write("\n".join(lines))  # type: ignore
 
             # Save to TensorBoard and log per-scale (only when TB is
@@ -995,7 +1028,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 and (self._current_batch_id == self._total_batches - 1)
             ):
                 for scale in scales:
-                    self.save_generated_facies(
+                    self.save_generated_outputs(
                         scale,
                         epoch,
                         self._current_batch_id,
@@ -1388,14 +1421,15 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 g.rec,
                 g.well,
                 g.div,
+                g.imp,
                 d.total,
                 d.real,
                 d.fake,
                 d.gp,
             ]
         ).tolist()
-        g_total, g_fake, g_rec, g_well, g_div = vals[:5]
-        d_total, d_real, d_fake, d_gp = vals[5:]
+        g_total, g_fake, g_rec, g_well, g_div, g_imp = vals[:6]
+        d_total, d_real, d_fake, d_gp = vals[6:]
 
         step = global_step if global_step is not None else epoch
 
@@ -1424,4 +1458,5 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         writer.add_scalar("Loss/train/generator/reconstruction", g_rec, step)  # type: ignore
         writer.add_scalar("Loss/train/generator/well_constraint", g_well, step)  # type: ignore
         writer.add_scalar("Loss/train/generator/diversity", g_div, step)  # type: ignore
+        writer.add_scalar("Loss/train/generator/impedance", g_imp, step)  # type: ignore
         writer.add_scalar("Loss/train/generator", g_total, step)  # type: ignore

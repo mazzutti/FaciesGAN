@@ -148,22 +148,28 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             )
 
             z_in = cast(mx.array, z[index])  # type: ignore
+            # When impedance is active, output_channels = 6 but the pure-noise
+            # part of z is still 3 channels (orig_output_channels).  Use noise_C
+            # as the split point so conditioning channels are always at z[..., noise_C:].
+            noise_C: int = getattr(self, "orig_output_channels", self.output_channels)
+            cond_C: int = self.input_channels - noise_C
+
             if self.has_cond_channels:
-                noise = z_in[..., : self.output_channels]
-                cond = z_in[..., self.output_channels :]
+                noise = z_in[..., :noise_C]
+                cond = z_in[..., noise_C:]
                 noise = amp[index] * noise
                 z_in = mx.concat([noise, cond], axis=-1)
             else:
                 z_in = amp[index] * z_in
 
             p = self.zero_padding
-            padded_facie = mx.pad(out_facie, [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
+            padded_facie = mx.pad(out_facie[..., :noise_C], [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
 
             if self.has_cond_channels:
-                num_repeats = self.cond_channels // self.output_channels
+                num_repeats = cond_C // noise_C
                 padded_facie = mx.tile(padded_facie, (1, 1, 1, num_repeats))
-                noise = z_in[..., : self.output_channels]
-                cond = z_in[..., self.output_channels :] + padded_facie
+                noise = z_in[..., :noise_C]
+                cond = z_in[..., noise_C:] + padded_facie
                 z_in = mx.concat([noise, cond], axis=-1)
             else:
                 # If channel counts differ unexpectedly, add only to the

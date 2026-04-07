@@ -284,7 +284,12 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, StepLR], nn.Module)
             (to be passed to the update method).
         """
         metrics: GeneratorMetrics[mx.array] = GeneratorMetrics(
-            mx.array(0.0), mx.array(0.0), mx.array(0.0), mx.array(0.0), mx.array(0.0)
+            mx.array(0.0),
+            mx.array(0.0),
+            mx.array(0.0),
+            mx.array(0.0),
+            mx.array(0.0),
+            mx.array(0.0),
         )
 
         rec_in = rec_in_pyramid[scale]

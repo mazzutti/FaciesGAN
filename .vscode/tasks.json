@@ -75,7 +75,7 @@
 			"command": "bash",
 			"args": [
 				"-lc",
-				"FG_PARITY_DUMP_EACH_STEP=1 FG_PARITY_DUMP_ACTIVATIONS=1 FG_PARITY_DEBUG_INIT=1 /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/.venv/bin/python /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/main.py --use-mlx --input-path /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/data --manual-seed 0 --num-iter 1 --num-train-pyramids 1 --num-parallel-scales 1 --stop-scale 0 --num-workers 0 --batch-size 1 --no-tensorboard --no-plot-facies > /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/results/py/py_init_log.txt 2>&1"
+				"FG_PARITY_DUMP_EACH_STEP=1 FG_PARITY_DUMP_ACTIVATIONS=1 FG_PARITY_DEBUG_INIT=1 /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/.venv/bin/python /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/main.py --use-mlx --input-path /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/data --manual-seed 0 --num-iter 1 --num-train-pyramids 1 --num-parallel-scales 1 --stop-scale 0 --num-workers 0 --batch-size 1 --no-tensorboard --no-plot-outputs > /Users/mazzutti/POSDOC/Experimentos/FaciesGAN/results/py/py_init_log.txt 2>&1"
 			],
 			"isBackground": false,
 			"problemMatcher": []
@@ -148,7 +148,7 @@
 			"command": "bash",
 			"args": [
 				"-lc",
-				"export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export OMP_NUM_THREADS=2 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/py/ddp_nvlink_smoke_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --num-train-pyramids 5 --batch-size 16 --num-workers 1 --num-iter 1 --num-parallel-scales 3 --discriminator-steps 1 --generator-steps 1 --stop-scale 2 --no-plot-facies 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+				"export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export OMP_NUM_THREADS=2 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/py/ddp_nvlink_smoke_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --num-train-pyramids 5 --batch-size 16 --num-workers 1 --num-iter 1 --num-parallel-scales 3 --discriminator-steps 1 --generator-steps 1 --stop-scale 2 --no-plot-outputs 2>&1 | tee \"$OUTPUT_DIR/train.log\""
 			],
 			"isBackground": false,
 			"problemMatcher": [],
@@ -166,7 +166,7 @@
 			"command": "bash",
 			"args": [
 				"-lc",
-				"set -euo pipefail && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/bench/1gpu_bs40_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/python ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --manual-seed 0 --num-train-pyramids 200 --batch-size 40 --num-workers 4 --num-iter 50 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic --no-tensorboard --no-plot-facies 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+				"set -euo pipefail && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/bench/1gpu_bs40_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/python ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --manual-seed 0 --num-train-pyramids 200 --batch-size 40 --num-workers 4 --num-iter 50 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic --no-tensorboard --no-plot-outputs 2>&1 | tee \"$OUTPUT_DIR/train.log\""
 			],
 			"isBackground": false,
 			"problemMatcher": [],
@@ -184,7 +184,7 @@
 			"command": "bash",
 			"args": [
 				"-lc",
-				"set -euo pipefail && export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export NCCL_DEBUG=WARN && export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/bench/2gpu_bs40_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --manual-seed 0 --num-train-pyramids 200 --batch-size 40 --num-workers 4 --num-iter 50 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic --no-tensorboard --no-plot-facies 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+				"set -euo pipefail && export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export NCCL_DEBUG=WARN && export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/bench/2gpu_bs40_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --manual-seed 0 --num-train-pyramids 200 --batch-size 40 --num-workers 4 --num-iter 50 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic --no-tensorboard --no-plot-outputs 2>&1 | tee \"$OUTPUT_DIR/train.log\""
 			],
 			"isBackground": false,
 			"problemMatcher": [],
@@ -202,7 +202,7 @@
 			"command": "bash",
 			"args": [
 				"-lc",
-				"set -euo pipefail && export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export NCCL_DEBUG=WARN && export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/bench/2gpu_bs80_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --manual-seed 0 --num-train-pyramids 200 --batch-size 80 --num-workers 4 --num-iter 50 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic --no-tensorboard --no-plot-facies 2>&1 | tee \"$OUTPUT_DIR/train.log\""
+				"set -euo pipefail && export NCCL_P2P_LEVEL=NVL && export NCCL_ALGO=Ring && export NCCL_PROTO=Simple && export NCCL_DEBUG=WARN && export TORCH_NCCL_ASYNC_ERROR_HANDLING=1 && export OMP_NUM_THREADS=4 && TIMESTAMP=$(date +%Y_%m_%d_%H_%M_%S) && OUTPUT_DIR=\"${workspaceFolder}/results/bench/2gpu_bs80_${TIMESTAMP}\" && mkdir -p \"$OUTPUT_DIR\" && ${workspaceFolder}/.venv/bin/torchrun --nproc_per_node=2 ${workspaceFolder}/main.py --input-path data --output-path \"$OUTPUT_DIR\" --manual-seed 0 --num-train-pyramids 200 --batch-size 80 --num-workers 4 --num-iter 50 --num-parallel-scales 7 --discriminator-steps 3 --generator-steps 3 --alpha 10 --scale0-noise-amp 1.5 --min-noise-amp 0.3 --lambda-diversity 1.0 --use-wells --use-seismic --no-tensorboard --no-plot-outputs 2>&1 | tee \"$OUTPUT_DIR/train.log\""
 			],
 			"isBackground": false,
 			"problemMatcher": [],

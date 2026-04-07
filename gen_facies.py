@@ -26,7 +26,7 @@ from sklearn.manifold import TSNE, Isomap, MDS  # type: ignore
 from sklearn.metrics import euclidean_distances # type: ignore
 from umap import UMAP  # type: ignore
 
-from background_workers import submit_plot_generated_facies
+from background_workers import submit_plot_generated_outputs
 from config import OPT_FILE
 from datasets.torch.dataset import TorchPyramidsDataset
 from log import format_time
@@ -204,7 +204,7 @@ def generate_comparison_plots(
                 )
                 fake_list.append(fake.detach().cpu())
 
-        submit_plot_generated_facies(
+        submit_plot_generated_outputs(
             torch.stack(fake_list), real, scale, start, out_path, masks
         )
 

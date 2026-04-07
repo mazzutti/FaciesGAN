@@ -19,7 +19,7 @@ import datasets.torch.utils as torch_utils
 import datasets.utils as data_utils
 from datasets.data_files import DataFiles
 from interpolators.config import InterpolatorConfig
-from interpolators.impedance import ImpedanceInterpolator, extract_crosslines, load_impedance_volume
+from interpolators.impedance import ImpedanceInterpolator, ImpedanceNeuralSmoother, extract_crosslines, load_impedance_volume
 from interpolators.nearest import NearestInterpolator
 from interpolators.neural import NeuralSmoother
 from interpolators.well import WellInterpolator
@@ -60,7 +60,6 @@ def _empty_pyramid_tensor(scale: tuple[int, ...], channels_last: bool) -> torch.
         return torch.empty((0, channels, height, width), dtype=torch.float32)
 
 
-@memory.cache  # type: ignore
 @memory.cache  # type: ignore
 def to_facies_pyramids(
     scale_list: tuple[tuple[int, ...], ...],
@@ -153,11 +152,28 @@ def to_impedance_pyramids(
         target_height,
     )
 
-    interpolator = ImpedanceInterpolator(config)
+    # Use neural smoother when per-crossline .pt checkpoints exist, otherwise
+    # fall back to the nearest-neighbour ImpedanceInterpolator.
+    model_paths = data_utils.as_model_file_list(DataFiles.IMPEDANCE)
+    use_neural = len(model_paths) == len(crosslines)
+    if use_neural:
+        logger.info("Found %d impedance neural checkpoints; using ImpedanceNeuralSmoother", len(model_paths))
+    else:
+        if model_paths:
+            logger.warning(
+                "Found %d neural checkpoints but %d crosslines; falling back to nearest-neighbour",
+                len(model_paths), len(crosslines),
+            )
+        interpolator = ImpedanceInterpolator(config)
+
     pyramids_list: list[list[torch.Tensor]] = [[] for _ in range(len(scale_list))]
 
-    for crossline in crosslines:
-        pyramid = interpolator.interpolate_array(crossline, scale_list)
+    for idx, crossline in enumerate(crosslines):
+        if use_neural:
+            smoother = ImpedanceNeuralSmoother(model_paths[idx], config)
+            pyramid = smoother.interpolate_array(crossline, scale_list)
+        else:
+            pyramid = interpolator.interpolate_array(crossline, scale_list)  # type: ignore[union-attr]
         for i in range(len(scale_list)):
             pyramids_list[i].append(torch_utils.norm(pyramid[i]))
 

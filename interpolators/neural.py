@@ -17,7 +17,6 @@ from torch import nn
 
 from apex_utils import FusedLayerNorm
 
-import datasets.utils as data_utils
 import utils
 from interpolators.color_encoder import ColorEncoder
 from interpolators.base import BaseInterpolator
@@ -177,6 +176,79 @@ class NeuralSmoother(BaseInterpolator):
         else:
             raise FileNotFoundError("No checkpoint found; training model from scratch.")
 
+    @classmethod
+    def train_on_image(
+        cls,
+        image_path: Path,
+        out_model_path: Path,
+        config: "InterpolatorConfig | None" = None,
+        epochs: int = 2000,
+        lr: float = 3e-4,
+    ) -> None:
+        """Train a NeuralSmoother on a single facies PNG and save the checkpoint.
+
+        The model is trained to predict the palette-class label for every
+        (x, y) coordinate in the image.  After training the model state dict
+        is saved to *out_model_path* so that :class:`NeuralSmoother` can load
+        it later via ``_load_model``.
+
+        Parameters
+        ----------
+        image_path : Path
+            Path to the input PNG image (e.g. a facies crossline).
+        out_model_path : Path
+            Destination ``.pt`` file for the trained model state dict.
+        config : InterpolatorConfig, optional
+            Interpolator configuration controlling geometry, scale, etc.
+            Defaults to ``InterpolatorConfig()``.
+        epochs : int
+            Number of gradient-descent steps.
+        lr : float
+            Adam learning rate.
+        """
+        import datasets.utils as data_utils
+
+        if config is None:
+            config = InterpolatorConfig()
+
+        device = utils.resolve_device()
+        model = ResidualMLP(
+            num_classes=config.num_classes,
+            scale=config.scale,
+        ).to(device)
+
+        native_h, native_w = config.geometry
+
+        img_np = data_utils.load_image(image_path)  # (H, W, 3) float32 [0,1]
+        encoder = ColorEncoder(img_np, device=device)
+
+        # Build coordinate grid for the native resolution
+        coords = get_mgrid(height=native_h, width=native_w).to(device)  # (H*W, 2)
+
+        # Ground-truth class labels (H*W,)
+        img_tensor = torch.from_numpy(img_np.reshape(-1, 3)).float().to(device) # type: ignore
+        labels = encoder.rgb_to_labels(img_tensor)  # (H*W,) long
+        class_weights = encoder.get_class_weights(labels)
+
+        criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+        model.train()
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+            logits = model(coords)          # (H*W, num_classes)
+            loss = criterion(logits, labels)
+            loss.backward()
+            optimizer.step() # type: ignore
+            scheduler.step()
+            if (epoch + 1) % 500 == 0:
+                logger.info("  epoch %d/%d  loss=%.4f", epoch + 1, epochs, loss.item())
+
+        out_model_path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({"model_state": model.state_dict()}, str(out_model_path))
+        logger.info("Saved checkpoint to %s", out_model_path)
+
     def interpolate(
         self,
         image_path: Path,
@@ -220,6 +292,8 @@ class NeuralSmoother(BaseInterpolator):
         - A ColorEncoder is created from ``image_path`` during this call and
           stored in ``self.encoder`` for palette-based RGB conversion.
         """
+        import datasets.utils as data_utils
+
         logger.info("Rendering facies pyramid...")
         # Get dimensions using base helper method
         _, _, super_height, super_width = self.get_target_dimensions()

@@ -41,6 +41,8 @@ from config import (
     G_FILE,
     OPT_D_FILE,
     OPT_G_FILE,
+    RESULT_FACIES_PATH,
+    RESULT_IMPEDANCE_PATH,
     SCH_D_FILE,
     SCH_G_FILE,
 )
@@ -233,6 +235,79 @@ class TorchTrainer(
                 )
                 for scale in scales
             )
+
+    def _warmup_compile_traces(
+        self,
+        scales: tuple[int, ...],
+        indexes: list[int],
+        facies_pyramid: dict[int, torch.Tensor],
+        rec_in_pyramid: dict[int, torch.Tensor],
+        wells_pyramid: dict[int, torch.Tensor],
+        seismic_pyramid: dict[int, torch.Tensor],
+    ) -> None:
+        """Run dummy forwards to pre-populate torch.compile trace caches.
+
+        Recovery loss and N>1 diversity activate after a warmup window
+        (``_rec_skip_epochs``).  Their generator calls use different
+        arguments (``in_noise``, ``start_scale``, larger batch) that
+        Dynamo has never traced.  If the first real recompilation
+        happens mid-training it can crash under debugpy or cause a long
+        stall that triggers a DDP timeout.
+
+        This method forces those traces at startup (within
+        ``inference_mode`` so no gradients are computed) so every
+        compiled specialization is cached before the training loop.
+        """
+        if not getattr(self.model, "_use_compile", False):
+            return
+
+        N = self.model.num_diversity_samples
+        if N <= 1 and self.model.alpha == 0:
+            return  # nothing extra to warm up
+
+        if self._is_main_process:
+            print("  Warming up torch.compile traces …")
+
+        with torch.inference_mode():
+            for scale in scales:
+                amps = self.model.get_noise_aplitude(scale)
+
+                # 1) Recovery-loss path: generator(rec_noise, amps,
+                #    in_noise=rec_in, start_scale=s, stop_scale=s)
+                if self.model.alpha > 0:
+                    rec_noise = self.model.get_pyramid_noise(
+                        scale, indexes, wells_pyramid, seismic_pyramid,
+                        rec=True,
+                    )
+                    rec_in = rec_in_pyramid[scale]
+                    self.model.generator(
+                        rec_noise, amps,
+                        in_noise=rec_in,
+                        start_scale=scale,
+                        stop_scale=scale,
+                    )
+
+                # 2) Diversity N>1 path: generator(batched_N*B, amps,
+                #    stop_scale=s)
+                if N > 1:
+                    noise_sets = [
+                        self.model.get_pyramid_noise(
+                            scale, indexes, wells_pyramid, seismic_pyramid,
+                        )
+                        for _ in range(N)
+                    ]
+                    batched_noises = [
+                        torch.cat(
+                            [noise_sets[k][lvl] for k in range(N)], dim=0,
+                        )
+                        for lvl in range(scale + 1)
+                    ]
+                    self.model.generator(
+                        batched_noises, amps, stop_scale=scale,
+                    )
+
+        if self._is_main_process:
+            print("  Compile warmup done.")
 
     def compute_rec_input(
         self,
@@ -454,7 +529,7 @@ class TorchTrainer(
             yield batch
             batch = prefetcher.next()
 
-    def save_generated_facies(
+    def save_generated_outputs(
         self,
         scale: int,
         epoch: int,
@@ -489,7 +564,7 @@ class TorchTrainer(
         seismic_pyramid : dict[int, torch.Tensor]
             Dictionary of seismic-conditioning tensors per scale.
         """
-        if self.enable_plot_facies:
+        if self.enable_plot_outputs:
             actual_batch = real_facies.shape[0]
             # Generate on CPU so .tolist() avoids a GPU→CPU sync.
             indexes = torch.randint(actual_batch, (self.num_real_facies,), device="cpu")
@@ -524,22 +599,55 @@ class TorchTrainer(
             # three DMA copies overlap, then sync once before numpy
             # conversion.  Denormalization runs on GPU to avoid a
             # redundant per-element copy on CPU.
-            facies_cpu = denorm(facies_tensor.detach()).to("cpu", non_blocking=True)  # type: ignore[arg-type]
-            real_cpu = denorm(real_facies_tensor.detach()).to("cpu", non_blocking=True)  # type: ignore[arg-type]
+            facies_cpu: torch.Tensor = cast(torch.Tensor, denorm(facies_tensor.detach()).to("cpu", non_blocking=True))  # type: ignore[arg-type]
+            real_cpu: torch.Tensor = cast(torch.Tensor, denorm(real_facies_tensor.detach()).to("cpu", non_blocking=True))  # type: ignore[arg-type]
             masks_cpu: torch.Tensor | None = None
             if len(masks_pyramid) > 0:
                 masks_cpu = masks_pyramid[scale][indexes].detach().to("cpu", non_blocking=True)
             torch.cuda.current_stream().synchronize()
 
-            bw.submit_plot_generated_facies(
-                torch2np(facies_cpu),
-                torch2np(real_cpu),
+            use_impedance: bool = getattr(self.model.options, "use_impedance", False)
+            # When impedance is active the tensor has 6 channels: first 3 are
+            # facies, last 3 are impedance.  Split before plotting.
+            num_facies_ch: int = self.model.options.noise_channels
+            if use_impedance:
+                facies_only_cpu = facies_cpu[:, :, :num_facies_ch]
+                real_facies_only_cpu = real_cpu[:, :num_facies_ch]
+                imp_cpu = facies_cpu[:, :, num_facies_ch:]
+                real_imp_cpu = real_cpu[:, num_facies_ch:]
+            else:
+                facies_only_cpu = facies_cpu
+                real_facies_only_cpu = real_cpu
+                imp_cpu = None
+                real_imp_cpu = None
+
+            masks_np = torch2np(masks_cpu) if masks_cpu is not None else None
+            bw.submit_plot_generated_outputs(
+                torch2np(facies_only_cpu),
+                torch2np(real_facies_only_cpu),
                 scale,
                 epoch,
                 results_path,
-                torch2np(masks_cpu) if masks_cpu is not None else None,
+                masks_np,
                 batch_id=batch_id,
             )
+
+            if use_impedance and imp_cpu is not None and real_imp_cpu is not None:
+                impedance_results_path = results_path.replace(
+                    RESULT_FACIES_PATH, RESULT_IMPEDANCE_PATH
+                )
+                os.makedirs(impedance_results_path, exist_ok=True)
+                bw.submit_plot_generated_outputs(
+                    torch2np(imp_cpu),
+                    torch2np(real_imp_cpu),
+                    scale,
+                    epoch,
+                    impedance_results_path,
+                    None,  # impedance is not well-conditioned
+                    batch_id=batch_id,
+                    plot_title="Impedance",
+                    quantize=False,
+                )
 
     def setup_optimizers(self, scales: tuple[int, ...]) -> None:
         for scale in scales:

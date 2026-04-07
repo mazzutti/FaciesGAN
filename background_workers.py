@@ -67,6 +67,8 @@ def _save_plot_task(
     out_dir: str,
     masks_arr: TTensor | None = None,
     batch_id: int | None = None,
+    plot_title: str = "Facies",
+    quantize: bool = True,
 ) -> bool:
     """
     Internal task to save a plot in a background process.
@@ -81,11 +83,11 @@ def _save_plot_task(
     os.environ["FG_NO_TORCH_IMPORT"] = "1"
 
     # Import locally so the worker process has its own module imports
-    from utils import plot_generated_facies
+    from utils import plot_generated_outputs
 
     # The plotting helper will accept the tensors and perform any
     # conversions internally as needed.
-    plot_generated_facies(
+    plot_generated_outputs(
         fake_list,
         real_arr,
         stage,
@@ -94,6 +96,8 @@ def _save_plot_task(
         out_dir,
         save=True,
         batch_id=batch_id,
+        plot_title=plot_title,
+        quantize=quantize,
     )
     return True
 
@@ -109,7 +113,7 @@ def _warmup_worker() -> bool:
     os.environ["FG_NO_TORCH_IMPORT"] = "1"
     # Import the plotting module which pulls in matplotlib, numpy, etc.
     try:
-        from utils import plot_generated_facies  # type: ignore[import]
+        from utils import plot_generated_outputs  # type: ignore[import]
     except Exception:
         pass
     return True
@@ -134,13 +138,13 @@ def _save_plot_task_from_npy(
 
     os.environ["FG_NO_TORCH_IMPORT"] = "1"
 
-    from utils import plot_generated_facies
+    from utils import plot_generated_outputs
 
     fake_arr = np.load(fake_path)
     real_arr = np.load(real_path)
     masks_arr = np.load(masks_path) if masks_path else None
 
-    plot_generated_facies(
+    plot_generated_outputs(
         fake_arr,
         real_arr,
         stage,
@@ -233,7 +237,7 @@ class BackgroundWorker:
                 self._pending.discard(fut)
                 self._pending_cond.notify_all()
 
-    def submit_plot_generated_facies(
+    def submit_plot_generated_outputs(
         self,
         fake_list: TTensor,
         real: TTensor,
@@ -244,6 +248,8 @@ class BackgroundWorker:
         wait_if_full: bool = True,
         timeout: float | None = None,
         batch_id: int | None = None,
+        plot_title: str = "Facies",
+        quantize: bool = True,
     ) -> Future[bool]:
         """
         Submit a plot job to the process pool (non-blocking by default).
@@ -298,13 +304,15 @@ class BackgroundWorker:
                 str(out_dir),
                 masks,
                 int(batch_id) if batch_id is not None else None,
+                str(plot_title),
+                bool(quantize),
             )
             # Track and attach callback
             self._pending.add(fut)
             fut.add_done_callback(self._on_done)
             return fut
 
-    def submit_plot_generated_facies_from_npy(
+    def submit_plot_generated_outputs_from_npy(
         self,
         fake_path: str,
         real_path: str,
@@ -390,7 +398,7 @@ class BackgroundWorker:
             logger.exception("Error shutting down BackgroundWorker")
 
 
-def submit_plot_generated_facies(
+def submit_plot_generated_outputs(
     fake: TTensor,
     real: TTensor,
     stage: int,
@@ -398,6 +406,8 @@ def submit_plot_generated_facies(
     out_dir: str,
     masks: TTensor | None = None,
     batch_id: int | None = None,
+    plot_title: str = "Facies",
+    quantize: bool = True,
 ) -> Future[bool]:
     """
     Submit a plot job using the module-level BackgroundWorker.
@@ -418,7 +428,7 @@ def submit_plot_generated_facies(
     # BackgroundWorker is a singleton — calling the constructor returns the
     # shared instance. Use it to submit the job.
     worker = BackgroundWorker()
-    return worker.submit_plot_generated_facies(
+    return worker.submit_plot_generated_outputs(
         fake,
         real,
         stage,
@@ -427,4 +437,6 @@ def submit_plot_generated_facies(
         masks,
         batch_id=batch_id,
         timeout=30.0,
+        plot_title=plot_title,
+        quantize=quantize,
     )

@@ -201,6 +201,14 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
             out_facie = in_noise
 
         stop_scale = stop_scale if stop_scale is not None else len(self.gens) - 1
+
+        # When impedance is active, output_channels = 6 but the pure-noise
+        # part of z is still 3 channels (orig_output_channels).  Use noise_C
+        # as the split point so that conditioning channels are always at
+        # z[:, noise_C:] regardless of impedance.
+        noise_C: int = getattr(self, "orig_output_channels", self.output_channels)
+        cond_C: int = self.input_channels - noise_C  # actual conditioning channels
+
         for index in range(start_scale, stop_scale + 1):
 
             out_facie = utils.interpolate(
@@ -214,19 +222,27 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
             if self.has_cond_channels:
                 # Build z_in without clone: use out-of-place ops to avoid
                 # copying the full tensor and in-place version-counter bumps.
+                # Repeat out_facie (noise_C channels) to fill the cond portion.
                 padded_facie = F.pad(
-                    out_facie, [self.zero_padding] * 4, value=0
-                ).repeat(1, self.cond_channels // self.output_channels, 1, 1)
+                    out_facie[:, :noise_C, ...], [self.zero_padding] * 4, value=0
+                ).repeat(1, cond_C // noise_C, 1, 1)
                 z_in = torch.cat(
                     [
-                        amp[index] * z[index][:, : self.output_channels, :, :],
-                        z[index][:, self.output_channels :, :, :] + padded_facie,
+                        amp[index] * z[index][:, :noise_C, :, :],
+                        z[index][:, noise_C:, :, :] + padded_facie,
                     ],
                     dim=1,
                 )
             else:
+                # When the generator produces more output channels than
+                # noise input channels (e.g. facies_RGB + impedance_3ch
+                # output with 3-ch noise), only residual-add the first
+                # input_channels channels of out_facie so that the shapes
+                # align.  The conv block maps input_channels → output_channels
+                # and the full output_channels residual is applied below.
+                facie_for_residual = out_facie[:, : self.input_channels, ...]
                 z_in = amp[index] * z[index] + F.pad(
-                    out_facie, [self.zero_padding] * 4, value=0
+                    facie_for_residual, [self.zero_padding] * 4, value=0
                 )
 
             if (
@@ -248,8 +264,19 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
             # single pointwise kernel, saving one kernel launch per scale.
             out_facie = self._residual_clamp(gen_out, out_facie)
 
-        # Apply color quantization to enforce pure colors
-        out_facie = self.color_quantizer(out_facie)
+        # Apply color quantization to enforce pure facies colors.
+        # If the generator was configured to output extra impedance
+        # channels (e.g. facies_RGB + imp_3ch), apply the quantizer
+        # only to the facies channels and then re-concatenate the
+        # impedance channels unchanged.
+        orig_C = getattr(self, "orig_output_channels", None)
+        if orig_C is not None and orig_C < out_facie.shape[1]:
+            facies = out_facie[:, :orig_C, ...]
+            imp = out_facie[:, orig_C:, ...]
+            facies_q = self.color_quantizer(facies)
+            out_facie = torch.cat([facies_q, imp], dim=1)
+        else:
+            out_facie = self.color_quantizer(out_facie)
 
         return out_facie  # type: ignore[return-value]
 

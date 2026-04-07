@@ -143,9 +143,20 @@ def get_arguments() -> ArgumentParser:
     )
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument(
-        "--no-plot-facies",
+        "--no-plot-outputs",
         action="store_true",
         help="Disable PNG sample plots during training.",
+    )
+    parser.add_argument(
+        "--use-impedance",
+        action="store_true",
+        help="Train with acoustic impedance as an additional output channel.",
+    )
+    parser.add_argument(
+        "--impedance-loss-penalty",
+        type=float,
+        default=1.0,
+        help="Weight for the impedance MSE reconstruction loss (default: 1.0).",
     )
 
     return parser
@@ -239,10 +250,14 @@ def _build_training_args(
         cmd_args.append("--use-wells")
     if variant["use_seismic"]:
         cmd_args.append("--use-seismic")
+    if getattr(args, "use_impedance", False):
+        cmd_args.append("--use-impedance")
+        penalty = getattr(args, "impedance_loss_penalty", 1.0)
+        cmd_args.extend(["--impedance-loss-penalty", str(penalty)])
     if getattr(args, "no_tensorboard", False):
         cmd_args.append("--no-tensorboard")
-    if getattr(args, "no_plot_facies", False):
-        cmd_args.append("--no-plot-facies")
+    if getattr(args, "no_plot_outputs", False):
+        cmd_args.append("--no-plot-outputs")
     else:
         # Plot 1 image per scale at the last epoch only: 5 real × 5 generated.
         # Setting save-interval to num_iter ensures only the final epoch
@@ -679,6 +694,90 @@ def _compute_shared_embeddings(
     return results
 
 
+def _plot_impedance_comparison(
+    model_paths: dict[str, str],
+    base_output: str,
+    num_samples: int = 5,
+) -> None:
+    """Create a side-by-side grid comparing real vs generated impedance per variant.
+
+    Reads the ``real_x_generated_impedance`` PNGs saved during training
+    (one composite PNG per save-interval event) and stacks them into a
+    variant × sample grid.
+
+    Parameters
+    ----------
+    model_paths : dict[str, str]
+        Mapping from variant name to the scale-0 model directory (the
+        directory produced by ``_build_training_args(…, start_scale=0)``).
+    base_output : str
+        Root output directory; the combined PNG is written here.
+    num_samples : int
+        Maximum number of sample PNGs to show per variant.
+    """
+    from matplotlib import pyplot as plt
+    from PIL import Image
+
+    rows: list[tuple[str, list[np.ndarray]]] = []
+    for name in VARIANT_NAMES:
+        if name not in model_paths:
+            continue
+        variant_dir = model_paths[name]
+        # Collect composite PNGs from all scale sub-directories
+        imp_imgs: list[np.ndarray] = []
+        for scale_dir in sorted(
+            (p for p in os.scandir(variant_dir) if p.is_dir()),
+            key=lambda e: int(e.name) if e.name.isdigit() else 99,
+        ):
+            imp_dir = os.path.join(scale_dir.path, "real_x_generated_impedance")
+            if not os.path.isdir(imp_dir):
+                continue
+            for png in sorted(os.listdir(imp_dir)):
+                if not png.endswith(".png"):
+                    continue
+                arr = np.array(Image.open(os.path.join(imp_dir, png)))
+                imp_imgs.append(arr)
+                if len(imp_imgs) >= num_samples:
+                    break
+            if len(imp_imgs) >= num_samples:
+                break
+        rows.append((name, imp_imgs[:num_samples]))
+
+    if not any(imgs for _, imgs in rows):
+        print("  No impedance output PNGs found; skipping impedance comparison plot.")
+        return
+
+    n_cols = max(len(imgs) for _, imgs in rows)
+    n_rows = len(rows)
+    fig, axes = plt.subplots( # type: ignore
+        n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows),
+        squeeze=False,
+    )
+    variant_labels = {
+        "wells_seismic": "Wells + Seismic",
+        "wells_only": "Wells Only",
+        "seismic_only": "Seismic Only",
+        "unconditional": "Unconditional",
+    }
+    for r, (name, imgs) in enumerate(rows):
+        for c in range(n_cols):
+            ax = axes[r][c]
+            if c < len(imgs):
+                ax.imshow(imgs[c])
+            else:
+                ax.set_facecolor("#111")
+            ax.axis("off")
+            if c == 0:
+                ax.set_ylabel(variant_labels.get(name, name), fontsize=9)
+
+    fig.suptitle("Real × Generated Impedance — all variants", fontsize=13)  # type: ignore
+    fig.tight_layout()
+    out_path = os.path.join(base_output, "impedance_comparison_all_variants.png")
+    plt.savefig(out_path, dpi=120, bbox_inches="tight")  # type: ignore
+    plt.close(fig)
+    print(f"\nImpedance comparison plot -> {out_path}")
+
+
 def _plot_per_variant_embedding(
     method: str,
     real_reduced: np.ndarray,
@@ -959,6 +1058,12 @@ def main() -> None:
             base_output,
             args.num_iter,
         )
+
+    # ── Impedance comparison grid (only when impedance is enabled) ──
+    if getattr(args, "use_impedance", False):
+        print(f"\n{'-' * 70}")
+        print("Generating impedance comparison plot...")
+        _plot_impedance_comparison(model_paths, base_output)
 
     total_elapsed = format_time(int(time.time() - total_start))
     print(f"\n{'=' * 70}")
