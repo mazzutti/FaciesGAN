@@ -22,8 +22,8 @@ from matplotlib.axes import Axes
 from matplotlib.figure import Figure
 from matplotlib.markers import MarkerStyle
 from numpy.typing import NDArray
-from sklearn.manifold import TSNE, Isomap, MDS  # type: ignore  
-from sklearn.metrics import euclidean_distances # type: ignore
+from sklearn.manifold import TSNE, Isomap, MDS  # type: ignore
+from sklearn.metrics import euclidean_distances  # type: ignore
 from umap import UMAP  # type: ignore
 
 from background_workers import submit_plot_generated_outputs
@@ -341,13 +341,13 @@ def plot_umap(
         random_state=42,
     )
     with warnings.catch_warnings():
-        warnings.filterwarnings("ignore", category=sparse.SparseEfficiencyWarning) # type: ignore
+        warnings.filterwarnings("ignore", category=sparse.SparseEfficiencyWarning)  # type: ignore
         warnings.filterwarnings("ignore", category=UserWarning, module="umap")
         embedding: np.ndarray = reducer.fit_transform(combined)  # type: ignore
 
     n_real = real_facies_flat.shape[0]
-    real_reduced: np.ndarray = embedding[:n_real] # type: ignore
-    fake_reduced: np.ndarray = embedding[n_real:] # type: ignore
+    real_reduced: np.ndarray = embedding[:n_real]  # type: ignore
+    fake_reduced: np.ndarray = embedding[n_real:]  # type: ignore
 
     plt.scatter(real_reduced[options.wells, 0], real_reduced[options.wells, 1])  # type: ignore
     plt.scatter(fake_reduced[:, 0], fake_reduced[:, 1])  # type: ignore
@@ -360,7 +360,7 @@ def plot_umap(
         plt.close()  # type: ignore
     else:
         plt.show()  # type: ignore
-    return real_reduced, fake_reduced #     type: ignore
+    return real_reduced, fake_reduced  #     type: ignore
 
 
 def plot_isomap(
@@ -678,7 +678,7 @@ if __name__ == "__main__":
             plt.close(fig)
     else:
         for i, facie in enumerate(facies, 1):
-            tif.imwrite(os.path.join(gen_output, f"generated_facie_{i}.tif"), facie) # type: ignore
+            tif.imwrite(os.path.join(gen_output, f"generated_facie_{i}.tif"), facie)  # type: ignore
 
     generated_pattern = os.path.join(gen_output, "generated_facie_[1, 2, ...].tif")
     print(f"Facies generated at '{generated_pattern}'.")

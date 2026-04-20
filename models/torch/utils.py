@@ -52,13 +52,9 @@ def calc_gradient_penalty(
         only_inputs=True,
     )[0]
 
-    # Numerically stable L2 norm: use sqrt(sum(g^2) + eps) to avoid
-    # NaN gradients when the norm is exactly 0 early in training.
-    # (d/dg sqrt(sum(g^2)) = g / sqrt(sum(g^2)) = 0/0 when g=0.)
-    grad_norm = torch.sqrt(
-        (gradients ** 2).sum(dim=1, keepdim=False) + 1e-8
-    )
-    gradient_penalty = cast(torch.Tensor, ((grad_norm - 1) ** 2).mean() * LAMBDA)  # type: ignore
+    # compute the L2 norm of gradients for each sample and apply the penalty
+    gradients = cast(torch.Tensor, gradients.norm(2, dim=1) - 1)  # type: ignore
+    gradient_penalty = (gradients**2).mean() * LAMBDA
 
     return gradient_penalty
 

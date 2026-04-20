@@ -110,14 +110,12 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
         # Residual add + clamp fused into a single callable so that
         # torch.compile can merge them into one Inductor kernel,
         # eliminating a separate clamp kernel launch per scale.
-        self._residual_clamp: Callable[
-            [torch.Tensor, torch.Tensor], torch.Tensor
-        ] = TorchGenerator.residual_clamp_fn
+        self._residual_clamp: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = (
+            TorchGenerator.residual_clamp_fn
+        )
 
     @staticmethod
-    def residual_clamp_fn(
-        gen_out: torch.Tensor, prev: torch.Tensor
-    ) -> torch.Tensor:
+    def residual_clamp_fn(gen_out: torch.Tensor, prev: torch.Tensor) -> torch.Tensor:
         """Add residual and clamp to [-1, 1] in one pass."""
         return (gen_out + prev).clamp(-1, 1)
 
@@ -219,7 +217,7 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
                 ),
             )
 
-            if self.has_cond_channels:
+            if cond_C > 0:
                 # Build z_in without clone: use out-of-place ops to avoid
                 # copying the full tensor and in-place version-counter bumps.
                 # Repeat out_facie (noise_C channels) to fill the cond portion.
@@ -245,17 +243,16 @@ class TorchGenerator(Generator[torch.Tensor, nn.Module], nn.Module):
                     facie_for_residual, [self.zero_padding] * 4, value=0
                 )
 
-            if (
-                self.use_gradient_checkpointing
-                and self.training
-                and z_in.requires_grad
-            ):
+            if self.use_gradient_checkpointing and self.training and z_in.requires_grad:
                 # Recompute this block's activations during backward.
                 # use_reentrant=False is the recommended mode (no
                 # nesting caveats, compatible with compiled models).
-                gen_out = cast(torch.Tensor, ckpt_utils.checkpoint(  # type: ignore[misc]
-                    self.gens[index], z_in, use_reentrant=False
-                ))
+                gen_out = cast(
+                    torch.Tensor,
+                    ckpt_utils.checkpoint(  # type: ignore[misc]
+                        self.gens[index], z_in, use_reentrant=False
+                    ),
+                )
             else:
                 gen_out = self.gens[index](z_in)
 

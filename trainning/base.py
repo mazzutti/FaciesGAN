@@ -92,9 +92,11 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         self.start_epoch: int = getattr(options, "start_epoch", 0)
         self.stop_scale: int = options.stop_scale
         self.output_path: str = options.output_path
-        self.num_iter: int = options.num_iter
+        self.num_iter: int = 1  # inner per-batch epoch loop always runs once
         self.save_interval: int = options.save_interval
         self.num_parallel_scales: int = options.num_parallel_scales
+        # Total dataset passes == the user's --num-iter value.
+        self._num_passes: int = options.num_iter
 
         # How often to flush TensorBoard scalars (epochs).  Writing every
         # epoch triggers a GPU→CPU sync per scale; batching to every N epochs
@@ -105,14 +107,6 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             options.batch_size
             if (options.batch_size < options.num_train_pyramids)
             else options.num_train_pyramids
-        )
-        self.batch_size = (
-            self.batch_size
-            if not (
-                len(options.wells_mask_columns) > 0
-                and options.batch_size < len(options.wells_mask_columns)
-            )
-            else len(options.wells_mask_columns)
         )
 
         # Feature flags
@@ -171,6 +165,10 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         # learning rate decay milestone
         self.lr_decay = options.lr_decay
 
+        # learning rate decay unit: 'epoch' (per-batch, reset each batch)
+        # or 'step' (global optimisation steps, not reset between batches)
+        self.lr_decay_unit: str = getattr(options, "lr_decay_unit", "epoch")
+
         # learning rate gamma
         self.gamma = options.gamma
 
@@ -220,6 +218,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 output_dir=viz_path,
                 log_dir=log_dir,
                 update_interval=1,
+                image_log_interval=100,
                 dataset_info=dataset_info,
                 purge_step=_purge,
             )
@@ -448,7 +447,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
     def train_scales(
         self,
         scales: tuple[int, ...],
-        writers: dict[int, SummaryWriter], # type: ignore
+        writers: dict[int, SummaryWriter],  # type: ignore
         scale_paths: dict[int, str],
         results_paths: dict[int, str],
         batch_id: int,
@@ -526,8 +525,12 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         # activate later (recovery loss, diversity N>1) so the first
         # recompilation doesn't happen mid-training where it can crash.
         self._warmup_compile_traces(
-            scales, indexes, facies_pyramid,
-            rec_in_pyramid, wells_pyramid, seismic_pyramid,
+            scales,
+            indexes,
+            facies_pyramid,
+            rec_in_pyramid,
+            wells_pyramid,
+            seismic_pyramid,
         )
 
         # Training loop - iterate epochs (0-based)
@@ -543,13 +546,17 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         prof_epochs = 0
 
         for epoch in range(start_epoch, self.num_iter):
+            _batches_per_pass = max(1, self._total_batches // self._num_passes)
+            _current_pass = self._current_batch_id // _batches_per_pass + 1
             progress.set_description(  # type: ignore
-                f"Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch+1:4d}/{self.num_iter}]"
+                f"Batch [{self._current_batch_id + 1}/{self._total_batches}] Pass [{_current_pass:4d}/{self._num_passes}]"
             )
 
             # Let the model know the current epoch so it can skip
             # recovery loss during the early-training warmup phase.
             self.model._current_epoch = epoch  # type: ignore[attr-defined]
+
+            global_step = self._current_batch_id * self.num_iter + epoch
 
             generated_samples: tuple[TTensor, ...] = ()
 
@@ -565,17 +572,14 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             if profile_timing:
                 prof_opt_time += time.perf_counter() - opt_t0
 
-            # Visualization epochs: 0, 199, 299, … (every 200 and last).
-            # Only rank-0 runs generate_visualization_samples; non-main
-            # ranks used to run it too to "warm up" compiled traces, but
-            # the training iterations already warm them up and the
-            # inference_mode specialisations are distinct, causing rank-1
-            # to lag minutes behind rank-0 at the barrier.
-            _is_viz_epoch = (
-                (epoch + 1) % 200 == 0
-                or epoch == 0
-                or epoch == (self.num_iter - 1)
+            # Visualization epochs: every 200 global steps, first step, and final step.
+            # Using global_step (= batch_id * num_iter + epoch) ensures correct throttling
+            # even when num_iter=1 (where epoch-only conditions would fire every batch).
+            _is_last_step = (
+                epoch == self.num_iter - 1
+                and self._current_batch_id == self._total_batches - 1
             )
+            _is_viz_epoch = global_step % 200 == 0 or _is_last_step
             if self._is_main_process and _is_viz_epoch:
                 generated_samples = self.generate_visualization_samples(
                     scales,
@@ -600,15 +604,15 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             )
             if profile_timing:
                 prof_epoch_end_time += time.perf_counter() - ep_t0
-            # Synchronize DDP ranks on visualization epochs and on
+            # Synchronize DDP ranks on visualization steps and on
             # save_generated_outputs epochs. Use _is_viz_epoch (symmetric
             # pure-Python arithmetic) instead of len(generated_samples)
             # so that rank-1 (which skips generate_visualization_samples)
-            # still reaches the barrier on the same epochs as rank-0.
+            # still reaches the barrier on the same steps as rank-0.
             _needs_barrier = _is_viz_epoch or (
                 self.enable_plot_outputs
                 and (epoch % self.save_interval == 0 or epoch == self.num_iter - 1)
-                and (epoch != 0 or self.num_iter == 1)
+                and (epoch != 0 or global_step == 0 or _is_last_step)
                 and self._current_batch_id == self._total_batches - 1
             )
             br_t0 = time.perf_counter() if profile_timing else 0.0
@@ -889,7 +893,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         epoch: int,
         scale_metrics: ScaleMetrics[TTensor],
         generated_samples: tuple[TTensor, ...],
-        writers: dict[int, SummaryWriter], # type: ignore
+        writers: dict[int, SummaryWriter],  # type: ignore
         results_paths: dict[int, str],
         progress: "tqdm[Any]",  # type: ignore
         facies_pyramid: dict[int, TTensor],
@@ -931,6 +935,10 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         # batches do not overwrite each other's TensorBoard entries.
         global_step = self._current_batch_id * self.num_iter + epoch
         samples_processed = self.batch_size * global_step
+        _is_last_step = (
+            epoch == self.num_iter - 1
+            and self._current_batch_id == self._total_batches - 1
+        )
 
         # ── Rank-0U-only I/O ─────────────────────────────────────────
         if self._is_main_process:
@@ -940,13 +948,34 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     global_step, scale_metrics, generated_samples, samples_processed
                 )
 
-            # Print formatted metrics table occasionally
-            if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
+            # Print formatted metrics table every 100 dataset batches (at last epoch)
+            _print_table = epoch == (self.num_iter - 1) and (
+                self._current_batch_id % 100 == 0
+                or self._current_batch_id == self._total_batches - 1
+            )
+            if _print_table:
+                from metrics import MetricSmoother as _MS
+
+                # Lazily initialise one smoother per scale per metric.
+                # Re-use the same alpha as the LR scheduler smoother.
+                _sm_alpha = getattr(self.options, "lr_smoothing_alpha", 0.99)
+                if not hasattr(self, "_table_smoothers"):
+                    self._table_smoothers: dict[int, list[_MS]] = {}
+                for scale in scales:
+                    if scale not in self._table_smoothers:
+                        self._table_smoothers[scale] = [
+                            _MS(alpha=_sm_alpha) for _ in range(10)
+                        ]
+
+                import torch as _t
+
                 lines: list[str] = []
+                _batches_per_pass = max(1, self._total_batches // self._num_passes)
+                _current_pass = self._current_batch_id // _batches_per_pass + 1
                 lines.append(
-                    f"\n  Batch [{self._current_batch_id + 1}/{self._total_batches}] Epoch [{epoch + 1:4d}/{self.num_iter}]"
+                    f"\n  Batch [{self._current_batch_id + 1}/{self._total_batches}] Pass [{_current_pass:4d}/{self._num_passes}]"
                 )
-                lines.append("  ┌" + "─" * 110 + "┐")
+                lines.append("  ┌" + "─" * 109 + "┐")
                 lines.append(
                     (
                         f"  │ {'Scale':^5} │ {'G_total':>8} │ {'G_adv':>7} │ {'G_rec':>7} │ "
@@ -954,14 +983,12 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                         f"{'D_fake':>7} │ {'D_gp':>7} │"
                     )
                 )
-                lines.append("  ├" + "─" * 110 + "┤")
-
-                import torch as _t
+                lines.append("  ├" + "─" * 109 + "┤")
 
                 for scale in scales:
                     g = scale_metrics.generator[scale]
                     d = scale_metrics.discriminator[scale]
-                    v: list[float] = _t.stack(  # type: ignore[arg-type]
+                    raw: list[float] = _t.stack(  # type: ignore[arg-type]
                         [  # type: ignore[arg-type]
                             g.total,
                             g.fake,
@@ -975,6 +1002,8 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                             d.gp,
                         ]
                     ).tolist()
+                    sm = self._table_smoothers[scale]
+                    v = [sm[i].update(raw[i]) for i in range(10)]
                     lines.append(
                         (
                             f"  │ {scale:^5} │ {v[0]:8.3f} │ {v[1]:7.3f} │ {v[2]:7.3f} │ "
@@ -983,41 +1012,52 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                         )
                     )
 
-                lines.append("  └" + "─" * 110 + "┘")
+                lines.append("  └" + "─" * 109 + "┘")
                 progress.write("\n".join(lines))  # type: ignore
 
             # Save to TensorBoard and log per-scale (only when TB is
             # enabled — each call does a GPU→CPU sync via torch.stack().tolist();
-            # throttled to every _tb_log_interval epochs to reduce host syncs).
-            _log_tb = (
-                (epoch + 1) % self._tb_log_interval == 0
-                or epoch == 0
-                or epoch == (self.num_iter - 1)
-            )
+            # throttled to every _tb_log_interval global steps to reduce host syncs).
+            _log_tb = global_step % self._tb_log_interval == 0 or _is_last_step
             if self.enable_tensorboard and _log_tb:
                 for scale in scales:
                     g = scale_metrics.generator[scale]
                     d = scale_metrics.discriminator[scale]
-                    self.log_epoch(progress, writers[scale], epoch, g, d, global_step)  # type: ignore
-                    # Log learning rates per scale
-                    lr_g = self.generator_schedulers[scale].get_last_lr()[0]  # type: ignore[union-attr]
+                    self.log_epoch(writers[scale], epoch, g, d, global_step)  # type: ignore
+                    # Log learning rates per scale.
+                    # ReduceLROnPlateau doesn't have get_last_lr(); read
+                    # the optimizer param group directly.
+                    lr_g = self.generator_optimizers[scale].param_groups[0]["lr"]  # type: ignore[index]
                     lr_d = self.discriminator_schedulers[scale].get_last_lr()[0]  # type: ignore[union-attr]
                     writers[scale].add_scalar("LearningRate/generator", lr_g, global_step)  # type: ignore
                     writers[scale].add_scalar("LearningRate/discriminator", lr_d, global_step)  # type: ignore
 
             # Log when learning rate decays (at every lr_decay interval,
             # before schedulers_step advances the count).
+            _decay_counter = (
+                global_step
+                if self.lr_decay_unit == "step"
+                else self._current_batch_id if self.lr_decay_unit == "batch" else epoch
+            )
             if (
                 self.lr_decay > 0
-                and epoch > 0
-                and epoch % self.lr_decay == 0
+                and _decay_counter > 0
+                and _decay_counter % self.lr_decay == 0
             ):
-                lr_g_before = self.generator_schedulers[scales[0]].get_last_lr()[0]  # type: ignore[union-attr]
-                lr_g_after = lr_g_before * self.gamma  # type: ignore[operator]
+                lr_d_before = self.discriminator_schedulers[scales[0]].get_last_lr()[0]  # type: ignore[union-attr]
+                lr_d_after = lr_d_before * self.gamma  # type: ignore[operator]
+                _unit_label = (
+                    f"step {global_step}"
+                    if self.lr_decay_unit == "step"
+                    else (
+                        f"batch {self._current_batch_id}"
+                        if self.lr_decay_unit == "batch"
+                        else f"epoch {epoch}"
+                    )
+                )
                 progress.write(  # type: ignore
-                    f"\n  ⚡ LR decay at epoch {epoch}: "
-                    f"lr_g {lr_g_before:.2e} → {lr_g_after:.2e}, "
-                    f"lr_d {lr_g_before:.2e} → {lr_g_after:.2e} "
+                    f"\n  ⚡ LR decay at {_unit_label}: "
+                    f"lr_d {lr_d_before:.2e} → {lr_d_after:.2e} "
                     f"(gamma={self.gamma})"
                 )
 
@@ -1040,28 +1080,50 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                     )
 
         # ── All ranks ─────────────────────────────────────────────────
-        # Step schedulers (LR decay happens here when epoch reaches
-        # the milestone — the console message above fires just before).
-        self.schedulers_step(scales)
+        # Step schedulers — generator uses smoothed loss via
+        # ReduceLROnPlateau, discriminator uses StepLR (epoch or step based).
+        self.schedulers_step(scales, scale_metrics)
         progress.update(1)  # type: ignore
 
     def schedulers_step(
         self,
         scales: tuple[int, ...],
+        scale_metrics: ScaleMetrics[TTensor] | None = None,
     ) -> None:
         """Step the learning-rate schedulers for the provided scales.
 
+        The generator scheduler is :class:`ReduceLROnPlateau` and receives
+        the EMA-smoothed generator total loss.  The discriminator scheduler
+        remains a plain :class:`StepLR`.
+
         Parameters
         ----------
-        generator_schedulers : dict[int, LRScheduler]
-            Generator learning-rate schedulers per scale.
-        discriminator_schedulers : dict[int, LRScheduler]
-            Discriminator learning-rate schedulers per scale.
         scales : tuple[int, ...]
             Tuple of scale indices to step the schedulers for.
+        scale_metrics : ScaleMetrics, optional
+            Current epoch metrics.  When provided the smoothed generator
+            loss is fed to ``ReduceLROnPlateau.step(metric)``.
         """
+        from metrics import MetricSmoother
+
+        if not hasattr(self, "_g_loss_smoothers"):
+            self._g_loss_smoothers: dict[int, MetricSmoother] = {}
+
+        alpha = getattr(self.options, "lr_smoothing_alpha", 0.9)
+
         for scale in scales:
-            self.generator_schedulers[scale].step()
+            # Generator: ReduceLROnPlateau with smoothed loss
+            if scale_metrics is not None and scale in scale_metrics.generator:
+                g = scale_metrics.generator[scale]
+                raw_loss = g.total.item()  # type: ignore[union-attr]
+                if scale not in self._g_loss_smoothers:
+                    self._g_loss_smoothers[scale] = MetricSmoother(alpha=alpha)
+                smoothed = self._g_loss_smoothers[scale].update(raw_loss)
+                self.generator_schedulers[scale].step(smoothed)  # type: ignore[arg-type]
+            else:
+                # Fallback for subclasses that don't pass metrics
+                self.generator_schedulers[scale].step()  # type: ignore[arg-type]
+            # Discriminator: plain StepLR
             self.discriminator_schedulers[scale].step()
 
     def _release_accelerator_memory(self) -> None:
@@ -1153,7 +1215,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
             }
 
             # Only main process creates directories, writers
-            writers: dict[int, SummaryWriter] = {} # type: ignore
+            writers: dict[int, SummaryWriter] = {}  # type: ignore
             if self._is_main_process:
                 for s in scales_to_train:
                     utils.create_dirs(scale_paths[s])
@@ -1240,6 +1302,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 total=progress_total,
                 position=0,
                 disable=not self._is_main_process,
+                delay=30,  # defer first render until compile warmup is done (~10-60 s)
             )
 
             # Use create_batch_iterator to allow subclasses to inject prefetching logic
@@ -1270,7 +1333,10 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
                 # Reset LR schedulers so each batch trains with the
                 # same schedule (decay at epoch lr_decay, 2*lr_decay, ...).
-                self.reset_schedulers(scales_to_train)
+                # In 'step' mode the schedulers accumulate across batches
+                # so they must NOT be reset.
+                if self.lr_decay_unit not in ("step", "batch"):
+                    self.reset_schedulers(scales_to_train)
 
                 # Expose batch info to train_scales so it can show epoch progress
                 self._total_batches = total_batches
@@ -1301,6 +1367,19 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
                 )
 
             progress.close()  # type: ignore
+
+            # Flush any pending background plot jobs so that they
+            # complete before model saving and DDP teardown.  Without
+            # this, torchrun may kill the process pool once rank 1
+            # exits, causing BrokenProcessPool for larger-scale images
+            # that are still being rendered.
+            if self._is_main_process and self.enable_plot_outputs:
+                try:
+                    from background_workers import BackgroundWorker
+
+                    BackgroundWorker().wait_pending()
+                except Exception:
+                    pass
 
             # After processing all batches for this group, save models (rank 0 only)
             if self._is_main_process:
@@ -1379,8 +1458,7 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
     def log_epoch(
         self,
-        epochs: "tqdm[int]",  # type: ignore
-        writer: SummaryWriter, # type: ignore
+        writer: SummaryWriter,  # type: ignore
         epoch: int,
         generator_metrics: GeneratorMetrics[TTensor],
         discriminator_metrics: DiscriminatorMetrics[TTensor],
@@ -1390,8 +1468,6 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
 
         Parameters
         ----------
-        epochs : tqdm[int]
-            Progress bar instance to update description text.
         writer : SummaryWriter
             Per-scale TensorBoard writer to record scalars.
         epoch : int
@@ -1432,18 +1508,6 @@ class Trainer(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler, IDataLoader
         d_total, d_real, d_fake, d_gp = vals[6:]
 
         step = global_step if global_step is not None else epoch
-
-        # Update progress bar description with more detailed info
-        if (epoch + 1) % 50 == 0 or epoch == 0 or epoch == (self.num_iter - 1):
-            epochs.set_description(  # type: ignore
-                "Epoch [{:4d}/{}] Scales {} | G: {:.3f} | D: {:.3f}".format(
-                    epoch + 1,
-                    self.num_iter,
-                    list(self.model.active_scales),
-                    g_total,
-                    d_total,
-                )
-            )
 
         # Log to TensorBoard - discriminator losses
         writer.add_scalar("Loss/train/discriminator/real", -d_real, step)  # type: ignore

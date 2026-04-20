@@ -83,14 +83,12 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         self.num_parallel_scales = options.num_parallel_scales
 
         # image channels
-        # Keep original channel count for facies-only data so we can
-        # append impedance channels when requested without losing the
-        # original semantic channel split.
         self.orig_num_img_channels = options.num_img_channels
         self.num_img_channels = options.num_img_channels
 
-        # If impedance training is enabled, add 3 channels for the
-        # acoustic impedance output (RGB-like grayscale replicated).
+        # When impedance is enabled the generator outputs 6 channels
+        # (3 facies RGB + 3 impedance) while the input noise stays at
+        # its base size.
         if getattr(options, "use_impedance", False):
             self.num_img_channels = self.num_img_channels + 3
 
@@ -101,10 +99,6 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
         self.disc_output_channels: int = self.num_img_channels
 
         # generator channels
-        # Generator input is always pure noise (noise_channels = 3).
-        # When impedance is enabled the generator produces extra output
-        # channels (facies_RGB + impedance_3ch), but the noise input
-        # itself does NOT carry impedance — impedance is output-only.
         self.gen_input_channels: int = noise_channels
 
         # output channels
@@ -115,21 +109,30 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
 
         # training hyperparameters
         self.discriminator_steps = options.discriminator_steps
+        self.scale0_disc_steps_multiplier = getattr(
+            options, "scale0_disc_steps_multiplier", 1
+        )
+        self.scale0_loss_multiplier = getattr(options, "scale0_loss_multiplier", 1.0)
 
         # generator hyperparameters
         self.generator_steps = options.generator_steps
 
         # loss weights
-        self.lambda_grad = options.lambda_grad
+        self.gradient_loss_penalty = options.gradient_loss_penalty
 
         # other loss/configuration params
-        self.alpha = options.alpha
+        self.reconstruction_loss_penalty = options.reconstruction_loss_penalty
 
         # well/mask loss weight
         self.well_loss_penalty = options.well_loss_penalty
 
         # diversity loss params
-        self.lambda_diversity = options.lambda_diversity
+        self.diversity_loss_penalty = getattr(options, "diversity_loss_penalty", 1.0)
+
+        # adversarial loss penalty
+        self.adversarial_loss_penalty = getattr(
+            options, "adversarial_loss_penalty", 1.0
+        )
 
         # number of diversity samples
         self.num_diversity_samples = options.num_diversity_samples
@@ -714,7 +717,7 @@ class FaciesGAN(ABC, Generic[TTensor, TModule, TOptimizer, TScheduler]):
             Scalar tensor equal to the negative mean score from the discriminator.
         """
         discriminator = self.discriminator.discs[scale]
-        return -discriminator(fake).mean()  # type: ignore
+        return self.adversarial_loss_penalty * (-discriminator(fake).mean())  # type: ignore
 
     @abstractmethod
     def compute_discriminator_metrics(

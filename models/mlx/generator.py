@@ -154,7 +154,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             noise_C: int = getattr(self, "orig_output_channels", self.output_channels)
             cond_C: int = self.input_channels - noise_C
 
-            if self.has_cond_channels:
+            if cond_C > 0:
                 noise = z_in[..., :noise_C]
                 cond = z_in[..., noise_C:]
                 noise = amp[index] * noise
@@ -165,7 +165,7 @@ class MLXGenerator(Generator[mx.array, nn.Module], nn.Module):
             p = self.zero_padding
             padded_facie = mx.pad(out_facie[..., :noise_C], [(0, 0), (p, p), (p, p), (0, 0)])  # type: ignore
 
-            if self.has_cond_channels:
+            if cond_C > 0:
                 num_repeats = cond_C // noise_C
                 padded_facie = mx.tile(padded_facie, (1, 1, 1, num_repeats))
                 noise = z_in[..., :noise_C]

@@ -184,7 +184,10 @@ def get_arguments() -> ArgumentParser:
 
     # optimization hyperparameters:
     parser.add_argument(
-        "--num-iter", type=int, default=2000, help="number of epochs to train per scale"
+        "--num-iter",
+        type=int,
+        default=2000,
+        help="number of full dataset passes (each pass shuffles the dataset independently)",
     )
     parser.add_argument("--gamma", type=float, help="scheduler gamma", default=0.9)
     parser.add_argument(
@@ -194,7 +197,43 @@ def get_arguments() -> ArgumentParser:
         "--lr-d", type=float, default=5e-4, help="learning rate, default=5e-4"
     )
     parser.add_argument(
-        "--lr-decay", type=int, default=1000, help="number of epochs before lr decay"
+        "--lr-decay",
+        type=int,
+        default=1000,
+        help="number of epochs (or steps if --lr-decay-unit=step) before lr decay (used by discriminator StepLR)",
+    )
+    parser.add_argument(
+        "--lr-decay-unit",
+        type=str,
+        choices=["epoch", "step", "batch"],
+        default="epoch",
+        help="unit for --lr-decay: 'epoch' decays per-batch epoch count (reset each batch), "
+        "'step' decays by global optimisation step across all batches, "
+        "'batch' decays once every N dataset batches (schedulers accumulate across batches, default: epoch)",
+    )
+    parser.add_argument(
+        "--lr-patience",
+        type=int,
+        default=400,
+        help="ReduceLROnPlateau patience: epochs with no improvement before reducing generator LR (default: 400)",
+    )
+    parser.add_argument(
+        "--lr-min",
+        type=float,
+        default=1e-4,
+        help="minimum learning rate for generator ReduceLROnPlateau (default: 1e-4)",
+    )
+    parser.add_argument(
+        "--lr-smoothing-alpha",
+        type=float,
+        default=0.95,
+        help="EMA smoothing factor for generator loss fed to ReduceLROnPlateau (0=no smoothing, 0.99=very smooth, default: 0.95)",
+    )
+    parser.add_argument(
+        "--lr-g-factor",
+        type=float,
+        default=0.8,
+        help="Factor by which the generator LR is reduced on plateau (default: 0.8)",
     )
     parser.add_argument(
         "--beta1", type=float, default=0.5, help="beta1 for adam. default=0.5"
@@ -206,10 +245,28 @@ def get_arguments() -> ArgumentParser:
         "--discriminator-steps", type=int, help="Discriminator inner steps", default=3
     )
     parser.add_argument(
-        "--lambda-grad", type=float, help="gradient penalty weight", default=0.1
+        "--scale0-disc-steps-multiplier",
+        type=int,
+        default=1,
+        help="Extra D-step multiplier for scale 0 only (default: 1, i.e. no extra steps).",
     )
     parser.add_argument(
-        "--alpha", type=float, help="reconstruction loss weight", default=10
+        "--scale0-loss-multiplier",
+        type=float,
+        default=1.0,
+        help="Extra loss multiplier applied to rec and impedance losses at scale 0 (default: 1.0).",
+    )
+    parser.add_argument(
+        "--gradient-loss-penalty",
+        type=float,
+        help="gradient penalty weight",
+        default=0.1,
+    )
+    parser.add_argument(
+        "--reconstruction-loss-penalty",
+        type=float,
+        help="reconstruction loss weight",
+        default=10,
     )
     parser.add_argument(
         "--gp-interval",
@@ -223,9 +280,21 @@ def get_arguments() -> ArgumentParser:
         default=16,
     )
     parser.add_argument(
-        "--lambda-diversity",
+        "--num-diversity-samples",
+        type=int,
+        help="number of diverse samples to generate per G-step for diversity loss (default: 3)",
+        default=3,
+    )
+    parser.add_argument(
+        "--diversity-loss-penalty",
         type=float,
-        help="diversity loss weight (encourages different outputs for different noise)",
+        help="additional scalar multiplier applied to the generator diversity loss (default: 1.0)",
+        default=1.0,
+    )
+    parser.add_argument(
+        "--adversarial-loss-penalty",
+        type=float,
+        help="scalar multiplier applied to the generator adversarial loss -E[D(fake)] (default: 1.0)",
         default=1.0,
     )
     parser.add_argument(
@@ -279,6 +348,13 @@ def get_arguments() -> ArgumentParser:
     )
 
     parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=1.0,
+        help="max gradient norm for generator clipping (default: 1.0; set to 0 to disable)",
+    )
+
+    parser.add_argument(
         "--use-seismic",
         action="store_true",
         help="enable using seismic data during data loading",
@@ -299,6 +375,11 @@ def get_arguments() -> ArgumentParser:
         "--use-mlx",
         action="store_true",
         help="enable MLX backend/model implementations when available",
+    )
+    parser.add_argument(
+        "--no-shuffle",
+        action="store_true",
+        help="disable dataset shuffling (useful for reproducible debugging)",
     )
     parser.add_argument(
         "--no-tensorboard",
@@ -410,6 +491,10 @@ def main() -> None:
     """
     argument_parser = get_arguments()
     options = argument_parser.parse_args(namespace=TrainningOptions())
+
+    # Handle --no-shuffle flag
+    if hasattr(options, "no_shuffle") and options.no_shuffle:
+        options.shuffle = False
 
     # Handle --no-tensorboard flag
     if hasattr(options, "no_tensorboard") and options.no_tensorboard:
@@ -533,7 +618,7 @@ def main() -> None:
 
     if is_main:
         print("\n" + "=" * 60)
-        print("PARALLEL LAPGAN TRAINING")
+        print("PARALLEL FACIESGAN TRAINING")
         print("=" * 60)
         print(f"Device: {device}")
         if distributed:
@@ -762,7 +847,9 @@ def main() -> None:
                     and hasattr(trainer, "model")
                     and hasattr(trainer.model, "report_allreduce_profile")
                 ):
-                    report_allreduce = getattr(trainer.model, "report_allreduce_profile")
+                    report_allreduce = getattr(
+                        trainer.model, "report_allreduce_profile"
+                    )
                     report_allreduce()
             except Exception as profile_err:
                 print(
@@ -781,6 +868,7 @@ def main() -> None:
                 except Exception:
                     pass
             import gc
+
             gc.collect()
 
             # Drain all pending GPU kernels before tearing down NCCL.
@@ -834,7 +922,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    import lovely_tensors as lt # type: ignore
+    import lovely_tensors as lt  # type: ignore
 
     lt.monkey_patch()
 

@@ -614,7 +614,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, StepLR], nn.Module)
         mx.array
             Scalar diversity loss.
         """
-        if self.lambda_diversity <= 0 or len(fake_samples) < 2:
+        if self.diversity_loss_penalty <= 0 or len(fake_samples) < 2:
             return mx.array(0.0)
 
         stacked = mx.stack([f.flatten() for f in fake_samples])
@@ -622,13 +622,13 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, StepLR], nn.Module)
         diffs = stacked[:, None] - stacked[None, :]
         sq_diffs = (diffs**2).mean(axis=-1)
         mask = mx.triu(mx.ones((n, n)), k=1)
-        diversity_matrix = mx.exp(-sq_diffs * 10)
+        diversity_matrix = 1.0 / (1.0 + sq_diffs * 10)
         diversity_loss = (diversity_matrix * mask).sum()
         num_pairs = mask.sum()
         if num_pairs == 0:
             return mx.array(0.0)
 
-        return self.lambda_diversity * (diversity_loss / num_pairs)
+        return self.diversity_loss_penalty * (diversity_loss / num_pairs)
 
     def compute_gradient_penalty(
         self, scale: int, real: mx.array, fake: mx.array
@@ -662,7 +662,9 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, StepLR], nn.Module)
         # Calculate gradients of the output w.r.t. the interpolates
         gradients = cast(mx.array, mx.grad(grad_fn)(interpolates))  # type: ignore
         grad_norm = mx.sqrt(mx.sum(mx.square(gradients), axis=-1) + 1e-12)
-        gradient_penalty = mx.mean(mx.square(grad_norm - 1.0)) * self.lambda_grad
+        gradient_penalty = (
+            mx.mean(mx.square(grad_norm - 1.0)) * self.gradient_loss_penalty
+        )
         return gradient_penalty
 
     def compute_masked_loss(
@@ -728,7 +730,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, StepLR], nn.Module)
         mx.array
             Reconstruction loss.
         """
-        if self.alpha == 0:
+        if self.reconstruction_loss_penalty == 0:
             return mx.array(0.0)
         rec_noise = self.get_pyramid_noise(
             scale,
@@ -744,7 +746,7 @@ class MLXFaciesGAN(FaciesGAN[mx.array, nn.Module, Optimizer, StepLR], nn.Module)
             start_scale=scale,
             stop_scale=scale,
         )
-        rec_loss = self.alpha * nn.losses.mse_loss(rec, real)
+        rec_loss = self.reconstruction_loss_penalty * nn.losses.mse_loss(rec, real)
         return rec_loss
 
     def finalize_discriminator_scale(self, scale: int) -> None:

@@ -10,17 +10,9 @@ docstrings describing parameters and returns.
 """
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
-
-# Triton is optional — only available on CUDA builds.
-_has_triton = False
-try:
-    from models.torch.triton_color_quantize import triton_color_quantize
-
-    _has_triton = True
-except ImportError:
-    pass
 
 
 class TorchConvBlock(nn.Sequential):
@@ -396,6 +388,8 @@ class TorchSPADEDiscriminator(nn.Module):
         kernel_size: int,
         padding_size: int,
         input_channels: int,
+        minibatch_stddev_group_size: int = 4,
+        minibatch_stddev_epsilon: float = 1e-8,
     ) -> None:
         """Initialize the convolutional discriminator.
 
@@ -413,10 +407,19 @@ class TorchSPADEDiscriminator(nn.Module):
             Padding applied to convolutions.
         input_channels : int
             Number of input image channels.
+        minibatch_stddev_group_size : int, optional
+            Group size used to compute minibatch standard deviation. The
+            implementation falls back to the full batch when the batch is
+            smaller than this value. Default is 4.
+        minibatch_stddev_epsilon : float, optional
+            Numerical stability constant added before the square root.
+            Default is 1e-8.
         """
         # Initialize both the framework-agnostic base and the PyTorch module
 
         nn.Module.__init__(self)  # type: ignore
+        self.minibatch_stddev_group_size = minibatch_stddev_group_size
+        self.minibatch_stddev_epsilon = minibatch_stddev_epsilon
 
         self.head = TorchDiscConvBlock(
             input_channels, num_features, kernel_size, padding_size, 1
@@ -437,12 +440,42 @@ class TorchSPADEDiscriminator(nn.Module):
 
         output_channels = max(num_features // (2 ** (num_layer - 2)), min_num_features)
         self.tail = nn.Conv2d(
-            output_channels,
+            output_channels + 1,
             1,
             kernel_size=kernel_size,
             stride=1,
             padding=padding_size,
         )
+
+    def _append_minibatch_stddev(self, x: torch.Tensor) -> torch.Tensor:
+        """Append a minibatch standard-deviation feature map.
+
+        The statistic is computed across the full global batch when DDP is
+        active, then averaged over channels/spatial dimensions so the
+        discriminator gets one extra map describing how much variation exists
+        within the batch.
+        """
+        batch_size = x.shape[0]
+        if dist.is_available() and dist.is_initialized():
+            world_size = dist.get_world_size()
+            rank = dist.get_rank()
+
+            gathered = [torch.zeros_like(x) for _ in range(world_size)]
+            dist.all_gather(gathered, x.detach())  # type: ignore
+            gathered[rank] = x
+            global_batch = torch.cat(gathered, dim=0)
+        else:
+            global_batch = x
+
+        if global_batch.shape[0] == 1:
+            stddev = torch.zeros((1, 1, 1, 1), device=x.device, dtype=x.dtype)
+        else:
+            stddev = global_batch.float().var(dim=0, unbiased=False, keepdim=True)
+            stddev = torch.sqrt(stddev + self.minibatch_stddev_epsilon)
+            stddev = stddev.mean(dim=1, keepdim=True).to(dtype=x.dtype)
+
+        stddev = stddev.expand(batch_size, 1, x.shape[2], x.shape[3])
+        return torch.cat([x, stddev], dim=1)
 
     def forward(self, generated_facie: torch.Tensor) -> torch.Tensor:
         """Discriminate input facies images.
@@ -461,6 +494,7 @@ class TorchSPADEDiscriminator(nn.Module):
         """
         scores = self.head(generated_facie)
         scores = self.body(scores)
+        scores = self._append_minibatch_stddev(scores)
         scores = self.tail(scores)
         return scores
 
@@ -490,9 +524,6 @@ class TorchColorQuantization(nn.Module):
         """
         super().__init__()  # type: ignore
         self.temperature = temperature
-
-        # Use Triton fused kernel on CUDA when available.
-        self.use_triton: bool = _has_triton
 
         # Define pure colors in [-1, 1] range (tanh output range)
         # Black, Red, Green, Blue
@@ -554,11 +585,6 @@ class TorchColorQuantization(nn.Module):
         torch.Tensor
             Quantized tensor with same shape.
         """
-        # Fast path: fused Triton kernel (single launch for the entire op).
-        if self.use_triton and x.is_cuda:
-            return triton_color_quantize(x, self.temperature, self.training) # type: ignore
-
-        # Fallback: einsum-based implementation (CPU or when Triton unavailable).
         colors = self.pure_colors  # (K, 3)
         distances = self._sq_distances_nchw(x)  # (B, K, H, W)
 

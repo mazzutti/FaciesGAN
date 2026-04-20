@@ -319,7 +319,17 @@ class MLXTrainer(
             dataset.batches = [dataset.batches[i] for i in selected_indices]
         else:
             selected_indices = list(range(len(dataset.batches)))
+        repeat = getattr(self.options, "num_iter", 1)
+        if repeat > 1:
+            import random
 
+            base = dataset.batches
+            repeated: list[Any] = []
+            for _ in range(repeat):
+                copy = list(base)
+                random.shuffle(copy)
+                repeated.extend(copy)
+            dataset.batches = repeated
         return dataset, dataset.scales
 
     def load_model(self, scale: int) -> None:
@@ -920,7 +930,8 @@ class MLXTrainer(
                 self.model.noise_amps[s] = amp_val
 
         # Fast-forward schedulers
-        for _ in range(effective_start):
+        ff_steps = effective_start
+        for _ in range(ff_steps):
             for s in scales:
                 self.generator_schedulers[s].step()
                 self.discriminator_schedulers[s].step()

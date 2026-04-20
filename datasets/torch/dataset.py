@@ -119,19 +119,17 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
         ):
             # When using impedance, concatenate facies (categorical RGB)
             # with impedance channels so the model receives a single
-            # multi-channel "real" tensor per scale: [facies_RGB | imp_3ch].
+            # 6-channel "real" tensor per scale: [facies_RGB | imp_3ch].
             facies_pyramids = torch_utils.to_facies_pyramids(self.scales)
             impedance_pyramids = torch_utils.to_impedance_pyramids(self.scales)
 
             combined: list[torch.Tensor] = []
             for f, i in zip(facies_pyramids, impedance_pyramids):
-                # If impedance pyramid is empty, keep facies only
                 if i.numel() == 0:
                     combined.append(f)
                 elif f.numel() == 0:
                     combined.append(i)
                 else:
-                    # Concatenate along channel dim (N, C, H, W)
                     combined.append(torch.cat([f, i], dim=1))
             facies_pyramids = tuple(combined)
         else:
@@ -181,7 +179,7 @@ class TorchPyramidsDataset(PyramidsDataset[torch.Tensor]):
 
     def clean_cache(self) -> None:
         """Clear any in-memory or on-disk cache used by the dataset."""
-        torch_utils.memory.clear(warn=False) # type: ignore
+        torch_utils.memory.clear(warn=False)  # type: ignore
 
     def get_scale_data(self, scale: int | None = None) -> tuple[torch.Tensor, ...]:
         """Return facies, wells and seismic tensors for a given scale.

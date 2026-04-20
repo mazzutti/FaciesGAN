@@ -111,22 +111,78 @@ def get_arguments() -> ArgumentParser:
     )
 
     # Forwarded training hyper-parameters with sensible defaults
-    parser.add_argument("--num-iter", type=int, default=2000)
+    parser.add_argument(
+        "--num-iter",
+        type=int,
+        default=2000,
+        help="number of full dataset passes (each pass shuffles independently)",
+    )
     parser.add_argument("--num-train-pyramids", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=40)
+    parser.add_argument("--batch-size", type=int, default=50)
     parser.add_argument("--num-workers", type=int, default=1)
     parser.add_argument("--num-parallel-scales", type=int, default=7)
     parser.add_argument("--stop-scale", type=int, default=6)
     parser.add_argument("--discriminator-steps", type=int, default=3)
+    parser.add_argument(
+        "--scale0-disc-steps-multiplier",
+        type=int,
+        default=1,
+        help="Extra D-step multiplier for scale 0 only (default: 1).",
+    )
+    parser.add_argument(
+        "--scale0-loss-multiplier",
+        type=float,
+        default=1.0,
+        help="Extra loss multiplier for rec and impedance at scale 0 (default: 1.0).",
+    )
     parser.add_argument("--generator-steps", type=int, default=3)
-    parser.add_argument("--alpha", type=float, default=10)
+    parser.add_argument("--reconstruction-loss-penalty", type=float, default=10)
+    parser.add_argument("--gamma", type=float, default=0.9)
     parser.add_argument("--lr-g", type=float, default=5e-4)
     parser.add_argument("--lr-d", type=float, default=5e-4)
-    parser.add_argument("--lr-decay", type=int, default=1000)
+    parser.add_argument("--lr-decay", type=int, default=999999)
+    parser.add_argument(
+        "--lr-decay-unit",
+        type=str,
+        choices=["epoch", "step", "batch"],
+        default="epoch",
+        help="unit for --lr-decay: 'epoch' resets per batch, 'step' uses global steps, 'batch' decays every N dataset batches (default: epoch)",
+    )
+    parser.add_argument("--lr-patience", type=int, default=400)
+    parser.add_argument("--lr-min", type=float, default=1e-4)
+    parser.add_argument("--lr-smoothing-alpha", type=float, default=0.95)
+    parser.add_argument("--lr-g-factor", type=float, default=0.8)
     parser.add_argument("--scale0-noise-amp", type=float, default=1.5)
     parser.add_argument("--min-noise-amp", type=float, default=0.3)
-    parser.add_argument("--lambda-diversity", type=float, default=1.0)
+    parser.add_argument("--num-diversity-samples", type=int, default=3)
+    parser.add_argument("--diversity-loss-penalty", type=float, default=1.0)
+    parser.add_argument("--adversarial-loss-penalty", type=float, default=1.0)
     parser.add_argument("--well-loss-penalty", type=float, default=10.0)
+    parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=1.0,
+        help="max gradient norm for generator clipping (default: 1.0; set to 0 to disable)",
+    )
+    parser.add_argument(
+        "--gradient-loss-penalty",
+        type=float,
+        default=0.1,
+        help="Gradient penalty weight (default: 0.1).",
+    )
+    parser.add_argument(
+        "--gp-interval",
+        type=int,
+        default=8,
+        help="Compute gradient penalty every N discriminator steps (default: 8).",
+    )
+    # parser.add_argument(
+    #     "--wells-mask-columns",
+    #     type=int,
+    #     nargs="+",
+    #     default=list(range(0, 200, 1)) * 100,
+    #     help="Explicit pyramid indices to train on. Default: 50 evenly spaced (0,1,2,...,199).",
+    # )
     parser.add_argument("--manual-seed", type=int, default=None)
     parser.add_argument("--gpu-device", type=int, default=0)
     parser.add_argument(
@@ -140,6 +196,9 @@ def get_arguments() -> ArgumentParser:
         type=int,
         default=0,
         help="Resume training from this epoch (default: 0).",
+    )
+    parser.add_argument(
+        "--no-shuffle", action="store_true", help="disable dataset shuffling"
     )
     parser.add_argument("--no-tensorboard", action="store_true")
     parser.add_argument(
@@ -157,6 +216,46 @@ def get_arguments() -> ArgumentParser:
         type=float,
         default=1.0,
         help="Weight for the impedance MSE reconstruction loss (default: 1.0).",
+    )
+
+    # ── Embedding selection ────────────────────────────────────────────────
+    _ALL_METHODS = ["isomap", "mds", "tsne", "umap"]
+    parser.add_argument(
+        "--embedding-methods",
+        nargs="+",
+        choices=_ALL_METHODS,
+        default=_ALL_METHODS,
+        metavar="METHOD",
+        help=(
+            "Embedding methods to compute and plot. Choose one or more of: "
+            "isomap mds tsne umap (default: all four)."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-data",
+        nargs="+",
+        choices=["facies", "impedance"],
+        default=["facies", "impedance"],
+        metavar="KIND",
+        help=(
+            "Data kinds to embed: 'facies', 'impedance', or both "
+            "(default: facies impedance)."
+        ),
+    )
+    parser.add_argument(
+        "--embedding-per-facies",
+        action="store_true",
+        help=(
+            "Also generate per-crossline embedding plots: for each unique "
+            "conditioning crossline index, produce a separate plot showing "
+            "the real facies vs the generated samples conditioned on that "
+            "crossline (using the shared embedding space)."
+        ),
+    )
+    parser.add_argument(
+        "--no-embeddings",
+        action="store_true",
+        help="Skip all embedding computation and plots.",
     )
 
     return parser
@@ -217,26 +316,57 @@ def _build_training_args(
         str(getattr(args, "stop_scale")),
         "--discriminator-steps",
         str(getattr(args, "discriminator_steps")),
+        "--scale0-disc-steps-multiplier",
+        str(getattr(args, "scale0_disc_steps_multiplier", 1)),
+        "--scale0-loss-multiplier",
+        str(getattr(args, "scale0_loss_multiplier", 1.0)),
         "--generator-steps",
         str(getattr(args, "generator_steps")),
-        "--alpha",
-        str(getattr(args, "alpha")),
+        "--reconstruction-loss-penalty",
+        str(getattr(args, "reconstruction_loss_penalty", 10)),
+        "--gamma",
+        str(getattr(args, "gamma")),
         "--lr-g",
         str(getattr(args, "lr_g")),
         "--lr-d",
         str(getattr(args, "lr_d")),
         "--lr-decay",
         str(getattr(args, "lr_decay")),
+        "--lr-decay-unit",
+        str(getattr(args, "lr_decay_unit", "epoch")),
+        "--lr-patience",
+        str(getattr(args, "lr_patience", 400)),
+        "--lr-min",
+        str(getattr(args, "lr_min", 1e-4)),
+        "--lr-smoothing-alpha",
+        str(getattr(args, "lr_smoothing_alpha", 0.95)),
+        "--lr-g-factor",
+        str(getattr(args, "lr_g_factor", 0.8)),
         "--scale0-noise-amp",
         str(getattr(args, "scale0_noise_amp")),
         "--min-noise-amp",
         str(getattr(args, "min_noise_amp")),
-        "--lambda-diversity",
-        str(getattr(args, "lambda_diversity")),
+        "--num-diversity-samples",
+        str(getattr(args, "num_diversity_samples", 3)),
+        "--diversity-loss-penalty",
+        str(getattr(args, "diversity_loss_penalty", 1.0)),
+        "--adversarial-loss-penalty",
+        str(getattr(args, "adversarial_loss_penalty", 1.0)),
         "--well-loss-penalty",
         str(getattr(args, "well_loss_penalty")),
+        "--grad-clip-norm",
+        str(getattr(args, "grad_clip_norm", 1.0)),
+        "--gradient-loss-penalty",
+        str(getattr(args, "gradient_loss_penalty", 0.1)),
+        "--gp-interval",
+        str(getattr(args, "gp_interval", 8)),
         "--compile-backend",
     ]
+
+    wells_mask = getattr(args, "wells_mask_columns", None)
+    if wells_mask:
+        cmd_args.append("--wells-mask-columns")
+        cmd_args.extend(str(i) for i in wells_mask)
 
     start_epoch = getattr(args, "start_epoch", 0)
     if start_epoch > 0:
@@ -254,6 +384,8 @@ def _build_training_args(
         cmd_args.append("--use-impedance")
         penalty = getattr(args, "impedance_loss_penalty", 1.0)
         cmd_args.extend(["--impedance-loss-penalty", str(penalty)])
+    if getattr(args, "no_shuffle", False):
+        cmd_args.append("--no-shuffle")
     if getattr(args, "no_tensorboard", False):
         cmd_args.append("--no-tensorboard")
     if getattr(args, "no_plot_outputs", False):
@@ -324,9 +456,7 @@ def _train_variant(
                 f"continuing.",
             )
         else:
-            raise RuntimeError(
-                f"Training failed with exit code {result.returncode}"
-            )
+            raise RuntimeError(f"Training failed with exit code {result.returncode}")
 
 
 def _generate_on_device(
@@ -340,8 +470,15 @@ def _generate_on_device(
     gen_output: str,
     start_index: int,
     batch_size: int = 100,
-) -> tuple[list[np.ndarray], list[int]]:
-    """Generate facies on a single device in batches, writing .tif files."""
+) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
+    """Generate facies (and impedance when enabled) on a single device.
+
+    Returns
+    -------
+    tuple[list[np.ndarray], list[np.ndarray], list[int]]
+        ``(facies_arrays, impedance_arrays, mask_indexes)``.
+        *impedance_arrays* is empty when impedance is not enabled.
+    """
     import random as _rng
 
     import tifffile as tif
@@ -351,9 +488,19 @@ def _generate_on_device(
     model = TorchFaciesGAN(options=opts, device=device, noise_channels=noise_channels)
     model.load(model_path, load_discriminator=False, load_wells=False)
 
+    has_impedance = getattr(opts, "use_impedance", False)
+    facies_ch = model.orig_num_img_channels  # 3
+
     max_scale = len(model.noise_amps) - 1
     all_facies: list[np.ndarray] = []
+    all_impedance: list[np.ndarray] = []
     all_mi: list[int] = []
+
+    facies_dir = os.path.join(gen_output, "facies")
+    impedance_dir = os.path.join(gen_output, "impedance")
+    os.makedirs(facies_dir, exist_ok=True)
+    if has_impedance:
+        os.makedirs(impedance_dir, exist_ok=True)
 
     for off in range(0, how_many, batch_size):
         chunk = min(batch_size, how_many - off)
@@ -365,19 +512,37 @@ def _generate_on_device(
             for j, g in enumerate(
                 model.generator(noises, model.get_noise_aplitude(max_scale))
             ):
-                arr = utils.torch2np(g.unsqueeze(0), denormalize=True)
-                all_facies.append(arr)
-                tif.imwrite(
-                    os.path.join(
-                        gen_output,
-                        f"generated_facie_{start_index + off + j + 1}.tif",
-                    ),
-                    arr,
-                )
+                idx = start_index + off + j + 1
+
+                if has_impedance:
+                    facies_t = g[:facies_ch, ...]
+                    imp_t = g[facies_ch : facies_ch + 3, ...]
+
+                    fac_arr = utils.torch2np(facies_t.unsqueeze(0), denormalize=True)
+                    imp_arr = utils.torch2np(imp_t.unsqueeze(0), denormalize=True)
+
+                    all_facies.append(fac_arr)
+                    all_impedance.append(imp_arr)
+
+                    tif.imwrite(
+                        os.path.join(facies_dir, f"generated_facie_{idx}.tif"),
+                        fac_arr,
+                    )
+                    tif.imwrite(
+                        os.path.join(impedance_dir, f"generated_impedance_{idx}.tif"),
+                        imp_arr,
+                    )
+                else:
+                    arr = utils.torch2np(g.unsqueeze(0), denormalize=True)
+                    all_facies.append(arr)
+                    tif.imwrite(
+                        os.path.join(facies_dir, f"generated_facie_{idx}.tif"),
+                        arr,
+                    )
         all_mi.extend(mi)
         print(f"    [{device}] {off + chunk}/{how_many}")
 
-    return all_facies, all_mi
+    return all_facies, all_impedance, all_mi
 
 
 def _generate_variant(
@@ -385,13 +550,14 @@ def _generate_variant(
     gen_output: str,
     how_many: int,
     device: torch.device,
-) -> tuple[list[np.ndarray], list[int]]:
-    """Load a trained model and generate facies samples using all GPUs.
+) -> tuple[list[np.ndarray], list[np.ndarray], list[int]]:
+    """Load a trained model and generate facies (and impedance) samples.
 
     Returns
     -------
-    tuple[list[np.ndarray], list[int]]
-        Generated facies arrays and mask indexes.
+    tuple[list[np.ndarray], list[np.ndarray], list[int]]
+        ``(facies_arrays, impedance_arrays, mask_indexes)``.
+        *impedance_arrays* is empty when impedance is not enabled.
     """
     # Load saved options, filtering out keys not accepted by TrainningOptions
     with open(os.path.join(model_path, OPT_FILE), "r") as f:
@@ -403,7 +569,9 @@ def _generate_variant(
         "self"
     }
     opts = TrainningOptions(**{k: v for k, v in json_data.items() if k in _valid_keys})
-    opts.wells = list(range(0, 200, 4))
+    opts.wells = (
+        list(opts.wells_mask_columns) if opts.wells_mask_columns else list(range(200))
+    )
     opts.rec = False
     opts.compile_backend = False  # no need to compile for one-shot generation
 
@@ -441,9 +609,15 @@ def _generate_variant(
     if num_gpus >= 2:
         from concurrent.futures import Future, ThreadPoolExecutor
 
+        # Pre-initialize CUDA contexts on every GPU from the main thread
+        # so worker threads don't hit "operation not permitted" errors.
+        for gpu_id in range(num_gpus):
+            torch.cuda.init()
+            torch.zeros(1, device=torch.device(f"cuda:{gpu_id}"))
+
         chunk_per_gpu = how_many // num_gpus
         remainder = how_many % num_gpus
-        futures: list[Future[tuple[list[np.ndarray], list[int]]]] = []
+        futures: list[Future[tuple[list[np.ndarray], list[np.ndarray], list[int]]]] = []
         with ThreadPoolExecutor(max_workers=num_gpus) as pool:
             start = 0
             for gpu_id in range(num_gpus):
@@ -465,13 +639,15 @@ def _generate_variant(
                 )
                 start += count
         facies: list[np.ndarray] = []
+        impedance: list[np.ndarray] = []
         mask_indexes: list[int] = []
         for fut in futures:
-            f, mi = fut.result()
+            f, imp, mi = fut.result()
             facies.extend(f)
+            impedance.extend(imp)
             mask_indexes.extend(mi)
     else:
-        facies, mask_indexes = _generate_on_device(
+        facies, impedance, mask_indexes = _generate_on_device(
             device,
             model_path,
             opts,
@@ -484,12 +660,15 @@ def _generate_variant(
         )
 
     print(f"  Generated {len(facies)} facies -> {gen_output}")
+    if impedance:
+        print(f"  Generated {len(impedance)} impedance -> {gen_output}")
 
-    return facies, mask_indexes
+    return facies, impedance, mask_indexes
 
 
 _EMBEDDINGS_FILE = "shared_embeddings.npz"
 _FACIES_FILE = "generated_facies.npz"
+_MASK_INDEXES_FILE = "mask_indexes.npz"
 
 
 def _save_shared_embeddings(
@@ -497,8 +676,9 @@ def _save_shared_embeddings(
     all_facies: dict[str, list[np.ndarray]],
     base_output: str,
     num_iter: int,
+    all_mask_indexes: dict[str, list[int]] | None = None,
 ) -> None:
-    """Persist shared embeddings and generated facies to disk."""
+    """Persist shared embeddings, generated facies, and mask indexes to disk."""
     data: dict[str, np.ndarray] = {"_num_iter": np.array(num_iter)}
     for method, (real_r, per_variant) in shared.items():
         data[f"{method}_real"] = real_r
@@ -510,14 +690,27 @@ def _save_shared_embeddings(
     for vname, flist in all_facies.items():
         facies_data[vname] = np.stack(flist, 0)
     np.savez(os.path.join(base_output, _FACIES_FILE), **facies_data)  # type: ignore
+
+    if all_mask_indexes:
+        mi_data: dict[str, np.ndarray] = {
+            vname: np.array(idxs) for vname, idxs in all_mask_indexes.items()
+        }
+        np.savez(os.path.join(base_output, _MASK_INDEXES_FILE), **mi_data)  # type: ignore
     print(f"  Saved embeddings checkpoint -> {base_output}/{_EMBEDDINGS_FILE}")
 
 
 def _load_shared_embeddings(
     base_output: str,
     num_iter: int,
-) -> tuple[_SharedEmbeddings, dict[str, list[np.ndarray]]] | None:
-    """Load previously saved shared embeddings if they match *num_iter*."""
+) -> tuple[_SharedEmbeddings, dict[str, list[np.ndarray]], dict[str, list[int]]] | None:
+    """Load previously saved shared embeddings if they match *num_iter*.
+
+    Returns
+    -------
+    tuple | None
+        ``(shared_embeddings, all_facies, all_mask_indexes)`` or *None* when
+        the cache is absent / stale.
+    """
     emb_path = os.path.join(base_output, _EMBEDDINGS_FILE)
     fac_path = os.path.join(base_output, _FACIES_FILE)
     if not (os.path.isfile(emb_path) and os.path.isfile(fac_path)):
@@ -546,18 +739,43 @@ def _load_shared_embeddings(
     for vname in VARIANT_NAMES:
         if vname in fac_data:
             all_facies[vname] = list(fac_data[vname])
-    return shared, all_facies
+
+    # Load mask indexes (optional — absent in older caches)
+    all_mask_indexes: dict[str, list[int]] = {}
+    mi_path = os.path.join(base_output, _MASK_INDEXES_FILE)
+    if os.path.isfile(mi_path):
+        mi_data = np.load(mi_path)
+        for vname in VARIANT_NAMES:
+            if vname in mi_data:
+                all_mask_indexes[vname] = mi_data[vname].tolist()
+
+    return shared, all_facies, all_mask_indexes
 
 
 def _compute_shared_embeddings(
     all_facies: dict[str, list[np.ndarray]],
     dataset: TorchPyramidsDataset,
+    impedance_only: bool = False,
+    methods: list[str] | None = None,
 ) -> _SharedEmbeddings:
     """Compute UMAP, Isomap, t-SNE, and MDS in a single shared space.
 
     Fits each reducer on the concatenation of real data and **all**
     variants' generated data so that the real-data coordinates are
     identical across subplots in both per-variant and combined plots.
+
+    Parameters
+    ----------
+    all_facies : dict[str, list[np.ndarray]]
+        Mapping variant -> list of generated arrays (facies or impedance).
+    dataset : TorchPyramidsDataset
+        Dataset with real samples.
+    impedance_only : bool
+        When *True*, use only the impedance channels from the real data
+        (channels after ``num_img_channels``).
+    methods : list[str] | None
+        Subset of ``["isomap", "mds", "tsne", "umap"]`` to compute.
+        *None* (default) computes all four.
 
     Returns
     -------
@@ -574,10 +792,14 @@ def _compute_shared_embeddings(
     import utils
 
     real_tensor, _, _ = dataset.get_scale_data(-1)
-    real_flat = np.reshape(
-        utils.torch2np(real_tensor, denormalize=True),
-        [real_tensor.shape[0], -1],
-    )
+    real_np = utils.torch2np(real_tensor, denormalize=True)
+    if impedance_only:
+        facies_ch = dataset.options.num_img_channels  # 3
+        real_np = real_np[..., facies_ch : facies_ch + 3]
+    elif real_np.shape[-1] > dataset.options.num_img_channels:
+        # When computing facies embeddings, strip impedance channels
+        real_np = real_np[..., : dataset.options.num_img_channels]
+    real_flat = np.reshape(real_np, [real_np.shape[0], -1])
     n_real = real_flat.shape[0]
 
     ordered = [n for n in VARIANT_NAMES if n in all_facies]
@@ -611,10 +833,14 @@ def _compute_shared_embeddings(
         flush=True,
     )
 
-    # Pre-compute the MDS distance matrix on the main thread (shared
-    # read-only memory avoids a copy in the thread pool).
-    distances = euclidean_distances(combined)
-    distances = (distances + distances.T) / 2
+    # Pre-compute the MDS distance matrix on the main thread only when
+    # MDS is actually requested (shared read-only memory avoids a copy).
+    _need_mds = methods is None or "mds" in (methods or [])
+    if _need_mds:
+        distances = euclidean_distances(combined)
+        distances = (distances + distances.T) / 2
+    else:
+        distances = np.empty((0,), dtype=np.float32)  # placeholder, never used
 
     # ── Helper closures (one per method) ──────────────────────────
     def _fit_umap() -> tuple[str, np.ndarray]:
@@ -633,7 +859,7 @@ def _compute_shared_embeddings(
             warnings.filterwarnings("ignore", category=UserWarning, module="umap")
             emb: np.ndarray = reducer.fit_transform(combined)  # type: ignore
         print("    UMAP done.", flush=True)
-        return "umap", emb # type: ignore
+        return "umap", emb  # type: ignore
 
     def _fit_isomap() -> tuple[str, np.ndarray]:
         print("  Computing shared Isomap embedding ...", flush=True)
@@ -677,105 +903,130 @@ def _compute_shared_embeddings(
     # ── Run all four in parallel ──────────────────────────────────
     # The underlying C/Cython/numba code releases the GIL, so threads
     # provide true parallelism without serialization overhead.
-    from concurrent.futures import ThreadPoolExecutor
+    from concurrent.futures import Future, ThreadPoolExecutor
+    from typing import Callable
 
-    print("  Running UMAP, Isomap, t-SNE, MDS in parallel ...", flush=True)
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = [
-            pool.submit(_fit_umap),
-            pool.submit(_fit_isomap),
-            pool.submit(_fit_tsne),
-            pool.submit(_fit_mds),
+    _active_methods = (
+        set(methods) if methods is not None else {"umap", "isomap", "tsne", "mds"}
+    )
+    _method_fns: dict[str, Callable[[], tuple[str, np.ndarray]]] = {
+        "umap": _fit_umap,
+        "isomap": _fit_isomap,
+        "tsne": _fit_tsne,
+        "mds": _fit_mds,
+    }
+    _selected = [(m, fn) for m, fn in _method_fns.items() if m in _active_methods]
+
+    label_str = ", ".join(m.upper() for m, _ in _selected)
+    print(f"  Running {label_str} in parallel ...", flush=True)
+    with ThreadPoolExecutor(max_workers=max(1, len(_selected))) as pool:
+        futures: list[Future[tuple[str, np.ndarray]]] = [
+            pool.submit(fn) for _, fn in _selected  # type: ignore[arg-type]
         ]
         for fut in futures:
-            method_name, emb = fut.result()
-            results[method_name] = _split(emb)
+            method_name, emb = fut.result()  # type: ignore[misc]
+            results[method_name] = _split(emb)  # type: ignore[arg-type]
 
     return results
 
 
-def _plot_impedance_comparison(
-    model_paths: dict[str, str],
+def _plot_sample_grid(
+    all_generated: dict[str, list[np.ndarray]],
+    real_samples: np.ndarray | None,
     base_output: str,
+    data_kind: str,
     num_samples: int = 5,
 ) -> None:
-    """Create a side-by-side grid comparing real vs generated impedance per variant.
+    """Create a comparison grid of real vs generated samples per variant.
 
-    Reads the ``real_x_generated_impedance`` PNGs saved during training
-    (one composite PNG per save-interval event) and stacks them into a
-    variant × sample grid.
+    Layout: one row per variant, first column shows a real sample,
+    remaining columns show generated samples.
 
     Parameters
     ----------
-    model_paths : dict[str, str]
-        Mapping from variant name to the scale-0 model directory (the
-        directory produced by ``_build_training_args(…, start_scale=0)``).
+    all_generated : dict[str, list[np.ndarray]]
+        Mapping from variant name to generated sample arrays (H, W, C) or
+        (1, H, W, C).
+    real_samples : np.ndarray | None
+        Real data tensor converted to numpy (B, H, W, C).  When *None*
+        the "Real" column is left blank.
     base_output : str
         Root output directory; the combined PNG is written here.
+    data_kind : str
+        ``"facies"`` or ``"impedance"`` — used in titles and filenames.
     num_samples : int
-        Maximum number of sample PNGs to show per variant.
+        Number of generated samples to show per variant (columns 1+).
     """
     from matplotlib import pyplot as plt
-    from PIL import Image
 
-    rows: list[tuple[str, list[np.ndarray]]] = []
-    for name in VARIANT_NAMES:
-        if name not in model_paths:
-            continue
-        variant_dir = model_paths[name]
-        # Collect composite PNGs from all scale sub-directories
-        imp_imgs: list[np.ndarray] = []
-        for scale_dir in sorted(
-            (p for p in os.scandir(variant_dir) if p.is_dir()),
-            key=lambda e: int(e.name) if e.name.isdigit() else 99,
-        ):
-            imp_dir = os.path.join(scale_dir.path, "real_x_generated_impedance")
-            if not os.path.isdir(imp_dir):
-                continue
-            for png in sorted(os.listdir(imp_dir)):
-                if not png.endswith(".png"):
-                    continue
-                arr = np.array(Image.open(os.path.join(imp_dir, png)))
-                imp_imgs.append(arr)
-                if len(imp_imgs) >= num_samples:
-                    break
-            if len(imp_imgs) >= num_samples:
-                break
-        rows.append((name, imp_imgs[:num_samples]))
-
-    if not any(imgs for _, imgs in rows):
-        print("  No impedance output PNGs found; skipping impedance comparison plot.")
-        return
-
-    n_cols = max(len(imgs) for _, imgs in rows)
-    n_rows = len(rows)
-    fig, axes = plt.subplots( # type: ignore
-        n_rows, n_cols, figsize=(4 * n_cols, 3.5 * n_rows),
-        squeeze=False,
-    )
     variant_labels = {
         "wells_seismic": "Wells + Seismic",
         "wells_only": "Wells Only",
         "seismic_only": "Seismic Only",
         "unconditional": "Unconditional",
     }
-    for r, (name, imgs) in enumerate(rows):
-        for c in range(n_cols):
+
+    # Build per-variant rows: (label, real_img_or_None, [generated_imgs])
+    rows: list[tuple[str, np.ndarray | None, list[np.ndarray]]] = []
+    for i, name in enumerate(VARIANT_NAMES):
+        if name not in all_generated or not all_generated[name]:
+            continue
+        samples = all_generated[name][:num_samples]
+        imgs = [s.squeeze(0) if s.ndim == 4 else s for s in samples]
+        real_img: np.ndarray | None = None
+        if real_samples is not None and i < len(real_samples):
+            real_img = real_samples[i]
+        rows.append((variant_labels.get(name, name), real_img, imgs))
+
+    if not rows:
+        print(f"  No {data_kind} data available; skipping comparison grid.")
+        return
+
+    # Columns: 1 (Real) + num generated
+    max_gen = max(len(imgs) for _, _, imgs in rows)
+    n_cols = 1 + max_gen
+    n_rows = len(rows)
+    fig, axes = plt.subplots(  # type: ignore
+        n_rows,
+        n_cols,
+        figsize=(4 * n_cols, 3.5 * n_rows),
+        squeeze=False,
+    )
+
+    # Column headers
+    axes[0][0].set_title("Real", fontsize=11, fontweight="bold")
+    for c in range(1, n_cols):
+        axes[0][c].set_title(f"Generated {c}", fontsize=11)
+
+    for r, (label, real_img, gen_imgs) in enumerate(rows):
+        # Column 0: real sample
+        ax = axes[r][0]
+        if real_img is not None:
+            ax.imshow(real_img)
+        else:
+            ax.set_facecolor("#111")
+        ax.axis("off")
+        ax.set_ylabel(label, fontsize=10, rotation=90, labelpad=10)
+
+        # Columns 1+: generated samples
+        for c in range(1, n_cols):
             ax = axes[r][c]
-            if c < len(imgs):
-                ax.imshow(imgs[c])
+            gi = c - 1
+            if gi < len(gen_imgs):
+                ax.imshow(gen_imgs[gi])
             else:
                 ax.set_facecolor("#111")
             ax.axis("off")
-            if c == 0:
-                ax.set_ylabel(variant_labels.get(name, name), fontsize=9)
 
-    fig.suptitle("Real × Generated Impedance — all variants", fontsize=13)  # type: ignore
+    kind_title = data_kind.capitalize()
+    fig.suptitle(  # type: ignore
+        f"Real vs Generated {kind_title} — All Variants", fontsize=14
+    )
     fig.tight_layout()
-    out_path = os.path.join(base_output, "impedance_comparison_all_variants.png")
-    plt.savefig(out_path, dpi=120, bbox_inches="tight")  # type: ignore
+    out_path = os.path.join(base_output, f"{data_kind}_comparison_all_variants.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")  # type: ignore
     plt.close(fig)
-    print(f"\nImpedance comparison plot -> {out_path}")
+    print(f"  {kind_title} comparison grid -> {out_path}")
 
 
 def _plot_per_variant_embedding(
@@ -804,6 +1055,7 @@ def _plot_combined_embeddings(
     shared_embedding: tuple[np.ndarray, dict[str, np.ndarray]],
     base_output: str,
     num_iter: int = 0,
+    data_kind: str = "facies",
 ) -> None:
     """Create a 2x2 combined embedding plot.
 
@@ -822,6 +1074,8 @@ def _plot_combined_embeddings(
         Directory where the combined PNG will be saved.
     num_iter : int, optional
         Epoch number appended to the filename when > 0.
+    data_kind : str
+        ``"facies"`` or ``"impedance"`` — used in titles and filenames.
     """
     from matplotlib import pyplot as plt
 
@@ -834,8 +1088,10 @@ def _plot_combined_embeddings(
         "unconditional": "Unconditional",
     }
 
+    kind_title = data_kind.capitalize()
+
     fig, axes = plt.subplots(2, 2, figsize=(12, 10))  # type: ignore
-    fig.suptitle(f"{label} Comparison: Real vs Generated Facies", fontsize=14)  # type: ignore
+    fig.suptitle(f"{label} Comparison: Real vs Generated {kind_title}", fontsize=14)  # type: ignore
 
     for ax, name in zip(axes.flat, VARIANT_NAMES):
         if name not in shared_embedding[1]:
@@ -855,11 +1111,144 @@ def _plot_combined_embeddings(
     plt.tight_layout()
     epoch_tag = f"_epoch{num_iter}" if num_iter > 0 else ""
     combined_path = os.path.join(
-        base_output, f"{method}_comparison_all_variants{epoch_tag}.png"
+        base_output, f"{method}_{data_kind}_comparison_all_variants{epoch_tag}.png"
     )
     plt.savefig(combined_path, dpi=150, bbox_inches="tight")  # type: ignore
     plt.close(fig)
-    print(f"\nCombined {label} plot -> {combined_path}")
+    print(f"\nCombined {label} {kind_title} plot -> {combined_path}")
+
+
+def _plot_per_facies_embedding(
+    method: str,
+    real_reduced: np.ndarray,
+    fake_reduced_for_facies: np.ndarray,
+    facies_idx: int,
+    save_path: str,
+    data_kind: str = "facies",
+) -> None:
+    """Save an embedding plot for a single conditioning crossline index.
+
+    Highlights the generated samples produced from crossline *facies_idx*
+    against the full real-data embedding cloud.
+
+    Parameters
+    ----------
+    method : str
+        Embedding method name.
+    real_reduced : np.ndarray
+        Pre-computed 2-D coordinates for all real samples.
+    fake_reduced_for_facies : np.ndarray
+        Pre-computed 2-D coordinates for generated samples conditioned on
+        this specific crossline.
+    facies_idx : int
+        Crossline index used for conditioning (for plot title / filename).
+    save_path : str
+        Destination file path.
+    data_kind : str
+        ``"facies"`` or ``"impedance"`` — used in the title.
+    """
+    from matplotlib import pyplot as plt
+
+    label = "t-SNE" if method == "tsne" else method.upper()
+    kind_title = data_kind.capitalize()
+    plt.figure()  # type: ignore
+    plt.scatter(  # type: ignore
+        real_reduced[:, 0],
+        real_reduced[:, 1],
+        alpha=0.4,
+        s=10,
+        label="Real (all)",
+        c="steelblue",
+    )
+    plt.scatter(  # type: ignore
+        fake_reduced_for_facies[:, 0],
+        fake_reduced_for_facies[:, 1],
+        alpha=0.8,
+        s=20,
+        label=f"Generated (crossline {facies_idx})",
+        c="tomato",
+    )
+    plt.title(f"{label} — {kind_title} conditioned on crossline {facies_idx}")  # type: ignore
+    plt.xlabel(f"{label} Dimension 1")  # type: ignore
+    plt.ylabel(f"{label} Dimension 2")  # type: ignore
+    plt.legend(loc="upper right", fontsize=8)  # type: ignore
+    plt.savefig(save_path, dpi=120, bbox_inches="tight")  # type: ignore
+    plt.close()  # type: ignore
+
+
+def _save_per_facies_embeddings(
+    shared: _SharedEmbeddings,
+    all_mask_indexes: dict[str, list[int]],
+    base_output: str,
+    methods: list[str],
+    data_kind: str = "facies",
+) -> None:
+    """Generate per-crossline embedding plots for every variant and method.
+
+    For each variant and each unique conditioning crossline index found in
+    *all_mask_indexes*, this writes one PNG per method to::
+
+        {base_output}/{variant}/generated/per_{data_kind}_embeddings/
+            {method}_{data_kind}_crossline_{idx}.png
+
+    Parameters
+    ----------
+    shared : _SharedEmbeddings
+        Shared embedding coordinates (method -> (real, {variant: fake})).
+    all_mask_indexes : dict[str, list[int]]
+        Mapping variant -> list of crossline indices (one per generated sample).
+    base_output : str
+        Experiment root directory.
+    methods : list[str]
+        Methods to plot (subset of those in *shared*).
+    data_kind : str
+        ``"facies"`` or ``"impedance"`` — drives subdirectory naming and titles.
+    """
+    for name in VARIANT_NAMES:
+        # Skip variants with no mask indexes or no computed embedding
+        if name not in all_mask_indexes:
+            continue
+        if not methods or not any(
+            name in shared.get(m, (None, {}))[1] for m in methods  # type: ignore[index]
+        ):
+            continue
+        mi_list = np.array(all_mask_indexes[name])
+        unique_idxs = sorted(set(mi_list.tolist()))
+
+        per_emb_dir = os.path.join(
+            base_output, name, "generated", f"per_{data_kind}_embeddings"
+        )
+        os.makedirs(per_emb_dir, exist_ok=True)
+
+        for method in methods:
+            if method not in shared:
+                continue
+            real_reduced, per_variant_fakes = shared[method]
+            if name not in per_variant_fakes:
+                continue
+            fake_all = per_variant_fakes[name]  # (N_generated, 2)
+
+            for idx in unique_idxs:
+                mask = mi_list == idx
+                fake_for_idx = fake_all[mask]
+                if fake_for_idx.shape[0] == 0:
+                    continue
+                save_path = os.path.join(
+                    per_emb_dir,
+                    f"{method}_{data_kind}_crossline_{idx:04d}.png",
+                )
+                _plot_per_facies_embedding(
+                    method,
+                    real_reduced,
+                    fake_for_idx,
+                    idx,
+                    save_path,
+                    data_kind=data_kind,
+                )
+        n_plots = len(unique_idxs) * len(methods)
+        print(
+            f"  Per-{data_kind} embeddings ({name}): {n_plots} plots -> {per_emb_dir}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1369,23 @@ def main() -> None:
             model_paths[name] = variant_output
             print(f"  Training complete ({elapsed}) -> {variant_output}")
 
+    # ── Load base options & dataset (needed for plots and embeddings) ──
+    import inspect
+
+    first_model = model_paths[VARIANT_NAMES[0]]
+    with open(os.path.join(first_model, OPT_FILE), "r") as f:
+        _json = json.load(f)
+    _valid = set(inspect.signature(TrainningOptions.__init__).parameters) - {"self"}
+    _base_opts = TrainningOptions(**{k: v for k, v in _json.items() if k in _valid})
+    # _base_opts.wells = (
+    #     list(_base_opts.wells_mask_columns)
+    #     if _base_opts.wells_mask_columns
+    #     else list(range(1, 200, 4))
+    # )
+    _base_opts.rec = False
+    _base_opts.compile_backend = True
+    _dataset = TorchPyramidsDataset(_base_opts)
+
     # ── Try to load cached embeddings ──
     # Reuse only when no variant was retrained (all skipped); if any model
     # was retrained the old embeddings are stale and must be recomputed.
@@ -989,15 +1395,18 @@ def main() -> None:
         else None
     )
     if cached is not None:
-        shared, all_facies = cached
+        shared, all_facies, _cached_mi = cached
+        all_impedance: dict[str, list[np.ndarray]] = {}
+        all_mask_indexes: dict[str, list[int]] = _cached_mi
         print(f"Loaded cached embeddings for epoch {args.num_iter}")
     else:
-        # ── Generate facies from all trained models ──
+        # ── Generate facies (and impedance) from all trained models ──
         print(f"\n{'=' * 70}")
         print("GENERATING FACIES FROM TRAINED MODELS")
         print(f"{'=' * 70}\n")
 
         all_facies: dict[str, list[np.ndarray]] = {}
+        all_impedance: dict[str, list[np.ndarray]] = {}
         all_mask_indexes: dict[str, list[int]] = {}
 
         for name in VARIANT_NAMES:
@@ -1007,63 +1416,154 @@ def main() -> None:
             print(f"Generating from variant: {name}")
             print(f"  model: {model_path}")
 
-            variant_facies, variant_mi = _generate_variant(
+            variant_facies, variant_imp, variant_mi = _generate_variant(
                 model_path=model_path,
                 gen_output=gen_output,
                 how_many=args.how_many,
                 device=device,
             )
             all_facies[name] = variant_facies
+            if variant_imp:
+                all_impedance[name] = variant_imp
             all_mask_indexes[name] = variant_mi
 
-        # ── Shared embeddings for all plots ──
-        # Fit UMAP, Isomap, t-SNE, and MDS once on real + ALL variants'
-        # fakes so the real dots are identical across all plots.
-        import inspect
-
-        first_model = model_paths[VARIANT_NAMES[0]]
-        with open(os.path.join(first_model, OPT_FILE), "r") as f:
-            _json = json.load(f)
-        _valid = set(inspect.signature(TrainningOptions.__init__).parameters) - {"self"}
-        _base_opts = TrainningOptions(**{k: v for k, v in _json.items() if k in _valid})
-        _base_opts.wells = list(range(0, 200, 4))
-        _base_opts.rec = False
-        _base_opts.compile_backend = False
-        _dataset = TorchPyramidsDataset(_base_opts)
-
-        print("\nComputing shared embeddings for all plots...", flush=True)
-        shared = _compute_shared_embeddings(all_facies, _dataset)
-
-        # Persist for future resume
-        _save_shared_embeddings(shared, all_facies, base_output, args.num_iter)
-
-    # ── Per-variant plots (consistent real coordinates) ──
-    for method in ("mds", "umap", "isomap", "tsne"):
-        real_reduced, per_variant_fakes = shared[method]
-        for name in VARIANT_NAMES:
-            if name not in per_variant_fakes:
-                continue
-            gen_output = os.path.join(base_output, name, "generated")
-            plot_path = os.path.join(gen_output, f"{method}_comparison.png")
-            _plot_per_variant_embedding(
-                method, real_reduced, per_variant_fakes[name], plot_path
+        if not args.no_embeddings:
+            # ── Shared embeddings for all plots ──
+            # Fit selected methods once on real + ALL variants' fakes so
+            # the real-data coordinates are identical across all plots.
+            emb_methods: list[str] = args.embedding_methods
+            print(
+                f"\nComputing shared embeddings "
+                f"({', '.join(m.upper() for m in emb_methods)}) ...",
+                flush=True,
             )
-            print(f"  {method.upper()} plot -> {plot_path}")
+            shared = _compute_shared_embeddings(
+                all_facies, _dataset, methods=emb_methods
+            )
 
-    # ── Combined comparison plots (2x2 grid) ──
-    for method in ("mds", "umap", "isomap", "tsne"):
-        _plot_combined_embeddings(
-            method,
-            shared[method],
-            base_output,
-            args.num_iter,
-        )
+            # Persist for future resume (includes mask indexes)
+            _save_shared_embeddings(
+                shared, all_facies, base_output, args.num_iter, all_mask_indexes
+            )
+        else:
+            shared = {}
 
-    # ── Impedance comparison grid (only when impedance is enabled) ──
-    if getattr(args, "use_impedance", False):
+    # ── Resolve effective embedding method list ────────────────────────────
+    emb_methods = list(
+        getattr(args, "embedding_methods", ["isomap", "mds", "tsne", "umap"])
+    )
+    emb_data_kinds: list[str] = list(
+        getattr(args, "embedding_data", ["facies", "impedance"])
+    )
+
+    # ── Facies comparison grid (real vs generated per variant) ──
+    print(f"\n{'-' * 70}")
+    print("Generating facies comparison grid...")
+    import utils as _utils
+
+    real_tensor, _, _ = _dataset.get_scale_data(-1)
+    real_facies_np = _utils.torch2np(real_tensor, denormalize=True)
+    # If impedance channels are present, keep only facies channels
+    facies_ch = _base_opts.num_img_channels  # 3
+    if real_facies_np.shape[-1] > facies_ch:
+        real_facies_np = real_facies_np[..., :facies_ch]
+    _plot_sample_grid(all_facies, real_facies_np, base_output, "facies")
+
+    # ── Impedance comparison grid (only when impedance data exists) ──
+    if all_impedance:
         print(f"\n{'-' * 70}")
-        print("Generating impedance comparison plot...")
-        _plot_impedance_comparison(model_paths, base_output)
+        print("Generating impedance comparison grid...")
+        real_imp_np: np.ndarray | None = None
+        real_full = _utils.torch2np(real_tensor, denormalize=True)
+        if real_full.shape[-1] > facies_ch:
+            real_imp_np = real_full[..., facies_ch : facies_ch + 3]
+        _plot_sample_grid(all_impedance, real_imp_np, base_output, "impedance")
+
+    if args.no_embeddings or not shared:
+        total_elapsed = format_time(int(time.time() - total_start))
+        print(f"\n{'=' * 70}")
+        print(f"ALL EXPERIMENTS COMPLETE  ({total_elapsed})")
+        print(f"{'=' * 70}")
+        print(f"\nResults in: {base_output}")
+        for name in VARIANT_NAMES:
+            print(f"  {name}: {model_paths[name]}")
+        return
+
+    # ── Facies embedding plots (per-variant + combined) ────────────────────
+    if "facies" in emb_data_kinds:
+        print(f"\n{'-' * 70}")
+        print("Generating facies embedding plots...")
+        for method in emb_methods:
+            if method not in shared:
+                continue
+            real_reduced, per_variant_fakes = shared[method]
+            # Per-variant individual plots
+            for name in VARIANT_NAMES:
+                if name not in per_variant_fakes:
+                    continue
+                gen_output = os.path.join(base_output, name, "generated")
+                plot_path = os.path.join(gen_output, f"{method}_comparison.png")
+                _plot_per_variant_embedding(
+                    method, real_reduced, per_variant_fakes[name], plot_path
+                )
+                print(f"  {method.upper()} plot -> {plot_path}")
+            # Combined 2×2 grid
+            _plot_combined_embeddings(
+                method, shared[method], base_output, args.num_iter, data_kind="facies"
+            )
+
+        # Per-crossline facies embeddings
+        if args.embedding_per_facies and all_mask_indexes:
+            print(f"\n{'-' * 70}")
+            print("Generating per-crossline facies embedding plots...")
+            _save_per_facies_embeddings(
+                shared, all_mask_indexes, base_output, emb_methods, data_kind="facies"
+            )
+
+    # ── Impedance embedding plots (only when impedance data exists) ────────
+    if "impedance" in emb_data_kinds and all_impedance:
+        imp_emb_methods: list[str] = [m for m in emb_methods]
+        print(f"\n{'-' * 70}")
+        print("Computing shared impedance embeddings for plots...", flush=True)
+        shared_imp = _compute_shared_embeddings(
+            all_impedance, _dataset, impedance_only=True, methods=imp_emb_methods
+        )
+        for method in imp_emb_methods:
+            if method not in shared_imp:
+                continue
+            real_reduced, per_variant_fakes = shared_imp[method]
+            # Per-variant individual plots
+            for name in VARIANT_NAMES:
+                if name not in per_variant_fakes:
+                    continue
+                gen_output = os.path.join(base_output, name, "generated")
+                plot_path = os.path.join(
+                    gen_output, f"{method}_impedance_comparison.png"
+                )
+                _plot_per_variant_embedding(
+                    method, real_reduced, per_variant_fakes[name], plot_path
+                )
+                print(f"  {method.upper()} impedance plot -> {plot_path}")
+            # Combined 2×2 grid
+            _plot_combined_embeddings(
+                method,
+                shared_imp[method],
+                base_output,
+                args.num_iter,
+                data_kind="impedance",
+            )
+
+        # Per-crossline impedance embeddings
+        if args.embedding_per_facies and all_mask_indexes:
+            print(f"\n{'-' * 70}")
+            print("Generating per-crossline impedance embedding plots...")
+            _save_per_facies_embeddings(
+                shared_imp,
+                all_mask_indexes,
+                base_output,
+                imp_emb_methods,
+                data_kind="impedance",
+            )
 
     total_elapsed = format_time(int(time.time() - total_start))
     print(f"\n{'=' * 70}")

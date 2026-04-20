@@ -187,3 +187,32 @@ IterableMetrics = tuple[
     dict[int, list[tuple[TTensor, ...]]],
     dict[int, list[dict[str, Any]]],
 ]
+
+
+class MetricSmoother:
+    """Exponential Moving Average smoother (same formula as TensorBoard).
+
+    Smoothed value:  ``s_t = alpha * s_{t-1} + (1 - alpha) * x_t``
+
+    Parameters
+    ----------
+    alpha : float
+        Smoothing factor in [0, 1).  Higher = smoother / slower to react.
+    """
+
+    __slots__ = ("alpha", "value")
+
+    def __init__(self, alpha: float = 0.9) -> None:
+        self.alpha = alpha
+        self.value: float | None = None
+
+    def update(self, raw: float) -> float:
+        """Feed a new raw value and return the smoothed result."""
+        if self.value is None:
+            self.value = raw
+        else:
+            self.value = self.alpha * self.value + (1.0 - self.alpha) * raw
+        return self.value
+
+    def reset(self) -> None:
+        self.value = None

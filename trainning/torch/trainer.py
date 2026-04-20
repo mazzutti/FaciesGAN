@@ -48,6 +48,7 @@ from config import (
 )
 from datasets import PyramidsDataset
 from datasets.torch.dataset import TorchPyramidsDataset
+from metrics import MetricSmoother
 from models import FaciesGAN, TorchFaciesGAN
 from models.torch import utils as torch_utils
 from models.torch.facies_gan import unwrap_ddp
@@ -135,6 +136,10 @@ class TorchTrainer(
             self._is_main_process = dist.get_rank() == 0
         super().__init__(options, fine_tuning, checkpoint_path)
         self._ckpt_thread: threading.Thread | None = None
+        # Per-scale EMA smoothers for generator loss (fed to ReduceLROnPlateau)
+        self._g_loss_smoothers: dict[int, MetricSmoother] = {}
+        # Track which scale-tuples have already been compile-warmed up
+        self._compile_warmed_up_scales: set[tuple[int, ...]] = set()
 
     def _ddp_barrier(self) -> None:
         """Synchronize DDP ranks via NCCL barrier."""
@@ -151,6 +156,7 @@ class TorchTrainer(
         is constructed with the correct value.
         """
         sampler: DistributedSampler[Batch[torch.Tensor]] | None = None
+        do_shuffle = getattr(self.options, "shuffle", True)
         shuffle = False
         if self.distributed:
             # Halve per-GPU batch size so the effective batch is unchanged.
@@ -160,8 +166,10 @@ class TorchTrainer(
                 self.dataset,
                 num_replicas=dist.get_world_size(),
                 rank=dist.get_rank(),
-                shuffle=True,
+                shuffle=do_shuffle,
             )
+        else:
+            shuffle = do_shuffle
         has_workers = self.options.num_workers > 0
         return DataLoader(
             self.dataset,
@@ -254,16 +262,34 @@ class TorchTrainer(
         happens mid-training it can crash under debugpy or cause a long
         stall that triggers a DDP timeout.
 
-        This method forces those traces at startup (within
-        ``inference_mode`` so no gradients are computed) so every
-        compiled specialization is cached before the training loop.
+        This method forces those traces at startup so every compiled
+        specialization is cached before the training loop.
+
+        Two distinct **Dynamo/AOTAutograd specialisation sets** exist for
+        each compiled gen block:
+
+        * **inference_mode** — no activations saved for backward; simpler
+          and faster to compile.  Used by the D-phase fake-generation and
+          ``generate_visualization_samples``.
+        * **training mode** (grad-enabled, NOT inference_mode) — AOTAutograd
+          traces a joint forward+backward graph.  Used by the G-phase
+          ``compute_generator_metrics`` and ``compute_recovery_loss``.
+
+        Both sets share the same Triton kernel compile cache on disk, so
+        the first set to run for a given tensor shape compiles the CUDA
+        kernels; the second set hits the cache.  However, *both* sets
+        must be traced here (before any NCCL collective is issued) to
+        prevent a multi-minute Triton compilation from stalling one rank
+        mid-training and triggering an NCCL watchdog timeout.
         """
         if not getattr(self.model, "_use_compile", False):
             return
 
+        if scales in self._compile_warmed_up_scales:
+            return
+        self._compile_warmed_up_scales.add(scales)
+
         N = self.model.num_diversity_samples
-        if N <= 1 and self.model.alpha == 0:
-            return  # nothing extra to warm up
 
         if self._is_main_process:
             print("  Warming up torch.compile traces …")
@@ -274,14 +300,18 @@ class TorchTrainer(
 
                 # 1) Recovery-loss path: generator(rec_noise, amps,
                 #    in_noise=rec_in, start_scale=s, stop_scale=s)
-                if self.model.alpha > 0:
+                if self.model.reconstruction_loss_penalty > 0:
                     rec_noise = self.model.get_pyramid_noise(
-                        scale, indexes, wells_pyramid, seismic_pyramid,
+                        scale,
+                        indexes,
+                        wells_pyramid,
+                        seismic_pyramid,
                         rec=True,
                     )
                     rec_in = rec_in_pyramid[scale]
                     self.model.generator(
-                        rec_noise, amps,
+                        rec_noise,
+                        amps,
                         in_noise=rec_in,
                         start_scale=scale,
                         stop_scale=scale,
@@ -292,22 +322,92 @@ class TorchTrainer(
                 if N > 1:
                     noise_sets = [
                         self.model.get_pyramid_noise(
-                            scale, indexes, wells_pyramid, seismic_pyramid,
+                            scale,
+                            indexes,
+                            wells_pyramid,
+                            seismic_pyramid,
                         )
                         for _ in range(N)
                     ]
                     batched_noises = [
                         torch.cat(
-                            [noise_sets[k][lvl] for k in range(N)], dim=0,
+                            [noise_sets[k][lvl] for k in range(N)],
+                            dim=0,
                         )
                         for lvl in range(scale + 1)
                     ]
                     self.model.generator(
-                        batched_noises, amps, stop_scale=scale,
+                        batched_noises,
+                        amps,
+                        stop_scale=scale,
                     )
 
+        # ── Training-mode specialisations ──────────────────────────────────
+        # AOTAutograd compiles a separate joint forward+backward graph when
+        # called outside inference_mode/no_grad (grad_enabled=True).  These
+        # specialisations are needed for the G-phase but NOT pre-built by the
+        # inference_mode block above.  We warm them up here so their Triton
+        # kernels are on-disk before the training loop starts.
+        #
+        # We do NOT call .backward(): AOTAutograd traces the backward graph as
+        # part of the FORWARD compilation (it uses functional transforms), so
+        # the compiled artifact is complete after the forward call alone.
+        # Deleting the output tensor releases the computation graph without
+        # polluting gen-parameter .grad tensors.
+        #
+        # Shape note: we trace with the actual training batch size (len(indexes))
+        # so the compiled kernel specialisation has the correct static shape for
+        # dynamic=False.  The N*B batched diversity path is traced separately
+        # because it has a distinct batch dimension.
         if self._is_main_process:
-            print("  Compile warmup done.")
+            print("  Warming up training-mode kernel cache …")
+
+        for scale in scales:
+            amps = self.model.get_noise_aplitude(scale)
+
+            # N=1 path (batch = B)
+            noises_1 = self.model.get_pyramid_noise(
+                scale, indexes, wells_pyramid, seismic_pyramid
+            )
+            _out = self.model.generator(noises_1, amps, stop_scale=scale)
+            del _out, noises_1
+
+            # N>1 diversity path (batch = N*B) — distinct static shape
+            if N > 1:
+                _noise_sets = [
+                    self.model.get_pyramid_noise(
+                        scale, indexes, wells_pyramid, seismic_pyramid
+                    )
+                    for _ in range(N)
+                ]
+                _batched = [
+                    torch.cat([_noise_sets[k][lvl] for k in range(N)], dim=0)
+                    for lvl in range(scale + 1)
+                ]
+                _out_n = self.model.generator(_batched, amps, stop_scale=scale)
+                del _out_n, _noise_sets, _batched
+
+            # Recovery-loss path (start_scale=scale, stop_scale=scale)
+            if self.model.reconstruction_loss_penalty > 0:
+                _rec_noise = self.model.get_pyramid_noise(
+                    scale, indexes, wells_pyramid, seismic_pyramid, rec=True
+                )
+                _rec_in = rec_in_pyramid[scale]
+                _out_r = self.model.generator(
+                    _rec_noise,
+                    amps,
+                    in_noise=_rec_in,
+                    start_scale=scale,
+                    stop_scale=scale,
+                )
+                del _out_r, _rec_noise
+
+            # Clear any .grad side-effects of AOTAutograd tracing
+            self.model.generator.zero_grad(set_to_none=True)  # type: ignore[attr-defined]
+            torch.cuda.empty_cache()
+
+        if self._is_main_process:
+            print("  Compile warmup done.\n")
 
     def compute_rec_input(
         self,
@@ -352,7 +452,13 @@ class TorchTrainer(
                     stop_scale=scale,
                 )
 
-            rmse = torch.sqrt(F.mse_loss(fake, real.to(fake.device)))
+            # Calibrate amplitude against facies channels only; when
+            # impedance is enabled real has 6 ch [facies | imp] and the
+            # continuous impedance scale would otherwise swamp the RMSE.
+            _orig_C = getattr(self.model, "orig_num_img_channels", fake.shape[1])
+            _real_f = real[:, :_orig_C].to(fake.device)
+            _fake_f = fake[:, :_orig_C]
+            rmse = torch.sqrt(F.mse_loss(_fake_f, _real_f))
             amp = self.scale0_noise_amp * rmse.item()
             if len(self.model.noise_amps) <= scale:
                 self.model.noise_amps.append(amp)
@@ -402,7 +508,13 @@ class TorchTrainer(
                 stop_scale=scale,
             )
 
-        rmse = torch.sqrt(F.mse_loss(fake, real.to(fake.device)))
+        # Use only facies channels for RMSE when impedance is enabled:
+        # the impedance channels are on a different numerical scale and
+        # would bias the noise amplitude estimate away from facies fidelity.
+        _orig_C = getattr(self.model, "orig_num_img_channels", fake.shape[1])
+        _real_f = real[:, :_orig_C].to(fake.device)
+        _fake_f = fake[:, :_orig_C]
+        rmse = torch.sqrt(F.mse_loss(_fake_f, _real_f))
         amp = max(self.noise_amp * rmse.item(), self.min_noise_amp)
 
         if scale < len(self.model.noise_amps):
@@ -433,6 +545,19 @@ class TorchTrainer(
         elif self.options.num_train_pyramids < len(dataset):
             idxs = torch.randperm(len(dataset))[: self.options.num_train_pyramids]
             dataset.batches = [dataset.batches[i] for i in idxs]
+        repeat = self.options.num_iter
+        if repeat > 1:
+            import random
+
+            do_shuffle = getattr(self.options, "shuffle", True)
+            base = dataset.batches
+            repeated: list[Batch[torch.Tensor]] = []
+            for _ in range(repeat):
+                copy = list(base)
+                if do_shuffle:
+                    random.shuffle(copy)
+                repeated.extend(copy)
+            dataset.batches = repeated
         return dataset, dataset.scales
 
     def load_model(self, scale: int) -> None:
@@ -569,9 +694,11 @@ class TorchTrainer(
             # Generate on CPU so .tolist() avoids a GPU→CPU sync.
             indexes = torch.randint(actual_batch, (self.num_real_facies,), device="cpu")
 
-            # Repeat each index num_generated_per_real times
+            # Repeat each index num_generated_per_real times so that
+            # after reshape(num_real, num_gen, ...) every column in a row
+            # shares the same conditioning (well/seismic) index.
             tiled_indexes: list[int] = cast(
-                list[int], indexes.repeat(self.num_generated_per_real).tolist()  # type: ignore
+                list[int], indexes.repeat_interleave(self.num_generated_per_real).tolist()  # type: ignore
             )
             noises = self.model.get_pyramid_noise(
                 scale,
@@ -603,12 +730,12 @@ class TorchTrainer(
             real_cpu: torch.Tensor = cast(torch.Tensor, denorm(real_facies_tensor.detach()).to("cpu", non_blocking=True))  # type: ignore[arg-type]
             masks_cpu: torch.Tensor | None = None
             if len(masks_pyramid) > 0:
-                masks_cpu = masks_pyramid[scale][indexes].detach().to("cpu", non_blocking=True)
+                masks_cpu = (
+                    masks_pyramid[scale][indexes].detach().to("cpu", non_blocking=True)
+                )
             torch.cuda.current_stream().synchronize()
 
             use_impedance: bool = getattr(self.model.options, "use_impedance", False)
-            # When impedance is active the tensor has 6 channels: first 3 are
-            # facies, last 3 are impedance.  Split before plotting.
             num_facies_ch: int = self.model.options.noise_channels
             if use_impedance:
                 facies_only_cpu = facies_cpu[:, :, :num_facies_ch]
@@ -643,7 +770,7 @@ class TorchTrainer(
                     scale,
                     epoch,
                     impedance_results_path,
-                    None,  # impedance is not well-conditioned
+                    None,
                     batch_id=batch_id,
                     plot_title="Impedance",
                     quantize=False,
@@ -670,32 +797,44 @@ class TorchTrainer(
                 set_grad_none=True,
             )
 
-            self.generator_schedulers[scale] = torch.optim.lr_scheduler.StepLR(
-                self.generator_optimizers[scale],
-                step_size=self.lr_decay,
-                gamma=self.gamma,
+            self.generator_schedulers[scale] = (
+                torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self.generator_optimizers[scale],
+                    mode="min",
+                    factor=self.options.lr_g_factor,
+                    patience=self.options.lr_patience,
+                    min_lr=self.options.lr_min,
+                    threshold=1e-4,
+                )
             )
 
     def reset_schedulers(self, scales: tuple[int, ...]) -> None:
         for scale in scales:
             # Reset optimizer param group LRs to initial values before
-            # creating new schedulers, otherwise StepLR picks up the
-            # already-decayed LR as its base.
+            # creating new schedulers.
             for pg in self.generator_optimizers[scale].param_groups:
                 pg["lr"] = self.lr_g
             for pg in self.discriminator_optimizers[scale].param_groups:
                 pg["lr"] = self.lr_d
 
-            self.generator_schedulers[scale] = torch.optim.lr_scheduler.StepLR(
-                self.generator_optimizers[scale],
-                step_size=self.lr_decay,
-                gamma=self.gamma,
+            self.generator_schedulers[scale] = (
+                torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    self.generator_optimizers[scale],
+                    mode="min",
+                    factor=self.options.lr_g_factor,
+                    patience=self.options.lr_patience,
+                    min_lr=self.options.lr_min,
+                    threshold=1e-4,
+                )
             )
             self.discriminator_schedulers[scale] = torch.optim.lr_scheduler.StepLR(
                 self.discriminator_optimizers[scale],
                 step_size=self.lr_decay,
                 gamma=self.gamma,
             )
+            # Reset the smoother for this scale so it starts fresh
+            if scale in self._g_loss_smoothers:
+                self._g_loss_smoothers[scale].reset()
 
     def save_optimizers(
         self,
@@ -872,10 +1011,13 @@ class TorchTrainer(
                 pass
 
         if not opts_loaded:
-            # Fast-forward the LR schedulers to match the requested epoch
-            for _ in range(effective_start):
+            # Fast-forward the discriminator StepLR schedulers to match the
+            # requested epoch (or global step in step mode).  Generator uses
+            # ReduceLROnPlateau which cannot be fast-forwarded (it needs
+            # actual loss values); it will start fresh from the current LR.
+            ff_steps = effective_start
+            for _ in range(ff_steps):
                 for s in scales:
-                    self.generator_schedulers[s].step()
                     self.discriminator_schedulers[s].step()
 
         if self._is_main_process:

@@ -1,4 +1,4 @@
-"""TensorBoard-based training visualizer for parallel LAPGAN training.
+"""TensorBoard-based training visualizer for parallel FACIESGAN training.
 
 This provides a clean, real-time, non-blocking visualization using TensorBoard.
 Much more responsive than matplotlib with better interactivity.
@@ -55,6 +55,7 @@ class TensorBoardVisualizer:
         output_dir: str,
         log_dir: str | None = None,
         update_interval: int = 1,
+        image_log_interval: int = 100,
         dataset_info: str | None = None,
         purge_step: int | None = None,
     ):
@@ -76,6 +77,7 @@ class TensorBoardVisualizer:
         self.num_scales = num_scales
         self.output_dir = output_dir
         self.update_interval = update_interval
+        self.image_log_interval = image_log_interval
         self.dataset_info = dataset_info or "Unknown dataset"
 
         # Setup TensorBoard logging
@@ -164,6 +166,7 @@ class TensorBoardVisualizer:
             self.writer.add_scalar(f"Scale_{scale}/D_Total", metrics["d_total"], epoch)
             self.writer.add_scalar(f"Scale_{scale}/D_Real", metrics["d_real"], epoch)
             self.writer.add_scalar(f"Scale_{scale}/D_Fake", metrics["d_fake"], epoch)
+            self.writer.add_scalar(f"Scale_{scale}/D_GP", metrics["d_gp"], epoch)
 
             # Generator losses
             self.writer.add_scalar(f"Scale_{scale}/G_Total", metrics["g_total"], epoch)
@@ -191,10 +194,12 @@ class TensorBoardVisualizer:
             mean_d_total = np.mean([flat_metrics[s]["d_total"] for s in scales])
             mean_d_real = np.mean([flat_metrics[s]["d_real"] for s in scales])
             mean_d_fake = np.mean([flat_metrics[s]["d_fake"] for s in scales])
+            mean_d_gp = np.mean([flat_metrics[s]["d_gp"] for s in scales])
 
             self.writer.add_scalar("Mean/D_Total", mean_d_total, epoch)
             self.writer.add_scalar("Mean/D_Real", mean_d_real, epoch)
             self.writer.add_scalar("Mean/D_Fake", mean_d_fake, epoch)
+            self.writer.add_scalar("Mean/D_GP", mean_d_gp, epoch)
 
             # Mean generator losses
             mean_g_total = np.mean([flat_metrics[s]["g_total"] for s in scales])
@@ -216,7 +221,7 @@ class TensorBoardVisualizer:
         self.writer.add_scalar("Training/Elapsed_Time_Minutes", elapsed / 60, epoch)
 
         # Log generated samples as images with color mapping
-        if generated_samples:
+        if generated_samples and epoch % self.image_log_interval == 0:
             print(f"   Logging {len(generated_samples)} sample images...")
             for scale, sample in enumerate(generated_samples):
                 # Convert to numpy
@@ -239,8 +244,10 @@ class TensorBoardVisualizer:
                 ):
                     img = np.transpose(img, (1, 2, 0))  # (C,H,W) → (H,W,C)
 
-                # 6-channel impedance: show only the facies RGB channels
+                # 6-channel: split into facies (0:3) and impedance (3:6).
+                imp_img: np.ndarray | None = None
                 if img.ndim == 3 and img.shape[2] == 6:
+                    imp_img = img[:, :, 3:6].copy()
                     img = img[:, :, :3]
 
                 # Check if already RGB (3 channels with values that look like RGB)
@@ -269,7 +276,20 @@ class TensorBoardVisualizer:
                     img_chw = img[np.newaxis, :, :]  # (1, H, W)
                 else:
                     img_chw = np.transpose(img, (2, 0, 1))  # (H,W,C) → (C,H,W)
-                self.writer.add_image(f"Samples/Scale_{scale}", img_chw, epoch)
+                self.writer.add_image(f"Samples_Facies/Scale_{scale}", img_chw, epoch)
+
+                # Log impedance channels as a separate image.
+                if imp_img is not None:
+                    imp_img = (imp_img - imp_img.min()) / (
+                        imp_img.max() - imp_img.min() + 1e-8
+                    )
+                    imp_img = np.clip(imp_img, 0, 1).astype(np.float32)  # type: ignore
+                    imp_chw = np.transpose(  # type: ignore
+                        imp_img, (2, 0, 1)  # type: ignore
+                    )  # (H,W,C) → (C,H,W) # type: ignore
+                    self.writer.add_image(
+                        f"Samples_Impedance/Scale_{scale}", imp_chw, epoch  # type: ignore
+                    )
 
         self.last_update_time = current_time
 

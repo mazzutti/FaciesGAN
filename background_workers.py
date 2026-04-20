@@ -224,7 +224,35 @@ class BackgroundWorker:
         except Exception:
             self._warmup_future = None
 
-    def _on_done(self, fut: Future[bool]) -> None:
+    def _restart_pool(self) -> None:
+        """Recreate the process pool after a BrokenProcessPool failure.
+
+        Discards all pending futures (they are already lost) and creates a
+        fresh ProcessPoolExecutor so subsequent submissions can succeed.
+        """
+        logger.warning("BackgroundWorker: process pool is broken — restarting pool")
+        try:
+            self._executor.shutdown(wait=False)
+        except Exception:
+            pass
+        # Discard all stale pending futures — the results are unrecoverable.
+        with self._pending_cond:
+            self._pending.clear()
+            self._pending_cond.notify_all()
+        ctx = mp.get_context("spawn")
+        self._executor = ProcessPoolExecutor(max_workers=2, mp_context=ctx)
+
+    def _submit_with_retry(self, fn: Any, *args: Any) -> "Future[bool]":
+        """Submit *fn* to the pool, restarting it once on BrokenProcessPool."""
+        from concurrent.futures.process import BrokenProcessPool
+
+        try:
+            return self._executor.submit(fn, *args)
+        except BrokenProcessPool:
+            self._restart_pool()
+            return self._executor.submit(fn, *args)
+
+    def _on_done(self, fut: "Future[bool]") -> None:
         # Callback executed in the main process thread when a Future completes
         try:
             exc = fut.exception()
@@ -295,7 +323,7 @@ class BackgroundWorker:
                             fut.set_result(False)
                             return fut
                         self._pending_cond.wait(timeout=remaining)
-            fut = self._executor.submit(
+            fut = self._submit_with_retry(
                 _save_plot_task,
                 fake_list,
                 real,
@@ -309,7 +337,7 @@ class BackgroundWorker:
             )
             # Track and attach callback
             self._pending.add(fut)
-            fut.add_done_callback(self._on_done)
+            fut.add_done_callback(self._on_done)  # type: ignore
             return fut
 
     def submit_plot_generated_outputs_from_npy(
@@ -349,7 +377,7 @@ class BackgroundWorker:
                             fut.set_result(False)
                             return fut
                         self._pending_cond.wait(timeout=remaining)
-            fut = self._executor.submit(
+            fut = self._submit_with_retry(
                 _save_plot_task_from_npy,
                 str(fake_path),
                 str(real_path),
@@ -359,7 +387,7 @@ class BackgroundWorker:
                 str(masks_path) if masks_path else None,
             )
             self._pending.add(fut)
-            fut.add_done_callback(self._on_done)
+            fut.add_done_callback(self._on_done)  # type: ignore
             return fut
 
     def pending_count(self) -> int:

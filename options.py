@@ -23,20 +23,22 @@ class TrainningOptions(argparse.Namespace):
 
     def __init__(
         self,
-        alpha: int = 10,
+        reconstruction_loss_penalty: float = 10,
         batch_size: int = 1,
         beta1: float = 0.5,
         crop_size: int = 256,
         discriminator_steps: int = 3,
+        scale0_disc_steps_multiplier: int = 1,
+        scale0_loss_multiplier: float = 1.0,
         num_img_channels: int = 3,
-        gamma: float = 0.5,
+        gamma: float = 0.9,
         generator_steps: int = 3,
         gpu_device: int = 0,
         gpu_devices: list[int] | None = None,
         img_color_range: tuple[int, int] = (0, 255),
         input_path: str = DATA_DIR,
         kernel_size: int = 3,
-        lambda_grad: float = 0.1,
+        gradient_loss_penalty: float = 0.1,
         lr_d: float = 5e-04,
         lr_decay: int = 1000,
         lr_g: float = 5e-04,
@@ -48,7 +50,9 @@ class TrainningOptions(argparse.Namespace):
         min_noise_amp: float = 0.1,
         scale0_noise_amp: float = 1.0,
         well_loss_penalty: float = 10.0,
-        lambda_diversity: float = 1.0,
+        grad_clip_norm: float = 1.0,
+        diversity_loss_penalty: float = 1.0,
+        adversarial_loss_penalty: float = 1.0,
         num_diversity_samples: int = 3,
         num_feature: int = 32,
         num_generated_per_real: int = 5,
@@ -76,16 +80,22 @@ class TrainningOptions(argparse.Namespace):
         enable_tensorboard: bool = True,
         enable_plot_outputs: bool = True,
         compile_backend: bool = False,
+        shuffle: bool = True,
         gp_interval: int = 8,
         gradient_checkpointing: bool = False,
         amp_dtype: str = "bf16",
         impedance_loss_penalty: float = 1.0,
+        lr_patience: int = 400,
+        lr_min: float = 1e-4,
+        lr_smoothing_alpha: float = 0.95,
+        lr_g_factor: float = 0.8,
+        lr_decay_unit: str = "epoch",
     ) -> None:
         """Create a TrainningOptions namespace with defaults for training.
 
         Parameters
         ----------
-        alpha : int, optional
+        reconstruction_loss_penalty : float, optional
             Weight for reconstruction loss (L1/L2) used by the model. Default
             is 10.
         batch_size : int, optional
@@ -96,6 +106,9 @@ class TrainningOptions(argparse.Namespace):
             Size to crop input facies for training. Default is 256.
         discriminator_steps : int, optional
             Number of discriminator steps per training iteration. Default is 3.
+        scale0_disc_steps_multiplier : int, optional
+            Multiplier for extra discriminator steps at scale 0 only. E.g. 2
+            runs twice as many D-steps at the coarsest scale. Default is 1.
         num_channels : int, optional
             Number of channels in the input facie. Default is 3.
         gamma : float, optional
@@ -110,7 +123,7 @@ class TrainningOptions(argparse.Namespace):
             Path to the dataset root directory. Default is "data/."
         kernel_size : int, optional
             Convolution kernel size used across the networks. Default is 3.
-        lambda_grad : float, optional
+        gradient_loss_penalty : float, optional
             Gradient penalty weight for discriminator regularization. Default
             is 0.1.
         lr_d : float, optional
@@ -134,9 +147,11 @@ class TrainningOptions(argparse.Namespace):
             Minimum noise amplitude floor for diversity. Default is 0.1.
         scale0_noise_amp : float, optional
             Noise amplitude at scale 0 (controls structural diversity). Default is 1.0.
-        lambda_diversity : float, optional
-            Weight for diversity loss that penalizes similar outputs from different
-            noise inputs, encouraging the generator to produce diverse facies. Default is 1.0.
+        diversity_loss_penalty : float, optional
+            Scalar multiplier for the generator diversity loss. Default is 1.0.
+        adversarial_loss_penalty : float, optional
+            Scalar multiplier applied to the generator adversarial loss
+            (``-E[D(fake)]``). Default is 1.0.
         num_diversity_samples : int, optional
             Number of noise samples to generate per real example when computing
             the diversity loss. Default is 3.
@@ -145,7 +160,8 @@ class TrainningOptions(argparse.Namespace):
         num_generated_per_real : int, optional
             How many generated facies to produce per real example. Default is 5.
         num_iter : int, optional
-            Number of training iterations (epochs) per scale. Default is 2000.
+            Number of full passes through the training dataset. Each pass
+            shuffles the dataset independently. Default is 2000.
         num_layer : int, optional
             Number of layers per block/scale. Default is 5.
         num_real_facies : int, optional
@@ -193,11 +209,13 @@ class TrainningOptions(argparse.Namespace):
         as the `namespace=` for `ArgumentParser.parse_args`.
         """
         # Assign attributes (alphabetical by attribute name)
-        self.alpha = alpha
+        self.reconstruction_loss_penalty = reconstruction_loss_penalty
         self.batch_size = batch_size
         self.beta1 = beta1
         self.crop_size = crop_size
         self.discriminator_steps = discriminator_steps
+        self.scale0_disc_steps_multiplier = scale0_disc_steps_multiplier
+        self.scale0_loss_multiplier = scale0_loss_multiplier
         self.num_img_channels = num_img_channels
         self.gamma = gamma
         self.generator_steps = generator_steps
@@ -206,7 +224,7 @@ class TrainningOptions(argparse.Namespace):
         self.img_color_range = img_color_range
         self.input_path = input_path
         self.kernel_size = kernel_size
-        self.lambda_grad = lambda_grad
+        self.gradient_loss_penalty = gradient_loss_penalty
         self.lr_d = lr_d
         self.lr_decay = lr_decay
         self.lr_g = lr_g
@@ -218,7 +236,9 @@ class TrainningOptions(argparse.Namespace):
         self.min_noise_amp = min_noise_amp
         self.scale0_noise_amp = scale0_noise_amp
         self.well_loss_penalty = well_loss_penalty
-        self.lambda_diversity = lambda_diversity
+        self.grad_clip_norm = grad_clip_norm
+        self.diversity_loss_penalty = diversity_loss_penalty
+        self.adversarial_loss_penalty = adversarial_loss_penalty
         self.num_diversity_samples = num_diversity_samples
         self.num_feature = num_feature
         self.num_generated_per_real = num_generated_per_real
@@ -245,10 +265,17 @@ class TrainningOptions(argparse.Namespace):
         self.enable_tensorboard = enable_tensorboard
         self.enable_plot_outputs = enable_plot_outputs
         self.compile_backend = compile_backend
+        self.shuffle = shuffle
         self.gp_interval = gp_interval
         self.gradient_checkpointing = gradient_checkpointing
         self.amp_dtype = amp_dtype
         self.impedance_loss_penalty = impedance_loss_penalty
+        self.lr_patience = lr_patience
+        self.lr_min = lr_min
+        self.lr_smoothing_alpha = lr_smoothing_alpha
+        self.lr_g_factor = lr_g_factor
+        self.lr_decay_unit = lr_decay_unit
+        self.num_iter = num_iter
 
 
 class ResumeOptions(argparse.Namespace):

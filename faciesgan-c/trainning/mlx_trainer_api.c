@@ -353,7 +353,7 @@ MLXTrainer *MLXTrainer_new(const TrainningOptions *opts, int fine_tuning,
 
     /* Print training banner (parity with Python main.py) */
     printf("\n============================================================\n");
-    printf("PARALLEL LAPGAN TRAINING\n");
+    printf("PARALLEL FACIESGAN TRAINING\n");
     printf("============================================================\n");
     printf("Device: MLX (gpu, 0)\n");
     printf("Training scales: %d to %d\n", opts->start_scale, opts->stop_scale);

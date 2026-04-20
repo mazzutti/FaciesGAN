@@ -87,7 +87,13 @@
   "python.analysis.typeEvaluation.analyzeUnannotatedFunctions": true,
   "python.analysis.languageServerMode": "full",
   "python.analysis.supportRestructuredText": true,
-  "python-envs.pythonProjects": [],
+  "python-envs.pythonProjects": [
+    {
+      "path": "results/experiments/seismic_only/tensorboard_logs",
+      "envManager": "ms-python.python:venv",
+      "packageManager": "ms-python.python:pip"
+    }
+  ],
   "[c]": {
     "editor.defaultFormatter": "chiehyu.vscode-astyle"
   },
